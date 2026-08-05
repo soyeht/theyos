@@ -294,6 +294,8 @@ pub async fn currency(
     let record = identity.record.clone();
     let auth = owner_auth.clone();
     let queried = tokio::task::spawn_blocking(move || {
+        let _lifecycle = household_auth::acquire_exact_household_lifecycle(&state_dir, &record)
+            .map_err(|_| RosterStoreError::InvalidCurrentOwnerAuthority)?;
         let coordinator =
             MachineRosterCoordinator::from_validated_household(&state_dir, &record, &auth)?;
         coordinator.query_machine_currency(&m_id)
@@ -523,6 +525,8 @@ pub async fn evidence(
     let auth = owner_auth.clone();
     let signer = Arc::clone(&identity);
     let produced = tokio::task::spawn_blocking(move || {
+        let _lifecycle = household_auth::acquire_exact_household_lifecycle(&state_dir, &record)
+            .map_err(|_| RosterStoreError::InvalidCurrentOwnerAuthority)?;
         let coordinator =
             MachineRosterCoordinator::from_validated_household(&state_dir, &record, &auth)?;
         // The store lock is taken and released inside this call; the body is

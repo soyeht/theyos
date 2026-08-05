@@ -113,10 +113,11 @@ pub fn write_self_m_id(state_dir: &Path, m_id: &str) -> Result<(), StorageError>
     Ok(())
 }
 
-/// Path to the active pair-device-window snapshot, written by
-/// `theyos install` so the long-running daemon process picks it up at
-/// startup. Phase 3 renamed this from `pair_window.cbor` to disambiguate
-/// from `pair_machine_window.cbor`.
+/// Legacy unscoped pair-device-window path.
+///
+/// Generation-scoped code must use [`crate::pair_window_namespace`] instead.
+/// This path remains public only for cleanup and compatibility tests; no
+/// production reader adopts its contents.
 #[must_use]
 pub fn pair_device_window_path(state_dir: &Path) -> PathBuf {
     household_dir(state_dir).join("pair_device_window.cbor")
@@ -195,6 +196,149 @@ pub fn delete_claw_vpn_mobile_mesh_snapshot(state_dir: &Path) -> Result<(), Stor
     delete_optional_file(&claw_vpn_mobile_mesh_path(state_dir))
 }
 
+/// Maximum accepted size of the single Phase-3 recovery authority.
+///
+/// Recovery runs before the household listener is allowed to publish
+/// authority. Bounding the record before allocation keeps a corrupted local
+/// file from turning fail-stop recovery into an unbounded allocation.
+pub const MAX_PHASE3_RECOVERY_MANIFEST_BYTES: u64 = 1_048_576;
+
+/// Path to the single founder-side Phase-3 recovery authority.
+///
+/// This replaces the legacy independent marker/pending-response files.  The
+/// manifest remains present after local promotion as the durable
+/// `MachineJoined` outbox and is cleared only after that exact side effect is
+/// observed or durably appended.
+#[must_use]
+pub fn phase3_recovery_manifest_path(state_dir: &Path) -> PathBuf {
+    household_dir(state_dir).join("phase3_recovery_manifest_v1.cbor")
+}
+
+#[must_use]
+pub fn phase3_recovery_manifest_exists(state_dir: &Path) -> bool {
+    // This is a destructive-recovery gate, not a successful decode probe.
+    // Any directory entry (including a dangling symlink or malformed file)
+    // must preserve staged evidence until the strict reader quarantines it.
+    match fs::symlink_metadata(phase3_recovery_manifest_path(state_dir)) {
+        Ok(_) => true,
+        Err(error) if error.kind() == ErrorKind::NotFound => false,
+        // Failure to inspect is uncertainty, never cleanup authority.
+        Err(_) => true,
+    }
+}
+
+/// Durably publish the exact, validated Phase-3 recovery manifest.
+///
+/// `MayHaveTakenEffect` must be reconciled by retrying this function with the
+/// same manifest until it returns `Ok`; callers must never roll back staged
+/// artifacts merely because the parent barrier failed after rename.
+pub fn write_phase3_recovery_manifest(
+    lifecycle: &crate::household_lifecycle::LifecycleWriteGuard,
+    state_dir: &Path,
+    manifest: &crate::pair_machine::Phase3RecoveryManifestV1,
+) -> Result<(), StorageError> {
+    lifecycle.verify_state_root(state_dir).map_err(|error| {
+        StorageError::Encoding(HouseholdError::Cbor(format!(
+            "Phase-3 manifest lifecycle binding: {error}"
+        )))
+    })?;
+    manifest
+        .validate()
+        .map_err(|error| StorageError::Encoding(HouseholdError::Cbor(error.to_string())))?;
+    let bytes = manifest
+        .to_canonical_bytes()
+        .map_err(StorageError::Encoding)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_PHASE3_RECOVERY_MANIFEST_BYTES {
+        return Err(StorageError::Encoding(HouseholdError::Cbor(format!(
+            "Phase-3 recovery manifest exceeds {MAX_PHASE3_RECOVERY_MANIFEST_BYTES} bytes"
+        ))));
+    }
+    if let Some(existing) = read_phase3_recovery_manifest(state_dir)?
+        && existing != *manifest
+    {
+        return Err(StorageError::Encoding(HouseholdError::Cbor(
+            "a divergent Phase-3 recovery manifest already owns this lifecycle".into(),
+        )));
+    }
+    // Rewriting an identical visible manifest is deliberate: it re-establishes
+    // the file and parent barriers after a prior MayHaveTakenEffect result.
+    atomic_write_cbor(&phase3_recovery_manifest_path(state_dir), manifest)
+}
+
+/// Read and strictly validate the single Phase-3 recovery authority.
+///
+/// The metadata bound is checked before allocating and the post-read bound is
+/// checked again to close a concurrent-growth window. Symlinks and non-regular
+/// files fail closed.
+pub fn read_phase3_recovery_manifest(
+    state_dir: &Path,
+) -> Result<Option<crate::pair_machine::Phase3RecoveryManifestV1>, StorageError> {
+    use std::io::Read as _;
+
+    let path = phase3_recovery_manifest_path(state_dir);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_to_storage(&error, &path)),
+    };
+    if !metadata.file_type().is_file() || metadata.len() > MAX_PHASE3_RECOVERY_MANIFEST_BYTES {
+        return Err(StorageError::Encoding(HouseholdError::Cbor(format!(
+            "unsafe Phase-3 recovery manifest shape at {}",
+            path.display()
+        ))));
+    }
+    let mut file = File::open(&path).map_err(|error| io_to_storage(&error, &path))?;
+    let mut bytes = Vec::new();
+    std::io::Read::by_ref(&mut file)
+        .take(MAX_PHASE3_RECOVERY_MANIFEST_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| io_to_storage(&error, &path))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_PHASE3_RECOVERY_MANIFEST_BYTES {
+        return Err(StorageError::Encoding(HouseholdError::Cbor(format!(
+            "Phase-3 recovery manifest grew beyond {MAX_PHASE3_RECOVERY_MANIFEST_BYTES} bytes"
+        ))));
+    }
+    let manifest: crate::pair_machine::Phase3RecoveryManifestV1 =
+        cbor::from_canonical_slice_strict(&bytes).map_err(StorageError::Encoding)?;
+    manifest
+        .validate()
+        .map_err(|error| StorageError::Encoding(HouseholdError::Cbor(error.to_string())))?;
+    Ok(Some(manifest))
+}
+
+/// Durably clear the Phase-3 recovery manifest after every terminal side
+/// effect, including `MachineJoined`, has been reconciled.
+pub fn clear_phase3_recovery_manifest(
+    lifecycle: &crate::household_lifecycle::LifecycleWriteGuard,
+    state_dir: &Path,
+) -> Result<(), StorageError> {
+    lifecycle.verify_state_root(state_dir).map_err(|error| {
+        StorageError::Encoding(HouseholdError::Cbor(format!(
+            "Phase-3 manifest cleanup lifecycle binding: {error}"
+        )))
+    })?;
+    let path = phase3_recovery_manifest_path(state_dir);
+    match fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(io_to_storage(&error, &path)),
+    }
+    let parent = path.parent().ok_or_else(|| StorageError::Io {
+        path: path.clone(),
+        kind: "InvalidInput".into(),
+        hint: "Phase-3 recovery manifest has no parent directory".into(),
+    })?;
+    let dir = File::open(parent).map_err(|error| StorageError::MayHaveTakenEffect {
+        path: path.clone(),
+        hint: format!("open parent after manifest absence: {error}"),
+    })?;
+    dir.sync_all()
+        .map_err(|error| StorageError::MayHaveTakenEffect {
+            path,
+            hint: format!("fsync parent after manifest absence: {error}"),
+        })
+}
+
 /// Path to the Phase 3 finalize-intent preservation marker.
 ///
 /// Written by `owner_approve_handler` before it launches the finalize
@@ -228,23 +372,7 @@ pub fn write_phase3_finalize_ack_marker(
     candidate_m_id: &str,
 ) -> Result<(), StorageError> {
     let path = phase3_finalize_ack_marker_path(state_dir);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| io_to_storage(&e, parent))?;
-    }
-    let staged = staged_path_for(&path);
-    {
-        let mut f = File::create(&staged).map_err(|e| io_to_storage(&e, &staged))?;
-        f.write_all(candidate_m_id.as_bytes())
-            .map_err(|e| io_to_storage(&e, &staged))?;
-        f.sync_all().map_err(|e| io_to_storage(&e, &staged))?;
-    }
-    fs::rename(&staged, &path).map_err(|e| io_to_storage(&e, &path))?;
-    if let Some(parent) = path.parent() {
-        if let Ok(dir) = File::open(parent) {
-            let _ = dir.sync_all();
-        }
-    }
-    Ok(())
+    write_phase3_recovery_evidence(&path, candidate_m_id.as_bytes())
 }
 
 /// Best-effort marker delete. Missing-file is not an error.
@@ -280,21 +408,61 @@ pub fn write_phase3_pending_join_response(
     join_response_bytes: &[u8],
 ) -> Result<(), StorageError> {
     let path = phase3_pending_join_response_path(state_dir);
+    write_phase3_recovery_evidence(&path, join_response_bytes)
+}
+
+/// Publish exact Phase-3 recovery evidence, returning success only after the
+/// destination bytes and their parent dirent are durable.
+///
+/// A post-rename failure is indeterminate by definition. Callers must not send
+/// the remote finalize request on that outcome; an exact retry rewrites the
+/// same bytes and re-establishes the parent barrier before returning `Ok`.
+fn write_phase3_recovery_evidence(path: &Path, exact_bytes: &[u8]) -> Result<(), StorageError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| io_to_storage(&e, parent))?;
     }
-    let staged = staged_path_for(&path);
-    {
+    let staged = staged_path_for(path);
+    let pre_rename = (|| {
         let mut f = File::create(&staged).map_err(|e| io_to_storage(&e, &staged))?;
-        f.write_all(join_response_bytes)
+        f.write_all(exact_bytes)
             .map_err(|e| io_to_storage(&e, &staged))?;
         f.sync_all().map_err(|e| io_to_storage(&e, &staged))?;
+        Ok::<(), StorageError>(())
+    })();
+    if let Err(error) = pre_rename {
+        let _ = fs::remove_file(&staged);
+        return Err(error);
     }
-    fs::rename(&staged, &path).map_err(|e| io_to_storage(&e, &path))?;
+    if let Err(error) = fs::rename(&staged, path) {
+        let _ = fs::remove_file(&staged);
+        return Err(io_to_storage(&error, path));
+    }
     if let Some(parent) = path.parent() {
-        if let Ok(dir) = File::open(parent) {
-            let _ = dir.sync_all();
+        if storage_fail_injection::take_phase3_evidence_parent_barrier() {
+            return Err(StorageError::MayHaveTakenEffect {
+                path: path.to_path_buf(),
+                hint: "injected Phase-3 evidence parent barrier failure after rename".into(),
+            });
         }
+        let dir = File::open(parent).map_err(|error| StorageError::MayHaveTakenEffect {
+            path: path.to_path_buf(),
+            hint: format!("open parent after Phase-3 evidence rename: {error}"),
+        })?;
+        dir.sync_all()
+            .map_err(|error| StorageError::MayHaveTakenEffect {
+                path: path.to_path_buf(),
+                hint: format!("fsync parent after Phase-3 evidence rename: {error}"),
+            })?;
+    }
+    let readback = fs::read(path).map_err(|error| StorageError::MayHaveTakenEffect {
+        path: path.to_path_buf(),
+        hint: format!("read back Phase-3 evidence after parent barrier: {error}"),
+    })?;
+    if readback != exact_bytes {
+        return Err(StorageError::MayHaveTakenEffect {
+            path: path.to_path_buf(),
+            hint: "Phase-3 evidence readback differed after parent barrier".into(),
+        });
     }
     Ok(())
 }
@@ -395,8 +563,15 @@ pub fn delete_household_auth_state(state_dir: &Path) -> Result<(), StorageError>
 /// fired so callers can `tracing::info!` them once at boot.
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct LoadStateOutcome {
-    /// `pair_window.cbor` was renamed to `pair_device_window.cbor` (T005).
+    /// Compatibility signal for the former raw-window adoption migration.
+    ///
+    /// This is always `false`: raw pair-window snapshots are no longer
+    /// migrated or adopted. The field remains so existing callers that only
+    /// observe migration telemetry do not suffer an API break.
     pub migrated_pair_device_window: bool,
+    /// Raw pre-generation pair-window snapshots were durably discarded.
+    /// Their contents are never adopted into a generation namespace.
+    pub discarded_legacy_pair_windows: bool,
     /// `machine_cert.cbor` was moved into `machine_certs/<m_id>.cbor` (T005a).
     /// Carries the `m_id` decoded from the migrated cert.
     pub migrated_self_machine_cert: Option<String>,
@@ -430,20 +605,18 @@ pub struct LoadStateOutcome {
 /// Run all idempotent one-shot file-layout migrations and return their
 /// outcome. Phase 3 introduces:
 ///
-/// - `pair_window.cbor` → `pair_device_window.cbor` (T005).
+/// - raw pre-generation pair-window snapshots are discarded, never adopted.
 /// - `machine_cert.cbor` (root of `<state_dir>/household/`) →
 ///   `machine_certs/<self_m_id>.cbor` (T005a).
 ///
-/// Both branches are no-ops when the legacy file is absent or the new path
-/// already exists. Calls are safe across concurrent invocations because the
-/// underlying `std::fs::rename` is atomic on POSIX. Restart-after-crash:
-/// either the legacy or the new path is observed, never both.
+/// The machine-cert migration is a no-op when the legacy file is absent or the
+/// new path already exists. Pair-window cleanup is idempotent and commits its
+/// removals with a parent-directory barrier.
 ///
 /// Production code MUST call this once at process startup, before any
-/// reader touches `pair_device_window.cbor` or
-/// `machine_certs/<m_id>.cbor`.
+/// reader touches `machine_certs/<m_id>.cbor`.
 pub fn load_state_dir(state_dir: &Path) -> Result<LoadStateOutcome, StorageError> {
-    let migrated_pair_device_window = migrate_pair_device_window(state_dir)?;
+    let discarded_legacy_pair_windows = discard_legacy_pair_windows(state_dir)?;
     let migrated_self_machine_cert = migrate_self_machine_cert(state_dir)?;
     // R7.4: `recover_partial_phase3_commit` MUST run BEFORE
     // `recover_self_m_id_marker`. Under the M2-side staged ordering
@@ -481,7 +654,8 @@ pub fn load_state_dir(state_dir: &Path) -> Result<LoadStateOutcome, StorageError
     // next boot and short-circuited before the clear).
     clear_stale_phase3_marker_if_post_shamir(state_dir);
     Ok(LoadStateOutcome {
-        migrated_pair_device_window,
+        migrated_pair_device_window: false,
+        discarded_legacy_pair_windows,
         migrated_self_machine_cert,
         recovered_self_m_id_marker,
         recovered_post_join_sole_shard_deleted,
@@ -638,22 +812,26 @@ fn recover_partial_phase3_commit(state_dir: &Path) -> (usize, usize) {
                 return (0, 0);
             }
         };
-    // R6.1/R8: finalize-intent preservation gate — when the on-disk
-    // record is still pre-Shamir BUT a `phase3_finalize_ack.marker`
-    // exists, M1 has launched or may have launched finalize with M2.
-    // The `.staged` files MUST survive on disk. T073/T074 will use
-    // them to drive `recover_phase3_ceremony` per
-    // `contracts/shamir-transition.md` §"Recovery on M1 boot".
-    // The roll-forward branch below (post-Shamir record) is unaffected
-    // — once the record has flipped, recovery completes the ceremony.
-    if !post_shamir && phase3_finalize_ack_marker_exists(state_dir) {
-        let marker = phase3_finalize_ack_marker_path(state_dir);
+    // Phase-3 preservation gate. The single manifest is the only current
+    // authority for these staged files; legacy marker/pending evidence is
+    // quarantined by the startup driver and is retained here solely so this
+    // lower-level recovery cannot destroy evidence before quarantine runs.
+    // A current manifest owns its staged set in both pre- and post-Shamir
+    // states. A visible post-Shamir record is not yet durable authority: the
+    // rename may have landed before its parent barrier failed. Only the
+    // manifest recovery driver validates exact hashes and re-establishes those
+    // barriers before removing staged evidence. Legacy evidence retains its
+    // historical pre-Shamir-only quarantine behavior.
+    if phase3_recovery_manifest_exists(state_dir)
+        || (!post_shamir
+            && (phase3_finalize_ack_marker_exists(state_dir)
+                || phase3_pending_join_response_exists(state_dir)))
+    {
         tracing::error!(
             stage = "recovery.partial_phase3_commit.post_finalize_ack_pending",
-            marker = %marker.display(),
+            manifest = %phase3_recovery_manifest_path(state_dir).display(),
             staged_count = staged.len(),
-            hint = "M1 finalize outcome is in-flight or ambiguous; preserving .staged for \
-                    T073/T074 recover_phase3_ceremony driver — do not unlink",
+            hint = "Phase-3 outcome is in-flight, ambiguous, or legacy-quarantined; preserving exact .staged evidence",
         );
         return (0, 0);
     }
@@ -898,25 +1076,33 @@ fn recover_self_m_id_marker(state_dir: &Path) -> Result<Option<String>, StorageE
     Ok(Some(m_id))
 }
 
-fn migrate_pair_device_window(state_dir: &Path) -> Result<bool, StorageError> {
-    let legacy = legacy_pair_window_path(state_dir);
-    let target = pair_device_window_path(state_dir);
-    if !legacy.exists() {
-        return Ok(false);
-    }
-    if target.exists() {
-        // Both present — the new path wins (Adoption-First, Constitution IV).
-        // Drop the stale legacy file so no future reader sees it.
-        delete_optional_file(&legacy)?;
-        return Ok(false);
-    }
-    fs::rename(&legacy, &target).map_err(|e| io_to_storage(&e, &target))?;
-    if let Some(parent) = target.parent() {
-        if let Ok(dir) = File::open(parent) {
-            let _ = dir.sync_all();
+fn discard_legacy_pair_windows(state_dir: &Path) -> Result<bool, StorageError> {
+    let household = household_dir(state_dir);
+    let paths = [
+        legacy_pair_window_path(state_dir),
+        pair_device_window_path(state_dir),
+        household.join("pair_machine_window.cbor"),
+    ];
+    let mut removed = false;
+    for path in &paths {
+        match fs::remove_file(path) {
+            Ok(()) => removed = true,
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(io_to_storage(&error, path)),
         }
     }
-    Ok(true)
+    if removed {
+        let dir = File::open(&household).map_err(|error| StorageError::MayHaveTakenEffect {
+            path: household.clone(),
+            hint: format!("open parent after discarding raw pair snapshots: {error}"),
+        })?;
+        dir.sync_all()
+            .map_err(|error| StorageError::MayHaveTakenEffect {
+                path: household,
+                hint: format!("fsync parent after discarding raw pair snapshots: {error}"),
+            })?;
+    }
+    Ok(removed)
 }
 
 fn migrate_self_machine_cert(state_dir: &Path) -> Result<Option<String>, StorageError> {
@@ -1023,10 +1209,24 @@ fn atomic_write_cbor_impl<T: Serialize>(
     }
 
     if let Some(parent) = path.parent() {
-        // fsync the parent dir so the rename is durable.
-        if let Ok(dir) = File::open(parent) {
-            let _ = dir.sync_all();
+        // The rename has already changed semantic state. Failure from this
+        // point is explicitly indeterminate; callers must reconcile instead
+        // of treating the write as KnownNoEffect.
+        if storage_fail_injection::take_atomic_parent_barrier() {
+            return Err(StorageError::MayHaveTakenEffect {
+                path: path.to_path_buf(),
+                hint: "injected parent-directory barrier failure after rename".into(),
+            });
         }
+        let dir = File::open(parent).map_err(|error| StorageError::MayHaveTakenEffect {
+            path: path.to_path_buf(),
+            hint: format!("open parent after rename: {error}"),
+        })?;
+        dir.sync_all()
+            .map_err(|error| StorageError::MayHaveTakenEffect {
+                path: path.to_path_buf(),
+                hint: format!("fsync parent after rename: {error}"),
+            })?;
     }
 
     Ok(())
@@ -1105,9 +1305,9 @@ pub fn stage_commit_files(items: &[(PathBuf, Vec<u8>)]) -> Result<StagedCommit, 
     // fsync every distinct parent directory exactly once so the
     // freshly-created `.staged` direntries are durable.
     for parent in &parents_to_fsync {
-        if let Ok(dir) = File::open(parent) {
-            let _ = dir.sync_all();
-        }
+        let dir = File::open(parent).map_err(|error| io_to_storage(&error, parent))?;
+        dir.sync_all()
+            .map_err(|error| io_to_storage(&error, parent))?;
     }
     Ok(StagedCommit {
         items: staged,
@@ -1121,7 +1321,9 @@ impl StagedCommit {
     /// is fsynced so the commit survives a crash mid-operation.
     pub fn commit(mut self) -> Result<(), StorageError> {
         let result = self.commit_inner();
-        if result.is_ok() {
+        if result.is_ok() || matches!(&result, Err(StorageError::MayHaveTakenEffect { .. })) {
+            // After any rename, surviving staged files are recovery evidence.
+            // Do not let Drop erase them on an indeterminate outcome.
             self.committed = true;
         }
         result
@@ -1161,13 +1363,37 @@ impl StagedCommit {
     }
 
     fn commit_inner(&mut self) -> Result<(), StorageError> {
+        let mut promoted_any = false;
         for item in &self.items {
-            fs::rename(&item.staged_path, &item.final_path)
-                .map_err(|e| io_to_storage(&e, &item.final_path))?;
-            if let Some(parent) = item.final_path.parent() {
-                if let Ok(dir) = File::open(parent) {
-                    let _ = dir.sync_all();
+            if let Err(error) = fs::rename(&item.staged_path, &item.final_path) {
+                if promoted_any {
+                    return Err(StorageError::MayHaveTakenEffect {
+                        path: item.final_path.clone(),
+                        hint: format!(
+                            "a prior staged file was promoted before rename failed: {error}"
+                        ),
+                    });
                 }
+                return Err(io_to_storage(&error, &item.final_path));
+            }
+            promoted_any = true;
+            if let Some(parent) = item.final_path.parent() {
+                if storage_fail_injection::take_staged_commit_parent_barrier() {
+                    return Err(StorageError::MayHaveTakenEffect {
+                        path: item.final_path.clone(),
+                        hint: "injected parent-directory barrier failure after staged rename"
+                            .into(),
+                    });
+                }
+                let dir = File::open(parent).map_err(|error| StorageError::MayHaveTakenEffect {
+                    path: item.final_path.clone(),
+                    hint: format!("open parent after staged rename: {error}"),
+                })?;
+                dir.sync_all()
+                    .map_err(|error| StorageError::MayHaveTakenEffect {
+                        path: item.final_path.clone(),
+                        hint: format!("fsync parent after staged rename: {error}"),
+                    })?;
             }
         }
         Ok(())
@@ -1179,6 +1405,56 @@ impl StagedCommit {
             let _ = fs::remove_file(&item.staged_path);
         }
         self.committed = true; // suppress drop-leak warning
+    }
+}
+
+#[cfg(test)]
+mod storage_fail_injection {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAIL_ATOMIC_PARENT_BARRIER: Cell<bool> = const { Cell::new(false) };
+        static FAIL_STAGED_COMMIT_PARENT_BARRIER: Cell<bool> = const { Cell::new(false) };
+        static FAIL_PHASE3_EVIDENCE_PARENT_BARRIER: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn arm_atomic_parent_barrier() {
+        FAIL_ATOMIC_PARENT_BARRIER.with(|armed| armed.set(true));
+    }
+
+    pub(super) fn take_atomic_parent_barrier() -> bool {
+        FAIL_ATOMIC_PARENT_BARRIER.with(|armed| armed.replace(false))
+    }
+
+    pub(super) fn arm_staged_commit_parent_barrier() {
+        FAIL_STAGED_COMMIT_PARENT_BARRIER.with(|armed| armed.set(true));
+    }
+
+    pub(super) fn take_staged_commit_parent_barrier() -> bool {
+        FAIL_STAGED_COMMIT_PARENT_BARRIER.with(|armed| armed.replace(false))
+    }
+
+    pub(super) fn arm_phase3_evidence_parent_barrier() {
+        FAIL_PHASE3_EVIDENCE_PARENT_BARRIER.with(|armed| armed.set(true));
+    }
+
+    pub(super) fn take_phase3_evidence_parent_barrier() -> bool {
+        FAIL_PHASE3_EVIDENCE_PARENT_BARRIER.with(|armed| armed.replace(false))
+    }
+}
+
+#[cfg(not(test))]
+mod storage_fail_injection {
+    pub(super) const fn take_atomic_parent_barrier() -> bool {
+        false
+    }
+
+    pub(super) const fn take_staged_commit_parent_barrier() -> bool {
+        false
+    }
+
+    pub(super) const fn take_phase3_evidence_parent_barrier() -> bool {
+        false
     }
 }
 
@@ -1408,5 +1684,140 @@ mod tests {
         let mut tmp = path.as_os_str().to_owned();
         tmp.push(".tmp");
         assert!(!std::path::Path::new(&tmp).exists());
+    }
+
+    #[test]
+    fn atomic_parent_barrier_failure_reports_effect_and_retry_stabilizes_same_value() {
+        let td = tempdir().unwrap();
+        let path = td.path().join("authority.cbor");
+        let value = Tiny(9, "installed".into());
+        storage_fail_injection::arm_atomic_parent_barrier();
+        let error = atomic_write_cbor(&path, &value).unwrap_err();
+        assert!(matches!(error, StorageError::MayHaveTakenEffect { .. }));
+        assert_eq!(
+            read_optional_cbor::<Tiny>(&path).unwrap(),
+            Some(Tiny(9, "installed".into())),
+            "the typed outcome must describe the semantic effect that actually landed"
+        );
+        atomic_write_cbor(&path, &value).expect("retry rewrites and stabilizes the same value");
+        assert_eq!(read_optional_cbor::<Tiny>(&path).unwrap(), Some(value));
+    }
+
+    #[test]
+    fn phase3_evidence_parent_barrier_failure_blocks_dispatch_until_exact_retry() {
+        let td = tempdir().unwrap();
+        let cases: [(
+            &[u8],
+            fn(&Path, &[u8]) -> Result<(), StorageError>,
+            fn(&Path) -> PathBuf,
+        ); 2] = [
+            (
+                b"exact canonical JoinResponse",
+                write_phase3_pending_join_response,
+                phase3_pending_join_response_path,
+            ),
+            (
+                b"m_exact_candidate",
+                |state_dir, bytes| {
+                    let candidate = std::str::from_utf8(bytes).expect("test candidate utf8");
+                    write_phase3_finalize_ack_marker(state_dir, candidate)
+                },
+                phase3_finalize_ack_marker_path,
+            ),
+        ];
+
+        for (exact, write, path_for) in cases {
+            storage_fail_injection::arm_phase3_evidence_parent_barrier();
+            let error = write(td.path(), exact).unwrap_err();
+            assert!(matches!(error, StorageError::MayHaveTakenEffect { .. }));
+            assert_eq!(
+                fs::read(path_for(td.path())).unwrap(),
+                exact,
+                "the typed outcome must admit that the rename may already be visible",
+            );
+            write(td.path(), exact).expect("exact retry must reapply and prove parent durability");
+            assert_eq!(fs::read(path_for(td.path())).unwrap(), exact);
+        }
+    }
+
+    #[test]
+    fn oversized_phase3_manifest_fails_closed_before_decode() {
+        let td = tempdir().unwrap();
+        let path = phase3_recovery_manifest_path(td.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let file = File::create(&path).unwrap();
+        file.set_len(MAX_PHASE3_RECOVERY_MANIFEST_BYTES + 1)
+            .unwrap();
+
+        let error = read_phase3_recovery_manifest(td.path()).unwrap_err();
+        assert!(matches!(error, StorageError::Encoding(_)));
+    }
+
+    #[test]
+    fn current_phase3_manifest_owns_staged_files_even_after_record_is_visible_post_shamir() {
+        let td = tempdir().unwrap();
+        let loaded = crate::bootstrap_or_load(
+            td.path(),
+            crate::BootstrapOpts {
+                household_name: "Manifest Gate".into(),
+                hostname_label: Some("manifest-gate".into()),
+            },
+            crate::KeyBackingPolicy::ForceSoftware,
+        )
+        .unwrap();
+        let mut visible_record = loaded.record.clone();
+        visible_record.shamir_k = 2;
+        visible_record.shamir_n = 2;
+        atomic_write_cbor(&household_record_path(td.path()), &visible_record).unwrap();
+
+        let staged = staged_path_for(&crate::pair_machine::shamir_self_shard_path(td.path()));
+        fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        fs::write(&staged, b"exact staged evidence").unwrap();
+        let manifest = phase3_recovery_manifest_path(td.path());
+        fs::write(&manifest, b"reader will quarantine this malformed manifest").unwrap();
+
+        assert_eq!(recover_partial_phase3_commit(td.path()), (0, 0));
+        assert!(
+            staged.exists(),
+            "generic post-Shamir recovery must not consume manifest-owned evidence"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_manifest_entry_is_still_a_fail_closed_staged_cleanup_gate() {
+        use std::os::unix::fs::symlink;
+
+        let td = tempdir().unwrap();
+        let staged = staged_path_for(&crate::pair_machine::shamir_self_shard_path(td.path()));
+        fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        fs::write(&staged, b"preserve me").unwrap();
+        let manifest = phase3_recovery_manifest_path(td.path());
+        symlink(td.path().join("missing-target"), &manifest).unwrap();
+
+        assert!(phase3_recovery_manifest_exists(td.path()));
+        assert_eq!(recover_partial_phase3_commit(td.path()), (0, 0));
+        assert!(staged.exists());
+    }
+
+    #[test]
+    fn staged_parent_barrier_failure_preserves_remaining_recovery_evidence() {
+        let td = tempdir().unwrap();
+        let first = td.path().join("first.cbor");
+        let second = td.path().join("second.cbor");
+        let staged = stage_commit_files(&[
+            (first.clone(), b"first".to_vec()),
+            (second.clone(), b"second".to_vec()),
+        ])
+        .unwrap();
+        storage_fail_injection::arm_staged_commit_parent_barrier();
+        let error = staged.commit().unwrap_err();
+        assert!(matches!(error, StorageError::MayHaveTakenEffect { .. }));
+        assert_eq!(fs::read(&first).unwrap(), b"first");
+        assert!(
+            staged_path_for(&second).exists(),
+            "Drop must preserve unpromoted staged evidence after any final rename"
+        );
+        assert!(!second.exists());
     }
 }

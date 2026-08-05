@@ -23,14 +23,18 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
 use household_rs::bootstrap_state::{self, BootstrapState};
 use household_rs::caveats;
+use household_rs::household_lifecycle::{HouseholdLifecycleLock, LifecycleWriteGuard};
 use household_rs::keys::P256PublicKey;
 use household_rs::pair_device::{ConsumeError, ConsumeWithError, PairDeviceWindow, PairNonce};
 use household_rs::person_cert::{SignOwnerOptions, derive_person_id};
 use household_rs::pop::PairingProofContext;
 use household_rs::{HouseholdAuthState, P256Signature};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::future::Future;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::household_bootstrap::global_bootstrap_state;
 use crate::household_state::HouseholdState;
@@ -78,6 +82,70 @@ struct ConfirmResponse {
 /// Hard ceiling on the base64-encoded nonce body so that a hostile client
 /// can't allocate hundreds of MB by sending an oversized request.
 const MAX_NONCE_B64_LEN: usize = 64;
+const PAIR_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn lifecycle_io(stage: &'static str, error: impl std::fmt::Display) -> io::Error {
+    io::Error::other(format!("{stage}: {error}"))
+}
+
+fn acquire_pair_lifecycle_exclusive(state_dir: &Path) -> io::Result<LifecycleWriteGuard> {
+    let lifecycle = HouseholdLifecycleLock::open_verified(state_dir)
+        .map_err(|error| lifecycle_io("open pair-device household lifecycle", error))?;
+    let deadline = Instant::now()
+        .checked_add(PAIR_LIFECYCLE_TIMEOUT)
+        .ok_or_else(|| io::Error::other("pair-device lifecycle deadline overflow"))?;
+    let guard = lifecycle
+        .lock_exclusive_until(deadline)
+        .map_err(|error| lifecycle_io("acquire pair-device lifecycle exclusive", error))?;
+    let recovered =
+        household_rs::bootstrap::recover_interrupted_household_teardown_under_lifecycle(
+            &guard, state_dir,
+        )
+        .map_err(|error| lifecycle_io("recover interrupted household teardown", error))?;
+    if recovered {
+        return Err(io::Error::other(
+            "recovered an interrupted teardown; refusing the stale pairing request",
+        ));
+    }
+    Ok(guard)
+}
+
+fn verify_installed_household_id(
+    guard: &LifecycleWriteGuard,
+    state_dir: &Path,
+    expected_hh_id: &str,
+) -> io::Result<()> {
+    guard
+        .verify_state_root(state_dir)
+        .map_err(|error| lifecycle_io("verify pair-device state root", error))?;
+    let record: household_rs::HouseholdRecord = household_rs::storage::read_optional_cbor(
+        &household_rs::storage::household_record_path(state_dir),
+    )
+    .map_err(|error| lifecycle_io("read installed household for pair-device", error))?
+    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "installed household is absent"))?;
+    if record.hh_id.as_str() != expected_hh_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "installed household changed before pair-device completion",
+        ));
+    }
+    Ok(())
+}
+
+async fn persist_ready_then_publish<F>(
+    guard: &LifecycleWriteGuard,
+    state_dir: &Path,
+    expected_generation: household_rs::household_lifecycle::HouseholdLifecycleGenerationV1,
+    publish: F,
+) -> io::Result<()>
+where
+    F: Future<Output = ()>,
+{
+    bootstrap_state::persist_ready_under_lifecycle(guard, state_dir, expected_generation)
+        .map_err(|error| lifecycle_io("persist pair-device ready state", error))?;
+    publish.await;
+    Ok(())
+}
 
 /// `POST /api/v1/household/pair-device/initiate`
 ///
@@ -165,6 +233,42 @@ pub async fn confirm(
         .lock()
         .await;
 
+    // Cross-process lifecycle ordering is deliberately outside every
+    // PairDeviceWindow/HouseholdState mutex: mutation lock -> lifecycle
+    // exclusive -> process state -> stores. A teardown or replacement cannot
+    // land between the authority write and Ready publication.
+    let lifecycle_state_dir = state.state_dir.clone();
+    let lifecycle_guard = match tokio::task::spawn_blocking(move || {
+        acquire_pair_lifecycle_exclusive(&lifecycle_state_dir)
+    })
+    .await
+    {
+        Ok(Ok(guard)) => guard,
+        Ok(Err(error)) => {
+            tracing::warn!(
+                stage = "pair_device.confirm.lifecycle_failed",
+                error = %error,
+            );
+            log_pair_rejected("identity_unavailable");
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        Err(error) => {
+            tracing::warn!(
+                stage = "pair_device.confirm.lifecycle_task_failed",
+                error = %error,
+            );
+            log_pair_rejected("identity_unavailable");
+            return StatusCode::NOT_FOUND.into_response();
+        }
+    };
+    let ready_generation = match lifecycle_guard.lifecycle_generation() {
+        Ok(Some(generation)) => generation,
+        Ok(None) | Err(_) => {
+            log_pair_rejected("identity_unavailable");
+            return StatusCode::NOT_FOUND.into_response();
+        }
+    };
+
     // Pair-device confirm writes owner auth, consumes the pairing window, and
     // may advance bootstrap state. Keep that transaction serialized with
     // initialize/teardown and the machine-pairing bootstrap mutations.
@@ -174,9 +278,19 @@ pub async fn confirm(
     };
     let state_dir = state.state_dir.clone();
     let household = state.household.clone();
+    if let Err(error) =
+        verify_installed_household_id(&lifecycle_guard, &state_dir, identity.record.hh_id.as_str())
+    {
+        tracing::warn!(
+            stage = "pair_device.confirm.household_recheck_failed",
+            error = %error,
+        );
+        log_pair_rejected("identity_unavailable");
+        return StatusCode::NOT_FOUND.into_response();
+    }
     match HouseholdAuthState::load_optional(&state_dir, &identity.record, now) {
         Ok(Some(_)) => {
-            state.window.close().await;
+            let _ = state.window.close_under_lifecycle(&lifecycle_guard).await;
             log_pair_rejected("owner_already_paired");
             return StatusCode::NOT_FOUND.into_response();
         }
@@ -186,7 +300,7 @@ pub async fn confirm(
                 stage = "pair_device.confirm.owner_auth_load_failed",
                 error = %e,
             );
-            state.window.close().await;
+            let _ = state.window.close_under_lifecycle(&lifecycle_guard).await;
             log_pair_rejected("owner_auth_invalid");
             return StatusCode::NOT_FOUND.into_response();
         }
@@ -194,7 +308,7 @@ pub async fn confirm(
 
     let result: Result<_, ConsumeWithError<PairConfirmFailure>> = state
         .window
-        .consume_token_with(&nonce, |token| {
+        .consume_token_with_under_lifecycle(&nonce, |token| {
             let proof_ctx = PairingProofContext::new(
                 identity.record.hh_id.clone(),
                 token.nonce.0,
@@ -205,14 +319,14 @@ pub async fn confirm(
                     stage = "pair_device.confirm.proof_rejected",
                     error.kind = %e,
                 );
-                PairConfirmFailure
+                PairConfirmFailure::Rejected
             })?;
             let Some(hh_priv) = identity.hh_priv.as_deref() else {
                 tracing::warn!(
                     stage = "pair_device.confirm.post_shamir_rejected",
                     hint = "owner pairing requires sole-shard household; cannot mint PersonCert after Shamir transition",
                 );
-                return Err(PairConfirmFailure);
+                return Err(PairConfirmFailure::Rejected);
             };
             let cert = household_rs::PersonCert::sign_owner(
                 hh_priv,
@@ -229,23 +343,44 @@ pub async fn confirm(
                     error.kind = e.kind(),
                     error.hint = %e.hint(),
                 );
-                PairConfirmFailure
+                PairConfirmFailure::Rejected
             })?;
             let auth = HouseholdAuthState::new(&identity.record, cert.clone());
-            auth.save(&state_dir).map_err(|e| {
-                tracing::warn!(
-                    stage = "pair_device.confirm.persist_failed",
-                    error = %e,
-                );
-                PairConfirmFailure
-            })?;
+            // Finish all pure response construction before the first durable
+            // authority write. No fallible encoding step may turn a committed
+            // owner into an ordinary callback rejection.
             let cert_bytes = household_rs::cbor::to_canonical_vec(&cert).map_err(|e| {
                 tracing::warn!(
                     stage = "pair_device.confirm.encode_failed",
                     error = %e,
                 );
-                PairConfirmFailure
+                PairConfirmFailure::Rejected
             })?;
+            if let Err(error) = auth.save(&state_dir) {
+                if matches!(
+                    error,
+                    household_rs::owner_auth::OwnerAuthError::Storage(
+                        household_rs::StorageError::MayHaveTakenEffect { .. }
+                    )
+                ) {
+                    // Only an exact-byte rewrite is safe after the authority
+                    // rename may have landed. Its successful parent barrier
+                    // stabilizes the same auth and its cert projection.
+                    if let Err(retry_error) = auth.save(&state_dir) {
+                        tracing::error!(
+                            stage = "pair_device.confirm.persist_indeterminate",
+                            error = %retry_error,
+                        );
+                        return Err(PairConfirmFailure::IndeterminateAuthority);
+                    }
+                } else {
+                    tracing::warn!(
+                        stage = "pair_device.confirm.persist_failed",
+                        error = %error,
+                    );
+                    return Err(PairConfirmFailure::Rejected);
+                }
+            }
             Ok((
                 auth,
                 ConfirmResponse {
@@ -257,31 +392,55 @@ pub async fn confirm(
                     consumed: true,
                 },
             ))
-        })
+        }, &lifecycle_guard)
         .await;
 
     match result {
         Ok((auth, response)) => {
-            household.set_owner_auth(Arc::new(auth)).await;
-
-            // T026 — drive named_awaiting_pair → ready on first successful owner pairing.
-            if let Some(bs_arc) = global_bootstrap_state() {
-                let mut bs = bs_arc.write().await;
-                if *bs == BootstrapState::NamedAwaitingPair {
-                    *bs = BootstrapState::Ready;
-                    if let Err(e) = bootstrap_state::persist(&state_dir, BootstrapState::Ready) {
-                        tracing::warn!(
-                            stage = "pair_device.confirm.state_persist_failed",
-                            error = %e,
-                        );
-                    } else {
-                        tracing::info!(
-                            stage = "pair_device.confirm.state_advanced",
-                            new_state = "ready",
-                        );
-                    }
+            // The auth file is already durable. Commit Ready next, then
+            // publish both in-memory views while the same lifecycle-exclusive
+            // guard is still live. A persist failure is fail-closed: never
+            // claim success from memory when disk does not name Ready.
+            let bs_arc = global_bootstrap_state();
+            let publish = async {
+                household.set_owner_auth(Arc::new(auth)).await;
+                if let Some(bs_arc) = bs_arc {
+                    *bs_arc.write().await = BootstrapState::Ready;
                 }
+            };
+            if let Err(error) =
+                persist_ready_then_publish(
+                    &lifecycle_guard,
+                    &state_dir,
+                    ready_generation,
+                    publish,
+                )
+                .await
+            {
+                tracing::error!(
+                    stage = "pair_device.confirm.state_persist_indeterminate",
+                    error = %error,
+                );
+                // Owner authority is already durable. A lost Ready
+                // acknowledgement cannot be reported as a normal 404 while
+                // this process keeps serving the pre-owner in-memory view.
+                let _ = state.window.close_under_lifecycle(&lifecycle_guard).await;
+                household.clear().await;
+                if let Some(bs_arc) = global_bootstrap_state() {
+                    *bs_arc.write().await = BootstrapState::Recovering;
+                }
+                #[cfg(not(test))]
+                tokio::spawn(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    std::process::exit(1);
+                });
+                log_pair_rejected("ready_persist_indeterminate_fail_stop");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
+            tracing::info!(
+                stage = "pair_device.confirm.state_advanced",
+                new_state = "ready",
+            );
 
             tracing::info!(
                 stage = "pair_device.confirm.success",
@@ -290,11 +449,52 @@ pub async fn confirm(
             );
             Json(response).into_response()
         }
+        Err(ConsumeWithError::Callback(PairConfirmFailure::IndeterminateAuthority)) => {
+            // Disk may already name the new owner while its durability could
+            // not be stabilized. Never continue serving the old in-memory
+            // authority or leave the bootstrap surface looking Ready.
+            let _ = state.window.close_under_lifecycle(&lifecycle_guard).await;
+            household.clear().await;
+            if let Some(bs_arc) = global_bootstrap_state() {
+                *bs_arc.write().await = BootstrapState::Recovering;
+            }
+            #[cfg(not(test))]
+            tokio::spawn(async {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                std::process::exit(1);
+            });
+            log_pair_rejected("authority_indeterminate_fail_stop");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+        Err(ConsumeWithError::Window(ConsumeError::Storage(error))) => {
+            // The callback may already have durably installed owner
+            // authority before exact-generation window cleanup failed. The
+            // consume API intentionally closes memory first, but cannot hand
+            // its successful callback value back after cleanup fails. Treat
+            // this as an authority-indeterminate boundary, never as a normal
+            // nonce rejection.
+            tracing::error!(
+                stage = "pair_device.confirm.window_cleanup_indeterminate",
+                error = %error,
+            );
+            let _ = state.window.close_under_lifecycle(&lifecycle_guard).await;
+            household.clear().await;
+            if let Some(bs_arc) = global_bootstrap_state() {
+                *bs_arc.write().await = BootstrapState::Recovering;
+            }
+            #[cfg(not(test))]
+            tokio::spawn(async {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                std::process::exit(1);
+            });
+            log_pair_rejected("window_cleanup_indeterminate_fail_stop");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
         Err(
             ConsumeWithError::Window(
                 ConsumeError::NotOpen | ConsumeError::Expired | ConsumeError::WrongNonce,
             )
-            | ConsumeWithError::Callback(_),
+            | ConsumeWithError::Callback(PairConfirmFailure::Rejected),
         ) => {
             log_pair_rejected("generic");
             StatusCode::NOT_FOUND.into_response()
@@ -303,7 +503,10 @@ pub async fn confirm(
 }
 
 #[derive(Debug)]
-struct PairConfirmFailure;
+enum PairConfirmFailure {
+    Rejected,
+    IndeterminateAuthority,
+}
 
 fn log_pair_rejected(reason: &'static str) {
     tracing::warn!(
@@ -311,4 +514,84 @@ fn log_pair_rejected(reason: &'static str) {
         reason,
         "pair-device confirm rejected"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use household_rs::household_lifecycle::HouseholdLifecycleLockError;
+    use std::sync::mpsc;
+
+    fn bootstrap_named(state_dir: &Path, name: &str) -> household_rs::LoadedIdentity {
+        household_rs::bootstrap_or_load(
+            state_dir,
+            household_rs::BootstrapOpts {
+                household_name: name.to_owned(),
+                hostname_label: Some(format!("{}-host", name.to_lowercase().replace(' ', "-"))),
+            },
+            household_rs::KeyBackingPolicy::ForceSoftware,
+        )
+        .expect("bootstrap household")
+    }
+
+    #[tokio::test]
+    async fn ready_publication_remains_inside_lifecycle_exclusive() {
+        let state = tempfile::tempdir().expect("state dir");
+        let _identity = bootstrap_named(state.path(), "Pair Device Lock Home");
+        let guard = acquire_pair_lifecycle_exclusive(state.path()).expect("exclusive");
+        let contender_path = state.path().to_path_buf();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let contender = std::thread::spawn(move || {
+            let lifecycle =
+                HouseholdLifecycleLock::open_verified(&contender_path).expect("open contender");
+            started_tx.send(()).expect("signal contender");
+            let deadline = Instant::now()
+                .checked_add(Duration::from_millis(100))
+                .expect("deadline");
+            result_tx
+                .send(lifecycle.lock_exclusive_until(deadline).map(|_| ()))
+                .expect("send contender result");
+        });
+
+        let generation = guard.ensure_lifecycle_generation().unwrap();
+        persist_ready_then_publish(&guard, state.path(), generation, async {
+            started_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("contender started");
+            assert_eq!(
+                result_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("contender result"),
+                Err(HouseholdLifecycleLockError::LockTimeout),
+                "teardown/replacement acquired between durable Ready and publication",
+            );
+        })
+        .await
+        .expect("persist and publish");
+        contender.join().expect("contender thread");
+        drop(guard);
+
+        let lifecycle = HouseholdLifecycleLock::open_verified(state.path()).expect("reopen");
+        lifecycle.lock_exclusive().expect("lock after publication");
+    }
+
+    #[test]
+    fn stale_pair_device_process_rejects_replacement_household() {
+        let old_state = tempfile::tempdir().expect("old state");
+        let replacement_state = tempfile::tempdir().expect("replacement state");
+        let old = bootstrap_named(old_state.path(), "Old Pair Device Home");
+        let replacement = bootstrap_named(replacement_state.path(), "Replacement Home");
+        household_rs::storage::atomic_write_cbor(
+            &household_rs::storage::household_record_path(old_state.path()),
+            &replacement.record,
+        )
+        .expect("install replacement record");
+
+        let guard = acquire_pair_lifecycle_exclusive(old_state.path()).expect("exclusive");
+        let error =
+            verify_installed_household_id(&guard, old_state.path(), old.record.hh_id.as_str())
+                .expect_err("stale identity must not mutate replacement");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
 }

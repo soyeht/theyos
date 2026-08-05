@@ -5,6 +5,7 @@ use std::sync::Arc;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
+use household_rs::household_lifecycle::HouseholdLifecycleLock;
 use household_rs::keys::{IdentityKey, P256Keypair, P256PublicKey, P256Signature};
 use household_rs::machine_cert::{MachineCert, Platform};
 use household_rs::owner_events::{
@@ -66,16 +67,23 @@ fn router_with_identity(
     identity: LoadedIdentity,
     owner_auth: Option<HouseholdAuthState>,
 ) -> axum::Router {
+    let expected_hh_id = identity.record.hh_id.to_string();
     let owner_auth = owner_auth.map(Arc::new);
     let household = HouseholdState::loaded_with_owner_auth(Arc::new(identity), owner_auth);
-    let event_log = OwnerEventLog::open_with_broadcaster(
+    let lifecycle = HouseholdLifecycleLock::open_verified(state_dir).unwrap();
+    let write = lifecycle.lock_exclusive().unwrap();
+    let event_log = OwnerEventLog::open_with_broadcaster_under_lifecycle(
+        &write,
         state_dir.to_path_buf(),
+        &expected_hh_id,
         OwnerEventsBroadcaster::new(),
     )
     .unwrap();
+    drop(write);
     sign_machine_cert_router(SignMachineCertRouterState {
         household,
         event_log,
+        state_dir: state_dir.to_path_buf(),
     })
 }
 
@@ -289,8 +297,17 @@ async fn sign_machine_cert_happy_path_returns_verifiable_cert_and_audit_event() 
     household_rs::keys::verify_signature(&identity.record.hh_pub, challenge, &challenge_sig)
         .unwrap();
 
-    let log = OwnerEventLog::open(td.path().to_path_buf()).unwrap();
-    let events = log.read_since(0).unwrap();
+    let lifecycle = HouseholdLifecycleLock::open_verified(td.path()).unwrap();
+    let write = lifecycle.lock_exclusive().unwrap();
+    let log = OwnerEventLog::open_under_lifecycle(
+        &write,
+        td.path().to_path_buf(),
+        &identity.record.hh_id.to_string(),
+    )
+    .unwrap();
+    drop(write);
+    let read = lifecycle.lock_shared().unwrap();
+    let events = log.read_since(&read, 0).unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(
         events[0].event_type,

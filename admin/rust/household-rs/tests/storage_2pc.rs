@@ -600,7 +600,9 @@ fn recover_partial_phase3_commit_rolls_back_m2_side_full_staged_set() {
     fs::write(self_m_id_marker_path(td.path()), format!("{m2_id}\n")).unwrap();
     let shard_path = household_dir(td.path()).join("shamir/self_shard.cbor");
     fs::write(&shard_path, b"shard-bytes").unwrap();
-    let window_path = household_rs::pair_machine::pair_machine_window_path(td.path());
+    // Simulate the pre-generation raw artifact. Production no longer exposes
+    // or reads this path; load_state_dir discards it without adoption.
+    let window_path = household_dir(td.path()).join("pair_machine_window.cbor");
     fs::write(&window_path, b"window-bytes").unwrap();
     let push_token_path = household_rs::owner_events::owner_push_token_path(td.path());
     fs::write(&push_token_path, b"push-token-bytes").unwrap();

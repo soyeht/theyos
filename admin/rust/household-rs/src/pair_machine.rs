@@ -5,7 +5,7 @@
 //! - [`verify_join_request`] — canonical-CBOR + signature validation
 //!   used by the founding machine before staging the ceremony.
 //! - [`PairMachineWindow`] — single-active-ceremony state machine on
-//!   M1, persisted to `pair_machine_window.cbor`.
+//!   M1, persisted in the current generation-scoped pair-window namespace.
 
 use std::io::Read;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -21,11 +21,14 @@ use tokio::sync::{Mutex, watch};
 
 use crate::cbor;
 use crate::error::{HouseholdError, KeystoreError, StorageError};
+use crate::household_lifecycle::HouseholdLifecycleGenerationV1;
 use crate::keys::{IdentityKey, P256PublicKey, P256Signature, verify_signature};
 use crate::machine_cert::Platform;
+use crate::pair_window_namespace::PairWindowNamespaceV2;
 
 /// Wire schema version of the join-ceremony types.
 pub const PAIR_MACHINE_VERSION: u8 = 1;
+const PAIR_MACHINE_SNAPSHOT_VERSION: u8 = 2;
 
 /// Maximum transport-string field length, mirroring Bonjour TXT
 /// constraints. Keeps the QR query string compact.
@@ -36,9 +39,19 @@ pub const HOSTNAME_MAX_BYTES: usize = 64;
 /// strings before they are persisted.
 pub const ADDR_MAX_BYTES: usize = 128;
 
-/// Recovery deadline (`FR-013a`). Past this point, M1's recovery probe
-/// rolls back the ceremony rather than waiting for M2 to come back.
+/// Recovery polling deadline. Past this point M1 stops polling, but retains
+/// the exact request and every recovery artifact: a launched finalize POST is
+/// `MayHaveTakenEffect`, so timeout alone can never authorize rollback to N=1.
 pub const RECOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Canonical delay advertised by a candidate that has durably installed the
+/// household but must restart before it can return the retained finalize Ack.
+pub const FINALIZE_RESTART_RETRY_AFTER_SECS: u64 = 1;
+
+const FINALIZE_RETRY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+const FINALIZE_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const MAX_FINALIZE_RESPONSE_BYTES: u64 = 65_536;
+const MAX_JOIN_REQUEST_WIRE_BYTES: u64 = 65_536;
 
 /// Transport carrier of the QR / Bonjour announcement. Reflects the
 /// contract's `transport=tailscale|lan` enum.
@@ -400,13 +413,18 @@ pub struct PairMachineWindowSnapshot {
     /// reject a second approval while the first one is between prepare and commit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_claim: Option<PairMachineApprovalClaim>,
+    /// State-root lifecycle generation observed when this candidate ceremony
+    /// was staged. Candidate anchor/finalize must bit-equal the current token;
+    /// a legacy snapshot without this witness is deliberately not resumable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_generation: Option<ByteBuf>,
 }
 
 impl PairMachineWindowSnapshot {
     #[must_use]
     pub fn idle() -> Self {
         Self {
-            version: PAIR_MACHINE_VERSION,
+            version: PAIR_MACHINE_SNAPSHOT_VERSION,
             state: PairMachineState::Idle,
             m_pub: None,
             nonce: None,
@@ -421,7 +439,14 @@ impl PairMachineWindowSnapshot {
             pinned_hh_pub: None,
             pinned_hh_id: None,
             approval_claim: None,
+            lifecycle_generation: None,
         }
+    }
+
+    fn idle_for_generation(generation: HouseholdLifecycleGenerationV1) -> Self {
+        let mut snapshot = Self::idle();
+        snapshot.lifecycle_generation = Some(ByteBuf::from(generation.token_bytes().to_vec()));
+        snapshot
     }
 }
 
@@ -444,9 +469,9 @@ pub enum WindowError {
     AlreadyClaimed,
 }
 
-/// Shared, mutable pair-machine window. Cloning the handle shares
-/// state via an `Arc`. Persisted to `pair_machine_window.cbor` on
-/// every transition so a daemon restart picks up the live ceremony.
+/// Shared, mutable pair-machine window. Cloning the handle shares state via an
+/// `Arc`. Persisted in the current generation-scoped namespace on every
+/// transition so a daemon restart picks up the live ceremony.
 #[derive(Clone)]
 pub struct PairMachineWindow {
     inner: Arc<PairMachineWindowInner>,
@@ -455,7 +480,7 @@ pub struct PairMachineWindow {
 struct PairMachineWindowInner {
     state: Mutex<PairMachineWindowSnapshot>,
     notifier: watch::Sender<PairMachineState>,
-    state_dir: Option<PathBuf>,
+    namespace: Option<PairWindowNamespaceV2>,
 }
 
 impl PairMachineWindow {
@@ -468,29 +493,141 @@ impl PairMachineWindow {
             inner: Arc::new(PairMachineWindowInner {
                 state: Mutex::new(snapshot),
                 notifier: tx,
-                state_dir: None,
+                namespace: None,
             }),
         }
     }
 
-    /// Construct a window that persists every transition to
-    /// `<state_dir>/household/pair_machine_window.cbor`. On boot, if
-    /// the file is present its snapshot is loaded; otherwise the
-    /// window starts `idle`.
+    /// Construct a generation-scoped window in a standalone synchronous site.
+    /// This may block up to the lifecycle lock deadline.
     pub fn with_persistence(state_dir: PathBuf) -> Result<Self, StorageError> {
-        let snap_path = pair_machine_window_path(&state_dir);
+        let namespace = PairWindowNamespaceV2::current(state_dir)?;
+        Self::with_namespace(namespace)
+    }
+
+    /// Construct without reacquiring a lifecycle lock held by the caller.
+    pub fn with_persistence_under_lifecycle(
+        state_dir: PathBuf,
+        lifecycle: &crate::household_lifecycle::LifecycleWriteGuard,
+    ) -> Result<Self, StorageError> {
+        let namespace = PairWindowNamespaceV2::current_under_lifecycle(state_dir, lifecycle)?;
+        Self::with_namespace_under_lifecycle(namespace, lifecycle)
+    }
+
+    /// Load only the snapshot belonging to `namespace`'s current generation.
+    pub fn with_namespace(namespace: PairWindowNamespaceV2) -> Result<Self, StorageError> {
         let mut snapshot: PairMachineWindowSnapshot =
-            crate::storage::read_optional_cbor(&snap_path)?
-                .unwrap_or_else(PairMachineWindowSnapshot::idle);
-        clear_stale_approval_claim_on_load(&state_dir, &snap_path, &mut snapshot)?;
+            namespace.read_pair_machine()?.unwrap_or_else(|| {
+                PairMachineWindowSnapshot::idle_for_generation(namespace.generation())
+            });
+        validate_snapshot_generation(&snapshot, &namespace)?;
+        clear_stale_approval_claim_on_load(&namespace, &mut snapshot, None)?;
         let (tx, _) = watch::channel(snapshot.state);
         Ok(Self {
             inner: Arc::new(PairMachineWindowInner {
                 state: Mutex::new(snapshot),
                 notifier: tx,
-                state_dir: Some(state_dir),
+                namespace: Some(namespace),
             }),
         })
+    }
+
+    /// Load from a namespace while reusing lifecycle-exclusive.
+    pub fn with_namespace_under_lifecycle(
+        namespace: PairWindowNamespaceV2,
+        lifecycle: &crate::household_lifecycle::LifecycleWriteGuard,
+    ) -> Result<Self, StorageError> {
+        let mut snapshot: PairMachineWindowSnapshot = namespace
+            .read_pair_machine_under_lifecycle(lifecycle)?
+            .unwrap_or_else(|| {
+                PairMachineWindowSnapshot::idle_for_generation(namespace.generation())
+            });
+        validate_snapshot_generation(&snapshot, &namespace)?;
+        clear_stale_approval_claim_on_load(&namespace, &mut snapshot, Some(lifecycle))?;
+        let (tx, _) = watch::channel(snapshot.state);
+        Ok(Self {
+            inner: Arc::new(PairMachineWindowInner {
+                state: Mutex::new(snapshot),
+                notifier: tx,
+                namespace: Some(namespace),
+            }),
+        })
+    }
+
+    /// Stage a multi-file commit through the retained generation capability.
+    pub fn stage_commit_under_lifecycle<'a>(
+        &'a self,
+        lifecycle: &'a crate::household_lifecycle::LifecycleWriteGuard,
+        pre_commit_items: Vec<(PathBuf, Vec<u8>)>,
+        committed_window_bytes: Vec<u8>,
+        commit_marker: (PathBuf, Vec<u8>),
+    ) -> Result<crate::pair_window_namespace::PairWindowStagedCommit<'a>, StorageError> {
+        self.inner
+            .namespace
+            .as_ref()
+            .ok_or_else(|| {
+                StorageError::Encoding(HouseholdError::InvalidRecord(
+                    "in-memory pair-machine window cannot join a disk commit".into(),
+                ))
+            })?
+            .stage_pair_machine_commit_under_lifecycle(
+                lifecycle,
+                pre_commit_items,
+                committed_window_bytes,
+                commit_marker,
+            )
+    }
+
+    /// Read the durable snapshot for this handle's exact lifecycle
+    /// generation without consulting process-local state.
+    pub fn read_persisted_snapshot_under_lifecycle(
+        &self,
+        lifecycle: &crate::household_lifecycle::LifecycleWriteGuard,
+    ) -> Result<Option<PairMachineWindowSnapshot>, StorageError> {
+        self.inner
+            .namespace
+            .as_ref()
+            .ok_or_else(|| {
+                StorageError::Encoding(HouseholdError::InvalidRecord(
+                    "in-memory pair-machine window has no durable snapshot".into(),
+                ))
+            })?
+            .read_pair_machine_under_lifecycle(lifecycle)
+    }
+
+    /// Clear an interrupted staged snapshot in this exact generation.
+    pub fn clear_staged_snapshot_under_lifecycle(
+        &self,
+        lifecycle: &crate::household_lifecycle::LifecycleWriteGuard,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .namespace
+            .as_ref()
+            .ok_or_else(|| {
+                StorageError::Encoding(HouseholdError::InvalidRecord(
+                    "in-memory pair-machine window has no durable snapshot".into(),
+                ))
+            })?
+            .clear_pair_machine_staged_under_lifecycle(lifecycle)
+    }
+
+    /// Run Phase-3 recovery through this window's retained generation
+    /// capability without reacquiring the lifecycle lock. Startup callers
+    /// holding lifecycle-exclusive must use this method rather than opening a
+    /// second namespace capability by path.
+    pub async fn recover_phase3_under_lifecycle(
+        &self,
+        state_dir: &Path,
+        lifecycle: &crate::household_lifecycle::LifecycleWriteGuard,
+        recovery_timeout: Duration,
+    ) -> Result<RecoveryOutcome, RecoveryError> {
+        let namespace = self
+            .inner
+            .namespace
+            .as_ref()
+            .ok_or(RecoveryError::PersistentNamespaceUnavailable)?;
+        recover_phase3_ceremony_under_lifecycle(state_dir, namespace, lifecycle, recovery_timeout)
+            .await
     }
 
     /// Subscribe to state changes (used by `bonjour_publisher.rs` for
@@ -503,6 +640,19 @@ impl PairMachineWindow {
     /// Return a clone of the current snapshot.
     pub async fn snapshot(&self) -> PairMachineWindowSnapshot {
         self.inner.state.lock().await.clone()
+    }
+
+    /// Bind transition methods to a lifecycle-exclusive guard without
+    /// reacquiring the cross-process lock.
+    #[must_use]
+    pub fn under_lifecycle<'a>(
+        &'a self,
+        lifecycle: &'a crate::household_lifecycle::LifecycleWriteGuard,
+    ) -> PairMachineWindowUnderLifecycle<'a> {
+        PairMachineWindowUnderLifecycle {
+            window: self,
+            lifecycle,
+        }
     }
 
     /// Open the window in `staging` after a verified [`JoinRequest`]
@@ -529,6 +679,33 @@ impl PairMachineWindow {
         ttl_seconds: u64,
         anchor_secret: Option<[u8; 32]>,
     ) -> Result<u64, WindowError> {
+        self.enter_staging_with(
+            m_pub,
+            nonce,
+            transport,
+            addr_hint,
+            fingerprint,
+            cached_join_request_bytes,
+            ttl_seconds,
+            anchor_secret,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn enter_staging_with(
+        &self,
+        m_pub: [u8; 33],
+        nonce: [u8; 32],
+        transport: JoinTransport,
+        addr_hint: String,
+        fingerprint: String,
+        cached_join_request_bytes: Vec<u8>,
+        ttl_seconds: u64,
+        anchor_secret: Option<[u8; 32]>,
+        lifecycle: Option<&crate::household_lifecycle::LifecycleWriteGuard>,
+    ) -> Result<u64, WindowError> {
         let mut guard = self.inner.state.lock().await;
         match guard.state {
             PairMachineState::Idle | PairMachineState::Aborted | PairMachineState::Committed => {}
@@ -539,7 +716,7 @@ impl PairMachineWindow {
         let now = unix_now()?;
         let expiry = now.saturating_add(ttl_seconds);
         *guard = PairMachineWindowSnapshot {
-            version: PAIR_MACHINE_VERSION,
+            version: PAIR_MACHINE_SNAPSHOT_VERSION,
             state: PairMachineState::Staging,
             m_pub: Some(ByteBuf::from(m_pub.to_vec())),
             nonce: Some(ByteBuf::from(nonce.to_vec())),
@@ -554,8 +731,13 @@ impl PairMachineWindow {
             pinned_hh_pub: None,
             pinned_hh_id: None,
             approval_claim: None,
+            lifecycle_generation: self
+                .inner
+                .namespace
+                .as_ref()
+                .map(|namespace| ByteBuf::from(namespace.generation().token_bytes().to_vec())),
         };
-        self.persist(&guard)?;
+        self.persist_with(&guard, lifecycle)?;
         let _ = self.inner.notifier.send(guard.state);
         // Positive observability gate (T093): the founder window has
         // transitioned `idle → staging`. Audit consumers count this
@@ -563,6 +745,50 @@ impl PairMachineWindow {
         // started but never reached the owner-event append stage.
         tracing::info!(stage = "pair_machine.window_opened", expiry = expiry,);
         Ok(expiry)
+    }
+
+    /// Bind a staged candidate ceremony to the exact state-root generation
+    /// observed under lifecycle-exclusive.
+    ///
+    /// This is separate from [`Self::enter_staging`] so founder-side windows
+    /// remain source-compatible. Production candidate entry points call it
+    /// before releasing the lifecycle guard and before exposing any QR or
+    /// listener. A crash between the two writes leaves a legacy-shaped window
+    /// that finalize rejects and the operator restages.
+    pub async fn bind_lifecycle_generation(
+        &self,
+        generation: HouseholdLifecycleGenerationV1,
+    ) -> Result<(), WindowError> {
+        self.bind_lifecycle_generation_with(generation, None).await
+    }
+
+    async fn bind_lifecycle_generation_with(
+        &self,
+        generation: HouseholdLifecycleGenerationV1,
+        lifecycle: Option<&crate::household_lifecycle::LifecycleWriteGuard>,
+    ) -> Result<(), WindowError> {
+        let mut guard = self.inner.state.lock().await;
+        if !matches!(
+            guard.state,
+            PairMachineState::Staging | PairMachineState::AwaitingOwner
+        ) {
+            return Err(WindowError::Transition {
+                from: guard.state,
+                to: guard.state,
+            });
+        }
+        let bytes = generation.token_bytes();
+        match guard.lifecycle_generation.as_ref() {
+            Some(existing) if existing.as_ref() == bytes.as_slice() => return Ok(()),
+            Some(_) => return Err(WindowError::MismatchedCeremony),
+            None => {}
+        }
+        guard.lifecycle_generation = Some(ByteBuf::from(bytes.to_vec()));
+        if let Err(error) = self.persist_with(&guard, lifecycle) {
+            guard.lifecycle_generation = None;
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Pin `(hh_id, hh_pub)` after a successful `local/anchor` POST per
@@ -574,6 +800,15 @@ impl PairMachineWindow {
         &self,
         hh_id: String,
         hh_pub: [u8; 33],
+    ) -> Result<(), WindowError> {
+        self.pin_household_anchor_with(hh_id, hh_pub, None).await
+    }
+
+    async fn pin_household_anchor_with(
+        &self,
+        hh_id: String,
+        hh_pub: [u8; 33],
+        lifecycle: Option<&crate::household_lifecycle::LifecycleWriteGuard>,
     ) -> Result<(), WindowError> {
         let mut guard = self.inner.state.lock().await;
         match guard.state {
@@ -602,7 +837,7 @@ impl PairMachineWindow {
         // because the on-disk snapshot has no pin.
         guard.pinned_hh_pub = Some(ByteBuf::from(hh_pub.to_vec()));
         guard.pinned_hh_id = Some(hh_id);
-        if let Err(e) = self.persist(&guard) {
+        if let Err(e) = self.persist_with(&guard, lifecycle) {
             guard.pinned_hh_pub = None;
             guard.pinned_hh_id = None;
             return Err(e);
@@ -613,6 +848,15 @@ impl PairMachineWindow {
     /// Promote a staged window to `awaiting_owner` once the
     /// `OwnerEvent{type=join-request}` has been appended.
     pub async fn enter_awaiting_owner(&self, owner_event_cursor: u64) -> Result<(), WindowError> {
+        self.enter_awaiting_owner_with(owner_event_cursor, None)
+            .await
+    }
+
+    async fn enter_awaiting_owner_with(
+        &self,
+        owner_event_cursor: u64,
+        lifecycle: Option<&crate::household_lifecycle::LifecycleWriteGuard>,
+    ) -> Result<(), WindowError> {
         let mut guard = self.inner.state.lock().await;
         if guard.state != PairMachineState::Staging {
             return Err(WindowError::Transition {
@@ -623,7 +867,7 @@ impl PairMachineWindow {
         guard.state = PairMachineState::AwaitingOwner;
         guard.owner_event_cursor = Some(owner_event_cursor);
         guard.approval_claim = None;
-        self.persist(&guard)?;
+        self.persist_with(&guard, lifecycle)?;
         let _ = self.inner.notifier.send(guard.state);
         Ok(())
     }
@@ -638,6 +882,17 @@ impl PairMachineWindow {
         owner_event_cursor: u64,
         claim_id: [u8; 32],
         claimed_at: u64,
+    ) -> Result<PairMachineApprovalClaim, WindowError> {
+        self.claim_owner_approval_with(owner_event_cursor, claim_id, claimed_at, None)
+            .await
+    }
+
+    async fn claim_owner_approval_with(
+        &self,
+        owner_event_cursor: u64,
+        claim_id: [u8; 32],
+        claimed_at: u64,
+        lifecycle: Option<&crate::household_lifecycle::LifecycleWriteGuard>,
     ) -> Result<PairMachineApprovalClaim, WindowError> {
         let mut guard = self.inner.state.lock().await;
         if guard.state != PairMachineState::AwaitingOwner
@@ -654,7 +909,7 @@ impl PairMachineWindow {
             claimed_at,
         };
         guard.approval_claim = Some(claim.clone());
-        if let Err(e) = self.persist(&guard) {
+        if let Err(e) = self.persist_with(&guard, lifecycle) {
             guard.approval_claim = None;
             return Err(e);
         }
@@ -665,6 +920,14 @@ impl PairMachineWindow {
     /// `cached_response_bytes` are returned to a duplicate
     /// `JoinRequest` within the replay grace window (R7 / FR-015).
     pub async fn enter_committed(&self, cached_response_bytes: Vec<u8>) -> Result<(), WindowError> {
+        self.enter_committed_with(cached_response_bytes, None).await
+    }
+
+    async fn enter_committed_with(
+        &self,
+        cached_response_bytes: Vec<u8>,
+        lifecycle: Option<&crate::household_lifecycle::LifecycleWriteGuard>,
+    ) -> Result<(), WindowError> {
         let mut guard = self.inner.state.lock().await;
         if !matches!(
             guard.state,
@@ -678,7 +941,7 @@ impl PairMachineWindow {
         guard.state = PairMachineState::Committed;
         guard.cached_response = Some(ByteBuf::from(cached_response_bytes));
         guard.approval_claim = None;
-        self.persist(&guard)?;
+        self.persist_with(&guard, lifecycle)?;
         let _ = self.inner.notifier.send(guard.state);
         Ok(())
     }
@@ -701,10 +964,17 @@ impl PairMachineWindow {
 
     /// Force-abort the active window (decline / timeout / failure).
     pub async fn enter_aborted(&self) -> Result<(), WindowError> {
+        self.enter_aborted_with(None).await
+    }
+
+    async fn enter_aborted_with(
+        &self,
+        lifecycle: Option<&crate::household_lifecycle::LifecycleWriteGuard>,
+    ) -> Result<(), WindowError> {
         let mut guard = self.inner.state.lock().await;
         guard.state = PairMachineState::Aborted;
         guard.approval_claim = None;
-        self.persist(&guard)?;
+        self.persist_with(&guard, lifecycle)?;
         let _ = self.inner.notifier.send(guard.state);
         Ok(())
     }
@@ -712,75 +982,218 @@ impl PairMachineWindow {
     /// Return the window to `idle` after the replay grace window
     /// elapses. Drops cached request/response bytes.
     pub async fn return_to_idle(&self) -> Result<(), WindowError> {
+        self.return_to_idle_with(None).await
+    }
+
+    async fn return_to_idle_with(
+        &self,
+        lifecycle: Option<&crate::household_lifecycle::LifecycleWriteGuard>,
+    ) -> Result<(), WindowError> {
         let mut guard = self.inner.state.lock().await;
-        *guard = PairMachineWindowSnapshot::idle();
-        self.persist(&guard)?;
+        *guard = self
+            .inner
+            .namespace
+            .as_ref()
+            .map_or_else(PairMachineWindowSnapshot::idle, |namespace| {
+                PairMachineWindowSnapshot::idle_for_generation(namespace.generation())
+            });
+        self.persist_with(&guard, lifecycle)?;
         let _ = self.inner.notifier.send(guard.state);
         Ok(())
     }
 
-    fn persist(&self, snapshot: &PairMachineWindowSnapshot) -> Result<(), WindowError> {
-        if let Some(dir) = &self.inner.state_dir {
-            crate::storage::atomic_write_cbor(&pair_machine_window_path(dir), snapshot)?;
+    fn persist_with(
+        &self,
+        snapshot: &PairMachineWindowSnapshot,
+        lifecycle: Option<&crate::household_lifecycle::LifecycleWriteGuard>,
+    ) -> Result<(), WindowError> {
+        if let Some(namespace) = &self.inner.namespace {
+            validate_snapshot_generation(snapshot, namespace)?;
+            match lifecycle {
+                Some(lifecycle) => {
+                    namespace.write_pair_machine_under_lifecycle(snapshot, lifecycle)
+                }
+                None => namespace.write_pair_machine(snapshot),
+            }?;
         }
         Ok(())
     }
 }
 
+/// Pair-machine transition facade tied to one retained lifecycle-exclusive
+/// guard. It exposes no raw path and cannot outlive either input.
+pub struct PairMachineWindowUnderLifecycle<'a> {
+    window: &'a PairMachineWindow,
+    lifecycle: &'a crate::household_lifecycle::LifecycleWriteGuard,
+}
+
+impl PairMachineWindowUnderLifecycle<'_> {
+    #[allow(clippy::too_many_arguments)]
+    pub async fn enter_staging(
+        &self,
+        m_pub: [u8; 33],
+        nonce: [u8; 32],
+        transport: JoinTransport,
+        addr_hint: String,
+        fingerprint: String,
+        cached_join_request_bytes: Vec<u8>,
+        ttl_seconds: u64,
+        anchor_secret: Option<[u8; 32]>,
+    ) -> Result<u64, WindowError> {
+        self.window
+            .enter_staging_with(
+                m_pub,
+                nonce,
+                transport,
+                addr_hint,
+                fingerprint,
+                cached_join_request_bytes,
+                ttl_seconds,
+                anchor_secret,
+                Some(self.lifecycle),
+            )
+            .await
+    }
+
+    pub async fn bind_lifecycle_generation(
+        &self,
+        generation: HouseholdLifecycleGenerationV1,
+    ) -> Result<(), WindowError> {
+        self.window
+            .bind_lifecycle_generation_with(generation, Some(self.lifecycle))
+            .await
+    }
+
+    pub async fn pin_household_anchor(
+        &self,
+        hh_id: String,
+        hh_pub: [u8; 33],
+    ) -> Result<(), WindowError> {
+        self.window
+            .pin_household_anchor_with(hh_id, hh_pub, Some(self.lifecycle))
+            .await
+    }
+
+    pub async fn enter_awaiting_owner(&self, owner_event_cursor: u64) -> Result<(), WindowError> {
+        self.window
+            .enter_awaiting_owner_with(owner_event_cursor, Some(self.lifecycle))
+            .await
+    }
+
+    pub async fn claim_owner_approval(
+        &self,
+        owner_event_cursor: u64,
+        claim_id: [u8; 32],
+        claimed_at: u64,
+    ) -> Result<PairMachineApprovalClaim, WindowError> {
+        self.window
+            .claim_owner_approval_with(
+                owner_event_cursor,
+                claim_id,
+                claimed_at,
+                Some(self.lifecycle),
+            )
+            .await
+    }
+
+    pub async fn enter_committed(&self, cached_response_bytes: Vec<u8>) -> Result<(), WindowError> {
+        self.window
+            .enter_committed_with(cached_response_bytes, Some(self.lifecycle))
+            .await
+    }
+
+    pub async fn enter_aborted(&self) -> Result<(), WindowError> {
+        self.window.enter_aborted_with(Some(self.lifecycle)).await
+    }
+
+    pub async fn return_to_idle(&self) -> Result<(), WindowError> {
+        self.window.return_to_idle_with(Some(self.lifecycle)).await
+    }
+}
+
+/// Legacy unscoped location. It is never a current-window lookup API.
+/// Lifecycle-exclusive namespace construction removes it without adoption.
 #[must_use]
-pub fn pair_machine_window_path(state_dir: &Path) -> PathBuf {
+pub(crate) fn legacy_pair_machine_window_path(state_dir: &Path) -> PathBuf {
     crate::storage::household_dir(state_dir).join("pair_machine_window.cbor")
 }
 
+pub(crate) fn pair_machine_window_path(state_dir: &Path) -> PathBuf {
+    legacy_pair_machine_window_path(state_dir)
+}
+
 fn clear_stale_approval_claim_on_load(
-    state_dir: &Path,
-    snap_path: &Path,
+    namespace: &PairWindowNamespaceV2,
     snapshot: &mut PairMachineWindowSnapshot,
+    lifecycle: Option<&crate::household_lifecycle::LifecycleWriteGuard>,
 ) -> Result<(), StorageError> {
     if snapshot.approval_claim.is_none() {
         return Ok(());
     }
-    if crate::storage::phase3_finalize_ack_marker_exists(state_dir) {
+    let snapshot_path = namespace.pair_machine_snapshot_path();
+    let state_dir = snapshot_path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| {
+            StorageError::Encoding(HouseholdError::InvalidRecord(
+                "namespace path missing root".into(),
+            ))
+        })?;
+    if crate::storage::phase3_recovery_manifest_exists(state_dir)
+        || crate::storage::phase3_finalize_ack_marker_exists(state_dir)
+    {
         return Ok(());
     }
 
     // A durable claim only protects the prepare/finalize race while a process is
     // actively driving the approval. After restart, no in-memory owner approval
-    // can still be alive. Without the Phase-3 finalize marker, recovery has no
-    // intent to preserve, so the claim is stale and must not wedge the window.
+    // can still be alive. Without the Phase-3 manifest (or legacy finalize
+    // marker), recovery has no intent to preserve, so the claim is stale and
+    // must not wedge the window.
     snapshot.approval_claim = None;
     crate::storage::clear_phase3_pending_join_response(state_dir)?;
-    crate::storage::atomic_write_cbor(snap_path, snapshot)?;
+    match lifecycle {
+        Some(lifecycle) => namespace.write_pair_machine_under_lifecycle(snapshot, lifecycle),
+        None => namespace.write_pair_machine(snapshot),
+    }?;
     Ok(())
 }
 
 fn mark_window_committed_after_recovery(
-    state_dir: &Path,
+    namespace: &PairWindowNamespaceV2,
+    lifecycle: Option<&crate::household_lifecycle::LifecycleWriteGuard>,
     cached_response_bytes: Vec<u8>,
 ) -> Result<(), StorageError> {
-    let snap_path = pair_machine_window_path(state_dir);
-    let Some(mut snapshot) =
-        crate::storage::read_optional_cbor::<PairMachineWindowSnapshot>(&snap_path)?
-    else {
+    let snapshot = match lifecycle {
+        Some(lifecycle) => namespace.read_pair_machine_under_lifecycle(lifecycle),
+        None => namespace.read_pair_machine(),
+    }?;
+    let Some(mut snapshot): Option<PairMachineWindowSnapshot> = snapshot else {
         return Ok(());
     };
+    validate_snapshot_generation(&snapshot, namespace)?;
     snapshot.state = PairMachineState::Committed;
     snapshot.cached_response = Some(ByteBuf::from(cached_response_bytes));
     snapshot.approval_claim = None;
-    crate::storage::atomic_write_cbor(&snap_path, &snapshot)?;
+    match lifecycle {
+        Some(lifecycle) => namespace.write_pair_machine_under_lifecycle(&snapshot, lifecycle),
+        None => namespace.write_pair_machine(&snapshot),
+    }?;
     Ok(())
 }
 
-fn mark_window_aborted_after_recovery(state_dir: &Path) -> Result<(), StorageError> {
-    let snap_path = pair_machine_window_path(state_dir);
-    let Some(mut snapshot) =
-        crate::storage::read_optional_cbor::<PairMachineWindowSnapshot>(&snap_path)?
-    else {
-        return Ok(());
-    };
-    snapshot.state = PairMachineState::Aborted;
-    snapshot.approval_claim = None;
-    crate::storage::atomic_write_cbor(&snap_path, &snapshot)?;
+fn validate_snapshot_generation(
+    snapshot: &PairMachineWindowSnapshot,
+    namespace: &PairWindowNamespaceV2,
+) -> Result<(), StorageError> {
+    if snapshot.version != PAIR_MACHINE_SNAPSHOT_VERSION
+        || snapshot.lifecycle_generation.as_ref().map(ByteBuf::as_ref)
+            != Some(namespace.generation().token_bytes().as_slice())
+    {
+        return Err(StorageError::Encoding(HouseholdError::InvalidRecord(
+            "pair-machine snapshot version/generation does not match its namespace".into(),
+        )));
+    }
     Ok(())
 }
 
@@ -866,6 +1279,14 @@ impl CeremonyError {
     }
 }
 
+fn finalize_http_status_error(action: &str, code: u16) -> CeremonyError {
+    if code >= 500 {
+        CeremonyError::Http(format!("{action}: indeterminate server status {code}"))
+    } else {
+        CeremonyError::FinalizeRejected(format!("{action}: status {code}"))
+    }
+}
+
 /// Outcome returned by the post-staged-rename hook injected into
 /// [`CeremonyTxn::commit_preserve_on_error_with_hook`]. Decoupled from
 /// the `server-rs::failure_injection` registry so `household-rs`
@@ -904,6 +1325,7 @@ pub struct CeremonyTxn {
     /// members=[m1_id, m2_id]`). Carried so callers can inspect it
     /// before/after commit.
     new_household_record: HouseholdRecord,
+    preinstall_household_record_hash: [u8; 32],
     staged: Option<crate::storage::StagedCommit>,
     sole_shard_path: PathBuf,
     /// Carried so `commit()` can destroy the keystore custody of `HH_priv`
@@ -1043,6 +1465,53 @@ impl FinalizeAck {
     }
 }
 
+/// Typed response emitted by M2 after it has durably installed the household
+/// but before its fresh G1 listener is ready to return the retained
+/// [`FinalizeAck`].
+///
+/// The fields are private so callers cannot manufacture a look-alike with a
+/// different version or error discriminator. [`Self::from_canonical_bytes`]
+/// additionally rejects non-canonical CBOR and every unknown field.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct FinalizeRestartRequired {
+    #[serde(rename = "v")]
+    version: u8,
+    error: String,
+}
+
+impl FinalizeRestartRequired {
+    const ERROR: &'static str = "restart_required";
+
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            version: PAIR_MACHINE_VERSION,
+            error: Self::ERROR.to_string(),
+        }
+    }
+
+    pub fn to_canonical_bytes(&self) -> Result<Vec<u8>, HouseholdError> {
+        crate::cbor::to_canonical_vec(self)
+    }
+
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, HouseholdError> {
+        let decoded: Self = crate::cbor::from_canonical_slice_strict(bytes)?;
+        if decoded.version != PAIR_MACHINE_VERSION || decoded.error != Self::ERROR {
+            return Err(HouseholdError::InvalidCert(
+                "finalize restart-required shape mismatch".into(),
+            ));
+        }
+        Ok(decoded)
+    }
+}
+
+impl Default for FinalizeRestartRequired {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Optional response header on M2's `local/finalize` response carrying the
 /// candidate's current Tailnet address.
 ///
@@ -1133,6 +1602,205 @@ pub struct FinalizeWithM2Options<'a> {
     pub response_signer: &'a dyn IdentityKey,
 }
 
+/// Single durable authority for founder-side Phase-3 recovery.
+///
+/// Recovery never reconstructs or mixes these values from independent marker,
+/// pending-response, and staged-file records. The manifest binds one lifecycle
+/// generation, the exact request/response/Ack, both machine identities, and
+/// every staged artifact that founder recovery is authorized to promote.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct Phase3RecoveryManifestV1 {
+    #[serde(rename = "v")]
+    version: u8,
+    lifecycle_generation: ByteBuf,
+    hh_id: String,
+    candidate_m_id: String,
+    founder_m_id: String,
+    founder_cert_hash: ByteBuf,
+    cached_join_request_hash: ByteBuf,
+    exact_join_response: ByteBuf,
+    exact_finalize_ack: ByteBuf,
+    staged_candidate_cert_hash: ByteBuf,
+    staged_self_shard_hash: ByteBuf,
+    staged_household_record_hash: ByteBuf,
+    preinstall_household_record_hash: ByteBuf,
+}
+
+impl Phase3RecoveryManifestV1 {
+    pub const VERSION: u8 = 1;
+
+    pub fn to_canonical_bytes(&self) -> Result<Vec<u8>, HouseholdError> {
+        crate::cbor::to_canonical_vec(self)
+    }
+
+    #[must_use]
+    pub fn lifecycle_generation(&self) -> &[u8] {
+        self.lifecycle_generation.as_ref()
+    }
+
+    #[must_use]
+    pub fn candidate_m_id(&self) -> &str {
+        &self.candidate_m_id
+    }
+
+    #[must_use]
+    pub fn hh_id(&self) -> &str {
+        &self.hh_id
+    }
+
+    #[must_use]
+    pub fn founder_m_id(&self) -> &str {
+        &self.founder_m_id
+    }
+
+    #[must_use]
+    pub fn exact_join_response(&self) -> &[u8] {
+        self.exact_join_response.as_ref()
+    }
+
+    #[must_use]
+    pub fn exact_finalize_ack(&self) -> &[u8] {
+        self.exact_finalize_ack.as_ref()
+    }
+
+    fn join_response(&self) -> Result<JoinResponse, CeremonyError> {
+        crate::cbor::from_canonical_slice_strict(self.exact_join_response.as_ref())
+            .map_err(|error| CeremonyError::Cbor(format!("manifest JoinResponse: {error}")))
+    }
+
+    fn expected_ack(&self) -> Result<FinalizeAck, CeremonyError> {
+        crate::cbor::from_canonical_slice_strict(self.exact_finalize_ack.as_ref())
+            .map_err(|error| CeremonyError::Cbor(format!("manifest FinalizeAck: {error}")))
+    }
+
+    fn validate_hash(name: &str, encoded: &ByteBuf, exact: &[u8]) -> Result<(), CeremonyError> {
+        if encoded.as_ref() != blake3::hash(exact).as_bytes() {
+            return Err(CeremonyError::Cbor(format!(
+                "manifest {name} hash mismatch"
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<(), CeremonyError> {
+        if self.version != Self::VERSION
+            || self.lifecycle_generation.len() != 32
+            || self.founder_cert_hash.len() != 32
+            || self.cached_join_request_hash.len() != 32
+            || self.staged_candidate_cert_hash.len() != 32
+            || self.staged_self_shard_hash.len() != 32
+            || self.staged_household_record_hash.len() != 32
+            || self.preinstall_household_record_hash.len() != 32
+        {
+            return Err(CeremonyError::Cbor(
+                "Phase3 recovery manifest fixed-width shape mismatch".into(),
+            ));
+        }
+        let join_response = self.join_response()?;
+        let expected_ack = self.expected_ack()?;
+        join_response
+            .household_record
+            .validate()
+            .map_err(|error| CeremonyError::Cbor(format!("manifest household record: {error}")))?;
+        if join_response.version != PAIR_MACHINE_VERSION
+            || join_response.machine_cert.m_id.to_string() != self.candidate_m_id
+            || join_response.household_record.hh_id.to_string() != self.hh_id
+            || join_response.join_request_hash.as_ref() != self.cached_join_request_hash.as_ref()
+        {
+            return Err(CeremonyError::Cbor(
+                "Phase3 recovery manifest response binding mismatch".into(),
+            ));
+        }
+        validate_finalize_ack_bytes(
+            self.exact_finalize_ack.as_ref(),
+            &join_response.machine_cert,
+        )?;
+        if expected_ack.m_id != self.candidate_m_id {
+            return Err(CeremonyError::Cbor(
+                "Phase3 recovery manifest Ack identity mismatch".into(),
+            ));
+        }
+
+        let candidate_cert_bytes = crate::cbor::to_canonical_vec(&join_response.machine_cert)
+            .map_err(|error| CeremonyError::Cbor(format!("manifest candidate cert: {error}")))?;
+        Self::validate_hash(
+            "candidate cert",
+            &self.staged_candidate_cert_hash,
+            &candidate_cert_bytes,
+        )?;
+        let record_bytes = crate::cbor::to_canonical_vec(&join_response.household_record)
+            .map_err(|error| CeremonyError::Cbor(format!("manifest household record: {error}")))?;
+        Self::validate_hash(
+            "household record",
+            &self.staged_household_record_hash,
+            &record_bytes,
+        )?;
+
+        if !join_response
+            .household_record
+            .members
+            .iter()
+            .any(|member| member.to_string() == self.candidate_m_id)
+            || !join_response
+                .household_record
+                .members
+                .iter()
+                .any(|member| member.to_string() == self.founder_m_id)
+        {
+            return Err(CeremonyError::Cbor(
+                "manifest candidate absent from staged household record".into(),
+            ));
+        }
+        let mut founder_entries = join_response.peer_list.iter().filter(|peer| {
+            peer.m_id == self.founder_m_id
+                && peer
+                    .machine_cert
+                    .as_ref()
+                    .is_some_and(|cert| cert.m_id.to_string() == self.founder_m_id)
+        });
+        let founder_entry = founder_entries.next().ok_or_else(|| {
+            CeremonyError::Cbor("manifest founder certificate missing from peer list".into())
+        })?;
+        if founder_entries.next().is_some() {
+            return Err(CeremonyError::Cbor(
+                "manifest founder certificate duplicated in peer list".into(),
+            ));
+        }
+        let founder_cert = founder_entry
+            .machine_cert
+            .as_ref()
+            .ok_or_else(|| CeremonyError::Cbor("manifest founder certificate missing".into()))?;
+        if founder_entry.m_pub.as_ref() != founder_cert.m_pub.as_bytes()
+            || founder_entry.hostname != founder_cert.hostname
+        {
+            return Err(CeremonyError::Cbor(
+                "manifest founder peer entry differs from certificate".into(),
+            ));
+        }
+        let founder_hash = machine_cert_hash(founder_cert)
+            .map_err(|error| CeremonyError::Cbor(format!("manifest founder cert: {error}")))?;
+        if self.founder_cert_hash.as_ref() != founder_hash {
+            return Err(CeremonyError::Cbor(
+                "manifest founder certificate hash mismatch".into(),
+            ));
+        }
+        founder_cert
+            .verify(&join_response.household_record.hh_pub)
+            .map_err(|error| CeremonyError::Cbor(format!("manifest founder cert: {error}")))?;
+        join_response
+            .machine_cert
+            .verify(&join_response.household_record.hh_pub)
+            .map_err(|error| CeremonyError::Cbor(format!("manifest candidate cert: {error}")))?;
+        join_response
+            .verify_response_sig(founder_cert)
+            .map_err(|error| {
+                CeremonyError::Cbor(format!("manifest response signature: {error}"))
+            })?;
+        Ok(())
+    }
+}
+
 /// Successful result of M1's call to M2's `local/finalize`.
 pub struct FinalizeWithM2Outcome {
     pub ack: FinalizeAck,
@@ -1146,9 +1814,241 @@ pub struct FinalizeWithM2Outcome {
     pub candidate_tailscale_addr: Option<String>,
 }
 
+#[derive(Debug)]
+struct VerifiedFinalizeAck {
+    ack: FinalizeAck,
+    candidate_tailscale_addr: Option<String>,
+}
+
+enum FinalizePostOutcome {
+    Ack(VerifiedFinalizeAck),
+    RestartRequired(Duration),
+}
+
+enum FinalizePostError {
+    Transport(CeremonyError),
+    RetryableServer(CeremonyError),
+    Protocol(CeremonyError),
+}
+
+impl FinalizePostError {
+    fn into_ceremony(self) -> CeremonyError {
+        match self {
+            Self::Transport(error) | Self::RetryableServer(error) | Self::Protocol(error) => error,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FinalizeRetryPolicy {
+    budget: Duration,
+    request_timeout: Duration,
+    maximum_sleep: Duration,
+}
+
+impl FinalizeRetryPolicy {
+    const PRODUCTION: Self = Self {
+        budget: RECOVERY_TIMEOUT,
+        request_timeout: FINALIZE_HTTP_TIMEOUT,
+        maximum_sleep: Duration::from_secs(FINALIZE_RESTART_RETRY_AFTER_SECS),
+    };
+}
+
 pub fn machine_cert_hash(cert: &MachineCert) -> Result<[u8; 32], HouseholdError> {
     let bytes = crate::cbor::to_canonical_vec(cert)?;
     Ok(*blake3::hash(&bytes).as_bytes())
+}
+
+fn read_finalize_response_body(
+    response: ureq::Response,
+    action: &str,
+) -> Result<Vec<u8>, FinalizePostError> {
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .take(MAX_FINALIZE_RESPONSE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| {
+            FinalizePostError::Transport(CeremonyError::Http(format!(
+                "{action}: read response body: {e}"
+            )))
+        })?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_FINALIZE_RESPONSE_BYTES {
+        return Err(FinalizePostError::Protocol(CeremonyError::FinalizeAck(
+            format!("{action}: response body exceeds {MAX_FINALIZE_RESPONSE_BYTES} bytes"),
+        )));
+    }
+    Ok(bytes)
+}
+
+fn validate_finalize_ack_bytes(
+    bytes: &[u8],
+    expected_cert: &MachineCert,
+) -> Result<FinalizeAck, CeremonyError> {
+    let ack: FinalizeAck = crate::cbor::from_canonical_slice_strict(bytes)
+        .map_err(|e| CeremonyError::FinalizeAck(format!("decode: {e}")))?;
+    if ack.version != PAIR_MACHINE_VERSION {
+        return Err(CeremonyError::FinalizeAck(format!(
+            "unsupported version {}",
+            ack.version
+        )));
+    }
+    if ack.m_id != expected_cert.m_id.to_string() {
+        return Err(CeremonyError::FinalizeAck(format!(
+            "m_id mismatch: expected {}, got {}",
+            expected_cert.m_id, ack.m_id
+        )));
+    }
+    let expected_hash = machine_cert_hash(expected_cert)
+        .map_err(|e| CeremonyError::FinalizeAck(format!("hash MachineCert: {e}")))?;
+    if ack.machine_cert_hash.as_ref() != expected_hash.as_slice() {
+        return Err(CeremonyError::FinalizeAck(
+            "machine_cert_hash mismatch".into(),
+        ));
+    }
+    Ok(ack)
+}
+
+fn post_finalize_once(
+    action: &str,
+    url: &str,
+    body: &[u8],
+    expected_cert: &MachineCert,
+    request_timeout: Duration,
+) -> Result<FinalizePostOutcome, FinalizePostError> {
+    let agent = ureq::AgentBuilder::new().timeout(request_timeout).build();
+    let response = match agent
+        .post(url)
+        .set("Content-Type", "application/cbor")
+        .send_bytes(body)
+    {
+        Ok(response) => response,
+        Err(ureq::Error::Status(503, response)) => {
+            let retry_after = response.header("Retry-After");
+            if retry_after != Some("1") {
+                return Err(FinalizePostError::Protocol(CeremonyError::Http(format!(
+                    "{action}: unrecognized 503 without Retry-After: 1"
+                ))));
+            }
+            let bytes = read_finalize_response_body(response, action)?;
+            FinalizeRestartRequired::from_canonical_bytes(&bytes).map_err(|e| {
+                FinalizePostError::Protocol(CeremonyError::Http(format!(
+                    "{action}: unrecognized 503 restart-required body: {e}"
+                )))
+            })?;
+            return Ok(FinalizePostOutcome::RestartRequired(Duration::from_secs(
+                FINALIZE_RESTART_RETRY_AFTER_SECS,
+            )));
+        }
+        Err(ureq::Error::Status(code, _)) => {
+            let error = finalize_http_status_error(action, code);
+            return if code >= 500 {
+                Err(FinalizePostError::RetryableServer(error))
+            } else {
+                Err(FinalizePostError::Protocol(error))
+            };
+        }
+        Err(other @ ureq::Error::Transport(_)) => {
+            return Err(FinalizePostError::Transport(CeremonyError::Http(format!(
+                "{action}: {other}"
+            ))));
+        }
+    };
+    if response.status() != 200 {
+        return Err(FinalizePostError::Protocol(CeremonyError::FinalizeAck(
+            format!(
+                "{action}: unexpected successful status {}",
+                response.status()
+            ),
+        )));
+    }
+    let candidate_tailscale_addr = response
+        .header(FINALIZE_CANDIDATE_TAILSCALE_ADDR_HEADER)
+        .map(str::to_owned);
+    let bytes = read_finalize_response_body(response, action)?;
+    let ack =
+        validate_finalize_ack_bytes(&bytes, expected_cert).map_err(FinalizePostError::Protocol)?;
+    Ok(FinalizePostOutcome::Ack(VerifiedFinalizeAck {
+        ack,
+        candidate_tailscale_addr,
+    }))
+}
+
+fn post_finalize_until_ack(
+    url: &str,
+    body: &[u8],
+    expected_cert: &MachineCert,
+    policy: FinalizeRetryPolicy,
+) -> Result<VerifiedFinalizeAck, CeremonyError> {
+    let started = std::time::Instant::now();
+    // Once any request may have reached M2 without a trustworthy terminal
+    // response, no later rejection can prove the earlier request had no
+    // effect. Keep that evidence monotonic across exact-body retries.
+    let mut ambiguous_attempt_observed = false;
+    loop {
+        let remaining = policy.budget.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(CeremonyError::Http(format!(
+                "POST {url}: finalize restart recovery timed out"
+            )));
+        }
+        let request_timeout = policy.request_timeout.min(remaining);
+        match post_finalize_once(
+            &format!("POST {url}"),
+            url,
+            body,
+            expected_cert,
+            request_timeout,
+        ) {
+            Ok(FinalizePostOutcome::Ack(verified)) => return Ok(verified),
+            Ok(FinalizePostOutcome::RestartRequired(server_delay)) => {
+                ambiguous_attempt_observed = true;
+                let remaining = policy.budget.saturating_sub(started.elapsed());
+                let delay = server_delay.min(policy.maximum_sleep).min(remaining);
+                std::thread::sleep(delay);
+            }
+            Err(
+                FinalizePostError::Transport(CeremonyError::Http(error))
+                | FinalizePostError::RetryableServer(CeremonyError::Http(error)),
+            ) => {
+                ambiguous_attempt_observed = true;
+                let remaining = policy.budget.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return Err(CeremonyError::Http(format!(
+                        "POST {url}: finalize restart recovery timed out after: {error}"
+                    )));
+                }
+                std::thread::sleep(
+                    FINALIZE_RETRY_POLL_INTERVAL
+                        .min(policy.maximum_sleep)
+                        .min(remaining),
+                );
+            }
+            Err(FinalizePostError::Protocol(error @ CeremonyError::Http(_)))
+                if ambiguous_attempt_observed =>
+            {
+                let remaining = policy.budget.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return Err(CeremonyError::Http(format!(
+                        "POST {url}: finalize restart recovery timed out after: {error}"
+                    )));
+                }
+                std::thread::sleep(
+                    FINALIZE_RETRY_POLL_INTERVAL
+                        .min(policy.maximum_sleep)
+                        .min(remaining),
+                );
+            }
+            Err(FinalizePostError::Protocol(error @ CeremonyError::FinalizeRejected(_)))
+                if ambiguous_attempt_observed =>
+            {
+                return Err(CeremonyError::Http(format!(
+                    "POST {url}: candidate rejected exact finalize replay after restart: {error}"
+                )));
+            }
+            Err(error) => return Err(error.into_ceremony()),
+        }
+    }
 }
 
 #[must_use]
@@ -1254,6 +2154,12 @@ impl CeremonyTxn {
         let mut new_members: Vec<MachineId> = existing_record.members.clone();
         new_members.push(candidate_m_id);
         new_members.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        let preinstall_household_record_hash = *blake3::hash(
+            &crate::cbor::to_canonical_vec(&existing_record).map_err(|error| {
+                CeremonyError::Cbor(format!("encode preinstall household record: {error}"))
+            })?,
+        )
+        .as_bytes();
         let new_record = HouseholdRecord {
             version: existing_record.version,
             hh_id: existing_record.hh_id.clone(),
@@ -1321,6 +2227,7 @@ impl CeremonyTxn {
             self_encrypted_shard: self_es,
             peer_encrypted_shard: peer_es,
             new_household_record: new_record,
+            preinstall_household_record_hash,
             staged: Some(staged),
             sole_shard_path,
             state_dir,
@@ -1385,6 +2292,110 @@ impl CeremonyTxn {
         .map_err(CeremonyError::Sign)
     }
 
+    /// Build the one durable authority consumed by founder restart recovery.
+    /// The returned manifest contains the exact bytes later `POSTed` by
+    /// [`Self::finalize_manifest_with_m2`]; callers must durably commit it
+    /// before launching that method.
+    pub fn build_phase3_recovery_manifest(
+        &self,
+        opts: &FinalizeWithM2Options<'_>,
+        lifecycle_generation: &HouseholdLifecycleGenerationV1,
+    ) -> Result<Phase3RecoveryManifestV1, CeremonyError> {
+        let join_request: JoinRequest =
+            crate::cbor::from_canonical_slice_strict(opts.join_request_cbor)
+                .map_err(|error| CeremonyError::Cbor(format!("cached JoinRequest: {error}")))?;
+        verify_join_request(&join_request)
+            .map_err(|error| CeremonyError::Cbor(format!("cached JoinRequest: {error}")))?;
+        if join_request.m_pub.as_ref() != self.candidate_cert.m_pub.as_bytes() {
+            return Err(CeremonyError::Cbor(
+                "cached JoinRequest candidate key mismatch".into(),
+            ));
+        }
+        let join_response = self.build_join_response(opts)?;
+        let exact_join_response = join_response
+            .to_canonical_bytes()
+            .map_err(|error| CeremonyError::Cbor(format!("encode JoinResponse: {error}")))?;
+        let exact_finalize_ack = FinalizeAck::for_machine_cert(&self.candidate_cert)
+            .map_err(|error| CeremonyError::Cbor(format!("build FinalizeAck: {error}")))?
+            .to_canonical_bytes()
+            .map_err(|error| CeremonyError::Cbor(format!("encode FinalizeAck: {error}")))?;
+        let candidate_cert_bytes = crate::cbor::to_canonical_vec(&self.candidate_cert)
+            .map_err(|error| CeremonyError::Cbor(format!("encode candidate cert: {error}")))?;
+        let self_shard_bytes = self
+            .self_encrypted_shard
+            .to_canonical_bytes()
+            .map_err(|error| CeremonyError::Cbor(format!("encode self shard: {error}")))?;
+        let record_bytes = crate::cbor::to_canonical_vec(&self.new_household_record)
+            .map_err(|error| CeremonyError::Cbor(format!("encode household record: {error}")))?;
+        let founder_cert_hash = machine_cert_hash(opts.founder_cert)
+            .map_err(|error| CeremonyError::Cbor(format!("hash founder cert: {error}")))?;
+        let manifest = Phase3RecoveryManifestV1 {
+            version: Phase3RecoveryManifestV1::VERSION,
+            lifecycle_generation: ByteBuf::from(lifecycle_generation.token_bytes().to_vec()),
+            hh_id: self.hh_id.to_string(),
+            candidate_m_id: self.candidate_cert.m_id.to_string(),
+            founder_m_id: opts.founder_cert.m_id.to_string(),
+            founder_cert_hash: ByteBuf::from(founder_cert_hash.to_vec()),
+            cached_join_request_hash: ByteBuf::from(
+                join_request_hash(opts.join_request_cbor).to_vec(),
+            ),
+            exact_join_response: ByteBuf::from(exact_join_response),
+            exact_finalize_ack: ByteBuf::from(exact_finalize_ack),
+            staged_candidate_cert_hash: ByteBuf::from(
+                blake3::hash(&candidate_cert_bytes).as_bytes().to_vec(),
+            ),
+            staged_self_shard_hash: ByteBuf::from(
+                blake3::hash(&self_shard_bytes).as_bytes().to_vec(),
+            ),
+            staged_household_record_hash: ByteBuf::from(
+                blake3::hash(&record_bytes).as_bytes().to_vec(),
+            ),
+            preinstall_household_record_hash: ByteBuf::from(
+                self.preinstall_household_record_hash.to_vec(),
+            ),
+        };
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    /// POST only the exact bytes already committed in `manifest` and accept
+    /// only its exact Ack. No ceremony bytes are rebuilt on this path.
+    pub fn finalize_manifest_with_m2(
+        &self,
+        addr: &str,
+        manifest: &Phase3RecoveryManifestV1,
+    ) -> Result<FinalizeWithM2Outcome, CeremonyError> {
+        manifest.validate()?;
+        let join_response = manifest.join_response()?;
+        if join_response.machine_cert != self.candidate_cert {
+            return Err(CeremonyError::Cbor(
+                "manifest candidate certificate does not belong to transaction".into(),
+            ));
+        }
+        let url = local_finalize_url(addr);
+        let verified = post_finalize_until_ack(
+            &url,
+            manifest.exact_join_response(),
+            &self.candidate_cert,
+            FinalizeRetryPolicy::PRODUCTION,
+        )?;
+        let returned_ack_bytes = verified
+            .ack
+            .to_canonical_bytes()
+            .map_err(|error| CeremonyError::FinalizeAck(format!("encode: {error}")))?;
+        if returned_ack_bytes != manifest.exact_finalize_ack() {
+            return Err(CeremonyError::FinalizeAck(
+                "Ack differs from the exact durable recovery manifest".into(),
+            ));
+        }
+        Ok(FinalizeWithM2Outcome {
+            ack: verified.ack,
+            join_response,
+            join_response_bytes: manifest.exact_join_response().to_vec(),
+            candidate_tailscale_addr: verified.candidate_tailscale_addr,
+        })
+    }
+
     /// POST the authenticated `JoinResponse` to M2 and verify its ack.
     pub fn finalize_with_m2(
         &self,
@@ -1395,55 +2406,17 @@ impl CeremonyTxn {
             .to_canonical_bytes()
             .map_err(|e| CeremonyError::Cbor(format!("encode JoinResponse: {e}")))?;
         let url = local_finalize_url(opts.addr);
-        let agent = ureq::AgentBuilder::new()
-            .timeout(std::time::Duration::from_secs(10))
-            .build();
-        let response = agent
-            .post(&url)
-            .set("Content-Type", "application/cbor")
-            .send_bytes(&join_response_bytes)
-            .map_err(|e| match e {
-                ureq::Error::Status(code, _) => {
-                    CeremonyError::FinalizeRejected(format!("POST {url}: status {code}"))
-                }
-                other @ ureq::Error::Transport(_) => {
-                    CeremonyError::Http(format!("POST {url}: {other}"))
-                }
-            })?;
-        let candidate_tailscale_addr = response
-            .header(FINALIZE_CANDIDATE_TAILSCALE_ADDR_HEADER)
-            .map(str::to_owned);
-        let mut ack_bytes = Vec::new();
-        response
-            .into_reader()
-            .read_to_end(&mut ack_bytes)
-            .map_err(|e| CeremonyError::Http(format!("read FinalizeAck from {url}: {e}")))?;
-        let ack: FinalizeAck = crate::cbor::from_canonical_slice(&ack_bytes)
-            .map_err(|e| CeremonyError::FinalizeAck(format!("decode: {e}")))?;
-        if ack.version != PAIR_MACHINE_VERSION {
-            return Err(CeremonyError::FinalizeAck(format!(
-                "unsupported version {}",
-                ack.version
-            )));
-        }
-        if ack.m_id != self.candidate_cert.m_id.to_string() {
-            return Err(CeremonyError::FinalizeAck(format!(
-                "m_id mismatch: expected {}, got {}",
-                self.candidate_cert.m_id, ack.m_id
-            )));
-        }
-        let expected_hash = machine_cert_hash(&self.candidate_cert)
-            .map_err(|e| CeremonyError::FinalizeAck(format!("hash MachineCert: {e}")))?;
-        if ack.machine_cert_hash.as_ref() != expected_hash.as_slice() {
-            return Err(CeremonyError::FinalizeAck(
-                "machine_cert_hash mismatch".into(),
-            ));
-        }
+        let verified = post_finalize_until_ack(
+            &url,
+            &join_response_bytes,
+            &self.candidate_cert,
+            FinalizeRetryPolicy::PRODUCTION,
+        )?;
         Ok(FinalizeWithM2Outcome {
-            ack,
+            ack: verified.ack,
             join_response,
             join_response_bytes,
-            candidate_tailscale_addr,
+            candidate_tailscale_addr: verified.candidate_tailscale_addr,
         })
     }
 
@@ -1534,17 +2507,15 @@ impl CeremonyTxn {
     /// Like [`commit`], but on partial promotion failure does NOT
     /// unlink the surviving `.staged` set. Used post-FinalizeAck on
     /// M1 where the staged evidence MUST survive for boot-time
-    /// recovery to probe M2 (T073/T074). The
-    /// `phase3_finalize_ack.marker` written by the caller before
-    /// `finalize_with_m2` is the recovery-driver intent pin; this
-    /// method honours it by guaranteeing the staged set stays on
-    /// disk on commit error.
+    /// recovery to reconcile M2 (T073/T074). The exact Phase-3 recovery
+    /// manifest committed by the caller before `finalize_manifest_with_m2`
+    /// is the recovery-driver authority; this method honours it by
+    /// guaranteeing the staged set stays on disk on commit error.
     ///
     /// On Ok, behaviour is identical to [`commit`].
     /// On Err, the staged set survives on disk; the caller MUST
-    /// leave the marker on disk too (it's how recovery distinguishes
-    /// "in-flight ceremony, do not roll back" from "no ceremony,
-    /// orphan staged files, roll back").
+    /// leave that manifest on disk too (it is how recovery distinguishes an
+    /// in-flight ceremony from unrelated orphaned staged files).
     ///
     /// [`commit`]: Self::commit
     pub fn commit_preserve_on_error(self) -> Result<Vec<u8>, CeremonyError> {
@@ -1639,10 +2610,23 @@ impl CeremonyTxn {
     /// Preserve the prepared M1 staged set for boot-time recovery.
     ///
     /// Used when M1 cannot prove whether M2 committed after the
-    /// finalize POST was launched. The caller must leave the Phase 3
-    /// marker on disk so recovery can identify this as an in-flight
-    /// ceremony instead of ordinary orphaned staged files.
+    /// finalize POST was launched. The caller must leave the exact Phase-3
+    /// recovery manifest on disk so recovery can identify this as an
+    /// in-flight ceremony instead of ordinary orphaned staged files.
     pub fn preserve_staged_for_recovery(mut self) {
+        if let Some(staged) = self.staged.take() {
+            staged.preserve_for_recovery();
+        }
+        self.closed = true;
+    }
+
+    /// Permanently disarm rollback-on-Drop after the exact recovery manifest
+    /// is durable, while retaining this transaction's read-only finalize API.
+    ///
+    /// This must run before spawning or performing any external effect. A
+    /// panic after the remote POST may have committed M2; unwinding must never
+    /// erase the staged evidence named by the manifest.
+    pub fn arm_manifest_recovery(&mut self) {
         if let Some(staged) = self.staged.take() {
             staged.preserve_for_recovery();
         }
@@ -1653,8 +2637,9 @@ impl CeremonyTxn {
 impl Drop for CeremonyTxn {
     fn drop(&mut self) {
         if !self.closed {
-            // Best-effort: drop staged files. Do not touch the sole
-            // shard; recovery decides on next boot.
+            // Best-effort rollback is safe only while the transaction remains
+            // armed. `arm_manifest_recovery` consumes the staged handle and
+            // closes the transaction before any finalize I/O can escape.
             if let Some(staged) = self.staged.take() {
                 staged.rollback();
             }
@@ -1873,6 +2858,23 @@ pub async fn prepare_candidate(
     window: &PairMachineWindow,
     opts: PrepareCandidateOpts,
 ) -> Result<PreparedCandidate, CandidateError> {
+    prepare_candidate_inner(window, opts, None).await
+}
+
+/// Candidate preparation while the caller retains lifecycle-exclusive.
+pub async fn prepare_candidate_under_lifecycle(
+    window: &PairMachineWindow,
+    opts: PrepareCandidateOpts,
+    lifecycle: &crate::household_lifecycle::LifecycleWriteGuard,
+) -> Result<PreparedCandidate, CandidateError> {
+    prepare_candidate_inner(window, opts, Some(lifecycle)).await
+}
+
+async fn prepare_candidate_inner(
+    window: &PairMachineWindow,
+    opts: PrepareCandidateOpts,
+    lifecycle: Option<&crate::household_lifecycle::LifecycleWriteGuard>,
+) -> Result<PreparedCandidate, CandidateError> {
     if opts.hostname.is_empty() || opts.hostname.len() > HOSTNAME_MAX_BYTES {
         return Err(CandidateError::BadHostname(opts.hostname.len()));
     }
@@ -1928,21 +2930,43 @@ pub async fn prepare_candidate(
     // current nonce/fingerprint pair.
     let snap = window.snapshot().await;
     if !matches!(snap.state, PairMachineState::Idle) {
-        window.return_to_idle().await?;
+        match lifecycle {
+            Some(lifecycle) => window.under_lifecycle(lifecycle).return_to_idle().await?,
+            None => window.return_to_idle().await?,
+        }
     }
 
-    let ttl_unix_from_window = window
-        .enter_staging(
-            m_pub_sec1,
-            nonce,
-            opts.transport,
-            opts.addr,
-            fingerprint.clone(),
-            join_request_cbor.clone(),
-            ttl_secs,
-            Some(anchor_secret),
-        )
-        .await?;
+    let ttl_unix_from_window = match lifecycle {
+        Some(lifecycle) => {
+            window
+                .under_lifecycle(lifecycle)
+                .enter_staging(
+                    m_pub_sec1,
+                    nonce,
+                    opts.transport,
+                    opts.addr,
+                    fingerprint.clone(),
+                    join_request_cbor.clone(),
+                    ttl_secs,
+                    Some(anchor_secret),
+                )
+                .await?
+        }
+        None => {
+            window
+                .enter_staging(
+                    m_pub_sec1,
+                    nonce,
+                    opts.transport,
+                    opts.addr,
+                    fingerprint.clone(),
+                    join_request_cbor.clone(),
+                    ttl_secs,
+                    Some(anchor_secret),
+                )
+                .await?
+        }
+    };
 
     Ok(PreparedCandidate {
         m_priv,
@@ -1963,20 +2987,20 @@ pub async fn prepare_candidate(
 /// Outcome of a [`recover_phase3_ceremony`] run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecoveryOutcome {
-    /// No marker / no `.staged` files / no pending `JoinResponse` — there
-    /// is nothing for the driver to do. The caller can proceed to the
-    /// normal household-listener startup path.
+    /// No Phase-3 manifest — there is nothing for this driver to do. Legacy
+    /// Phase-3 evidence without a valid manifest fails closed instead.
     NotApplicable,
-    /// M2 confirmed committed via the post-commit identity probe AND
-    /// M1 finished step 12+13+14. Household is fully N=2.
+    /// The founder's exact manifest-bound post-Shamir record was already
+    /// durable. This is local terminal evidence from a prior verified-Ack
+    /// promotion, never inferred from remote household-identity visibility.
     RolledForwardPostCommit,
     /// M2 was reachable in pre-household mode AND the staged
     /// `JoinResponse` re-POST landed an ack. M1 finished step 12+13+14.
     RolledForwardPreCommit,
-    /// `RECOVERY_TIMEOUT` elapsed without a successful probe. M1
-    /// unlinked staged files, marker, and pending `JoinResponse`. The
-    /// candidate's possibly-orphaned `MachineCert` is no longer
-    /// honoured per `FR-013a`.
+    /// Legacy compatibility variant. Once the finalize intent has been
+    /// durably launched, timeout cannot prove that M2 did not commit, so the
+    /// current recovery driver never rolls the founder back on reachability
+    /// failure alone.
     RolledBack,
 }
 
@@ -1991,30 +3015,35 @@ pub enum RecoveryError {
     StagedRecordMissing(String),
     #[error("pending JoinResponse missing while marker present: {0}")]
     PendingJoinResponseMissing(String),
+    #[error("Phase-3 recovery evidence exists without one valid manifest")]
+    RecoveryManifestMissing,
     #[error("cached JoinRequest unavailable: {0}")]
     CachedJoinRequestUnavailable(String),
     #[error("post-commit promotion failed: {0}")]
     Promotion(String),
+    #[error("phase-3 recovery requires a persistent generation namespace")]
+    PersistentNamespaceUnavailable,
+    #[error(
+        "finalize outcome remains indeterminate after the recovery deadline; retained manifest and staged state for exact replay or manual recovery"
+    )]
+    FinalizeOutcomeIndeterminate,
 }
 
 /// Boot-time recovery driver for an in-flight Phase-3 join ceremony
 /// per `contracts/shamir-transition.md` §"Recovery on M1 boot".
 ///
 /// Runs unconditionally at server startup before any household-scoped
-/// listener binds. If the on-disk state shows no in-flight ceremony
-/// (no marker, no pending `JoinResponse`, no `.staged` siblings), this
-/// returns [`RecoveryOutcome::NotApplicable`] and the caller proceeds
-/// normally.
+/// listener binds. If the on-disk state has no Phase-3 manifest, this returns
+/// [`RecoveryOutcome::NotApplicable`] unless incompatible legacy evidence is
+/// present, in which case it fails closed.
 ///
 /// Otherwise the driver loops on a two-state probe of M2 until:
 /// * the pre-commit probe (`GET /pair-machine/local/seed`) lands, in
 ///   which case M1 re-POSTs the staged `JoinResponse` (idempotent on
 ///   M2's side) and finishes step 12+;
-/// * the post-commit probe (`GET /api/v1/household/identity`) confirms
-///   M2's committed `hh_id`/`hh_pub` match the staged record's, in
-///   which case M1 finishes step 12+ without any further M2 contact;
-/// * `recovery_timeout` elapses, in which case M1 rolls the ceremony
-///   back per `FR-013a`.
+/// * `recovery_timeout` elapses, in which case M1 fails closed and retains all
+///   recovery evidence. A launched exact POST is `MayHaveTakenEffect`, so mere
+///   unreachability never authorizes returning the founder to N=1.
 ///
 /// `recovery_timeout` is `RECOVERY_TIMEOUT` in production (5 minutes).
 /// Tests pass a shorter deadline.
@@ -2025,54 +3054,105 @@ pub async fn recover_phase3_ceremony(
     state_dir: &Path,
     recovery_timeout: Duration,
 ) -> Result<RecoveryOutcome, RecoveryError> {
+    let namespace = PairWindowNamespaceV2::current(state_dir.to_path_buf())?;
+    recover_phase3_ceremony_inner(state_dir, &namespace, None, recovery_timeout).await
+}
+
+/// Recover Phase 3 using a namespace resolved under the caller's retained
+/// lifecycle-exclusive guard. Startup must use this form to avoid reacquiring
+/// the same cross-process lock.
+pub async fn recover_phase3_ceremony_under_lifecycle(
+    state_dir: &Path,
+    namespace: &PairWindowNamespaceV2,
+    lifecycle: &crate::household_lifecycle::LifecycleWriteGuard,
+    recovery_timeout: Duration,
+) -> Result<RecoveryOutcome, RecoveryError> {
+    recover_phase3_ceremony_inner(state_dir, namespace, Some(lifecycle), recovery_timeout).await
+}
+
+/// Complete the exact manifest-bound founder promotion after the live handler
+/// has received M2's strict Ack. This is the same idempotent disk-only path
+/// used by boot recovery; the manifest deliberately remains as the terminal
+/// `MachineJoined` outbox.
+pub async fn finish_phase3_manifest_under_lifecycle(
+    state_dir: &Path,
+    namespace: &PairWindowNamespaceV2,
+    lifecycle: &crate::household_lifecycle::LifecycleWriteGuard,
+    manifest: Phase3RecoveryManifestV1,
+) -> Result<(), RecoveryError> {
+    finish_phase3_locally(state_dir, namespace, Some(lifecycle), manifest).await
+}
+
+async fn recover_phase3_ceremony_inner(
+    state_dir: &Path,
+    namespace: &PairWindowNamespaceV2,
+    lifecycle: Option<&crate::household_lifecycle::LifecycleWriteGuard>,
+    recovery_timeout: Duration,
+) -> Result<RecoveryOutcome, RecoveryError> {
     use crate::storage as st;
 
-    // Fast path: no marker = nothing to do. The shorter
-    // `clear_stale_phase3_marker_if_post_shamir` already ran in
-    // `load_state_dir`, so a post-Shamir household has its marker
-    // cleared.
-    if !st::phase3_finalize_ack_marker_exists(state_dir) {
+    // A single manifest is the only recovery authority. Legacy marker,
+    // pending-response, or staged evidence without it is quarantined rather
+    // than mixed or inferred across ceremonies.
+    let manifest = st::read_phase3_recovery_manifest(state_dir)?;
+    let Some(manifest) = manifest else {
+        if legacy_phase3_evidence_without_manifest(state_dir) {
+            return Err(RecoveryError::RecoveryManifestMissing);
+        }
         return Ok(RecoveryOutcome::NotApplicable);
+    };
+    manifest
+        .validate()
+        .map_err(|error| RecoveryError::Cbor(format!("validate recovery manifest: {error}")))?;
+    if manifest.lifecycle_generation() != namespace.generation().token_bytes() {
+        return Err(RecoveryError::Cbor(
+            "recovery manifest lifecycle generation mismatch".into(),
+        ));
     }
 
-    // Marker present → an in-flight ceremony was launched. Read the
-    // staged record + pending JoinResponse + cached JoinRequest.
-    let staged_record_path = st::staged_path_for(&st::household_record_path(state_dir));
-    let staged_record_bytes = match std::fs::read(&staged_record_path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(RecoveryError::StagedRecordMissing(
-                staged_record_path.display().to_string(),
-            ));
-        }
-        Err(e) => {
-            return Err(RecoveryError::Cbor(format!(
-                "read {}: {e}",
-                staged_record_path.display()
-            )));
-        }
-    };
-    let staged_record: HouseholdRecord = cbor::from_canonical_slice(&staged_record_bytes)
-        .map_err(|e| RecoveryError::Cbor(format!("decode staged record: {e}")))?;
-
-    let Some(pending_response_bytes) = st::read_phase3_pending_join_response(state_dir)? else {
-        return Err(RecoveryError::PendingJoinResponseMissing(
-            st::phase3_pending_join_response_path(state_dir)
-                .display()
-                .to_string(),
-        ));
-    };
-
-    let snap_path = pair_machine_window_path(state_dir);
-    let snap_opt: Option<PairMachineWindowSnapshot> = st::read_optional_cbor(&snap_path)?;
+    let snap_path = namespace.pair_machine_snapshot_path();
+    let snap_opt: Option<PairMachineWindowSnapshot> = match lifecycle {
+        Some(lifecycle) => namespace.read_pair_machine_under_lifecycle(lifecycle),
+        None => namespace.read_pair_machine(),
+    }?;
     let snap = snap_opt.ok_or_else(|| {
         RecoveryError::CachedJoinRequestUnavailable(snap_path.display().to_string())
     })?;
+    validate_snapshot_generation(&snap, namespace)?;
     let cached_join_request_bytes = snap.cached_join_request.as_ref().ok_or_else(|| {
         RecoveryError::CachedJoinRequestUnavailable("snapshot.cached_join_request".into())
     })?;
-    let cached_join_request: JoinRequest = cbor::from_canonical_slice(cached_join_request_bytes)
-        .map_err(|e| RecoveryError::Cbor(format!("decode cached JoinRequest: {e}")))?;
+    let cached_join_request: JoinRequest =
+        cbor::from_canonical_slice_strict(cached_join_request_bytes)
+            .map_err(|e| RecoveryError::Cbor(format!("decode cached JoinRequest: {e}")))?;
+    verify_join_request(&cached_join_request)
+        .map_err(|error| RecoveryError::Cbor(format!("verify cached JoinRequest: {error}")))?;
+    if blake3::hash(cached_join_request_bytes).as_bytes()
+        != manifest.cached_join_request_hash.as_ref()
+    {
+        return Err(RecoveryError::Cbor(
+            "cached JoinRequest differs from recovery manifest".into(),
+        ));
+    }
+    let manifest_response = manifest
+        .join_response()
+        .map_err(|error| RecoveryError::Cbor(format!("manifest response: {error}")))?;
+    if cached_join_request.m_pub.as_ref() != manifest_response.machine_cert.m_pub.as_bytes() {
+        return Err(RecoveryError::Cbor(
+            "cached JoinRequest candidate key differs from manifest certificate".into(),
+        ));
+    }
+    validate_phase3_recovery_artifacts(state_dir, &manifest)?;
+
+    let record_path = crate::storage::household_record_path(state_dir);
+    let record_is_manifest_final =
+        read_phase3_recovery_artifact(&record_path)?.is_some_and(|bytes| {
+            blake3::hash(&bytes).as_bytes() == manifest.staged_household_record_hash.as_ref()
+        });
+    if record_is_manifest_final {
+        finish_phase3_locally(state_dir, namespace, lifecycle, manifest).await?;
+        return Ok(RecoveryOutcome::RolledForwardPostCommit);
+    }
 
     let m2_addr = cached_join_request.addr.clone();
     let nonce_bytes: Vec<u8> = cached_join_request.nonce.to_vec();
@@ -2083,9 +3163,6 @@ pub async fn recover_phase3_ceremony(
         )));
     }
     let nonce_short = crate::ids::base32_lower_nopad_encode(&nonce_bytes[..8]);
-
-    let staged_hh_id = staged_record.hh_id.to_string();
-    let staged_hh_pub_bytes = *staged_record.hh_pub.as_bytes();
 
     let started = std::time::Instant::now();
     let mut attempt: u32 = 0;
@@ -2104,7 +3181,7 @@ pub async fn recover_phase3_ceremony(
         //     non-2xx and fall through to the post-commit probe.
         // A 200 from either branch is sufficient evidence that M2 is
         // logically committed; we finish step 12+ on M1.
-        match repost_finalize(&m2_addr, &pending_response_bytes).await {
+        match repost_finalize(&m2_addr, &manifest).await {
             Ok(()) => {
                 tracing::info!(
                     stage = "recovery.phase3.repost_finalize_ok",
@@ -2112,7 +3189,7 @@ pub async fn recover_phase3_ceremony(
                     addr = %m2_addr,
                     "M2 ack'd JoinResponse re-POST; finishing M1 step 12+ locally"
                 );
-                finish_phase3_locally(state_dir, pending_response_bytes.clone()).await?;
+                finish_phase3_locally(state_dir, namespace, lifecycle, manifest.clone()).await?;
                 return Ok(RecoveryOutcome::RolledForwardPreCommit);
             }
             Err(e) => {
@@ -2122,32 +3199,6 @@ pub async fn recover_phase3_ceremony(
                     error = %e,
                 );
             }
-        }
-
-        // Fall back to the post-commit identity probe. Useful when M2
-        // is reachable on the household listener but its pre-household
-        // listener is gone. In production this is HTTPS over Tailscale.
-        match probe_post_commit(&m2_addr, &staged_hh_id, &staged_hh_pub_bytes).await {
-            ProbeOutcome::Match => {
-                tracing::info!(
-                    stage = "recovery.phase3.post_commit_match",
-                    attempt = attempt,
-                    addr = %m2_addr,
-                    hh_id = %staged_hh_id,
-                    "M2 identity probe matches; finishing M1 step 12+ locally"
-                );
-                finish_phase3_locally(state_dir, pending_response_bytes.clone()).await?;
-                return Ok(RecoveryOutcome::RolledForwardPostCommit);
-            }
-            ProbeOutcome::Mismatch => {
-                tracing::warn!(
-                    stage = "recovery.phase3.post_commit_mismatch",
-                    attempt = attempt,
-                    addr = %m2_addr,
-                    "M2 identity does not match staged household",
-                );
-            }
-            ProbeOutcome::Unreachable | ProbeOutcome::WrongShape => {}
         }
 
         // Surface the pre-commit probe's outcome via tracing only —
@@ -2166,14 +3217,13 @@ pub async fn recover_phase3_ceremony(
 
         if started.elapsed() >= recovery_timeout {
             tracing::error!(
-                stage = "recovery.phase3.timeout_rollback",
+                stage = "recovery.phase3.timeout_indeterminate",
                 timeout_secs = recovery_timeout.as_secs(),
                 attempts = attempt,
                 addr = %m2_addr,
-                "RECOVERY_TIMEOUT elapsed; rolling back per FR-013a"
+                "RECOVERY_TIMEOUT elapsed; retaining MayHaveTakenEffect evidence and failing closed"
             );
-            rollback_phase3_locally(state_dir);
-            return Ok(RecoveryOutcome::RolledBack);
+            return finalize_recovery_timeout();
         }
 
         // Backoff. 250 ms is short enough for tests to drive multiple
@@ -2184,58 +3234,185 @@ pub async fn recover_phase3_ceremony(
     }
 }
 
+fn legacy_phase3_evidence_without_manifest(state_dir: &Path) -> bool {
+    crate::storage::phase3_finalize_ack_marker_exists(state_dir)
+        || crate::storage::phase3_pending_join_response_exists(state_dir)
+}
+
+fn finalize_recovery_timeout() -> Result<RecoveryOutcome, RecoveryError> {
+    // Deliberately accepts no path/capability: this terminal branch is not
+    // authorized to mutate or clear any MayHaveTakenEffect evidence.
+    Err(RecoveryError::FinalizeOutcomeIndeterminate)
+}
+
+const MAX_PHASE3_RECOVERY_ARTIFACT_BYTES: u64 = 1_048_576;
+
+fn read_phase3_recovery_artifact(path: &Path) -> Result<Option<Vec<u8>>, RecoveryError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(RecoveryError::Promotion(format!(
+                "inspect recovery artifact {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    if !metadata.file_type().is_file() || metadata.len() > MAX_PHASE3_RECOVERY_ARTIFACT_BYTES {
+        return Err(RecoveryError::Promotion(format!(
+            "unsafe recovery artifact shape: {}",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o022 != 0 {
+            return Err(RecoveryError::Promotion(format!(
+                "recovery artifact is group/world writable: {}",
+                path.display()
+            )));
+        }
+    }
+    let bytes = std::fs::read(path).map_err(|error| {
+        RecoveryError::Promotion(format!(
+            "read recovery artifact {}: {error}",
+            path.display()
+        ))
+    })?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_PHASE3_RECOVERY_ARTIFACT_BYTES {
+        return Err(RecoveryError::Promotion(format!(
+            "recovery artifact grew beyond bound while reading: {}",
+            path.display()
+        )));
+    }
+    Ok(Some(bytes))
+}
+
+fn require_phase3_artifact_hash(
+    description: &str,
+    path: &Path,
+    bytes: &[u8],
+    expected_hash: &[u8],
+) -> Result<(), RecoveryError> {
+    if blake3::hash(bytes).as_bytes() != expected_hash {
+        return Err(RecoveryError::Promotion(format!(
+            "{description} differs from recovery manifest: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_phase3_artifact_pair(
+    description: &str,
+    final_path: &Path,
+    expected_hash: &[u8],
+    allow_preinstall_final_while_staged_exists: bool,
+) -> Result<(), RecoveryError> {
+    let staged_path = crate::storage::staged_path_for(final_path);
+    let staged = read_phase3_recovery_artifact(&staged_path)?;
+    let final_bytes = read_phase3_recovery_artifact(final_path)?;
+    match (&staged, &final_bytes) {
+        (None, None) => Err(RecoveryError::Promotion(format!(
+            "{description} is absent at both staged and final paths"
+        ))),
+        (Some(bytes), _) => {
+            require_phase3_artifact_hash(description, &staged_path, bytes, expected_hash)?;
+            if let Some(final_bytes) = final_bytes
+                && !allow_preinstall_final_while_staged_exists
+            {
+                require_phase3_artifact_hash(description, final_path, &final_bytes, expected_hash)?;
+            }
+            Ok(())
+        }
+        (None, Some(bytes)) => {
+            require_phase3_artifact_hash(description, final_path, bytes, expected_hash)
+        }
+    }
+}
+
+fn validate_phase3_recovery_artifacts(
+    state_dir: &Path,
+    manifest: &Phase3RecoveryManifestV1,
+) -> Result<(), RecoveryError> {
+    let response = manifest
+        .join_response()
+        .map_err(|error| RecoveryError::Cbor(format!("manifest response: {error}")))?;
+    let record_path = crate::storage::household_record_path(state_dir);
+    validate_phase3_artifact_pair(
+        "staged household record",
+        &record_path,
+        manifest.staged_household_record_hash.as_ref(),
+        true,
+    )?;
+    let candidate_cert_path = crate::storage::machine_cert_for(state_dir, &manifest.candidate_m_id);
+    validate_phase3_artifact_pair(
+        "candidate certificate",
+        &candidate_cert_path,
+        manifest.staged_candidate_cert_hash.as_ref(),
+        false,
+    )?;
+    let self_shard_path = shamir_self_shard_path(state_dir);
+    validate_phase3_artifact_pair(
+        "founder self shard",
+        &self_shard_path,
+        manifest.staged_self_shard_hash.as_ref(),
+        false,
+    )?;
+
+    let founder_cert_path = crate::storage::machine_cert_for(state_dir, &manifest.founder_m_id);
+    let founder_cert_bytes =
+        read_phase3_recovery_artifact(&founder_cert_path)?.ok_or_else(|| {
+            RecoveryError::Promotion("founder certificate missing during recovery".into())
+        })?;
+    require_phase3_artifact_hash(
+        "founder certificate",
+        &founder_cert_path,
+        &founder_cert_bytes,
+        manifest.founder_cert_hash.as_ref(),
+    )?;
+    let founder_cert: MachineCert =
+        crate::cbor::from_canonical_slice_strict(&founder_cert_bytes)
+            .map_err(|error| RecoveryError::Cbor(format!("founder certificate: {error}")))?;
+    response
+        .verify_response_sig(&founder_cert)
+        .map_err(|error| RecoveryError::Cbor(format!("response signature: {error}")))?;
+
+    let current_record_bytes = read_phase3_recovery_artifact(&record_path)?.ok_or_else(|| {
+        RecoveryError::Promotion("founder household record missing during recovery".into())
+    })?;
+    let current_record_hash = blake3::hash(&current_record_bytes);
+    if current_record_hash.as_bytes() != manifest.preinstall_household_record_hash.as_ref()
+        && current_record_hash.as_bytes() != manifest.staged_household_record_hash.as_ref()
+    {
+        return Err(RecoveryError::Promotion(
+            "current household record is neither manifest preinstall nor exact staged state".into(),
+        ));
+    }
+    let current_record: HouseholdRecord =
+        crate::cbor::from_canonical_slice_strict(&current_record_bytes)
+            .map_err(|error| RecoveryError::Cbor(format!("current household record: {error}")))?;
+    if current_record.hh_id != response.household_record.hh_id
+        || current_record.hh_pub != response.household_record.hh_pub
+        || !current_record
+            .members
+            .iter()
+            .any(|member| member.to_string() == manifest.founder_m_id)
+    {
+        return Err(RecoveryError::Cbor(
+            "current founder household does not bind recovery manifest".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 enum ProbeOutcome {
     Match,
     Mismatch,
     WrongShape,
     Unreachable,
-}
-
-/// `GET /api/v1/household/identity` over HTTP/HTTPS to detect that M2
-/// has committed and is now serving the household listener with the
-/// expected `hh_id`/`hh_pub`.
-async fn probe_post_commit(
-    addr: &str,
-    expected_hh_id: &str,
-    expected_hh_pub: &[u8; 33],
-) -> ProbeOutcome {
-    let url = identity_url(addr);
-    let owned = url.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        let agent = ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(5))
-            .build();
-        agent.get(&owned).call().map_err(|_| ())
-    })
-    .await;
-    let Ok(Ok(response)) = result else {
-        return ProbeOutcome::Unreachable;
-    };
-    let mut body = String::new();
-    if response.into_reader().read_to_string(&mut body).is_err() {
-        return ProbeOutcome::WrongShape;
-    }
-    let value: serde_json::Value = match serde_json::from_str(&body) {
-        Ok(v) => v,
-        Err(_) => return ProbeOutcome::WrongShape,
-    };
-    let Some(hh_id) = value.get("hh_id").and_then(|v| v.as_str()) else {
-        return ProbeOutcome::WrongShape;
-    };
-    let Some(hh_pub_b64) = value.get("hh_pub_b64").and_then(|v| v.as_str()) else {
-        return ProbeOutcome::WrongShape;
-    };
-    if hh_id != expected_hh_id {
-        return ProbeOutcome::Mismatch;
-    }
-    let Ok(hh_pub_bytes) = base64::engine::general_purpose::STANDARD.decode(hh_pub_b64) else {
-        return ProbeOutcome::WrongShape;
-    };
-    if hh_pub_bytes.as_slice() != expected_hh_pub.as_slice() {
-        return ProbeOutcome::Mismatch;
-    }
-    ProbeOutcome::Match
 }
 
 /// `GET /pair-machine/local/seed?nonce=<short>` to detect M2 is still
@@ -2257,10 +3434,16 @@ async fn probe_pre_commit(addr: &str, nonce_short: &str, expected_m_pub: &[u8]) 
         return ProbeOutcome::Unreachable;
     };
     let mut bytes = Vec::new();
-    if response.into_reader().read_to_end(&mut bytes).is_err() {
+    if response
+        .into_reader()
+        .take(MAX_JOIN_REQUEST_WIRE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_JOIN_REQUEST_WIRE_BYTES
+    {
         return ProbeOutcome::WrongShape;
     }
-    let req: JoinRequest = match cbor::from_canonical_slice(&bytes) {
+    let req: JoinRequest = match cbor::from_canonical_slice_strict(&bytes) {
         Ok(r) => r,
         Err(_) => return ProbeOutcome::WrongShape,
     };
@@ -2280,169 +3463,880 @@ fn local_seed_url(addr: &str, nonce: &str) -> String {
     format!("{base}/pair-machine/local/seed?nonce={nonce}")
 }
 
-fn identity_url(addr: &str) -> String {
-    let trimmed = addr.trim_end_matches('/');
-    let base = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        trimmed.to_string()
-    } else {
-        // Production: HTTPS over Tailscale once M2 is committed. Tests
-        // pass `http://...` explicitly.
-        format!("https://{trimmed}")
-    };
-    format!("{base}/api/v1/household/identity")
-}
-
-async fn repost_finalize(addr: &str, body: &[u8]) -> Result<(), CeremonyError> {
+async fn repost_finalize(
+    addr: &str,
+    manifest: &Phase3RecoveryManifestV1,
+) -> Result<(), CeremonyError> {
+    manifest.validate()?;
+    let expected_cert = manifest.join_response()?.machine_cert;
     let url = local_finalize_url(addr);
-    let body = body.to_vec();
+    let body = manifest.exact_join_response().to_vec();
     let owned = url.clone();
     tokio::task::spawn_blocking(move || {
-        let agent = ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(10))
-            .build();
-        let resp = agent
-            .post(&owned)
-            .set("Content-Type", "application/cbor")
-            .send_bytes(&body)
-            .map_err(|e| match e {
-                ureq::Error::Status(code, _) => {
-                    CeremonyError::FinalizeRejected(format!("re-POST {owned}: status {code}"))
-                }
-                other @ ureq::Error::Transport(_) => {
-                    CeremonyError::Http(format!("re-POST {owned}: {other}"))
-                }
-            })?;
-        // We don't need to verify the FinalizeAck here — local/finalize
-        // is idempotent on M2's side (it short-circuits to the cached
-        // ack when the same body has already committed). The fact
-        // that M2 returned 200 OK is sufficient evidence that the
-        // ceremony is logically committed on M2.
-        let mut sink = Vec::new();
-        let _ = resp.into_reader().read_to_end(&mut sink);
-        Ok::<(), CeremonyError>(())
+        match post_finalize_once(
+            &format!("re-POST {owned}"),
+            &owned,
+            &body,
+            &expected_cert,
+            FINALIZE_HTTP_TIMEOUT,
+        )
+        .map_err(FinalizePostError::into_ceremony)?
+        {
+            FinalizePostOutcome::Ack(_) => Ok(()),
+            FinalizePostOutcome::RestartRequired(_) => Err(CeremonyError::Http(format!(
+                "re-POST {owned}: candidate restart still in progress"
+            ))),
+        }
     })
     .await
     .map_err(|e| CeremonyError::Http(format!("repost_finalize task failed: {e}")))?
 }
 
-/// Promote M1's staged files to their final paths, delete the
-/// sole-shard plaintext, clear the marker and pending `JoinResponse`.
+#[cfg(test)]
+mod phase3_recovery_failpoint {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAIL_NEXT_PARENT_BARRIER: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn arm_parent_barrier() {
+        FAIL_NEXT_PARENT_BARRIER.with(|armed| armed.set(true));
+    }
+
+    pub(super) fn take_parent_barrier() -> bool {
+        FAIL_NEXT_PARENT_BARRIER.with(|armed| armed.replace(false))
+    }
+}
+
+#[cfg(not(test))]
+mod phase3_recovery_failpoint {
+    pub(super) const fn take_parent_barrier() -> bool {
+        false
+    }
+}
+
+fn sync_phase3_parent(path: &Path) -> Result<(), RecoveryError> {
+    let parent = path.parent().ok_or_else(|| {
+        RecoveryError::Promotion(format!("recovery path has no parent: {}", path.display()))
+    })?;
+    if phase3_recovery_failpoint::take_parent_barrier() {
+        return Err(RecoveryError::Promotion(format!(
+            "injected parent barrier failure for {}",
+            path.display()
+        )));
+    }
+    let dir = std::fs::File::open(parent).map_err(|error| {
+        RecoveryError::Promotion(format!(
+            "open recovery parent {}: {error}",
+            parent.display()
+        ))
+    })?;
+    dir.sync_all().map_err(|error| {
+        RecoveryError::Promotion(format!(
+            "fsync recovery parent {}: {error}",
+            parent.display()
+        ))
+    })
+}
+
+fn phase3_promote_temp_path(final_path: &Path) -> PathBuf {
+    let mut path = final_path.as_os_str().to_owned();
+    path.push(".phase3-promote-v1");
+    PathBuf::from(path)
+}
+
+fn promote_phase3_artifact_exact(
+    description: &str,
+    final_path: &Path,
+    expected_hash: &[u8],
+    replace_existing: bool,
+) -> Result<(), RecoveryError> {
+    let staged_path = crate::storage::staged_path_for(final_path);
+    let staged = read_phase3_recovery_artifact(&staged_path)?;
+    if let Some(staged_bytes) = staged.as_ref() {
+        require_phase3_artifact_hash(description, &staged_path, staged_bytes, expected_hash)?;
+    }
+
+    if replace_existing && staged.is_some() {
+        // Preserve the `.staged` evidence while replacing the pre-Shamir
+        // household record: link its exact inode to a deterministic recovery
+        // temp, fsync that direntry, then rename the temp over the old record.
+        let promote_path = phase3_promote_temp_path(final_path);
+        match std::fs::hard_link(&staged_path, &promote_path) {
+            Ok(()) => sync_phase3_parent(&promote_path)?,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let promote_bytes =
+                    read_phase3_recovery_artifact(&promote_path)?.ok_or_else(|| {
+                        RecoveryError::Promotion(format!(
+                            "recovery promote temp vanished: {}",
+                            promote_path.display()
+                        ))
+                    })?;
+                require_phase3_artifact_hash(
+                    description,
+                    &promote_path,
+                    &promote_bytes,
+                    expected_hash,
+                )?;
+            }
+            Err(error) => {
+                return Err(RecoveryError::Promotion(format!(
+                    "link exact {description} {} -> {}: {error}",
+                    staged_path.display(),
+                    promote_path.display()
+                )));
+            }
+        }
+        std::fs::rename(&promote_path, final_path).map_err(|error| {
+            RecoveryError::Promotion(format!(
+                "replace exact {description} {}: {error}",
+                final_path.display()
+            ))
+        })?;
+        sync_phase3_parent(final_path)?;
+    } else if staged.is_some() {
+        match std::fs::hard_link(&staged_path, final_path) {
+            Ok(()) => sync_phase3_parent(final_path)?,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(RecoveryError::Promotion(format!(
+                    "link exact {description} {} -> {}: {error}",
+                    staged_path.display(),
+                    final_path.display()
+                )));
+            }
+        }
+    }
+
+    let final_bytes = read_phase3_recovery_artifact(final_path)?.ok_or_else(|| {
+        RecoveryError::Promotion(format!(
+            "{description} final path absent after recovery promotion: {}",
+            final_path.display()
+        ))
+    })?;
+    require_phase3_artifact_hash(description, final_path, &final_bytes, expected_hash)?;
+    // Re-run the barrier even when a prior attempt already installed the exact
+    // bytes but lost the parent-fsync acknowledgement.
+    sync_phase3_parent(final_path)
+}
+
+fn remove_phase3_file_durably(path: &Path) -> Result<(), RecoveryError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(RecoveryError::Promotion(format!(
+                "remove recovery file {}: {error}",
+                path.display()
+            )));
+        }
+    }
+    // Absence is not durable authority until the containing directory is
+    // synchronized, including the retry path that observed NotFound.
+    sync_phase3_parent(path)
+}
+
+/// Promote M1's exact manifest-bound staged files to their final paths and
+/// durably delete the sole-shard plaintext.
 /// This is the disk-only finishing logic for steps 12+13+17 of the
 /// 2PC; `OwnerEvent` append (step 14) is not done here because the
 /// recovery driver runs before the owner-events broadcaster is wired.
+/// The manifest remains as a durable terminal outbox until the startup/handler
+/// layer appends the exact `MachineJoined` event and explicitly clears it.
 async fn finish_phase3_locally(
     state_dir: &Path,
-    cached_response_bytes: Vec<u8>,
+    namespace: &PairWindowNamespaceV2,
+    lifecycle: Option<&crate::household_lifecycle::LifecycleWriteGuard>,
+    manifest: Phase3RecoveryManifestV1,
 ) -> Result<(), RecoveryError> {
-    use crate::storage as st;
     let state_dir_owned = state_dir.to_path_buf();
+    let state_dir_for_promotion = state_dir_owned.clone();
+    let manifest_for_promotion = manifest.clone();
     tokio::task::spawn_blocking(move || -> Result<(), RecoveryError> {
-        // Promote each `.staged` file to its final path. We delegate to
-        // `recover_partial_phase3_commit` via an explicit roll-forward
-        // helper; the simplest correct approach is to rename them
-        // ourselves, mirroring the ordering in `CeremonyTxn::prepare`
-        // (record LAST is the canonical commit marker — but here we've
-        // already passed the "is M2 committed?" gate, so the order is
-        // less critical and we promote everything we find).
-        let staged_files = st::detect_orphan_staged_files(&state_dir_owned);
-        // First, promote non-record files; promote record last so the
-        // canonical commit marker flips after every other file is
-        // durable.
-        let record_path = st::household_record_path(&state_dir_owned);
-        let staged_record_path = st::staged_path_for(&record_path);
-        let mut non_record: Vec<_> = staged_files
-            .iter()
-            .filter(|p| **p != staged_record_path)
-            .cloned()
-            .collect();
-        non_record.sort();
-        for staged_path in &non_record {
-            let s = staged_path.to_string_lossy().to_string();
-            let final_path = std::path::PathBuf::from(s.trim_end_matches(".staged"));
-            if final_path.exists() {
-                let _ = std::fs::remove_file(staged_path);
-                continue;
-            }
-            std::fs::rename(staged_path, &final_path).map_err(|e| {
-                RecoveryError::Promotion(format!(
-                    "rename {} -> {}: {e}",
-                    staged_path.display(),
-                    final_path.display()
-                ))
-            })?;
-            if let Some(parent) = final_path.parent() {
-                if let Ok(dir) = std::fs::File::open(parent) {
-                    let _ = dir.sync_all();
-                }
-            }
-        }
-        if staged_record_path.exists() {
-            std::fs::rename(&staged_record_path, &record_path).map_err(|e| {
-                RecoveryError::Promotion(format!(
-                    "rename {} -> {}: {e}",
-                    staged_record_path.display(),
-                    record_path.display()
-                ))
-            })?;
-            if let Some(parent) = record_path.parent() {
-                if let Ok(dir) = std::fs::File::open(parent) {
-                    let _ = dir.sync_all();
-                }
-            }
-        }
-
-        // Step 13: delete sole-shard plaintext.
-        let sole = household_root_sole_path(&state_dir_owned);
-        if sole.exists() {
-            if let Err(e) = std::fs::remove_file(&sole) {
-                tracing::warn!(
-                    stage = "recovery.phase3.sole_shard_unlink_failed",
-                    path = %sole.display(),
-                    error = %e,
-                );
-            }
-        }
-
-        // Clear the marker + pending JoinResponse — ceremony complete.
-        mark_window_committed_after_recovery(&state_dir_owned, cached_response_bytes)?;
-        let _ = st::clear_phase3_finalize_ack_marker(&state_dir_owned);
-        let _ = st::clear_phase3_pending_join_response(&state_dir_owned);
+        validate_phase3_recovery_artifacts(&state_dir_for_promotion, &manifest_for_promotion)?;
+        let candidate_cert_path = crate::storage::machine_cert_for(
+            &state_dir_for_promotion,
+            &manifest_for_promotion.candidate_m_id,
+        );
+        promote_phase3_artifact_exact(
+            "candidate certificate",
+            &candidate_cert_path,
+            manifest_for_promotion.staged_candidate_cert_hash.as_ref(),
+            false,
+        )?;
+        let self_shard_path = shamir_self_shard_path(&state_dir_for_promotion);
+        promote_phase3_artifact_exact(
+            "founder self shard",
+            &self_shard_path,
+            manifest_for_promotion.staged_self_shard_hash.as_ref(),
+            false,
+        )?;
+        let record_path = crate::storage::household_record_path(&state_dir_for_promotion);
+        promote_phase3_artifact_exact(
+            "household record",
+            &record_path,
+            manifest_for_promotion.staged_household_record_hash.as_ref(),
+            true,
+        )?;
+        remove_phase3_file_durably(&household_root_sole_path(&state_dir_for_promotion))?;
         Ok(())
     })
     .await
-    .map_err(|e| RecoveryError::Promotion(format!("blocking task failed: {e}")))?
-}
-
-/// `RECOVERY_TIMEOUT` elapsed: tear down the in-flight ceremony per
-/// `FR-013a`.
-fn rollback_phase3_locally(state_dir: &Path) {
-    use crate::storage as st;
-    if let Err(e) = mark_window_aborted_after_recovery(state_dir) {
-        tracing::warn!(
-            stage = "recovery.phase3.window_abort_failed",
-            error = %e,
-            hint = "leaving Phase-3 marker/pending/staged files for retry"
-        );
-        return;
-    }
-    let staged = st::detect_orphan_staged_files(state_dir);
-    for staged_path in &staged {
-        let _ = std::fs::remove_file(staged_path);
-    }
-    // Also unlink any partially-promoted candidate cert. The
-    // staged record's `members[]` (read above) carried the candidate
-    // m_id; we re-read it here defensively in case the staged record
-    // has just been deleted.
-    // (No-op if this code path runs again with the staged set already
-    // gone.)
-    let _ = st::clear_phase3_finalize_ack_marker(state_dir);
-    let _ = st::clear_phase3_pending_join_response(state_dir);
+    .map_err(|e| RecoveryError::Promotion(format!("blocking task failed: {e}")))??;
+    mark_window_committed_after_recovery(
+        namespace,
+        lifecycle,
+        manifest.exact_join_response().to_vec(),
+    )?;
+    let staged_paths = [
+        crate::storage::staged_path_for(&crate::storage::machine_cert_for(
+            &state_dir_owned,
+            &manifest.candidate_m_id,
+        )),
+        crate::storage::staged_path_for(&shamir_self_shard_path(&state_dir_owned)),
+        crate::storage::staged_path_for(&crate::storage::household_record_path(&state_dir_owned)),
+    ];
+    tokio::task::spawn_blocking(move || {
+        for path in &staged_paths {
+            remove_phase3_file_durably(path)?;
+        }
+        Ok::<(), RecoveryError>(())
+    })
+    .await
+    .map_err(|error| RecoveryError::Promotion(format!("blocking cleanup failed: {error}")))??;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ids::derive_household_id;
     use crate::keys::{IdentityKey, P256Keypair};
+    use crate::machine_cert::SignOptions;
+    use std::io::Write as _;
+    use std::net::{Shutdown, TcpListener, TcpStream};
+
+    enum TestFinalizeReply {
+        DropConnection,
+        PartialResponse {
+            status: u16,
+            body_prefix: Vec<u8>,
+            declared_length: usize,
+        },
+        Response {
+            status: u16,
+            body: Vec<u8>,
+            retry_after: bool,
+            delay: Duration,
+        },
+    }
+
+    fn test_candidate_cert() -> MachineCert {
+        let household_key = P256Keypair::generate();
+        let candidate_key = P256Keypair::generate();
+        MachineCert::sign(
+            &household_key,
+            &candidate_key.public(),
+            &SignOptions {
+                hh_id: derive_household_id(&household_key.public()),
+                hostname: "candidate-mac".into(),
+                platform: Platform::Macos,
+                joined_at: 1_714_972_800,
+            },
+        )
+        .unwrap()
+    }
+
+    fn test_recovery_manifest() -> Phase3RecoveryManifestV1 {
+        let household_key = P256Keypair::generate();
+        let founder_key = P256Keypair::generate();
+        let candidate_key = P256Keypair::generate();
+        let hh_id = derive_household_id(&household_key.public());
+        let founder_cert = MachineCert::sign(
+            &household_key,
+            &founder_key.public(),
+            &SignOptions {
+                hh_id: hh_id.clone(),
+                hostname: "founder-mac".into(),
+                platform: Platform::Macos,
+                joined_at: 1,
+            },
+        )
+        .unwrap();
+        let candidate_cert = MachineCert::sign(
+            &household_key,
+            &candidate_key.public(),
+            &SignOptions {
+                hh_id: hh_id.clone(),
+                hostname: "candidate-mac".into(),
+                platform: Platform::Macos,
+                joined_at: 2,
+            },
+        )
+        .unwrap();
+        let mut members = vec![founder_cert.m_id.clone(), candidate_cert.m_id.clone()];
+        members.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        let record = HouseholdRecord {
+            version: HouseholdRecord::SCHEMA_VERSION,
+            hh_id: hh_id.clone(),
+            hh_pub: household_key.public(),
+            name: "Test Household".into(),
+            created_at: 1,
+            shamir_k: 2,
+            shamir_n: 2,
+            members,
+            is_follower: false,
+        };
+        record.validate().unwrap();
+        let request_hash = [0x11; 32];
+        let peer_shard = crate::shard_at_rest::EncryptedShard {
+            version: crate::shard_at_rest::ENCRYPTED_SHARD_VERSION,
+            index: crate::shamir::SHARD_X_M2,
+            nonce: [0x22; 12],
+            ciphertext: ByteBuf::from(vec![0x33; 48]),
+        };
+        let response = JoinResponseUnsigned {
+            version: PAIR_MACHINE_VERSION,
+            join_request_hash: ByteBuf::from(request_hash.to_vec()),
+            machine_cert: candidate_cert.clone(),
+            encrypted_shard: peer_shard,
+            household_record: record.clone(),
+            peer_list: vec![PeerEntry {
+                m_id: founder_cert.m_id.to_string(),
+                m_pub: ByteBuf::from(founder_cert.m_pub.as_bytes().to_vec()),
+                hostname: founder_cert.hostname.clone(),
+                tailscale_addr: None,
+                machine_cert: Some(founder_cert.clone()),
+            }],
+            push_token_seed: None,
+        }
+        .sign(&founder_key)
+        .unwrap();
+        let response_bytes = response.to_canonical_bytes().unwrap();
+        let ack_bytes = FinalizeAck::for_machine_cert(&candidate_cert)
+            .unwrap()
+            .to_canonical_bytes()
+            .unwrap();
+        let candidate_cert_bytes = crate::cbor::to_canonical_vec(&candidate_cert).unwrap();
+        let record_bytes = crate::cbor::to_canonical_vec(&record).unwrap();
+        let self_shard = crate::shard_at_rest::EncryptedShard {
+            version: crate::shard_at_rest::ENCRYPTED_SHARD_VERSION,
+            index: crate::shamir::SHARD_X_M1,
+            nonce: [0x44; 12],
+            ciphertext: ByteBuf::from(vec![0x55; 48]),
+        }
+        .to_canonical_bytes()
+        .unwrap();
+        Phase3RecoveryManifestV1 {
+            version: Phase3RecoveryManifestV1::VERSION,
+            lifecycle_generation: ByteBuf::from(vec![0x66; 32]),
+            hh_id: hh_id.to_string(),
+            candidate_m_id: candidate_cert.m_id.to_string(),
+            founder_m_id: founder_cert.m_id.to_string(),
+            founder_cert_hash: ByteBuf::from(machine_cert_hash(&founder_cert).unwrap().to_vec()),
+            cached_join_request_hash: ByteBuf::from(request_hash.to_vec()),
+            exact_join_response: ByteBuf::from(response_bytes),
+            exact_finalize_ack: ByteBuf::from(ack_bytes),
+            staged_candidate_cert_hash: ByteBuf::from(
+                blake3::hash(&candidate_cert_bytes).as_bytes().to_vec(),
+            ),
+            staged_self_shard_hash: ByteBuf::from(blake3::hash(&self_shard).as_bytes().to_vec()),
+            staged_household_record_hash: ByteBuf::from(
+                blake3::hash(&record_bytes).as_bytes().to_vec(),
+            ),
+            preinstall_household_record_hash: ByteBuf::from(vec![0x77; 32]),
+        }
+    }
+
+    fn read_test_http_body(stream: &mut TcpStream) -> Vec<u8> {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut received = Vec::new();
+        let header_end = loop {
+            let mut chunk = [0_u8; 1024];
+            let read = stream.read(&mut chunk).unwrap();
+            assert_ne!(read, 0, "request ended before its HTTP headers");
+            received.extend_from_slice(&chunk[..read]);
+            if let Some(index) = received.windows(4).position(|window| window == b"\r\n\r\n") {
+                break index + 4;
+            }
+        };
+        let headers = std::str::from_utf8(&received[..header_end]).unwrap();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .expect("ureq request must carry Content-Length");
+        while received.len() - header_end < content_length {
+            let mut chunk = [0_u8; 1024];
+            let read = stream.read(&mut chunk).unwrap();
+            assert_ne!(read, 0, "request ended before its declared body");
+            received.extend_from_slice(&chunk[..read]);
+        }
+        received[header_end..header_end + content_length].to_vec()
+    }
+
+    fn spawn_finalize_server(
+        replies: Vec<TestFinalizeReply>,
+    ) -> (String, std::thread::JoinHandle<Vec<Vec<u8>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut bodies = Vec::new();
+            for reply in replies {
+                let (mut stream, _) = listener.accept().unwrap();
+                bodies.push(read_test_http_body(&mut stream));
+                match reply {
+                    TestFinalizeReply::DropConnection => {
+                        stream.shutdown(Shutdown::Both).unwrap();
+                    }
+                    TestFinalizeReply::PartialResponse {
+                        status,
+                        body_prefix,
+                        declared_length,
+                    } => {
+                        write!(
+                            stream,
+                            "HTTP/1.1 {status} OK\r\nContent-Type: application/cbor\r\nContent-Length: {declared_length}\r\nConnection: close\r\n\r\n"
+                        )
+                        .unwrap();
+                        stream.write_all(&body_prefix).unwrap();
+                        stream.flush().unwrap();
+                        stream.shutdown(Shutdown::Both).unwrap();
+                    }
+                    TestFinalizeReply::Response {
+                        status,
+                        body,
+                        retry_after,
+                        delay,
+                    } => {
+                        std::thread::sleep(delay);
+                        let reason = match status {
+                            200 => "OK",
+                            401 => "Unauthorized",
+                            503 => "Service Unavailable",
+                            _ => "Test",
+                        };
+                        let retry_header = if retry_after {
+                            "Retry-After: 1\r\n"
+                        } else {
+                            ""
+                        };
+                        write!(
+                            stream,
+                            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/cbor\r\nContent-Length: {}\r\n{retry_header}Connection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .unwrap();
+                        stream.write_all(&body).unwrap();
+                        stream.flush().unwrap();
+                    }
+                }
+            }
+            bodies
+        });
+        (
+            format!("http://{address}/pair-machine/local/finalize"),
+            handle,
+        )
+    }
+
+    fn fast_retry_policy() -> FinalizeRetryPolicy {
+        FinalizeRetryPolicy {
+            budget: Duration::from_secs(2),
+            request_timeout: Duration::from_millis(200),
+            maximum_sleep: Duration::from_millis(5),
+        }
+    }
+
+    #[test]
+    fn finalize_server_errors_preserve_recovery_evidence() {
+        for code in [500, 503, 599] {
+            let error = finalize_http_status_error("POST candidate", code);
+            assert!(
+                error.is_ambiguous_finalize_outcome(),
+                "server status {code} may follow a durable candidate commit"
+            );
+        }
+        assert!(matches!(
+            finalize_http_status_error("POST candidate", 401),
+            CeremonyError::FinalizeRejected(_)
+        ));
+    }
+
+    #[test]
+    fn recovery_manifest_rejects_cross_ceremony_mixes() {
+        let first = test_recovery_manifest();
+        first.validate().unwrap();
+        let second = test_recovery_manifest();
+        second.validate().unwrap();
+
+        let mut response_mix = first.clone();
+        response_mix.exact_join_response = second.exact_join_response.clone();
+        assert!(response_mix.validate().is_err());
+
+        let mut record_mix = first.clone();
+        record_mix.staged_household_record_hash = second.staged_household_record_hash.clone();
+        assert!(record_mix.validate().is_err());
+
+        let mut ack_mix = first;
+        ack_mix.exact_finalize_ack = second.exact_finalize_ack;
+        assert!(ack_mix.validate().is_err());
+    }
+
+    #[test]
+    fn terminal_m2_offline_timeout_retains_all_recovery_evidence() {
+        let state = tempfile::tempdir().unwrap();
+        crate::storage::write_phase3_pending_join_response(state.path(), b"exact request").unwrap();
+        crate::storage::write_phase3_finalize_ack_marker(state.path(), "m_candidate").unwrap();
+        let staged =
+            crate::storage::staged_path_for(&crate::storage::household_record_path(state.path()));
+        std::fs::write(&staged, b"staged founder N=2 record").unwrap();
+
+        assert!(matches!(
+            finalize_recovery_timeout(),
+            Err(RecoveryError::FinalizeOutcomeIndeterminate)
+        ));
+        assert_eq!(
+            crate::storage::read_phase3_pending_join_response(state.path())
+                .unwrap()
+                .unwrap(),
+            b"exact request"
+        );
+        assert!(crate::storage::phase3_finalize_ack_marker_exists(
+            state.path()
+        ));
+        assert_eq!(std::fs::read(staged).unwrap(), b"staged founder N=2 record");
+    }
+
+    #[test]
+    fn unrelated_staged_file_is_not_phase3_evidence_without_manifest() {
+        let state = tempfile::tempdir().unwrap();
+        let unrelated = crate::storage::staged_path_for(
+            &crate::storage::household_dir(state.path()).join("self_m_id"),
+        );
+        std::fs::create_dir_all(unrelated.parent().unwrap()).unwrap();
+        std::fs::write(&unrelated, b"other subsystem recovery evidence").unwrap();
+        assert!(!legacy_phase3_evidence_without_manifest(state.path()));
+        assert_eq!(
+            std::fs::read(unrelated).unwrap(),
+            b"other subsystem recovery evidence"
+        );
+    }
+
+    #[test]
+    fn exact_promotion_parent_barrier_failure_preserves_staged_and_retries() {
+        let state = tempfile::tempdir().unwrap();
+        let final_path = state.path().join("machine_certs/candidate.cbor");
+        std::fs::create_dir_all(final_path.parent().unwrap()).unwrap();
+        let staged_path = crate::storage::staged_path_for(&final_path);
+        let exact = b"exact candidate certificate";
+        std::fs::write(&staged_path, exact).unwrap();
+        let expected = *blake3::hash(exact).as_bytes();
+
+        phase3_recovery_failpoint::arm_parent_barrier();
+        assert!(
+            promote_phase3_artifact_exact("candidate certificate", &final_path, &expected, false,)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&staged_path).unwrap(), exact);
+        promote_phase3_artifact_exact("candidate certificate", &final_path, &expected, false)
+            .unwrap();
+        assert_eq!(std::fs::read(final_path).unwrap(), exact);
+        assert_eq!(std::fs::read(staged_path).unwrap(), exact);
+    }
+
+    #[test]
+    fn stale_final_destination_never_discards_exact_staged_evidence() {
+        let state = tempfile::tempdir().unwrap();
+        let final_path = state.path().join("shamir/self_shard.cbor");
+        std::fs::create_dir_all(final_path.parent().unwrap()).unwrap();
+        let staged_path = crate::storage::staged_path_for(&final_path);
+        let exact = b"exact encrypted self shard";
+        std::fs::write(&staged_path, exact).unwrap();
+        std::fs::write(&final_path, b"foreign stale destination").unwrap();
+        let expected = *blake3::hash(exact).as_bytes();
+
+        assert!(
+            promote_phase3_artifact_exact("founder self shard", &final_path, &expected, false)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&staged_path).unwrap(), exact);
+        assert_eq!(
+            std::fs::read(&final_path).unwrap(),
+            b"foreign stale destination"
+        );
+    }
+
+    #[test]
+    fn record_replace_crash_keeps_evidence_and_final_exact_can_resume_without_staged() {
+        let state = tempfile::tempdir().unwrap();
+        let final_path = state.path().join("household_record.cbor");
+        let staged_path = crate::storage::staged_path_for(&final_path);
+        let exact = b"exact post-Shamir record";
+        std::fs::write(&final_path, b"pre-Shamir record").unwrap();
+        std::fs::write(&staged_path, exact).unwrap();
+        let expected = *blake3::hash(exact).as_bytes();
+
+        phase3_recovery_failpoint::arm_parent_barrier();
+        assert!(
+            promote_phase3_artifact_exact("household record", &final_path, &expected, true)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&staged_path).unwrap(), exact);
+        promote_phase3_artifact_exact("household record", &final_path, &expected, true).unwrap();
+        assert_eq!(std::fs::read(&final_path).unwrap(), exact);
+
+        remove_phase3_file_durably(&staged_path).unwrap();
+        validate_phase3_artifact_pair("household record", &final_path, &expected, true).unwrap();
+        promote_phase3_artifact_exact("household record", &final_path, &expected, true).unwrap();
+    }
+
+    #[test]
+    fn finalize_restart_required_is_strict_canonical_cbor() {
+        let canonical = FinalizeRestartRequired::new().to_canonical_bytes().unwrap();
+        assert_eq!(
+            FinalizeRestartRequired::from_canonical_bytes(&canonical).unwrap(),
+            FinalizeRestartRequired::new()
+        );
+
+        let mut trailing = canonical;
+        trailing.push(0);
+        assert!(FinalizeRestartRequired::from_canonical_bytes(&trailing).is_err());
+
+        let wrong = FinalizeRestartRequired {
+            version: PAIR_MACHINE_VERSION,
+            error: "temporarily_unavailable".into(),
+        };
+        assert!(
+            FinalizeRestartRequired::from_canonical_bytes(
+                &crate::cbor::to_canonical_vec(&wrong).unwrap()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn transport_reset_then_typed_restart_and_gap_replay_exact_bytes_until_ack() {
+        let cert = test_candidate_cert();
+        let ack_bytes = FinalizeAck::for_machine_cert(&cert)
+            .unwrap()
+            .to_canonical_bytes()
+            .unwrap();
+        let restart_bytes = FinalizeRestartRequired::new().to_canonical_bytes().unwrap();
+        let (url, server) = spawn_finalize_server(vec![
+            TestFinalizeReply::DropConnection,
+            TestFinalizeReply::Response {
+                status: 503,
+                body: restart_bytes,
+                retry_after: true,
+                delay: Duration::ZERO,
+            },
+            TestFinalizeReply::DropConnection,
+            TestFinalizeReply::Response {
+                status: 200,
+                body: ack_bytes,
+                retry_after: false,
+                delay: Duration::ZERO,
+            },
+        ]);
+        let request = b"exact-durable-join-response";
+        let verified = post_finalize_until_ack(&url, request, &cert, fast_retry_policy()).unwrap();
+        assert_eq!(verified.ack.m_id, cert.m_id.to_string());
+        assert_eq!(
+            server.join().unwrap(),
+            vec![
+                request.to_vec(),
+                request.to_vec(),
+                request.to_vec(),
+                request.to_vec()
+            ]
+        );
+    }
+
+    #[test]
+    fn delayed_restart_response_never_sleeps_against_a_stale_budget() {
+        let cert = test_candidate_cert();
+        let restart_bytes = FinalizeRestartRequired::new().to_canonical_bytes().unwrap();
+        let (url, server) = spawn_finalize_server(vec![TestFinalizeReply::Response {
+            status: 503,
+            body: restart_bytes,
+            retry_after: true,
+            delay: Duration::from_millis(200),
+        }]);
+        let policy = FinalizeRetryPolicy {
+            budget: Duration::from_millis(250),
+            request_timeout: Duration::from_millis(240),
+            maximum_sleep: Duration::from_secs(1),
+        };
+        let started = std::time::Instant::now();
+        let error = post_finalize_until_ack(&url, b"request", &cert, policy).unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(matches!(error, CeremonyError::Http(_)));
+        assert!(
+            elapsed < Duration::from_millis(375),
+            "stale pre-request budget caused an oversleep: {elapsed:?}"
+        );
+        assert_eq!(server.join().unwrap(), vec![b"request".to_vec()]);
+    }
+
+    #[test]
+    fn partial_success_body_is_transport_ambiguity_and_exactly_retried() {
+        let cert = test_candidate_cert();
+        let ack_bytes = FinalizeAck::for_machine_cert(&cert)
+            .unwrap()
+            .to_canonical_bytes()
+            .unwrap();
+        let (url, server) = spawn_finalize_server(vec![
+            TestFinalizeReply::PartialResponse {
+                status: 200,
+                body_prefix: ack_bytes[..ack_bytes.len() / 2].to_vec(),
+                declared_length: ack_bytes.len(),
+            },
+            TestFinalizeReply::Response {
+                status: 200,
+                body: ack_bytes,
+                retry_after: false,
+                delay: Duration::ZERO,
+            },
+        ]);
+        let request = b"exact-request";
+        let verified = post_finalize_until_ack(&url, request, &cert, fast_retry_policy()).unwrap();
+        assert_eq!(verified.ack.m_id, cert.m_id.to_string());
+        assert_eq!(
+            server.join().unwrap(),
+            vec![request.to_vec(), request.to_vec()]
+        );
+    }
+
+    #[test]
+    fn initial_server_error_is_ambiguous_and_exactly_retried() {
+        let cert = test_candidate_cert();
+        let ack_bytes = FinalizeAck::for_machine_cert(&cert)
+            .unwrap()
+            .to_canonical_bytes()
+            .unwrap();
+        let (url, server) = spawn_finalize_server(vec![
+            TestFinalizeReply::Response {
+                status: 500,
+                body: Vec::new(),
+                retry_after: false,
+                delay: Duration::ZERO,
+            },
+            TestFinalizeReply::Response {
+                status: 200,
+                body: ack_bytes,
+                retry_after: false,
+                delay: Duration::ZERO,
+            },
+        ]);
+        let request = b"exact-request";
+        let verified = post_finalize_until_ack(&url, request, &cert, fast_retry_policy()).unwrap();
+        assert_eq!(verified.ack.m_id, cert.m_id.to_string());
+        assert_eq!(
+            server.join().unwrap(),
+            vec![request.to_vec(), request.to_vec()]
+        );
+    }
+
+    #[test]
+    fn malformed_503_does_not_enter_restart_retry() {
+        let cert = test_candidate_cert();
+        let (url, server) = spawn_finalize_server(vec![TestFinalizeReply::Response {
+            status: 503,
+            body: b"not canonical restart CBOR".to_vec(),
+            retry_after: true,
+            delay: Duration::ZERO,
+        }]);
+        let error =
+            post_finalize_until_ack(&url, b"request", &cert, fast_retry_policy()).unwrap_err();
+        assert!(matches!(error, CeremonyError::Http(_)));
+        assert_eq!(server.join().unwrap(), vec![b"request".to_vec()]);
+    }
+
+    #[test]
+    fn rejection_after_typed_restart_is_always_ambiguous() {
+        let cert = test_candidate_cert();
+        let restart_bytes = FinalizeRestartRequired::new().to_canonical_bytes().unwrap();
+        let (url, server) = spawn_finalize_server(vec![
+            TestFinalizeReply::Response {
+                status: 503,
+                body: restart_bytes,
+                retry_after: true,
+                delay: Duration::ZERO,
+            },
+            TestFinalizeReply::Response {
+                status: 401,
+                body: Vec::new(),
+                retry_after: false,
+                delay: Duration::ZERO,
+            },
+        ]);
+        let error =
+            post_finalize_until_ack(&url, b"request", &cert, fast_retry_policy()).unwrap_err();
+        assert!(matches!(error, CeremonyError::Http(_)));
+        assert!(error.is_ambiguous_finalize_outcome());
+        assert_eq!(server.join().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn rejection_after_transport_ambiguity_never_authorizes_rollback() {
+        let cert = test_candidate_cert();
+        let (url, server) = spawn_finalize_server(vec![
+            TestFinalizeReply::DropConnection,
+            TestFinalizeReply::Response {
+                status: 401,
+                body: Vec::new(),
+                retry_after: false,
+                delay: Duration::ZERO,
+            },
+        ]);
+        let request = b"exact-request";
+        let error = post_finalize_until_ack(&url, request, &cert, fast_retry_policy()).unwrap_err();
+        assert!(matches!(error, CeremonyError::Http(_)));
+        assert!(error.is_ambiguous_finalize_outcome());
+        assert_eq!(
+            server.join().unwrap(),
+            vec![request.to_vec(), request.to_vec()]
+        );
+    }
+
+    #[test]
+    fn every_success_ack_is_strictly_bound_to_candidate_cert() {
+        let cert = test_candidate_cert();
+        assert!(validate_finalize_ack_bytes(&[], &cert).is_err());
+
+        let mut wrong_m_id = FinalizeAck::for_machine_cert(&cert).unwrap();
+        wrong_m_id.m_id = "m_wrong".into();
+        assert!(
+            validate_finalize_ack_bytes(&wrong_m_id.to_canonical_bytes().unwrap(), &cert).is_err()
+        );
+
+        let mut wrong_hash = FinalizeAck::for_machine_cert(&cert).unwrap();
+        wrong_hash.machine_cert_hash = ByteBuf::from(vec![0xAA; 32]);
+        assert!(
+            validate_finalize_ack_bytes(&wrong_hash.to_canonical_bytes().unwrap(), &cert).is_err()
+        );
+
+        let mut wrong_version = FinalizeAck::for_machine_cert(&cert).unwrap();
+        wrong_version.version = PAIR_MACHINE_VERSION + 1;
+        assert!(
+            validate_finalize_ack_bytes(&wrong_version.to_canonical_bytes().unwrap(), &cert)
+                .is_err()
+        );
+
+        let mut trailing = FinalizeAck::for_machine_cert(&cert)
+            .unwrap()
+            .to_canonical_bytes()
+            .unwrap();
+        trailing.push(0);
+        assert!(validate_finalize_ack_bytes(&trailing, &cert).is_err());
+    }
 
     fn signed_request(kp: &P256Keypair) -> JoinRequest {
         let m_pub_arr = *kp.public().as_bytes();
@@ -2659,10 +4553,14 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, WindowError::AlreadyClaimed));
 
-        let persisted: PairMachineWindowSnapshot =
-            crate::storage::read_optional_cbor(&pair_machine_window_path(td.path()))
-                .unwrap()
-                .unwrap();
+        let persisted: PairMachineWindowSnapshot = win
+            .inner
+            .namespace
+            .as_ref()
+            .unwrap()
+            .read_pair_machine()
+            .unwrap()
+            .unwrap();
         assert_eq!(persisted.approval_claim, Some(claim));
 
         let reloaded = PairMachineWindow::with_persistence(td.path().to_path_buf()).unwrap();
@@ -2731,6 +4629,97 @@ mod tests {
         crate::storage::clear_phase3_finalize_ack_marker(td.path()).unwrap();
         let cleaned = PairMachineWindow::with_persistence(td.path().to_path_buf()).unwrap();
         assert!(cleaned.snapshot().await.approval_claim.is_none());
+    }
+
+    #[tokio::test]
+    async fn owner_approval_claim_with_phase3_manifest_survives_reload() {
+        let td = tempfile::tempdir().unwrap();
+        let win = PairMachineWindow::with_persistence(td.path().to_path_buf()).unwrap();
+        win.enter_staging(
+            [0x02; 33],
+            [0x42; 32],
+            JoinTransport::Tailscale,
+            "100.64.0.10:5040".into(),
+            "fp test".into(),
+            vec![0xAA, 0xBB],
+            300,
+            None,
+        )
+        .await
+        .unwrap();
+        win.enter_awaiting_owner(7).await.unwrap();
+        let claim = win
+            .claim_owner_approval(7, [0xA5; 32], 1_800)
+            .await
+            .unwrap();
+
+        let lifecycle =
+            crate::household_lifecycle::HouseholdLifecycleLock::open_verified(td.path()).unwrap();
+        let guard = lifecycle.lock_exclusive().unwrap();
+        let generation = guard.ensure_lifecycle_generation().unwrap();
+        let mut manifest = test_recovery_manifest();
+        manifest.lifecycle_generation = ByteBuf::from(generation.token_bytes().to_vec());
+        crate::storage::write_phase3_recovery_manifest(&guard, td.path(), &manifest).unwrap();
+
+        let reloaded =
+            PairMachineWindow::with_persistence_under_lifecycle(td.path().to_path_buf(), &guard)
+                .unwrap();
+        assert_eq!(reloaded.snapshot().await.approval_claim, Some(claim));
+        assert!(matches!(
+            reloaded
+                .under_lifecycle(&guard)
+                .claim_owner_approval(7, [0x5A; 32], 1_801)
+                .await,
+            Err(WindowError::AlreadyClaimed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_generation_abort_and_idle_cannot_touch_current_window() {
+        let td = tempfile::tempdir().unwrap();
+        let lifecycle =
+            crate::household_lifecycle::HouseholdLifecycleLock::open_verified(td.path()).unwrap();
+        let guard = lifecycle.lock_exclusive().unwrap();
+        let old =
+            PairMachineWindow::with_persistence_under_lifecycle(td.path().to_path_buf(), &guard)
+                .unwrap();
+        old.under_lifecycle(&guard)
+            .enter_staging(
+                [2; 33],
+                [9; 32],
+                JoinTransport::Lan,
+                "127.0.0.1:5040".into(),
+                "old".into(),
+                vec![1, 2, 3],
+                60,
+                None,
+            )
+            .await
+            .unwrap();
+        guard.rotate_lifecycle_generation().unwrap();
+        let current =
+            PairMachineWindow::with_persistence_under_lifecycle(td.path().to_path_buf(), &guard)
+                .unwrap();
+        drop(guard);
+        assert!(old.enter_aborted().await.is_err());
+        assert!(old.return_to_idle().await.is_err());
+        assert_eq!(current.snapshot().await.state, PairMachineState::Idle);
+    }
+
+    #[test]
+    fn snapshot_missing_generation_is_never_loaded_as_current() {
+        let td = tempfile::tempdir().unwrap();
+        let lifecycle =
+            crate::household_lifecycle::HouseholdLifecycleLock::open_verified(td.path()).unwrap();
+        let guard = lifecycle.lock_exclusive().unwrap();
+        let namespace =
+            PairWindowNamespaceV2::current_under_lifecycle(td.path().to_path_buf(), &guard)
+                .unwrap();
+        let legacy_shaped = PairMachineWindowSnapshot::idle();
+        namespace
+            .write_pair_machine_under_lifecycle(&legacy_shaped, &guard)
+            .unwrap();
+        assert!(PairMachineWindow::with_namespace_under_lifecycle(namespace, &guard).is_err());
     }
 
     #[tokio::test]

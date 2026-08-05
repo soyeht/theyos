@@ -8,6 +8,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
 use axum::{Router, routing::post};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
+use household_rs::household_lifecycle::HouseholdLifecycleLock;
 use household_rs::keys::{IdentityKey, P256Keypair};
 use household_rs::owner_events::{OwnerEventLog, OwnerEventsBroadcaster, get_owner_push_token};
 use household_rs::pair_machine::PairMachineWindow;
@@ -96,8 +97,16 @@ fn router_with_state() -> (TempDir, Router, P256Keypair) {
     let household =
         HouseholdState::loaded_with_owner_auth(Arc::clone(&identity), Some(Arc::new(owner_auth)));
     let broadcaster = OwnerEventsBroadcaster::new();
-    let event_log =
-        OwnerEventLog::open_with_broadcaster(td.path().to_path_buf(), broadcaster.clone()).unwrap();
+    let lifecycle = HouseholdLifecycleLock::open_verified(td.path()).unwrap();
+    let write = lifecycle.lock_exclusive().unwrap();
+    let event_log = OwnerEventLog::open_with_broadcaster_under_lifecycle(
+        &write,
+        td.path().to_path_buf(),
+        &identity.record.hh_id.to_string(),
+        broadcaster.clone(),
+    )
+    .unwrap();
+    drop(write);
     let window = Arc::new(PairMachineWindow::with_persistence(td.path().to_path_buf()).unwrap());
     let state = OwnerEventsRouterState::with_timeout(
         household,

@@ -31,23 +31,304 @@ use crate::state::SharedState;
 use crate::time_util;
 use crate::{bonjour_browser, bonjour_publisher, setup_beacon, startup_wiring};
 use household_rs::KeyBackingPolicy;
+use household_rs::bootstrap::{
+    recover_interrupted_household_teardown_under_lifecycle, try_load_existing_under_lifecycle,
+};
 use household_rs::bootstrap_state::{self, BootstrapState};
 use household_rs::claw_share::ClawShareSlotStore;
 use household_rs::claw_share_data_tunnel::ReplayGuard;
+use household_rs::household_lifecycle::{
+    HouseholdLifecycleLock, HouseholdLifecycleLockError, LifecycleWriteGuard,
+};
 use household_rs::household_mesh_log::MeshLogStore;
 use household_rs::owner_events::{OwnerEventLog, OwnerEventsBroadcaster};
 use household_rs::pair_machine::PairMachineWindow;
 use nostr_relay_rs::nostr::Keys;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::info;
+
+const TERMINAL_REPLAY_REBIND_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Global bootstrap state — shared by all handlers that need to read or
 /// transition the onboarding state machine. Set once at engine startup.
 static BOOTSTRAP_STATE: OnceLock<BootstrapStateArc> = OnceLock::new();
+
+const HOUSEHOLD_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug, thiserror::Error)]
+enum LifecycleIdentityLoadError {
+    #[error("household lifecycle lock failed: {0}")]
+    Lifecycle(#[from] HouseholdLifecycleLockError),
+    #[error("household teardown recovery failed: {0}")]
+    Recovery(#[from] household_rs::StorageError),
+    #[error("household identity load failed: {0}")]
+    Bootstrap(#[from] household_rs::BootstrapError),
+    #[error("household lifecycle deadline overflowed")]
+    DeadlineOverflow,
+}
+
+/// A disk identity observation that remains serialized against teardown until
+/// its matching in-memory authority has been published.
+///
+/// Keeping the write guard in the transaction makes it impossible for either
+/// startup call site to accidentally return a naked `LoadedIdentity` and drop
+/// lifecycle protection before publication.
+struct LifecycleIdentityLoad {
+    _guard: LifecycleWriteGuard,
+    loaded: Option<Arc<household_rs::LoadedIdentity>>,
+    owner_auth: Option<Arc<household_rs::HouseholdAuthState>>,
+}
+
+impl LifecycleIdentityLoad {
+    fn lifecycle_guard(&self) -> &LifecycleWriteGuard {
+        &self._guard
+    }
+
+    async fn publish_into(&self, household: &HouseholdState) {
+        let Some(loaded) = self.loaded.as_ref() else {
+            return;
+        };
+        household
+            .set_loaded_with_owner_auth(Arc::clone(loaded), self.owner_auth.clone())
+            .await;
+    }
+}
+
+fn acquire_recovered_household_lifecycle(
+    state_dir: &Path,
+) -> Result<LifecycleWriteGuard, LifecycleIdentityLoadError> {
+    let lifecycle = HouseholdLifecycleLock::open_verified(state_dir)?;
+    let deadline = Instant::now()
+        .checked_add(HOUSEHOLD_LIFECYCLE_TIMEOUT)
+        .ok_or(LifecycleIdentityLoadError::DeadlineOverflow)?;
+    let guard = lifecycle.lock_exclusive_until(deadline)?;
+    recover_interrupted_household_teardown_under_lifecycle(&guard, state_dir)?;
+    Ok(guard)
+}
+
+fn load_identity_under_lifecycle(
+    guard: LifecycleWriteGuard,
+    state_dir: &Path,
+    key_policy: KeyBackingPolicy,
+) -> Result<LifecycleIdentityLoad, LifecycleIdentityLoadError> {
+    let loaded = try_load_existing_under_lifecycle(&guard, state_dir, key_policy)?.map(Arc::new);
+    let owner_auth = loaded
+        .as_deref()
+        .and_then(|identity| load_owner_auth_for_identity(state_dir, identity));
+    Ok(LifecycleIdentityLoad {
+        _guard: guard,
+        loaded,
+        owner_auth,
+    })
+}
+
+fn active_terminal_replay_addr(
+    lifecycle: &LifecycleWriteGuard,
+    state_dir: &Path,
+    loaded: Option<&household_rs::LoadedIdentity>,
+) -> Result<Option<(SocketAddr, household_rs::pair_machine::JoinTransport)>, String> {
+    let terminal = household_rs::household_install_transaction::load_active_finalize_terminal_result_under_lifecycle(lifecycle)
+        .map_err(|error| format!("load active pair-machine terminal result: {error}"))?;
+    let Some(terminal) = terminal else {
+        return Ok(None);
+    };
+    let loaded = loaded.ok_or_else(|| {
+        "active pair-machine terminal result exists without installed identity".to_string()
+    })?;
+    if loaded.record.hh_id != *terminal.hh_id() || loaded.cert.m_id != *terminal.m_id() {
+        return Err("active pair-machine terminal result differs from local identity".into());
+    }
+    lifecycle
+        .verify_state_root(state_dir)
+        .map_err(|error| format!("verify terminal state root: {error}"))?;
+    let bootstrap = bootstrap_state::load(state_dir)
+    .map_err(|error| format!("load terminal bootstrap state: {error}"))?;
+    let delivery = household_rs::household_install_transaction::load_finalize_ack_delivery_under_lifecycle(lifecycle)
+        .map_err(|error| format!("load pair-machine delivery boundary: {error}"))?;
+    match (&bootstrap, &delivery) {
+        (
+            BootstrapState::PairMachineInstallRestartRequired,
+            household_rs::household_install_transaction::FinalizeAckDeliveryRecoveryOutcome::Absent,
+        ) => {}
+        (
+            BootstrapState::PairMachineInstallRestartRequired | BootstrapState::Ready,
+            household_rs::household_install_transaction::FinalizeAckDeliveryRecoveryOutcome::MayHaveTakenEffect(delivered),
+        ) if delivered.as_ref() == &terminal => {}
+        _ => {
+            return Err(
+                "terminal bootstrap state and full delivery authority diverged".to_string(),
+            );
+        }
+    }
+    let (addr, transport) = handlers_pair_machine::exact_terminal_replay_endpoint(&terminal)
+        .map_err(|error| format!("resolve exact pair-machine terminal address: {error}"))?;
+    addr.parse::<SocketAddr>()
+        .map(|addr| Some((addr, transport)))
+        .map_err(|error| format!("parse exact pair-machine terminal address: {error}"))
+}
+
+pub(crate) async fn bind_terminal_replay_listener(
+    addr: SocketAddr,
+    state: handlers_pair_machine::PreHouseholdRouterState,
+) -> std::io::Result<(tokio::net::TcpListener, axum::Router)> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    Ok((
+        listener,
+        handlers_pair_machine::terminal_replay_router(state),
+    ))
+}
+
+fn terminal_replay_endpoint_is_still_active(
+    state_dir: &Path,
+    expected: SocketAddr,
+    expected_transport: household_rs::pair_machine::JoinTransport,
+) -> bool {
+    let Ok(lifecycle) = HouseholdLifecycleLock::open_verified(state_dir) else {
+        return false;
+    };
+    let Some(deadline) = Instant::now().checked_add(Duration::from_secs(1)) else {
+        return false;
+    };
+    let guard = match lifecycle.lock_exclusive_until(deadline) {
+        Ok(guard) => guard,
+        Err(error) if terminal_replay_lock_failure_is_contention(error) => {
+            // Contention is not evidence that replay authority disappeared.
+            // Keep the terminal listener and retry the check rather than
+            // creating a transient lost-Ack outage.
+            return true;
+        }
+        Err(error) => {
+            // Unsafe path/filesystem, required recovery, and I/O failure are
+            // persistent authority failures, not contention. Stop serving so
+            // a degraded listener cannot monopolize the retained LAN address.
+            tracing::warn!(
+                stage = "pair_machine.terminal_replay_lifecycle_invalid",
+                error = %error,
+                "terminal replay listener is shutting down fail-closed"
+            );
+            return false;
+        }
+    };
+    let Ok(Some(terminal)) = household_rs::household_install_transaction::load_active_finalize_terminal_result_under_lifecycle(&guard)
+    else {
+        return false;
+    };
+    let Ok((addr, transport)) = handlers_pair_machine::exact_terminal_replay_endpoint(&terminal)
+    else {
+        return false;
+    };
+    transport == expected_transport && addr.parse::<SocketAddr>() == Ok(expected)
+}
+
+const fn terminal_replay_lock_failure_is_contention(error: HouseholdLifecycleLockError) -> bool {
+    matches!(error, HouseholdLifecycleLockError::LockTimeout)
+}
+
+pub(crate) async fn wait_until_terminal_replay_is_inactive(
+    state_dir: PathBuf,
+    expected: SocketAddr,
+    expected_transport: household_rs::pair_machine::JoinTransport,
+    bootstrap: BootstrapStateArc,
+) {
+    loop {
+        tokio::time::sleep(TERMINAL_REPLAY_REBIND_INTERVAL).await;
+        if !matches!(
+            *bootstrap.read().await,
+            BootstrapState::PairMachineInstallRestartRequired | BootstrapState::Ready
+        ) {
+            return;
+        }
+        let check_dir = state_dir.clone();
+        let active = tokio::task::spawn_blocking(move || {
+            terminal_replay_endpoint_is_still_active(&check_dir, expected, expected_transport)
+        })
+        .await
+        .unwrap_or(false);
+        if !active {
+            return;
+        }
+    }
+}
+
+fn spawn_supervised_terminal_replay_listener(
+    addr: SocketAddr,
+    transport: household_rs::pair_machine::JoinTransport,
+    state: handlers_pair_machine::PreHouseholdRouterState,
+    initial: Option<(tokio::net::TcpListener, axum::Router)>,
+) {
+    tokio::spawn(async move {
+        let state_dir = state.state_dir.clone();
+        let Some(bootstrap) = state.bootstrap.clone() else {
+            return;
+        };
+        let mut initial = initial;
+        loop {
+            if !matches!(
+                *bootstrap.read().await,
+                BootstrapState::PairMachineInstallRestartRequired | BootstrapState::Ready
+            ) {
+                return;
+            }
+            let check_dir = state_dir.clone();
+            let active = tokio::task::spawn_blocking(move || {
+                terminal_replay_endpoint_is_still_active(&check_dir, addr, transport)
+            })
+            .await
+            .unwrap_or(false);
+            if !active {
+                return;
+            }
+            let bound = match initial.take() {
+                Some(bound) => Ok(bound),
+                None => bind_terminal_replay_listener(addr, state.clone()).await,
+            };
+            match bound {
+                Ok((listener, router)) => {
+                    tracing::info!(
+                        stage = "pair_machine.terminal_replay_listener_live",
+                        address = %addr,
+                    );
+                    if let Err(error) =
+                        core_rs::phase0_axum_serve!(listener, router, connect_info = SocketAddr)
+                            .with_graceful_shutdown(wait_until_terminal_replay_is_inactive(
+                                state_dir.clone(),
+                                addr,
+                                transport,
+                                Arc::clone(&bootstrap),
+                            ))
+                            .await
+                    {
+                        tracing::warn!(
+                            stage = "pair_machine.terminal_replay_listener_exited",
+                            address = %addr,
+                            error = %error,
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        stage = "pair_machine.terminal_replay_bind_retry",
+                        address = %addr,
+                        error = %error,
+                    );
+                }
+            }
+            tokio::time::sleep(TERMINAL_REPLAY_REBIND_INTERVAL).await;
+        }
+    });
+}
+
+fn acquire_and_load_identity_under_lifecycle(
+    state_dir: &Path,
+    key_policy: KeyBackingPolicy,
+) -> Result<LifecycleIdentityLoad, LifecycleIdentityLoadError> {
+    let guard = acquire_recovered_household_lifecycle(state_dir)?;
+    load_identity_under_lifecycle(guard, state_dir, key_policy)
+}
 
 /// Access the global bootstrap state.
 ///
@@ -448,66 +729,175 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
 
     let key_policy = household_rs::KeyBackingPolicy::from_env();
 
+    // The disk observation and its in-memory publication are one lifecycle
+    // transaction. In particular, a concurrent teardown cannot detach
+    // household A after we load it and before the handler state publishes A.
+    let lifecycle_state_dir = state_dir.clone();
+    let lifecycle_guard = match tokio::task::spawn_blocking(move || {
+        acquire_recovered_household_lifecycle(&lifecycle_state_dir)
+    })
+    .await
+    {
+        Ok(Ok(guard)) => guard,
+        Ok(Err(error)) => {
+            tracing::error!(
+                stage = "bootstrap.lifecycle_acquire_failed",
+                error = %error,
+                "household startup lifecycle transaction failed"
+            );
+            panic!("household startup lifecycle transaction failed: {error}");
+        }
+        Err(error) => {
+            tracing::error!(
+                stage = "bootstrap.lifecycle_worker_failed",
+                error = %error,
+                "household startup lifecycle worker failed"
+            );
+            panic!("household startup lifecycle worker failed: {error}");
+        }
+    };
+
+    // Recover the stable install breadcrumb before opening a *current*
+    // pair-window namespace. A crash after terminal G0->G1 rotation but
+    // before breadcrumb cleanup still needs to validate G0's committed
+    // snapshot; current-namespace construction deliberately sweeps retired
+    // generations and therefore must happen only after this recovery.
+    let install_rotated = handlers_pair_machine::recover_candidate_install_under_lifecycle(
+        &state_dir,
+        &lifecycle_guard,
+        key_policy,
+    )
+    .await
+    .unwrap_or_else(|error| panic!("household install recovery failed closed: {error}"));
+    if install_rotated {
+        tracing::info!(
+            stage = "bootstrap.household_install_recovered",
+            "terminal install generation recovered before authority publication"
+        );
+    }
+
+    // Resolve both ceremony namespaces while the startup-exclusive guard is
+    // still retained. Falling back to an in-memory window would silently
+    // discard durable pre-household authority and would let later writes
+    // escape generation binding, so an unsafe/corrupt namespace is a
+    // refuse-to-start condition.
+    let pair_device_window = Arc::new(
+        household_rs::pair_device::PairDeviceWindow::with_persistence_under_lifecycle(
+            state_dir.clone(),
+            &lifecycle_guard,
+        )
+        .unwrap_or_else(|error| panic!("pair-device namespace recovery failed: {error}")),
+    );
+    let pair_machine_window = Arc::new(
+        PairMachineWindow::with_persistence_under_lifecycle(state_dir.clone(), &lifecycle_guard)
+            .unwrap_or_else(|error| panic!("pair-machine namespace recovery failed: {error}")),
+    );
+
     // T074: Phase-3 in-flight ceremony recovery driver. Runs BEFORE
     // `try_load_existing` consumes the on-disk record so that any
     // committed-but-unfinished ceremony rolls forward (post-Shamir
     // record on disk, with this process picking up the N=2 identity)
-    // before the household listener binds. If the marker is absent
-    // this is a no-op fast path. Past `RECOVERY_TIMEOUT` the driver
-    // rolls back per `FR-013a` and the household stays N=1.
+    // before the household listener binds. If durable recovery evidence is
+    // absent this is a no-op fast path. Once finalize may have reached M2,
+    // timeout is indeterminate and must never become an N=1 rollback.
     //
     // The probe operates on disk and over HTTP only; no in-memory
-    // state from this process is required. Errors are logged but do
-    // NOT panic — a failed probe falls back to "household stays in
-    // its current on-disk state" and the operator can retry on the
-    // next boot.
-    if household_rs::storage::phase3_finalize_ack_marker_exists(&state_dir) {
-        match household_rs::pair_machine::recover_phase3_ceremony(
+    // state from this process is required. Any error while recovery evidence
+    // exists is fail-stop: publishing the pre-Shamir N=1 identity after M2 may
+    // have committed N=2 would create two live authorities.
+    let phase3_recovery_completed = match pair_machine_window
+        .recover_phase3_under_lifecycle(
             &state_dir,
+            &lifecycle_guard,
             household_rs::pair_machine::RECOVERY_TIMEOUT,
         )
         .await
-        {
-            Ok(outcome) => {
-                tracing::info!(
-                    stage = "bootstrap.phase3_recovery",
-                    outcome = ?outcome,
-                    "boot-time Phase 3 in-flight ceremony recovery completed"
-                );
-            }
-            Err(e) => {
+    {
+        Ok(outcome) => {
+            let completed = !matches!(
+                outcome,
+                household_rs::pair_machine::RecoveryOutcome::NotApplicable
+            );
+            tracing::info!(
+                stage = "bootstrap.phase3_recovery",
+                outcome = ?outcome,
+                "boot-time Phase 3 recovery inspection completed"
+            );
+            completed
+        }
+        Err(e) => {
+            tracing::error!(
+                stage = "bootstrap.phase3_recovery_failed",
+                error = %e,
+                "boot-time Phase 3 recovery is indeterminate; refusing to \
+                 publish identity or listeners"
+            );
+            if let Err(state_error) =
+                bootstrap_state::persist(&state_dir, BootstrapState::Recovering)
+            {
                 tracing::error!(
-                    stage = "bootstrap.phase3_recovery_failed",
-                    error = %e,
-                    "boot-time Phase 3 in-flight ceremony recovery failed; \
-                     identity will load from current on-disk state"
+                    stage = "bootstrap.phase3_recovery_fail_stop_persist_failed",
+                    error = %state_error,
+                );
+            } else if let Err(sync_error) = lifecycle_guard.sync_state_root() {
+                tracing::error!(
+                    stage = "bootstrap.phase3_recovery_fail_stop_sync_failed",
+                    error = %sync_error,
                 );
             }
+            // Drop lifecycle-exclusive without constructing or publishing
+            // LoadedIdentity, routers, Bonjour, or any listener. A later cold
+            // start retries the retained exact recovery evidence.
+            return;
         }
-    }
-
-    let loaded_arc: Option<Arc<household_rs::LoadedIdentity>> =
-        match household_rs::try_load_existing(&state_dir, key_policy) {
-            Ok(Some(loaded)) => Some(Arc::new(loaded)),
-            Ok(None) => {
-                info!(
-                    stage = "bootstrap.cold",
-                    "no household identity on disk; /identity will return 503 until `theyos install` runs"
-                );
-                None
-            }
-            Err(e) => {
-                household_rs::bootstrap::log_error(&e);
-                panic!("household identity load failed: {e}");
-            }
-        };
-    let identity_state = match loaded_arc.as_ref() {
-        Some(arc) => {
-            let owner_auth = load_owner_auth_for_identity(&state_dir, arc);
-            HouseholdState::loaded_with_owner_auth(Arc::clone(arc), owner_auth)
-        }
-        None => HouseholdState::empty(),
     };
+
+    let load_state_dir = state_dir.clone();
+    let identity_load = match tokio::task::spawn_blocking(move || {
+        load_identity_under_lifecycle(lifecycle_guard, &load_state_dir, key_policy)
+    })
+    .await
+    {
+        Ok(Ok(load)) => load,
+        Ok(Err(error)) => {
+            if let LifecycleIdentityLoadError::Bootstrap(source) = &error {
+                household_rs::bootstrap::log_error(source);
+            } else {
+                tracing::error!(
+                    stage = "bootstrap.lifecycle_load_failed",
+                    error = %error,
+                    "household identity lifecycle load failed"
+                );
+            }
+            panic!("household identity load failed: {error}");
+        }
+        Err(error) => {
+            tracing::error!(
+                stage = "bootstrap.lifecycle_load_worker_failed",
+                error = %error,
+                "household identity lifecycle load worker failed"
+            );
+            panic!("household identity load worker failed: {error}");
+        }
+    };
+    let loaded_arc = identity_load.loaded.clone();
+    let terminal_replay_endpoint =
+        active_terminal_replay_addr(
+            identity_load.lifecycle_guard(),
+            &state_dir,
+            loaded_arc.as_deref(),
+        )
+            .unwrap_or_else(|error| {
+                panic!("pair-machine terminal replay recovery failed: {error}")
+            });
+    if loaded_arc.is_none() {
+        info!(
+            stage = "bootstrap.cold",
+            "no household identity on disk; /identity will return 503 until `theyos install` runs"
+        );
+    }
+    let identity_state = HouseholdState::empty();
+    identity_load.publish_into(&identity_state).await;
 
     // ── Bootstrap state machine (T007 / T011) ─────────────────────────────
     //
@@ -539,19 +929,21 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
     };
     // For legacy engines: if the file says Uninitialized but we already have
     // identity+auth on disk, promote to the correct live state and persist it.
-    let initial_bootstrap_state =
+    let mut initial_bootstrap_state =
         if initial_bootstrap_state == BootstrapState::Uninitialized && loaded_arc.is_some() {
             let inferred = infer_bootstrap_state(loaded_arc.as_ref(), &identity_state).await;
             if inferred == BootstrapState::Uninitialized {
                 initial_bootstrap_state
             } else {
-                if let Err(e) = bootstrap_state::persist(&state_dir, inferred) {
-                    tracing::warn!(
-                        stage = "bootstrap_state.infer_persist_failed",
-                        error = %e,
-                    );
-                }
-                inferred
+                bootstrap_state_after_inferred_persist(
+                    initial_bootstrap_state,
+                    inferred,
+                    persist_bootstrap_state_under_lifecycle(
+                        identity_load.lifecycle_guard(),
+                        &state_dir,
+                        inferred,
+                    ),
+                )
             }
         } else {
             initial_bootstrap_state
@@ -570,25 +962,192 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
     {
         tracing::warn!("BOOTSTRAP_STATE already installed; keeping first handle");
     }
-
-    // Build the persistent PairDeviceWindow — synchronizes on-disk snapshot with
-    // in-memory state so that `theyos install` (separate process) and the
-    // daemon agree on which token is currently live.
-    let pair_device_window =
-        Arc::new(household_rs::pair_device::PairDeviceWindow::with_persistence(state_dir.clone()));
+    // Synchronize the retained generation's pair-device snapshot into memory
+    // before lifecycle publication ends. A sibling `theyos install` process
+    // can only publish into this exact generation, and teardown cannot rotate
+    // it between the disk observation and the in-memory adoption.
     if identity_state.current_owner_auth().await.is_some() {
-        pair_device_window.close().await;
-    } else if let Err(e) = load_persisted_pair_device_window(&state_dir, &pair_device_window).await
-    {
-        // Stale or corrupt snapshot: drop it, log, and proceed with closed
-        // window. The operator can rerun `theyos install --reissue-pair-qr`.
-        tracing::warn!(
-            stage = "pair_device_window.snapshot_load_failed",
-            error = %e,
-            "discarding pair-window snapshot"
-        );
-        let _ = household_rs::storage::delete_pair_device_window_snapshot(&state_dir);
+        pair_device_window
+            .close_under_lifecycle(identity_load.lifecycle_guard())
+            .await
+            .unwrap_or_else(|error| {
+                panic!("failed to close owner-complete pair-device window: {error}")
+            });
+    } else {
+        load_persisted_pair_device_window_under_lifecycle(
+            &pair_device_window,
+            identity_load.lifecycle_guard(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("pair-device snapshot recovery failed closed: {error}"));
     }
+
+    // Owner events are installed authority, so opening the log requires the
+    // same startup-exclusive transaction and exact loaded household id. In a
+    // cold state there is deliberately no log handle and no directory to
+    // create.
+    let owner_event_broadcaster = OwnerEventsBroadcaster::new();
+    let owner_event_log = identity_load.loaded.as_ref().map(|loaded| {
+        OwnerEventLog::open_with_broadcaster_under_lifecycle(
+            identity_load.lifecycle_guard(),
+            state_dir.clone(),
+            loaded.record.hh_id.as_str(),
+            owner_event_broadcaster.clone(),
+        )
+    });
+
+    // The Phase-3 manifest survives local promotion as a durable terminal
+    // outbox. Reconcile it while the startup lifecycle writer and exact
+    // installed identity/log binding are still retained, before any listener
+    // or Bonjour authority can become observable.
+    let phase3_outbox_present = household_rs::storage::phase3_recovery_manifest_exists(&state_dir);
+    let machine_joined_reconciled = match (identity_load.loaded.as_ref(), owner_event_log.as_ref())
+    {
+        (Some(loaded), Some(Ok(log))) => {
+            match handlers_owner_events::reconcile_phase3_machine_joined_outbox_under_lifecycle(
+                &state_dir,
+                identity_load.lifecycle_guard(),
+                loaded,
+                log,
+            ) {
+                Ok(reconciled) => reconciled,
+                Err(error) => {
+                    tracing::error!(
+                        stage = "bootstrap.phase3_machine_joined_outbox_failed",
+                        error = %error,
+                        "terminal Phase-3 side effect is unresolved; refusing all listeners",
+                    );
+                    if let Err(state_error) =
+                        bootstrap_state::persist(&state_dir, BootstrapState::Recovering)
+                    {
+                        tracing::error!(
+                            stage = "bootstrap.phase3_outbox_fail_stop_persist_failed",
+                            error = %state_error,
+                        );
+                    } else if let Err(sync_error) =
+                        identity_load.lifecycle_guard().sync_state_root()
+                    {
+                        tracing::error!(
+                            stage = "bootstrap.phase3_outbox_fail_stop_sync_failed",
+                            error = %sync_error,
+                        );
+                    }
+                    return;
+                }
+            }
+        }
+        (_, _) if phase3_outbox_present => {
+            // A retained terminal outbox is unresolved authority. In
+            // particular, failure to open the owner-event log is not license
+            // to publish identity/listeners while silently postponing
+            // MachineJoined.
+            tracing::error!(
+                stage = "bootstrap.phase3_machine_joined_outbox_dependencies_unavailable",
+                "terminal Phase-3 outbox exists but its exact identity/log binding is unavailable; refusing all listeners",
+            );
+            if let Err(state_error) =
+                bootstrap_state::persist(&state_dir, BootstrapState::Recovering)
+            {
+                tracing::error!(
+                    stage = "bootstrap.phase3_outbox_fail_stop_persist_failed",
+                    error = %state_error,
+                );
+            } else if let Err(sync_error) = identity_load.lifecycle_guard().sync_state_root() {
+                tracing::error!(
+                    stage = "bootstrap.phase3_outbox_fail_stop_sync_failed",
+                    error = %sync_error,
+                );
+            }
+            return;
+        }
+        _ => false,
+    };
+
+    if machine_joined_reconciled {
+        // A prior Phase-3 recovery failure may have latched the generic
+        // fail-stop state. Repair it before clearing the manifest breadcrumb,
+        // so a crash can never leave `Recovering` with no evidence identifying
+        // which subsystem is now safe to resume.
+        if initial_bootstrap_state == BootstrapState::Recovering {
+            if !phase3_recovery_completed {
+                tracing::error!(
+                    stage = "bootstrap.phase3_recovery_state_unscoped",
+                    "refusing to clear a Phase-3 outbox without a successful Phase-3 recovery in this boot",
+                );
+                return;
+            }
+            let recovered_state = infer_bootstrap_state(loaded_arc.as_ref(), &identity_state).await;
+            if matches!(
+                recovered_state,
+                BootstrapState::Recovering | BootstrapState::Uninitialized
+            ) {
+                tracing::error!(
+                    stage = "bootstrap.phase3_recovery_state_inference_failed",
+                    state = recovered_state.as_str(),
+                    "installed Phase-3 identity cannot be resumed safely",
+                );
+                return;
+            }
+            if let Err(error) = persist_bootstrap_state_under_lifecycle(
+                identity_load.lifecycle_guard(),
+                &state_dir,
+                recovered_state,
+            ) {
+                tracing::error!(
+                    stage = "bootstrap.phase3_recovery_state_persist_failed",
+                    error = %error,
+                );
+                return;
+            }
+            if let Err(error) = identity_load.lifecycle_guard().sync_state_root() {
+                tracing::error!(
+                    stage = "bootstrap.phase3_recovery_state_sync_failed",
+                    error = %error,
+                );
+                return;
+            }
+            initial_bootstrap_state = recovered_state;
+            *bootstrap_state_arc.write().await = recovered_state;
+        }
+
+        if let Err(error) = household_rs::storage::clear_phase3_recovery_manifest(
+            identity_load.lifecycle_guard(),
+            &state_dir,
+        ) {
+            tracing::error!(
+                stage = "bootstrap.phase3_machine_joined_outbox_clear_failed",
+                error = %error,
+                "event is idempotently durable but outbox absence is unresolved; refusing all listeners",
+            );
+            if let Err(state_error) =
+                bootstrap_state::persist(&state_dir, BootstrapState::Recovering)
+            {
+                tracing::error!(
+                    stage = "bootstrap.phase3_outbox_fail_stop_persist_failed",
+                    error = %state_error,
+                );
+            } else if let Err(sync_error) = identity_load.lifecycle_guard().sync_state_root() {
+                tracing::error!(
+                    stage = "bootstrap.phase3_outbox_fail_stop_sync_failed",
+                    error = %sync_error,
+                );
+            }
+            return;
+        }
+    }
+
+    // `identity_state`, `bootstrap_state_arc`, both ceremony windows, and the
+    // optional owner-event handle now all describe the exact disk generation
+    // observed under this transaction. Only now may teardown detach it.
+    drop(identity_load);
+
+    if machine_joined_reconciled {
+        handlers_owner_events::dispatch_owner_event_tickle_if_idle(
+            state_dir.clone(),
+            &owner_event_broadcaster,
+        );
+    }
+
     spawn_pair_device_window_snapshot_watcher(
         state_dir.clone(),
         Arc::clone(&pair_device_window),
@@ -659,26 +1218,9 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
     // shared `PairMachineRouterState` (window + event log + broadcaster +
     // household identity slot) lives independently of the Phase 2
     // pair-device state.
-    let pair_machine_window = match PairMachineWindow::with_persistence(state_dir.clone()) {
-        Ok(w) => Arc::new(w),
-        Err(e) => {
-            tracing::warn!(
-                stage = "pair_machine_window.load_failed",
-                error = %e,
-                "starting Phase 3 pair-machine window in idle (snapshot will be rewritten on first transition)",
-            );
-            // Construct an in-memory window so the router still mounts.
-            // The next successful transition will persist a fresh snapshot.
-            Arc::new(PairMachineWindow::new_in_memory())
-        }
-    };
-    let owner_event_broadcaster = OwnerEventsBroadcaster::new();
     let mut bonjour_browser_state = None;
-    let pair_machine_router = match OwnerEventLog::open_with_broadcaster(
-        state_dir.clone(),
-        owner_event_broadcaster.clone(),
-    ) {
-        Ok(owner_event_log) => {
+    let pair_machine_router = match owner_event_log {
+        Some(Ok(owner_event_log)) => {
             let pair_machine_state = handlers_pair_machine::PairMachineRouterState {
                 window: Arc::clone(&pair_machine_window),
                 household: identity_state.clone(),
@@ -719,6 +1261,7 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
                 crate::handlers_sign_machine_cert::SignMachineCertRouterState {
                     household: identity_state.clone(),
                     event_log: Arc::clone(&pair_machine_state.event_log),
+                    state_dir: state_dir.clone(),
                 };
             let sign_machine_cert_router =
                 crate::handlers_sign_machine_cert::sign_machine_cert_router(
@@ -948,7 +1491,7 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
                     .merge(sign_machine_cert_router),
             )
         }
-        Err(e) => {
+        Some(Err(e)) => {
             // Refuse to bring up the join-request endpoint without a
             // working append log: silently dropping events would leave
             // the iPhone long-poll permanently empty after a partial
@@ -962,6 +1505,7 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
             );
             None
         }
+        None => None,
     };
 
     // ── Bootstrap router (T008 / T009 / T010 / T011) ─────────────────────
@@ -1072,6 +1616,7 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
             state_dir: state_dir.clone(),
             key_policy,
             bootstrap: Some(Arc::clone(&bootstrap_state_arc)),
+            runtime_signal: None,
         },
     );
 
@@ -1163,6 +1708,61 @@ pub async fn bootstrap_household(shared_state: Option<SharedState>) {
         port = port,
         "household listeners up"
     );
+    if let Some((terminal_addr, terminal_transport)) = terminal_replay_endpoint
+        && (terminal_transport == household_rs::pair_machine::JoinTransport::Lan
+            || terminal_addr.port() != port)
+        && matches!(
+            *bootstrap_state_arc.read().await,
+            BootstrapState::PairMachineInstallRestartRequired | BootstrapState::Ready
+        )
+    {
+        let exact_addr_is_already_served = initial_bound
+            .iter()
+            .any(|(ip, _)| SocketAddr::new(*ip, port) == terminal_addr);
+        if exact_addr_is_already_served {
+            tracing::info!(
+                stage = "pair_machine.terminal_replay_listener_shared",
+                address = %terminal_addr,
+                "the policy-approved household listener already carries the terminal-only route"
+            );
+        } else {
+            // Ready intentionally excludes the regular household router from
+            // LAN. Keep only the exact retained finalize endpoint reachable
+            // across the indistinguishable pre-flush/post-flush crash cuts.
+            let terminal_state = handlers_pair_machine::PreHouseholdRouterState {
+                window: Arc::clone(&pair_machine_window),
+                state_dir: state_dir.clone(),
+                key_policy,
+                bootstrap: Some(Arc::clone(&bootstrap_state_arc)),
+                runtime_signal: None,
+            };
+            let initial =
+                match bind_terminal_replay_listener(terminal_addr, terminal_state.clone()).await {
+                    Ok((listener, router)) => {
+                        tracing::info!(
+                            stage = "pair_machine.terminal_replay_listener_live",
+                            address = %terminal_addr,
+                        );
+                        Some((listener, router))
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            stage = "pair_machine.terminal_replay_bind_deferred",
+                            address = %terminal_addr,
+                            error = %error,
+                            "daemon remains live and retries the exact terminal-only bind"
+                        );
+                        None
+                    }
+                };
+            spawn_supervised_terminal_replay_listener(
+                terminal_addr,
+                terminal_transport,
+                terminal_state,
+                initial,
+            );
+        }
+    }
     publish_setup_beacon_for_startup(
         Arc::clone(&bootstrap_state_arc),
         initial_bound.clone(),
@@ -1387,20 +1987,30 @@ fn spawn_household_identity_watcher_with_interval(
                 }
                 break;
             }
-            match household_rs::try_load_existing(&state_dir, key_policy) {
-                Ok(Some(loaded)) => {
-                    let loaded = Arc::new(loaded);
-                    let owner_auth = load_owner_auth_for_identity(&state_dir, &loaded);
+            let load_state_dir = state_dir.clone();
+            match tokio::task::spawn_blocking(move || {
+                acquire_and_load_identity_under_lifecycle(&load_state_dir, key_policy)
+            })
+            .await
+            {
+                Ok(Ok(identity_load)) if identity_load.loaded.is_some() => {
+                    let loaded = Arc::clone(
+                        identity_load
+                            .loaded
+                            .as_ref()
+                            .expect("guarded by match condition"),
+                    );
                     // Set identity + owner_auth atomically so no reader sees the
                     // intermediate state (identity=Some, owner_auth=None) that
                     // causes infer_bootstrap_state to return NamedAwaitingPair.
-                    let close_window = owner_auth.is_some();
-                    identity_state
-                        .set_loaded_with_owner_auth(Arc::clone(&loaded), owner_auth)
-                        .await;
+                    // The lifecycle exclusive remains owned by `identity_load`
+                    // until both pieces of memory authority are published.
+                    let close_window = identity_load.owner_auth.is_some();
+                    identity_load.publish_into(&identity_state).await;
                     if close_window {
-                        pair_device_window.close().await;
+                        let _ = pair_device_window.close().await;
                     }
+                    drop(identity_load);
                     if let Some(runtime) = &claw_share {
                         mount_claw_share_relay_stream_live_if_enabled(
                             state_dir.clone(),
@@ -1434,12 +2044,19 @@ fn spawn_household_identity_watcher_with_interval(
                     }
                     break;
                 }
-                Ok(None) => {}
-                Err(e) => {
+                Ok(Ok(_cold)) => {}
+                Ok(Err(error)) => {
                     tracing::warn!(
                         stage = "bootstrap.hot_load_failed",
-                        error = %e,
+                        error = %error,
                         "household identity hot-load failed; retrying"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        stage = "bootstrap.hot_load_worker_failed",
+                        error = %error,
+                        "household identity hot-load worker failed; retrying"
                     );
                 }
             }
@@ -1487,7 +2104,7 @@ fn spawn_pair_device_window_snapshot_watcher(
 }
 
 fn spawn_pair_device_window_snapshot_watcher_with_interval(
-    state_dir: PathBuf,
+    _state_dir: PathBuf,
     pair_device_window: Arc<household_rs::pair_device::PairDeviceWindow>,
     identity_state: HouseholdState,
     poll_interval: Duration,
@@ -1497,33 +2114,31 @@ fn spawn_pair_device_window_snapshot_watcher_with_interval(
         loop {
             interval.tick().await;
             if identity_state.current_owner_auth().await.is_some() {
-                pair_device_window.close().await;
+                if let Err(error) = pair_device_window.close().await {
+                    tracing::error!(
+                        stage = "pair_device_window.owner_close_failed",
+                        error = %error,
+                        "pair-device authority closed in memory but its exact-generation snapshot could not be durably removed"
+                    );
+                }
                 break;
             }
 
-            let path = household_rs::storage::pair_device_window_path(&state_dir);
-            match std::fs::metadata(&path) {
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => {
-                    tracing::warn!(
-                        stage = "pair_device_window.snapshot_watch_failed",
-                        path = %path.display(),
-                        error = %e,
-                    );
-                    continue;
-                }
-            }
-
-            match load_pair_device_window_snapshot_if_new(&state_dir, &pair_device_window).await {
+            match load_pair_device_window_snapshot_if_new(&pair_device_window).await {
                 Ok(()) => {}
                 Err(e) => {
                     tracing::warn!(
                         stage = "pair_device_window.snapshot_reload_failed",
                         error = %e,
-                        "discarding pair-window snapshot"
+                        "closing the exact-generation pair-window snapshot"
                     );
-                    let _ = household_rs::storage::delete_pair_device_window_snapshot(&state_dir);
+                    if let Err(close_error) = pair_device_window.close().await {
+                        tracing::error!(
+                            stage = "pair_device_window.snapshot_close_failed",
+                            error = %close_error,
+                            "pair-device authority closed in memory but cleanup remains indeterminate"
+                        );
+                    }
                 }
             }
         }
@@ -1531,20 +2146,16 @@ fn spawn_pair_device_window_snapshot_watcher_with_interval(
 }
 
 async fn load_pair_device_window_snapshot_if_new(
-    state_dir: &Path,
     pair_device_window: &household_rs::pair_device::PairDeviceWindow,
 ) -> Result<(), String> {
-    let snap_path = household_rs::storage::pair_device_window_path(state_dir);
-    let snap: Option<household_rs::pair_device::PairDeviceWindowSnapshot> =
-        household_rs::storage::read_optional_cbor(&snap_path)
-            .map_err(|e| format!("read pair-window snapshot: {e}"))?;
+    let snap = pair_device_window.read_persisted_snapshot()?;
     let Some(snap) = snap else {
         return Ok(());
     };
     let Some(token) = household_rs::pair_device::PairToken::from_snapshot(&snap)
         .map_err(|e| format!("decode pair-window snapshot: {e}"))?
     else {
-        let _ = household_rs::storage::delete_pair_device_window_snapshot(state_dir);
+        pair_device_window.close().await?;
         return Ok(());
     };
     let expires_at_unix = token.expires_at_unix;
@@ -1564,14 +2175,11 @@ async fn load_pair_device_window_snapshot_if_new(
 /// Read a persisted pair-window snapshot (if any) and install it into the
 /// in-memory `PairDeviceWindow`. Returns `Ok(())` on success or absence,
 /// `Err(String)` on parse / decode errors.
-async fn load_persisted_pair_device_window(
-    state_dir: &Path,
+async fn load_persisted_pair_device_window_under_lifecycle(
     pair_device_window: &household_rs::pair_device::PairDeviceWindow,
+    lifecycle: &LifecycleWriteGuard,
 ) -> Result<(), String> {
-    let snap_path = household_rs::storage::pair_device_window_path(state_dir);
-    let snap: Option<household_rs::pair_device::PairDeviceWindowSnapshot> =
-        household_rs::storage::read_optional_cbor(&snap_path)
-            .map_err(|e| format!("read pair-window snapshot: {e}"))?;
+    let snap = pair_device_window.read_persisted_snapshot_under_lifecycle(lifecycle)?;
     let Some(snap) = snap else {
         return Ok(());
     };
@@ -1584,11 +2192,13 @@ async fn load_persisted_pair_device_window(
                 source = "snapshot",
                 expires_at_unix = snap.expires_at_unix,
             );
-            pair_device_window.install_token(token).await;
+            let _ = pair_device_window
+                .install_token_from_current_snapshot_under_lifecycle(token, &snap, lifecycle)
+                .await?;
         }
         None => {
             // Expired snapshot: clean it up.
-            let _ = household_rs::storage::delete_pair_device_window_snapshot(state_dir);
+            pair_device_window.close_under_lifecycle(lifecycle).await?;
         }
     }
     Ok(())
@@ -1613,6 +2223,40 @@ async fn infer_bootstrap_state(
     }
 }
 
+fn bootstrap_state_after_inferred_persist(
+    current: BootstrapState,
+    inferred: BootstrapState,
+    persist_result: Result<(), household_rs::bootstrap_state::BootstrapStateError>,
+) -> BootstrapState {
+    match persist_result {
+        Ok(()) => inferred,
+        Err(error) => {
+            tracing::warn!(
+                stage = "bootstrap_state.infer_persist_failed",
+                error = %error,
+                retained_state = current.as_str(),
+                rejected_inference = inferred.as_str(),
+                "refusing to publish an inferred bootstrap state that was not durably persisted"
+            );
+            current
+        }
+    }
+}
+
+fn persist_bootstrap_state_under_lifecycle(
+    lifecycle: &LifecycleWriteGuard,
+    state_dir: &Path,
+    state: BootstrapState,
+) -> Result<(), household_rs::bootstrap_state::BootstrapStateError> {
+    if state != BootstrapState::Ready {
+        return bootstrap_state::persist(state_dir, state);
+    }
+    let generation = lifecycle
+        .lifecycle_generation()?
+        .ok_or(household_rs::bootstrap_state::BootstrapStateError::ReadyGenerationChanged)?;
+    bootstrap_state::persist_ready_under_lifecycle(lifecycle, state_dir, generation)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1620,6 +2264,124 @@ mod tests {
     use household_rs::household_mesh_log::{LogEntry, MeshEvent};
     use household_rs::keys::{IdentityKey, P256Keypair};
     use household_rs::person_cert::SignOwnerOptions;
+
+    #[test]
+    fn terminal_replay_keeps_the_listener_only_for_real_lock_contention() {
+        assert!(terminal_replay_lock_failure_is_contention(
+            HouseholdLifecycleLockError::LockTimeout
+        ));
+        for permanent in [
+            HouseholdLifecycleLockError::UnsafePath,
+            HouseholdLifecycleLockError::UnsupportedFilesystem,
+            HouseholdLifecycleLockError::RecoveryRequired,
+            HouseholdLifecycleLockError::Io,
+        ] {
+            assert!(
+                !terminal_replay_lock_failure_is_contention(permanent),
+                "{permanent:?} must shut the retained listener down fail-closed"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_inferred_bootstrap_persist_never_publishes_the_inference() {
+        let result = bootstrap_state_after_inferred_persist(
+            BootstrapState::Uninitialized,
+            BootstrapState::NamedAwaitingPair,
+            Err(household_rs::bootstrap_state::BootstrapStateError::Io(
+                std::io::Error::other("injected persistence failure"),
+            )),
+        );
+        assert_eq!(result, BootstrapState::Uninitialized);
+
+        let committed = bootstrap_state_after_inferred_persist(
+            BootstrapState::Uninitialized,
+            BootstrapState::NamedAwaitingPair,
+            Ok(()),
+        );
+        assert_eq!(committed, BootstrapState::NamedAwaitingPair);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lifecycle_load_blocks_teardown_until_identity_is_published() {
+        let td = tempfile::tempdir().unwrap();
+        household_rs::bootstrap_or_load(
+            td.path(),
+            household_rs::BootstrapOpts {
+                household_name: "Lifecycle Home".to_string(),
+                hostname_label: Some("lifecycle-host".to_string()),
+            },
+            household_rs::KeyBackingPolicy::ForceSoftware,
+        )
+        .expect("install fixture household");
+
+        // This is the same transaction used by both cold startup and the hot
+        // watcher. It has observed household A but has not published A yet.
+        let identity_load = acquire_and_load_identity_under_lifecycle(
+            td.path(),
+            household_rs::KeyBackingPolicy::ForceSoftware,
+        )
+        .expect("load fixture under lifecycle exclusive");
+        let expected_hh_id = identity_load
+            .loaded
+            .as_ref()
+            .expect("fixture identity is present")
+            .record
+            .hh_id
+            .clone();
+
+        let state_dir = td.path().to_path_buf();
+        let (attempting_tx, attempting_rx) = std::sync::mpsc::sync_channel(1);
+        let (renamed_tx, renamed_rx) = std::sync::mpsc::sync_channel(1);
+        let contender = std::thread::spawn(move || {
+            let lifecycle = HouseholdLifecycleLock::open_verified(&state_dir)
+                .expect("teardown opens stable lifecycle lock");
+            attempting_tx
+                .send(())
+                .expect("signal teardown acquisition attempt");
+            let guard = lifecycle
+                .lock_exclusive_until(Instant::now() + Duration::from_secs(5))
+                .expect("teardown eventually acquires lifecycle exclusive");
+            let renamed = guard
+                .rename_household_to_tearing_down()
+                .expect("teardown rename succeeds after publication");
+            renamed_tx
+                .send(renamed)
+                .expect("report teardown rename result");
+        });
+
+        attempting_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("teardown contender started");
+        assert!(
+            matches!(
+                renamed_rx.recv_timeout(Duration::from_millis(100)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "teardown must not rename after load and before memory publication"
+        );
+
+        let identity_state = HouseholdState::empty();
+        identity_load.publish_into(&identity_state).await;
+        assert_eq!(
+            identity_state
+                .current()
+                .await
+                .expect("identity is published before lifecycle release")
+                .record
+                .hh_id,
+            expected_hh_id
+        );
+        drop(identity_load);
+
+        assert!(
+            renamed_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("teardown completes after publication"),
+            "installed household should be detached"
+        );
+        contender.join().expect("teardown contender does not panic");
+    }
 
     #[test]
     fn clamp_pair_window_ttl_secs_passes_through_in_range() {
@@ -1727,10 +2489,26 @@ mod tests {
     #[test]
     fn macos_local_registration_state_wires_runtime_webauthn_dependencies() {
         let td = tempfile::tempdir().unwrap();
+        let identity = household_rs::bootstrap_or_load(
+            td.path(),
+            household_rs::BootstrapOpts {
+                household_name: "Owner Events Test".into(),
+                hostname_label: Some("owner-events-test".into()),
+            },
+            household_rs::KeyBackingPolicy::ForceSoftware,
+        )
+        .unwrap();
+        let lifecycle = HouseholdLifecycleLock::open_verified(td.path()).unwrap();
+        let lifecycle_guard = lifecycle.lock_exclusive().unwrap();
         let broadcaster = OwnerEventsBroadcaster::new();
-        let event_log =
-            OwnerEventLog::open_with_broadcaster(td.path().to_path_buf(), broadcaster.clone())
-                .unwrap();
+        let event_log = OwnerEventLog::open_with_broadcaster_under_lifecycle(
+            &lifecycle_guard,
+            td.path().to_path_buf(),
+            identity.record.hh_id.as_str(),
+            broadcaster.clone(),
+        )
+        .unwrap();
+        drop(lifecycle_guard);
         let window = Arc::new(PairMachineWindow::new_in_memory());
         let state = handlers_owner_events::OwnerEventsRouterState::new(
             HouseholdState::empty(),
@@ -1892,10 +2670,12 @@ mod tests {
     async fn snapshot_watcher_installs_reissued_token_without_restart() {
         let td = tempfile::tempdir().unwrap();
         let daemon_window = Arc::new(
-            household_rs::pair_device::PairDeviceWindow::with_persistence(td.path().to_path_buf()),
+            household_rs::pair_device::PairDeviceWindow::with_persistence(td.path().to_path_buf())
+                .unwrap(),
         );
         let cli_window =
-            household_rs::pair_device::PairDeviceWindow::with_persistence(td.path().to_path_buf());
+            household_rs::pair_device::PairDeviceWindow::with_persistence(td.path().to_path_buf())
+                .unwrap();
 
         let watcher = spawn_pair_device_window_snapshot_watcher_with_interval(
             td.path().to_path_buf(),
@@ -1923,11 +2703,10 @@ mod tests {
     #[tokio::test]
     async fn snapshot_watcher_closes_and_exits_after_owner_auth_exists() {
         let td = tempfile::tempdir().unwrap();
-        let daemon_window = Arc::new(
-            household_rs::pair_device::PairDeviceWindow::with_persistence(td.path().to_path_buf()),
-        );
-        let cli_window =
-            household_rs::pair_device::PairDeviceWindow::with_persistence(td.path().to_path_buf());
+        // Installing household authority rotates the lifecycle generation.
+        // Open both watcher handles only after that rotation so they retain
+        // the same generation-scoped namespace the watcher is allowed to
+        // close.
         let identity = household_rs::bootstrap_or_load(
             td.path(),
             household_rs::BootstrapOpts {
@@ -1937,6 +2716,13 @@ mod tests {
             household_rs::KeyBackingPolicy::ForceSoftware,
         )
         .expect("bootstrap identity from install path");
+        let daemon_window = Arc::new(
+            household_rs::pair_device::PairDeviceWindow::with_persistence(td.path().to_path_buf())
+                .unwrap(),
+        );
+        let cli_window =
+            household_rs::pair_device::PairDeviceWindow::with_persistence(td.path().to_path_buf())
+                .unwrap();
         let owner_auth = owner_auth_for(&identity);
         let identity_state =
             HouseholdState::loaded_with_owner_auth(Arc::new(identity), Some(Arc::new(owner_auth)));
@@ -1945,7 +2731,7 @@ mod tests {
             .mint_token(Duration::from_secs(60), None)
             .await
             .unwrap();
-        assert!(household_rs::storage::pair_device_window_path(td.path()).exists());
+        assert!(cli_window.read_persisted_snapshot().unwrap().is_some());
 
         let watcher = spawn_pair_device_window_snapshot_watcher_with_interval(
             td.path().to_path_buf(),
@@ -1959,7 +2745,7 @@ mod tests {
             .expect("snapshot watcher should stop after owner auth exists")
             .expect("snapshot watcher should not panic");
         assert!(!daemon_window.is_open().await);
-        assert!(!household_rs::storage::pair_device_window_path(td.path()).exists());
+        assert!(cli_window.read_persisted_snapshot().unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1967,7 +2753,8 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let identity_state = HouseholdState::empty();
         let pair_device_window = Arc::new(
-            household_rs::pair_device::PairDeviceWindow::with_persistence(td.path().to_path_buf()),
+            household_rs::pair_device::PairDeviceWindow::with_persistence(td.path().to_path_buf())
+                .unwrap(),
         );
         let pair_machine_window = Arc::new(
             household_rs::pair_machine::PairMachineWindow::with_persistence(

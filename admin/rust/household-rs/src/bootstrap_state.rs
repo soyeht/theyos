@@ -11,6 +11,11 @@
 //! Uninitialized     → NamedAwaitingPair  (POST /bootstrap/initialize)
 //! ReadyForNaming    → NamedAwaitingPair  (POST /bootstrap/initialize)
 //! NamedAwaitingPair → Ready              (owner-pairing finalizes)
+//! NamedAwaitingPair → PairMachineInstallRestartRequired
+//!                                            (candidate install committed;
+//!                                             exact finalize replay pending)
+//! PairMachineInstallRestartRequired → Ready  (exact retained Ack replay armed;
+//!                                             peer receipt remains unproven)
 //! *                 → Recovering         (future spec 007-recovery-flow)
 //! ```
 //!
@@ -25,6 +30,9 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 
 use crate::error::StorageError;
+use crate::household_lifecycle::{
+    HouseholdLifecycleGenerationV1, HouseholdLifecycleLockError, LifecycleWriteGuard,
+};
 
 // ── State enum ────────────────────────────────────────────────────────────────
 
@@ -35,6 +43,11 @@ pub enum BootstrapState {
     Uninitialized,
     ReadyForNaming,
     NamedAwaitingPair,
+    /// A Pair-Machine candidate install is terminal and its exact Ack is
+    /// retained, but the cold G1 process has not yet established the named
+    /// conservative delivery boundary for exact replay.
+    /// This is deliberately distinct from generic fail-stop `Recovering`.
+    PairMachineInstallRestartRequired,
     Ready,
     Recovering,
 }
@@ -47,6 +60,7 @@ impl BootstrapState {
             Self::Uninitialized => "uninitialized",
             Self::ReadyForNaming => "ready_for_naming",
             Self::NamedAwaitingPair => "named_awaiting_pair",
+            Self::PairMachineInstallRestartRequired => "pair_machine_install_restart_required",
             Self::Ready => "ready",
             Self::Recovering => "recovering",
         }
@@ -63,6 +77,9 @@ impl BootstrapState {
             "uninitialized" => Some(Self::Uninitialized),
             "ready_for_naming" => Some(Self::ReadyForNaming),
             "named_awaiting_pair" => Some(Self::NamedAwaitingPair),
+            "pair_machine_install_restart_required" => {
+                Some(Self::PairMachineInstallRestartRequired)
+            }
             "ready" => Some(Self::Ready),
             "recovering" => Some(Self::Recovering),
             _ => None,
@@ -72,14 +89,25 @@ impl BootstrapState {
     /// Attempt to transition to `next`. Returns `Err` if the transition is
     /// not valid per the state machine specification.
     pub fn transition(self, next: Self) -> Result<Self, TransitionError> {
-        use BootstrapState::{NamedAwaitingPair, Ready, ReadyForNaming, Recovering, Uninitialized};
+        use BootstrapState::{
+            NamedAwaitingPair, PairMachineInstallRestartRequired, Ready, ReadyForNaming,
+            Recovering, Uninitialized,
+        };
         let ok = matches!(
             (self, next),
             // Forward onboarding transitions + idempotent self-transitions
             // (self-loops allowed; persist is skipped upstream).
             (Uninitialized, Uninitialized | ReadyForNaming | NamedAwaitingPair)
             | (ReadyForNaming, ReadyForNaming | NamedAwaitingPair)
+            | (
+                Uninitialized | ReadyForNaming | NamedAwaitingPair,
+                PairMachineInstallRestartRequired,
+            )
             | (NamedAwaitingPair, NamedAwaitingPair | Ready | Recovering)
+            | (
+                PairMachineInstallRestartRequired,
+                PairMachineInstallRestartRequired | Ready | Recovering,
+            )
             // Recovery interplays with Ready bidirectionally.
             | (Ready | Recovering, Ready | Recovering)
         );
@@ -119,12 +147,36 @@ pub enum BootstrapStateError {
     Transition(#[from] TransitionError),
     #[error("storage error: {0}")]
     Storage(#[from] StorageError),
+    #[error("household lifecycle operation failed: {0}")]
+    Lifecycle(#[from] HouseholdLifecycleLockError),
+    #[error("Ready must be persisted through a lifecycle-generation guard")]
+    ReadyRequiresLifecycleGuard,
+    #[error("the lifecycle generation changed before Ready could be persisted")]
+    ReadyGenerationChanged,
 }
 
 // ── Persistence ────────────────────────────────────────────────────────────────
 
-pub(crate) fn state_file_path(state_dir: &Path) -> PathBuf {
+fn state_file_path(state_dir: &Path) -> PathBuf {
     state_dir.join("identity.bootstrap_state")
+}
+
+/// Build a staged bootstrap-state item only for a non-Ready transaction.
+///
+/// Multi-file onboarding staging needs the path and exact bytes, but exposing
+/// the path alone would let a sibling module bypass
+/// [`persist_ready_under_lifecycle`]. This constructor keeps that capability
+/// closed and applies the same Ready rejection as [`persist`].
+pub(crate) fn staged_non_ready_item(
+    state_dir: &Path,
+    state: BootstrapState,
+) -> Result<(PathBuf, Vec<u8>), BootstrapStateError> {
+    if state == BootstrapState::Ready {
+        return Err(BootstrapStateError::ReadyRequiresLifecycleGuard);
+    }
+    let mut bytes = state.as_str().as_bytes().to_vec();
+    bytes.push(b'\n');
+    Ok((state_file_path(state_dir), bytes))
 }
 
 /// Read the bootstrap state from `<state_dir>/identity.bootstrap_state`.
@@ -149,6 +201,41 @@ pub fn load(state_dir: &Path) -> Result<BootstrapState, BootstrapStateError> {
 ///
 /// Write strategy: write to `<path>.tmp` → fsync → rename → fsync parent.
 pub fn persist(state_dir: &Path, state: BootstrapState) -> Result<(), BootstrapStateError> {
+    if state == BootstrapState::Ready {
+        return Err(BootstrapStateError::ReadyRequiresLifecycleGuard);
+    }
+    persist_impl(state_dir, state)
+}
+
+/// Durably persist `Ready` while proving the writer still owns the exact
+/// lifecycle generation whose authority it is publishing.
+///
+/// This is the only production entry point that can write `Ready`. Keeping
+/// that invariant in the persistence API (instead of at a source-code
+/// convention) means a newly added direct or dynamic call to [`persist`]
+/// fails closed. `expected_generation` must come from the ceremony or record
+/// being completed; merely reading a generation and later reopening a guard is
+/// insufficient.
+pub fn persist_ready_under_lifecycle(
+    lifecycle: &LifecycleWriteGuard,
+    state_dir: &Path,
+    expected_generation: HouseholdLifecycleGenerationV1,
+) -> Result<(), BootstrapStateError> {
+    lifecycle.verify_state_root(state_dir)?;
+    if lifecycle.lifecycle_generation()? != Some(expected_generation) {
+        return Err(BootstrapStateError::ReadyGenerationChanged);
+    }
+    persist_impl(state_dir, BootstrapState::Ready)?;
+    lifecycle.sync_state_root()?;
+    if lifecycle.lifecycle_generation()? != Some(expected_generation)
+        || load(state_dir)? != BootstrapState::Ready
+    {
+        return Err(BootstrapStateError::ReadyGenerationChanged);
+    }
+    Ok(())
+}
+
+fn persist_impl(state_dir: &Path, state: BootstrapState) -> Result<(), BootstrapStateError> {
     let path = state_file_path(state_dir);
     let tmp = path.with_extension("tmp");
 
@@ -165,12 +252,27 @@ pub fn persist(state_dir: &Path, state: BootstrapState) -> Result<(), BootstrapS
 
     fs::rename(&tmp, &path)?;
 
-    // fsync parent directory so the rename is durable on crash.
-    if let Some(parent) = path.parent() {
-        if let Ok(dir) = fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
-    }
+    // Propagate the parent-directory barrier. A visible rename is not proof
+    // that the new directory entry will survive a crash, and callers use a
+    // successful return as the durable bootstrap-state commit point.
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "bootstrap state path has no parent directory",
+        )
+    })?;
+    let dir = fs::File::open(parent).map_err(|error| {
+        BootstrapStateError::Storage(StorageError::MayHaveTakenEffect {
+            path: path.clone(),
+            hint: format!("open parent after bootstrap-state rename: {error}"),
+        })
+    })?;
+    dir.sync_all().map_err(|error| {
+        BootstrapStateError::Storage(StorageError::MayHaveTakenEffect {
+            path: path.clone(),
+            hint: format!("fsync parent after bootstrap-state rename: {error}"),
+        })
+    })?;
 
     Ok(())
 }
@@ -180,6 +282,7 @@ pub fn persist(state_dir: &Path, state: BootstrapState) -> Result<(), BootstrapS
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::household_lifecycle::HouseholdLifecycleLock;
     use tempfile::TempDir;
 
     fn tmp() -> TempDir {
@@ -199,13 +302,48 @@ mod tests {
             BootstrapState::Uninitialized,
             BootstrapState::ReadyForNaming,
             BootstrapState::NamedAwaitingPair,
-            BootstrapState::Ready,
+            BootstrapState::PairMachineInstallRestartRequired,
             BootstrapState::Recovering,
         ];
         for state in cases {
             persist(dir.path(), state).unwrap();
             assert_eq!(load(dir.path()).unwrap(), state);
         }
+    }
+
+    #[test]
+    fn ready_requires_the_exact_lifecycle_generation() {
+        let dir = tmp();
+        assert!(matches!(
+            persist(dir.path(), BootstrapState::Ready),
+            Err(BootstrapStateError::ReadyRequiresLifecycleGuard)
+        ));
+        assert!(matches!(
+            staged_non_ready_item(dir.path(), BootstrapState::Ready),
+            Err(BootstrapStateError::ReadyRequiresLifecycleGuard)
+        ));
+
+        let lifecycle = HouseholdLifecycleLock::open_verified(dir.path()).unwrap();
+        let guard = lifecycle.lock_exclusive().unwrap();
+        let generation = guard.ensure_lifecycle_generation().unwrap();
+        let stale = guard.rotate_lifecycle_generation().unwrap();
+        assert_ne!(generation, stale);
+        assert!(matches!(
+            persist_ready_under_lifecycle(&guard, dir.path(), generation),
+            Err(BootstrapStateError::ReadyGenerationChanged)
+        ));
+        assert_eq!(load(dir.path()).unwrap(), BootstrapState::Uninitialized);
+
+        persist_ready_under_lifecycle(&guard, dir.path(), stale).unwrap();
+        assert_eq!(load(dir.path()).unwrap(), BootstrapState::Ready);
+
+        let other = tmp();
+        assert!(matches!(
+            persist_ready_under_lifecycle(&guard, other.path(), stale),
+            Err(BootstrapStateError::Lifecycle(
+                HouseholdLifecycleLockError::UnsafePath
+            ))
+        ));
     }
 
     #[test]
@@ -216,6 +354,8 @@ mod tests {
             (Uninitialized, NamedAwaitingPair),
             (ReadyForNaming, NamedAwaitingPair),
             (NamedAwaitingPair, Ready),
+            (NamedAwaitingPair, PairMachineInstallRestartRequired),
+            (PairMachineInstallRestartRequired, Ready),
             (NamedAwaitingPair, Recovering),
             (Ready, Recovering),
             (Recovering, Ready),
@@ -232,6 +372,8 @@ mod tests {
             (Ready, Uninitialized),
             (Ready, ReadyForNaming),
             (Ready, NamedAwaitingPair),
+            (Ready, PairMachineInstallRestartRequired),
+            (Recovering, PairMachineInstallRestartRequired),
             (NamedAwaitingPair, Uninitialized),
             (NamedAwaitingPair, ReadyForNaming),
         ];
@@ -263,6 +405,7 @@ mod tests {
             BootstrapState::Uninitialized,
             BootstrapState::ReadyForNaming,
             BootstrapState::NamedAwaitingPair,
+            BootstrapState::PairMachineInstallRestartRequired,
             BootstrapState::Ready,
             BootstrapState::Recovering,
         ];

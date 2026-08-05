@@ -14,7 +14,7 @@
 //! Or, on idempotent rerun, a single `bootstrap.skip` line.
 
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -50,6 +50,10 @@ fn log_ts() -> String {
 use crate::bootstrap_state::{self, BootstrapState};
 use crate::chain::verify_loaded_chain;
 use crate::error::{BootstrapError, HouseholdError, KeystoreError, StorageError};
+use crate::household_lifecycle::{
+    HOUSEHOLD_LIFECYCLE_LOCK_FILENAME, HouseholdLifecycleLock, HouseholdLifecycleLockError,
+    LifecycleWriteGuard,
+};
 use crate::household_record::{HouseholdRecord, validate_household_name};
 use crate::ids::{HouseholdId, MachineId, derive_household_id, derive_machine_id};
 use crate::keys::{IdentityKey, P256Keypair, P256PublicKey, P256Signature, verify_signature};
@@ -58,6 +62,114 @@ use crate::machine_cert::{MachineCert, Platform, SignOptions};
 use crate::storage::{
     self, atomic_write_cbor, household_record_path, machine_cert_for, self_m_id_marker_path,
 };
+
+const HOUSEHOLD_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn lifecycle_storage_error(state_dir: &Path, error: impl std::fmt::Display) -> StorageError {
+    StorageError::Io {
+        path: state_dir.join(HOUSEHOLD_LIFECYCLE_LOCK_FILENAME),
+        kind: "household_lifecycle".to_owned(),
+        hint: error.to_string(),
+    }
+}
+
+fn lifecycle_bootstrap_error(
+    state_dir: &Path,
+    stage: &'static str,
+    error: impl std::fmt::Display,
+) -> BootstrapError {
+    BootstrapError::Storage {
+        source: lifecycle_storage_error(state_dir, error),
+        stage,
+    }
+}
+
+/// Converge a teardown that crashed after installing the durable breadcrumb.
+///
+/// This function does not infer authority from the lifecycle lock. The named
+/// topology and durable bootstrap state remain authoritative; the guard only
+/// prevents a concurrent ledger/open/install transaction while those objects
+/// converge.
+pub fn recover_interrupted_household_teardown_under_lifecycle(
+    guard: &LifecycleWriteGuard,
+    state_dir: &Path,
+) -> Result<bool, StorageError> {
+    guard
+        .verify_state_root(state_dir)
+        .map_err(|error| lifecycle_storage_error(state_dir, error))?;
+    let household_present = guard
+        .household_exists()
+        .map_err(|error| lifecycle_storage_error(state_dir, error))?;
+    let teardown_present = guard
+        .teardown_breadcrumb_exists()
+        .map_err(|error| lifecycle_storage_error(state_dir, error))?;
+    if household_present && teardown_present {
+        return Err(lifecycle_storage_error(
+            state_dir,
+            "both household and household.tearing-down are present; refusing to choose authority",
+        ));
+    }
+    if !teardown_present {
+        return Ok(false);
+    }
+
+    // Recovery is itself a teardown completion point. Advance again even if a
+    // newer writer already rotated before the rename: repeated rotation is
+    // safe, while a legacy breadcrumb without a witness must not leave the
+    // final absence indistinguishable from a pre-teardown candidate state.
+    guard
+        .rotate_lifecycle_generation()
+        .map_err(|error| lifecycle_storage_error(state_dir, error))?;
+    bootstrap_state::persist(state_dir, BootstrapState::Uninitialized)
+        .map_err(|error| lifecycle_storage_error(state_dir, error))?;
+    guard
+        .sync_state_root()
+        .map_err(|error| lifecycle_storage_error(state_dir, error))?;
+    guard
+        .remove_tearing_down()
+        .map_err(|error| lifecycle_storage_error(state_dir, error))?;
+    Ok(true)
+}
+
+fn acquire_bootstrap_lifecycle(
+    state_dir: &Path,
+    stage: &'static str,
+) -> Result<LifecycleWriteGuard, BootstrapError> {
+    let lifecycle = HouseholdLifecycleLock::open_verified(state_dir)
+        .map_err(|error| lifecycle_bootstrap_error(state_dir, stage, error))?;
+    let deadline = Instant::now()
+        .checked_add(HOUSEHOLD_LIFECYCLE_TIMEOUT)
+        .ok_or_else(|| {
+            lifecycle_bootstrap_error(state_dir, stage, HouseholdLifecycleLockError::LockTimeout)
+        })?;
+    let guard = lifecycle
+        .lock_exclusive_until(deadline)
+        .map_err(|error| lifecycle_bootstrap_error(state_dir, stage, error))?;
+    recover_interrupted_household_teardown_under_lifecycle(&guard, state_dir)
+        .map_err(|source| BootstrapError::Storage { source, stage })?;
+    Ok(guard)
+}
+
+fn verify_bootstrap_lifecycle_guard(
+    guard: &LifecycleWriteGuard,
+    state_dir: &Path,
+    stage: &'static str,
+) -> Result<(), BootstrapError> {
+    guard
+        .verify_state_root(state_dir)
+        .map_err(|error| lifecycle_bootstrap_error(state_dir, stage, error))?;
+    if guard
+        .teardown_breadcrumb_exists()
+        .map_err(|error| lifecycle_bootstrap_error(state_dir, stage, error))?
+    {
+        return Err(lifecycle_bootstrap_error(
+            state_dir,
+            stage,
+            HouseholdLifecycleLockError::RecoveryRequired,
+        ));
+    }
+    Ok(())
+}
 
 /// Caller-supplied options for a fresh bootstrap.
 #[derive(Clone)]
@@ -130,6 +242,25 @@ pub struct LoadedIdentity {
 /// `Err` if the files are partially present or corrupted (refuse-to-start
 /// per US1 acceptance C6).
 pub fn try_load_existing(
+    state_dir: &Path,
+    policy: KeyBackingPolicy,
+) -> Result<Option<LoadedIdentity>, BootstrapError> {
+    let guard = acquire_bootstrap_lifecycle(state_dir, "bootstrap.load.lifecycle")?;
+    try_load_existing_under_lifecycle(&guard, state_dir, policy)
+}
+
+/// Load/recover an existing identity while a caller-owned lifecycle-exclusive
+/// transaction remains live across adjacent durable state changes.
+pub fn try_load_existing_under_lifecycle(
+    guard: &LifecycleWriteGuard,
+    state_dir: &Path,
+    policy: KeyBackingPolicy,
+) -> Result<Option<LoadedIdentity>, BootstrapError> {
+    verify_bootstrap_lifecycle_guard(guard, state_dir, "bootstrap.load.lifecycle")?;
+    try_load_existing_impl(state_dir, policy)
+}
+
+fn try_load_existing_impl(
     state_dir: &Path,
     policy: KeyBackingPolicy,
 ) -> Result<Option<LoadedIdentity>, BootstrapError> {
@@ -252,6 +383,28 @@ pub fn bootstrap_or_load(
     opts: BootstrapOpts,
     policy: KeyBackingPolicy,
 ) -> Result<LoadedIdentity, BootstrapError> {
+    let guard = acquire_bootstrap_lifecycle(state_dir, "bootstrap.install.lifecycle")?;
+    bootstrap_or_load_under_lifecycle(&guard, state_dir, opts, policy)
+}
+
+/// Install or load while a caller-owned lifecycle-exclusive transaction
+/// remains live through its adjacent bootstrap-state commit.
+pub fn bootstrap_or_load_under_lifecycle(
+    guard: &LifecycleWriteGuard,
+    state_dir: &Path,
+    opts: BootstrapOpts,
+    policy: KeyBackingPolicy,
+) -> Result<LoadedIdentity, BootstrapError> {
+    verify_bootstrap_lifecycle_guard(guard, state_dir, "bootstrap.install.lifecycle")?;
+    bootstrap_or_load_impl(guard, state_dir, opts, policy)
+}
+
+fn bootstrap_or_load_impl(
+    guard: &LifecycleWriteGuard,
+    state_dir: &Path,
+    opts: BootstrapOpts,
+    policy: KeyBackingPolicy,
+) -> Result<LoadedIdentity, BootstrapError> {
     let bootstrap_started = Instant::now();
     info!(
         ts = %log_ts(),
@@ -351,6 +504,15 @@ pub fn bootstrap_or_load(
         (Some(_), None) => Err(BootstrapError::CertMissingButRecordPresent),
         (None, Some(_)) => Err(BootstrapError::RecordMissingButCertPresent),
         (None, None) => {
+            guard
+                .reserve_household_install_generation()
+                .map_err(|error| {
+                    lifecycle_bootstrap_error(
+                        state_dir,
+                        "bootstrap.install.rotate_generation",
+                        error,
+                    )
+                })?;
             drop_legacy_tables_before_first_bootstrap(state_dir)?;
             fresh_bootstrap(state_dir, opts, policy, bootstrap_started)
         }
@@ -708,6 +870,28 @@ pub fn prepare_accept_household(
     opts: AcceptHouseholdPrepareOpts,
     policy: KeyBackingPolicy,
 ) -> Result<PreparedAcceptHousehold, BootstrapError> {
+    let guard = acquire_bootstrap_lifecycle(state_dir, "accept_household.lifecycle")?;
+    prepare_accept_household_under_lifecycle(&guard, state_dir, opts, policy)
+}
+
+/// Prepare follower state under a caller-owned lifecycle-exclusive
+/// transaction, allowing the server to keep topology and in-memory state
+/// publication in one cross-process critical section.
+pub fn prepare_accept_household_under_lifecycle(
+    guard: &LifecycleWriteGuard,
+    state_dir: &Path,
+    opts: AcceptHouseholdPrepareOpts,
+    policy: KeyBackingPolicy,
+) -> Result<PreparedAcceptHousehold, BootstrapError> {
+    verify_bootstrap_lifecycle_guard(guard, state_dir, "accept_household.lifecycle")?;
+    prepare_accept_household_impl(state_dir, opts, policy)
+}
+
+fn prepare_accept_household_impl(
+    state_dir: &Path,
+    opts: AcceptHouseholdPrepareOpts,
+    policy: KeyBackingPolicy,
+) -> Result<PreparedAcceptHousehold, BootstrapError> {
     validate_household_name(&opts.household_name).map_err(|e| BootstrapError::Encoding {
         source: e,
         stage: "accept_household.opts.household_name",
@@ -829,10 +1013,20 @@ pub fn prepare_accept_household(
             source: e,
             stage: "accept_household.encode_pending",
         })?;
-    let mut state_bytes = BootstrapState::ReadyForNaming.as_str().as_bytes().to_vec();
-    state_bytes.push(b'\n');
+    let state_item = bootstrap_state::staged_non_ready_item(
+        state_dir,
+        BootstrapState::ReadyForNaming,
+    )
+    .map_err(|e| BootstrapError::Storage {
+        source: StorageError::Io {
+            path: state_dir.join("identity.bootstrap_state"),
+            kind: "invalid_bootstrap_state".into(),
+            hint: e.to_string(),
+        },
+        stage: "accept_household.encode_bootstrap_state",
+    })?;
     let staged = storage::stage_commit_files(&[
-        (bootstrap_state::state_file_path(state_dir), state_bytes),
+        state_item,
         (household_record_path(state_dir), record_bytes),
         (pending_accept_household_path(state_dir), pending_bytes),
     ])
@@ -855,6 +1049,82 @@ pub fn prepare_accept_household(
 }
 
 pub fn confirm_accept_household(
+    state_dir: &Path,
+    m_id: &MachineId,
+    machine_cert: MachineCert,
+    challenge_sig: &P256Signature,
+    policy: KeyBackingPolicy,
+) -> Result<LoadedIdentity, AcceptHouseholdConfirmError> {
+    let lifecycle = HouseholdLifecycleLock::open_verified(state_dir).map_err(|error| {
+        AcceptHouseholdConfirmError::Storage {
+            source: lifecycle_storage_error(state_dir, error),
+            stage: "accept_household.confirm.lifecycle",
+        }
+    })?;
+    let deadline = Instant::now()
+        .checked_add(HOUSEHOLD_LIFECYCLE_TIMEOUT)
+        .ok_or_else(|| AcceptHouseholdConfirmError::Storage {
+            source: lifecycle_storage_error(state_dir, HouseholdLifecycleLockError::LockTimeout),
+            stage: "accept_household.confirm.lifecycle",
+        })?;
+    let guard = lifecycle.lock_exclusive_until(deadline).map_err(|error| {
+        AcceptHouseholdConfirmError::Storage {
+            source: lifecycle_storage_error(state_dir, error),
+            stage: "accept_household.confirm.lifecycle",
+        }
+    })?;
+    recover_interrupted_household_teardown_under_lifecycle(&guard, state_dir).map_err(
+        |source| AcceptHouseholdConfirmError::Storage {
+            source,
+            stage: "accept_household.confirm.lifecycle",
+        },
+    )?;
+    confirm_accept_household_under_lifecycle(
+        &guard,
+        state_dir,
+        m_id,
+        machine_cert,
+        challenge_sig,
+        policy,
+    )
+}
+
+/// Confirm follower state while the caller keeps lifecycle-exclusive through
+/// the durable bootstrap-state publication.
+pub fn confirm_accept_household_under_lifecycle(
+    guard: &LifecycleWriteGuard,
+    state_dir: &Path,
+    m_id: &MachineId,
+    machine_cert: MachineCert,
+    challenge_sig: &P256Signature,
+    policy: KeyBackingPolicy,
+) -> Result<LoadedIdentity, AcceptHouseholdConfirmError> {
+    guard
+        .verify_state_root(state_dir)
+        .map_err(|error| AcceptHouseholdConfirmError::Storage {
+            source: lifecycle_storage_error(state_dir, error),
+            stage: "accept_household.confirm.lifecycle",
+        })?;
+    if guard
+        .teardown_breadcrumb_exists()
+        .map_err(|error| AcceptHouseholdConfirmError::Storage {
+            source: lifecycle_storage_error(state_dir, error),
+            stage: "accept_household.confirm.lifecycle",
+        })?
+    {
+        return Err(AcceptHouseholdConfirmError::Storage {
+            source: lifecycle_storage_error(
+                state_dir,
+                HouseholdLifecycleLockError::RecoveryRequired,
+            ),
+            stage: "accept_household.confirm.lifecycle",
+        });
+    }
+    confirm_accept_household_impl(guard, state_dir, m_id, machine_cert, challenge_sig, policy)
+}
+
+fn confirm_accept_household_impl(
+    guard: &LifecycleWriteGuard,
     state_dir: &Path,
     m_id: &MachineId,
     machine_cert: MachineCert,
@@ -958,6 +1228,12 @@ pub fn confirm_accept_household(
     let cert_bytes = crate::cbor::to_canonical_vec(&machine_cert)?;
     let mut marker_bytes = pending.m_id.to_string().into_bytes();
     marker_bytes.push(b'\n');
+    guard
+        .reserve_household_install_generation()
+        .map_err(|error| AcceptHouseholdConfirmError::Storage {
+            source: lifecycle_storage_error(state_dir, error),
+            stage: "accept_household.confirm.rotate_generation",
+        })?;
     let staged = storage::stage_commit_files(&[
         (household_record_path(state_dir), record_bytes),
         (

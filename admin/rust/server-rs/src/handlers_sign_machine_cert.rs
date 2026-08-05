@@ -1,5 +1,6 @@
 //! `POST /api/v1/household/sign-machine-cert` handler.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{
@@ -12,6 +13,7 @@ use axum::{
 };
 use household_rs::bootstrap_error::BootstrapErrorCode;
 use household_rs::caveats::Operation;
+use household_rs::household_lifecycle::{HouseholdLifecycleLock, LifecycleReadGuard};
 use household_rs::ids::{MachineId, derive_machine_id};
 use household_rs::keys::P256PublicKey;
 use household_rs::machine_cert::{MachineCert, Platform, SignOptions};
@@ -31,6 +33,7 @@ const CBOR_CONTENT_TYPE: &str = "application/cbor";
 pub struct SignMachineCertRouterState {
     pub household: HouseholdState,
     pub event_log: Arc<OwnerEventLog>,
+    pub state_dir: PathBuf,
 }
 
 pub fn sign_machine_cert_router(state: SignMachineCertRouterState) -> Router {
@@ -127,6 +130,15 @@ pub async fn sign_machine_cert_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let lifecycle_guard = match acquire_lifecycle_read(state.state_dir.clone()).await {
+        Ok(guard) => guard,
+        Err(()) => {
+            return cbor_error(
+                StatusCode::CONFLICT,
+                BootstrapErrorCode::HouseholdNotInitialized.as_str(),
+            );
+        }
+    };
     let Some(now) = time_util::unix_now_secs_checked("sign_machine_cert.clock") else {
         return cbor_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -292,18 +304,29 @@ pub async fn sign_machine_cert_handler(
         }
     };
 
-    if let Err(e) = state.event_log.append(
-        identity.cert.m_id.as_str(),
-        identity.m_priv.as_ref(),
-        OwnerEventType::SignMachineCertForProxy,
-        OwnerEventPayload::SignMachineCertForProxy(SignMachineCertForProxyPayload {
-            actor_person_id: authorized.actor_person_id,
-            target_m_id: m_id.to_string(),
-            joined_at: now,
-            hostname: req.subject.hostname,
-            platform: req.subject.platform,
-        }),
-    ) {
+    let append_log = Arc::clone(&state.event_log);
+    let append_identity = Arc::clone(&identity);
+    let append_result = tokio::task::spawn_blocking(move || {
+        append_log.append(
+            &lifecycle_guard,
+            append_identity.cert.m_id.as_str(),
+            append_identity.m_priv.as_ref(),
+            OwnerEventType::SignMachineCertForProxy,
+            OwnerEventPayload::SignMachineCertForProxy(SignMachineCertForProxyPayload {
+                actor_person_id: authorized.actor_person_id,
+                target_m_id: m_id.to_string(),
+                joined_at: now,
+                hostname: req.subject.hostname,
+                platform: req.subject.platform,
+            }),
+        )
+    })
+    .await;
+    if let Err(e) = append_result.unwrap_or_else(|join_error| {
+        Err(household_rs::owner_events::EventError::Cbor(format!(
+            "append worker failed: {join_error}"
+        )))
+    }) {
         tracing::error!(stage = "sign_machine_cert.audit_append_failed", error = %e);
         return cbor_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -315,9 +338,18 @@ pub async fn sign_machine_cert_handler(
         version: 1,
         machine_cert: ByteBuf::from(machine_cert),
         challenge_signature: ByteBuf::from(challenge_signature.as_bytes().to_vec()),
-        m_id: m_id.to_string(),
+        m_id: derived_m_id.to_string(),
         joined_at: now,
     })
+}
+
+async fn acquire_lifecycle_read(state_dir: PathBuf) -> Result<LifecycleReadGuard, ()> {
+    tokio::task::spawn_blocking(move || {
+        let lifecycle = HouseholdLifecycleLock::open_verified(&state_dir).map_err(|_| ())?;
+        lifecycle.lock_shared().map_err(|_| ())
+    })
+    .await
+    .map_err(|_| ())?
 }
 
 fn valid_hostname(hostname: &str) -> bool {

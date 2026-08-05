@@ -11,6 +11,7 @@
 //! - `GET  /health`                           — liveness probe (T010)
 //! - `POST /api/v1/household/reachability/echo` — Ready-only diagnostic echo
 
+use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -30,11 +31,13 @@ use household_rs::HouseholdAuthState;
 use household_rs::MachineCert;
 use household_rs::bootstrap::{
     AcceptHouseholdConfirmError, AcceptHouseholdPrepareOpts, BootstrapOpts, KeyBackingPolicy,
-    bootstrap_or_load, confirm_accept_household, load_pending_accept_household,
-    prepare_accept_household,
+    bootstrap_or_load_under_lifecycle, confirm_accept_household_under_lifecycle,
+    load_pending_accept_household, prepare_accept_household_under_lifecycle,
+    recover_interrupted_household_teardown_under_lifecycle,
 };
 use household_rs::bootstrap_error::BootstrapErrorCode;
 use household_rs::bootstrap_state::{self, BootstrapState};
+use household_rs::household_lifecycle::{HouseholdLifecycleLock, LifecycleWriteGuard};
 use household_rs::household_record::validate_household_name;
 use household_rs::ids::{HouseholdId, MachineId, derive_household_id};
 use household_rs::keys::{P256PublicKey, P256Signature, verify_signature};
@@ -47,6 +50,164 @@ use tokio::time::Duration;
 use tracing::info;
 
 use crate::household_state::{HouseholdState, SharedHouseholdIdentity};
+
+const HOUSEHOLD_LIFECYCLE_HANDLER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[derive(Debug)]
+enum HouseholdTeardownDiskOutcome {
+    /// This call detached the installed household. Cleanup is deliberately
+    /// returned to the async caller and may start only after the bootstrap
+    /// state has been committed durably.
+    Detached { guard: LifecycleWriteGuard },
+    /// A prior process already detached the household and died before it
+    /// could finish the durable state transition and cleanup. This call
+    /// completed that recovery under the lifecycle-exclusive lock.
+    Recovered { guard: LifecycleWriteGuard },
+    /// The household rename may already be visible, but a later durability
+    /// barrier or the `Uninitialized` commit failed. Rollback is forbidden:
+    /// the caller must publish a fail-closed runtime, retain the guard until
+    /// deterministic shutdown, and let restart recovery finish the breadcrumb.
+    DetachedNeedsRecovery {
+        guard: LifecycleWriteGuard,
+        error: io::Error,
+    },
+}
+
+fn lifecycle_io(stage: &'static str, error: impl std::fmt::Display) -> io::Error {
+    io::Error::other(format!("{stage}: {error}"))
+}
+
+fn persist_uninitialized_durably(
+    guard: &LifecycleWriteGuard,
+    state_dir: &std::path::Path,
+) -> io::Result<()> {
+    bootstrap_state::persist(state_dir, BootstrapState::Uninitialized)
+        .map_err(|error| lifecycle_io("persist bootstrap state", error))?;
+
+    // Keep the lifecycle contract explicit at its call site: the state-file
+    // rename and the household rename must both be durable before cleanup can
+    // erase the breadcrumb. This barrier must not become an accidental side
+    // effect of an unrelated writer during a later refactor.
+    guard
+        .sync_state_root()
+        .map_err(|error| lifecycle_io("fsync state root after bootstrap state", error))
+}
+
+/// Finish a teardown that crashed after installing
+/// `household.tearing-down/`.
+///
+/// Caller must hold the state-root lifecycle lock exclusively. Persisting
+/// `Uninitialized` comes before recursive cleanup, so a cleanup that succeeds
+/// can never erase the only recovery breadcrumb while the durable bootstrap
+/// state still names a live household.
+fn acquire_recovered_lifecycle_exclusive(
+    state_dir: &std::path::Path,
+) -> io::Result<(LifecycleWriteGuard, bool)> {
+    let lifecycle = HouseholdLifecycleLock::open_verified(state_dir)
+        .map_err(|error| lifecycle_io("open household lifecycle lock", error))?;
+    let deadline = Instant::now()
+        .checked_add(HOUSEHOLD_LIFECYCLE_HANDLER_TIMEOUT)
+        .ok_or_else(|| io::Error::other("household lifecycle deadline overflow"))?;
+    let guard = lifecycle
+        .lock_exclusive_until(deadline)
+        .map_err(|error| lifecycle_io("acquire household lifecycle exclusive", error))?;
+    let recovered = recover_interrupted_household_teardown_under_lifecycle(&guard, state_dir)
+        .map_err(|error| lifecycle_io("recover interrupted household teardown", error))?;
+    Ok((guard, recovered))
+}
+
+fn verify_installed_household_for_teardown(
+    state_dir: &std::path::Path,
+    expected_hh_id: &str,
+    expected_m_id: &str,
+) -> io::Result<()> {
+    let record: household_rs::HouseholdRecord = household_rs::storage::read_optional_cbor(
+        &household_rs::storage::household_record_path(state_dir),
+    )
+    .map_err(|error| lifecycle_io("load household record for teardown recheck", error))?
+    .ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "household record disappeared before teardown",
+        )
+    })?;
+    if record.hh_id.as_str() != expected_hh_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "installed household changed before teardown",
+        ));
+    }
+
+    let cert = household_rs::machine_cert::load_self_cert(state_dir)
+        .map_err(|error| lifecycle_io("load machine cert for teardown recheck", error))?
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "machine cert disappeared before teardown",
+            )
+        })?;
+    if cert.m_id.as_str() != expected_m_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "installed machine identity changed before teardown",
+        ));
+    }
+    Ok(())
+}
+
+/// Cross-process household teardown transaction.
+///
+/// Lock order is the server's process-local `BOOTSTRAP_MUTATION_LOCK` (held by
+/// the caller) followed by this state-root lifecycle-exclusive lock. This
+/// function never acquires the ledger lock: taking exclusive has already
+/// drained every ledger transaction that acquired lifecycle-shared first.
+fn teardown_household_on_disk(
+    state_dir: &std::path::Path,
+    expected_hh_id: &str,
+    expected_m_id: &str,
+) -> io::Result<HouseholdTeardownDiskOutcome> {
+    let (guard, recovered) = acquire_recovered_lifecycle_exclusive(state_dir)?;
+    if recovered {
+        return Ok(HouseholdTeardownDiskOutcome::Recovered { guard });
+    }
+
+    if !guard
+        .household_exists()
+        .map_err(|error| lifecycle_io("inspect installed household", error))?
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "installed household is absent and no teardown breadcrumb exists",
+        ));
+    }
+    verify_installed_household_for_teardown(state_dir, expected_hh_id, expected_m_id)?;
+
+    match guard.rename_household_to_tearing_down() {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "installed household disappeared before teardown rename",
+            ));
+        }
+        Err(error) => {
+            // `renameat` may have installed the breadcrumb before the parent
+            // fsync reported failure. Once the rename was attempted there is
+            // no sound rollback classification, so preserve the retained
+            // guard and force the runtime into the same fail-closed path as a
+            // definitely detached household.
+            return Ok(HouseholdTeardownDiskOutcome::DetachedNeedsRecovery {
+                guard,
+                error: lifecycle_io("rename and fsync installed household", error),
+            });
+        }
+    }
+    if let Err(error) = persist_uninitialized_durably(&guard, state_dir) {
+        return Ok(HouseholdTeardownDiskOutcome::DetachedNeedsRecovery { guard, error });
+    }
+
+    Ok(HouseholdTeardownDiskOutcome::Detached { guard })
+}
 
 /// Diagnostic reachability endpoint shared by the daemon and its peer probe.
 pub const REACHABILITY_ECHO_PATH: &str = "/api/v1/household/reachability/echo";
@@ -837,6 +998,51 @@ pub async fn post_pair_machine_local_stage(
         let _mutation_guard = crate::bootstrap_mutation_lock::BOOTSTRAP_MUTATION_LOCK
             .lock()
             .await;
+        let lifecycle_state_dir = state.state_dir.clone();
+        let (lifecycle_guard, recovered) = match tokio::task::spawn_blocking(move || {
+            acquire_recovered_lifecycle_exclusive(&lifecycle_state_dir)
+        })
+        .await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => {
+                tracing::error!(
+                    stage = "pair_machine.local.stage.lifecycle_failed",
+                    error = %error,
+                );
+                return cbor_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    BootstrapErrorCode::InternalError.as_str(),
+                    None,
+                    None,
+                );
+            }
+            Err(error) => {
+                tracing::error!(
+                    stage = "pair_machine.local.stage.lifecycle_worker_failed",
+                    error = %error,
+                );
+                return cbor_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    BootstrapErrorCode::InternalError.as_str(),
+                    None,
+                    None,
+                );
+            }
+        };
+        if recovered {
+            // Recovery durably selected Uninitialized. Publish that selection
+            // while the same lifecycle exclusive remains live, but fail this
+            // request so it cannot continue from a pre-recovery state check.
+            state.household.clear().await;
+            *state.bootstrap.write().await = BootstrapState::Uninitialized;
+            return cbor_error(
+                StatusCode::CONFLICT,
+                "stage_failed",
+                None,
+                Some(BootstrapState::Uninitialized.as_str()),
+            );
+        }
         let current_bs = *state.bootstrap.read().await;
         match current_bs {
             BootstrapState::Uninitialized | BootstrapState::ReadyForNaming => {}
@@ -854,13 +1060,15 @@ pub async fn post_pair_machine_local_stage(
                 );
             }
         }
-        crate::pair_machine_local::stage(
+        let result = crate::pair_machine_local::stage(
             &state.state_dir,
             Arc::clone(&state.pair_machine_window),
             transport,
             key_policy,
         )
-        .await
+        .await;
+        drop(lifecycle_guard);
+        result
     };
 
     match stage_result {
@@ -1296,7 +1504,10 @@ pub async fn get_bootstrap_pair_device_uri(
 
     // Gate 3 — identity must be loaded in memory.
     let Some(identity) = state.household.current().await else {
-        tracing::warn!(stage = "pair_device.uri.rejected", reason = "identity_unavailable");
+        tracing::warn!(
+            stage = "pair_device.uri.rejected",
+            reason = "identity_unavailable"
+        );
         return cbor_error(
             StatusCode::NOT_FOUND,
             BootstrapErrorCode::IdentityUnavailable.as_str(),
@@ -1311,7 +1522,10 @@ pub async fn get_bootstrap_pair_device_uri(
     // memory yet must still fail closed. Both halves run under the mutation
     // lock taken above, so a confirm cannot land between them and the mint.
     if state.household.current_owner_auth().await.is_some() {
-        tracing::warn!(stage = "pair_device.uri.rejected", reason = "owner_already_paired");
+        tracing::warn!(
+            stage = "pair_device.uri.rejected",
+            reason = "owner_already_paired"
+        );
         return cbor_error(
             StatusCode::NOT_FOUND,
             BootstrapErrorCode::AlreadyPaired.as_str(),
@@ -1744,12 +1958,23 @@ pub async fn post_teardown(State(state): State<BootstrapHandlerState>, body: Byt
         }
     }
 
-    // Step 10: Atomic household dir teardown — rename then async rm -rf.
-    let hh_dir = household_rs::storage::household_dir(&state.state_dir);
-    let tearing_down = state.state_dir.join("household.tearing-down");
-    if hh_dir.exists() {
-        if let Err(e) = std::fs::rename(&hh_dir, &tearing_down) {
-            tracing::error!(stage = "teardown.rename_failed", error = %e);
+    // Steps 10-11: drain lifecycle-shared ledger transactions, re-check the
+    // installed disk identity under lifecycle-exclusive, detach the household,
+    // fsync the state-root rename, and durably persist Uninitialized. All
+    // blocking flock/filesystem work stays off the async executor. Recursive
+    // cleanup is intentionally scheduled only after this transaction returns:
+    // the breadcrumb must survive every failure before durable Uninitialized.
+    let teardown_state_dir = state.state_dir.clone();
+    let teardown_hh_id = req.hh_id.clone();
+    let teardown_m_id = req.m_id.clone();
+    let disk_outcome = match tokio::task::spawn_blocking(move || {
+        teardown_household_on_disk(&teardown_state_dir, &teardown_hh_id, &teardown_m_id)
+    })
+    .await
+    {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(error)) => {
+            tracing::error!(stage = "teardown.disk_transaction_failed", error = %error);
             return cbor_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 BootstrapErrorCode::InternalError.as_str(),
@@ -1757,20 +1982,78 @@ pub async fn post_teardown(State(state): State<BootstrapHandlerState>, body: Byt
                 None,
             );
         }
-        let td = tearing_down.clone();
-        tokio::spawn(async move {
-            if let Err(e) = tokio::fs::remove_dir_all(&td).await {
-                tracing::warn!(stage = "teardown.rmrf_failed", error = %e, path = ?td);
-            }
-        });
+        Err(error) => {
+            tracing::error!(stage = "teardown.disk_task_failed", error = %error);
+            return cbor_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                BootstrapErrorCode::InternalError.as_str(),
+                None,
+                None,
+            );
+        }
+    };
+
+    let (cleanup_required, needs_recovery, lifecycle_guard) = match disk_outcome {
+        HouseholdTeardownDiskOutcome::Detached { guard } => (true, None, guard),
+        HouseholdTeardownDiskOutcome::Recovered { guard } => (false, None, guard),
+        HouseholdTeardownDiskOutcome::DetachedNeedsRecovery { guard, error } => {
+            (false, Some(error), guard)
+        }
+    };
+
+    // Clear and publish Uninitialized while the same cross-process exclusive
+    // guard still protects the just-committed disk transition. Releasing the
+    // guard earlier would let another process install a new household and
+    // then have this process erase the new authority from shared memory.
+    state.household.clear().await;
+    *state.bootstrap.write().await = BootstrapState::Uninitialized;
+    // Pairing windows are authority producers too. Close their in-memory
+    // surfaces before any response or guard release; persistence may fail for
+    // the now-stale generation, but both methods clear memory first.
+    if let Err(error) = state
+        .pair_device_window
+        .close_under_lifecycle(&lifecycle_guard)
+        .await
+    {
+        tracing::warn!(
+            stage = "teardown.pair_device_close_failed",
+            error = %error,
+            hint = "runtime household authority is already cleared; retained lifecycle-exclusive prevents stale persistence",
+        );
+    }
+    if let Err(error) = state
+        .pair_machine_window
+        .under_lifecycle(&lifecycle_guard)
+        .return_to_idle()
+        .await
+    {
+        tracing::warn!(
+            stage = "teardown.pair_machine_close_failed",
+            error = %error,
+            hint = "in-memory window is idle; stale-generation persistence was refused",
+        );
     }
     crate::setup_invitation::clear_persisted_invitation(&state.state_dir);
 
-    // Step 11: Persist bootstrap state = uninitialized. If persist fails, return
-    // 500 and leave `household.tearing-down/` as a recovery breadcrumb — on next
-    // boot the engine detects it and completes the teardown (R5-F).
-    if let Err(e) = bootstrap_state::persist(&state.state_dir, BootstrapState::Uninitialized) {
-        tracing::error!(stage = "teardown.state_persist_failed", error = %e);
+    if let Some(error) = needs_recovery {
+        tracing::error!(
+            stage = "teardown.detached_needs_recovery",
+            error = %error,
+            hint = "runtime authority cleared; retaining lifecycle guard until fail-stop; restart recovery must finish the breadcrumb",
+        );
+        // A post-rename failure is never a normal 500 followed by continued
+        // service. Keep the exclusive guard live until deterministic process
+        // termination so no replacement household can be installed beneath
+        // this old process. Tests cannot call `process::exit`; dropping there
+        // still leaves every runtime authority surface fail-closed.
+        #[cfg(not(test))]
+        tokio::spawn(async move {
+            let _retained_guard = lifecycle_guard;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            std::process::exit(1);
+        });
+        #[cfg(test)]
+        drop(lifecycle_guard);
         return cbor_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             BootstrapErrorCode::InternalError.as_str(),
@@ -1779,10 +2062,25 @@ pub async fn post_teardown(State(state): State<BootstrapHandlerState>, body: Byt
         );
     }
 
-    // Clear in-memory identity so no stale cert material is reachable after
-    // teardown (R5-B). Do this before flipping the state flag.
-    state.household.clear().await;
-    *state.bootstrap.write().await = BootstrapState::Uninitialized;
+    if cleanup_required {
+        let cleanup_state_dir = state.state_dir.clone();
+        // Move, rather than release, the exclusive guard into the blocking
+        // cleanup worker. The fixed breadcrumb name cannot undergo an ABA
+        // cycle while this old cleanup is delayed: no recovery/install/second
+        // teardown can acquire lifecycle-exclusive until remove+root-fsync or
+        // a reported cleanup failure releases this exact guard.
+        let _cleanup = tokio::task::spawn_blocking(move || {
+            if let Err(error) = lifecycle_guard.remove_tearing_down() {
+                tracing::warn!(
+                    stage = "teardown.rmrf_failed",
+                    error = %error,
+                    path = ?cleanup_state_dir.join("household.tearing-down")
+                );
+            }
+        });
+    } else {
+        drop(lifecycle_guard);
+    }
 
     // Steps 12-13 bridge: schedule process exit so listener unbind + Bonjour
     // revert happen automatically on next boot. Exit is delayed 100 ms to allow
@@ -1939,8 +2237,11 @@ pub async fn post_accept_household(
     let state_dir = state.state_dir.clone();
     let hh_name = req.hh_name.clone();
     let policy = KeyBackingPolicy::from_env();
-    let prepared = match tokio::task::spawn_blocking(move || {
-        prepare_accept_household(
+    let (prepared, lifecycle_guard) = match tokio::task::spawn_blocking(move || {
+        let (guard, _) = acquire_recovered_lifecycle_exclusive(&state_dir)
+            .map_err(|error| lifecycle_io("accept-household lifecycle", error))?;
+        let prepared = prepare_accept_household_under_lifecycle(
+            &guard,
             &state_dir,
             AcceptHouseholdPrepareOpts {
                 household_name: hh_name,
@@ -1950,10 +2251,15 @@ pub async fn post_accept_household(
             },
             policy,
         )
+        .map_err(|error| lifecycle_io("prepare accept-household", error))?;
+        guard
+            .sync_state_root()
+            .map_err(|error| lifecycle_io("fsync prepared accept-household", error))?;
+        Ok::<_, io::Error>((prepared, guard))
     })
     .await
     {
-        Ok(Ok(prepared)) => prepared,
+        Ok(Ok(result)) => result,
         Ok(Err(e)) => {
             tracing::error!(stage = "bootstrap.accept_household_failed", error = %e);
             crate::setup_invitation::cache_reinsert_if_absent(
@@ -1988,6 +2294,7 @@ pub async fn post_accept_household(
         let mut bs = state.bootstrap.write().await;
         *bs = BootstrapState::ReadyForNaming;
     }
+    drop(lifecycle_guard);
 
     tracing::info!(
         stage = "bootstrap.accept_household.prepared",
@@ -2069,6 +2376,15 @@ pub async fn post_accept_household_confirm(
     State(state): State<BootstrapHandlerState>,
     body: Bytes,
 ) -> Response {
+    enum ConfirmDiskError {
+        Lifecycle(io::Error),
+        Confirm(AcceptHouseholdConfirmError),
+    }
+    enum ConfirmDiskOutcome {
+        Confirmed(Box<household_rs::LoadedIdentity>, LifecycleWriteGuard),
+        Recovered(LifecycleWriteGuard),
+    }
+
     let _guard = crate::bootstrap_mutation_lock::BOOTSTRAP_MUTATION_LOCK
         .lock()
         .await;
@@ -2151,13 +2467,60 @@ pub async fn post_accept_household_confirm(
 
     let state_dir = state.state_dir.clone();
     let policy = KeyBackingPolicy::from_env();
-    let loaded = match tokio::task::spawn_blocking(move || {
-        confirm_accept_household(&state_dir, &m_id, machine_cert, &challenge_sig, policy)
+    let disk_outcome = match tokio::task::spawn_blocking(move || {
+        let (guard, recovered) = acquire_recovered_lifecycle_exclusive(&state_dir)
+            .map_err(ConfirmDiskError::Lifecycle)?;
+        if recovered {
+            return Ok::<_, ConfirmDiskError>(ConfirmDiskOutcome::Recovered(guard));
+        }
+        let loaded = confirm_accept_household_under_lifecycle(
+            &guard,
+            &state_dir,
+            &m_id,
+            machine_cert,
+            &challenge_sig,
+            policy,
+        )
+        .map_err(ConfirmDiskError::Confirm)?;
+        bootstrap_state::persist(&state_dir, BootstrapState::NamedAwaitingPair).map_err(
+            |error| {
+                ConfirmDiskError::Lifecycle(lifecycle_io(
+                    "persist accept-household named-awaiting-pair",
+                    error,
+                ))
+            },
+        )?;
+        guard.sync_state_root().map_err(|error| {
+            ConfirmDiskError::Lifecycle(lifecycle_io(
+                "fsync accept-household named-awaiting-pair",
+                error,
+            ))
+        })?;
+        let ready_generation = guard.lifecycle_generation().map_err(|error| {
+            ConfirmDiskError::Lifecycle(lifecycle_io(
+                "read accept-household lifecycle generation",
+                error,
+            ))
+        })?;
+        let ready_generation = ready_generation.ok_or_else(|| {
+            ConfirmDiskError::Lifecycle(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "accept-household lifecycle generation is absent",
+            ))
+        })?;
+        bootstrap_state::persist_ready_under_lifecycle(&guard, &state_dir, ready_generation)
+            .map_err(|error| {
+                ConfirmDiskError::Lifecycle(lifecycle_io(
+                    "persist accept-household ready",
+                    error,
+                ))
+            })?;
+        Ok::<_, ConfirmDiskError>(ConfirmDiskOutcome::Confirmed(Box::new(loaded), guard))
     })
     .await
     {
-        Ok(Ok(loaded)) => loaded,
-        Ok(Err(AcceptHouseholdConfirmError::PendingMissing)) => {
+        Ok(Ok(result)) => result,
+        Ok(Err(ConfirmDiskError::Confirm(AcceptHouseholdConfirmError::PendingMissing))) => {
             return cbor_error(
                 StatusCode::CONFLICT,
                 BootstrapErrorCode::AcceptHouseholdNotPending.as_str(),
@@ -2165,9 +2528,9 @@ pub async fn post_accept_household_confirm(
                 Some("ready_for_naming"),
             );
         }
-        Ok(Err(
+        Ok(Err(ConfirmDiskError::Confirm(
             AcceptHouseholdConfirmError::Mismatch(_) | AcceptHouseholdConfirmError::Crypto(_),
-        )) => {
+        ))) => {
             return cbor_error(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 BootstrapErrorCode::CryptoValidationFailed.as_str(),
@@ -2175,8 +2538,20 @@ pub async fn post_accept_household_confirm(
                 None,
             );
         }
-        Ok(Err(e)) => {
+        Ok(Err(ConfirmDiskError::Confirm(e))) => {
             tracing::error!(stage = "bootstrap.accept_household.confirm_failed", error = %e);
+            return cbor_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                BootstrapErrorCode::InternalError.as_str(),
+                None,
+                None,
+            );
+        }
+        Ok(Err(ConfirmDiskError::Lifecycle(e))) => {
+            tracing::error!(
+                stage = "bootstrap.accept_household.confirm_lifecycle_failed",
+                error = %e
+            );
             return cbor_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 BootstrapErrorCode::InternalError.as_str(),
@@ -2191,6 +2566,21 @@ pub async fn post_accept_household_confirm(
                 BootstrapErrorCode::InternalError.as_str(),
                 None,
                 None,
+            );
+        }
+    };
+
+    let (loaded, lifecycle_guard) = match disk_outcome {
+        ConfirmDiskOutcome::Confirmed(loaded, guard) => (*loaded, guard),
+        ConfirmDiskOutcome::Recovered(guard) => {
+            state.household.clear().await;
+            *state.bootstrap.write().await = BootstrapState::Uninitialized;
+            drop(guard);
+            return cbor_error(
+                StatusCode::CONFLICT,
+                BootstrapErrorCode::AcceptHouseholdNotPending.as_str(),
+                None,
+                Some(BootstrapState::Uninitialized.as_str()),
             );
         }
     };
@@ -2210,27 +2600,7 @@ pub async fn post_accept_household_confirm(
             );
         }
         *bs = BootstrapState::NamedAwaitingPair;
-        if let Err(e) =
-            bootstrap_state::persist(&state.state_dir, BootstrapState::NamedAwaitingPair)
-        {
-            tracing::error!(stage = "bootstrap.accept_household.state_persist_failed", error = %e);
-            return cbor_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                BootstrapErrorCode::InternalError.as_str(),
-                None,
-                None,
-            );
-        }
         *bs = BootstrapState::Ready;
-        if let Err(e) = bootstrap_state::persist(&state.state_dir, BootstrapState::Ready) {
-            tracing::error!(stage = "bootstrap.accept_household.state_persist_failed", error = %e);
-            return cbor_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                BootstrapErrorCode::InternalError.as_str(),
-                None,
-                None,
-            );
-        }
     }
 
     let hh_id = loaded.record.hh_id.to_string();
@@ -2239,6 +2609,7 @@ pub async fn post_accept_household_confirm(
         .household
         .set_loaded(SharedHouseholdIdentity::new(loaded))
         .await;
+    drop(lifecycle_guard);
 
     tracing::info!(
         stage = "bootstrap.accept_household.ready",
@@ -2380,12 +2751,22 @@ pub async fn post_initialize(
     };
     let policy = KeyBackingPolicy::from_env();
     let t_keygen = Instant::now();
-    let loaded = match tokio::task::spawn_blocking(move || {
-        bootstrap_or_load(&state_dir, opts, policy)
+    let (loaded, m_cert_fp, lifecycle_guard) = match tokio::task::spawn_blocking(move || {
+        let (guard, _) = acquire_recovered_lifecycle_exclusive(&state_dir)?;
+        let loaded = bootstrap_or_load_under_lifecycle(&guard, &state_dir, opts, policy)
+            .map_err(|error| lifecycle_io("bootstrap identity under lifecycle", error))?;
+        let m_cert_fp = household_rs::machine_cert::fingerprint(&loaded.cert)
+            .map_err(|error| lifecycle_io("fingerprint bootstrap machine cert", error))?;
+        bootstrap_state::persist(&state_dir, BootstrapState::NamedAwaitingPair)
+            .map_err(|error| lifecycle_io("persist named-awaiting-pair", error))?;
+        guard
+            .sync_state_root()
+            .map_err(|error| lifecycle_io("fsync named-awaiting-pair state", error))?;
+        Ok::<_, io::Error>((loaded, m_cert_fp, guard))
     })
     .await
     {
-        Ok(Ok(id)) => id,
+        Ok(Ok(result)) => result,
         Ok(Err(e)) => {
             tracing::error!(stage = "bootstrap.initialize_failed", error = %e);
             return cbor_error(
@@ -2415,34 +2796,12 @@ pub async fn post_initialize(
     let name_persisted = loaded.record.name.clone();
     let machine_id = loaded.cert.m_id.to_string();
 
-    // Fingerprint the cert this bootstrap just validated, before any of the
-    // state transitions below. An encode failure here is a fault, not an
-    // absence: the identity exists and was validated, so it cannot be folded
-    // into "no QR this time". Returning early leaves the install inert —
-    // nothing persisted as NamedAwaitingPair, nothing published to shared
-    // state, no window minted — instead of reporting success with a hollow
-    // `pair_qr_uri` and a machine already advanced past bootstrap.
-    let m_cert_fp = match household_rs::machine_cert::fingerprint(&loaded.cert) {
-        Ok(fp) => fp,
-        Err(e) => {
-            tracing::error!(stage = "bootstrap.m_cert_fp_failed", error = %e);
-            return cbor_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                BootstrapErrorCode::InternalError.as_str(),
-                None,
-                None,
-            );
-        }
-    };
-
-    // 5. Advance bootstrap state to named_awaiting_pair.
+    // 5. Publish the already-durable state in memory while lifecycle-exclusive
+    // is still live. A competing process cannot teardown or install between
+    // the on-disk identity/state transaction and this publication.
     {
         let mut bs = state.bootstrap.write().await;
         *bs = BootstrapState::NamedAwaitingPair;
-        let state_dir = state.state_dir.clone();
-        if let Err(e) = bootstrap_state::persist(&state_dir, BootstrapState::NamedAwaitingPair) {
-            tracing::error!(stage = "bootstrap.state_persist_failed", error = %e);
-        }
     }
 
     // 6. Update HouseholdState in memory.
@@ -2478,6 +2837,11 @@ pub async fn post_initialize(
         // Pre-existing degradation for a bad household key, unchanged.
         Err(_) => String::new(),
     };
+    // The pair-window snapshot belongs to the just-installed household. Keep
+    // lifecycle-exclusive through its persistence and URI construction so a
+    // teardown cannot detach A and let this mint write into A's breadcrumb (or
+    // race a replacement household) after A was published in memory.
+    drop(lifecycle_guard);
 
     // u128→u64 truncation impossible in practice (u64 covers ~585 millennia).
     #[allow(clippy::cast_possible_truncation)]
@@ -2533,7 +2897,7 @@ pub async fn post_initialize(
 async fn hh_info(household: &HouseholdState, state: BootstrapState) -> (Option<String>, u32) {
     match state {
         BootstrapState::Uninitialized | BootstrapState::ReadyForNaming => (None, 0),
-        BootstrapState::NamedAwaitingPair => {
+        BootstrapState::NamedAwaitingPair | BootstrapState::PairMachineInstallRestartRequired => {
             let hh_id = household
                 .current()
                 .await
@@ -2695,6 +3059,405 @@ mod m_cert_fp_ordering_guard {
                 fp < at,
                 "post_initialize: fingerprint must be resolved before `{later}`"
             );
+        }
+    }
+
+    #[test]
+    fn post_initialize_holds_lifecycle_through_pair_window_persistence() {
+        let source = include_str!("handlers_bootstrap.rs");
+        let body = fn_body(source, "post_initialize");
+        let mint = unique_offset(&body, "mint_token(", "post_initialize");
+        let uri = unique_offset(&body, "token.to_uri_with_host_and_name(", "post_initialize");
+        let release = unique_offset(&body, "drop(lifecycle_guard);", "post_initialize");
+        assert!(
+            mint < uri && uri < release,
+            "post_initialize must retain lifecycle-exclusive until the pair-window snapshot and QR URI are complete"
+        );
+    }
+
+    #[test]
+    fn pair_machine_stage_holds_lifecycle_through_window_and_key_persistence() {
+        let source = include_str!("handlers_bootstrap.rs");
+        let body = fn_body(source, "post_pair_machine_local_stage");
+        let acquire = unique_offset(
+            &body,
+            "acquire_recovered_lifecycle_exclusive(",
+            "post_pair_machine_local_stage",
+        );
+        let stage = unique_offset(
+            &body,
+            "crate::pair_machine_local::stage(",
+            "post_pair_machine_local_stage",
+        );
+        let release = unique_offset(
+            &body,
+            "drop(lifecycle_guard);",
+            "post_pair_machine_local_stage",
+        );
+        assert!(
+            acquire < stage && stage < release,
+            "pair-machine stage must retain lifecycle-exclusive through all window/key persistence"
+        );
+    }
+}
+
+#[cfg(test)]
+mod household_teardown_lifecycle_tests {
+    use super::*;
+    use household_rs::machine_cert::SignOptions;
+    use household_rs::{HouseholdRecord, IdentityKey, P256Keypair, Platform};
+    use std::sync::mpsc;
+    use std::time::Duration as StdDuration;
+
+    const CRASH_STAGE_ENV: &str = "THEYOS_TEST_HOUSEHOLD_TEARDOWN_CRASH_STAGE";
+    const CRASH_STATE_DIR_ENV: &str = "THEYOS_TEST_HOUSEHOLD_TEARDOWN_STATE_DIR";
+    const CRASH_HH_ID_ENV: &str = "THEYOS_TEST_HOUSEHOLD_TEARDOWN_HH_ID";
+    const CRASH_M_ID_ENV: &str = "THEYOS_TEST_HOUSEHOLD_TEARDOWN_M_ID";
+    const CRASH_EXIT: i32 = 73;
+
+    fn installed_household() -> (tempfile::TempDir, String, String) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path();
+        let household_key = P256Keypair::generate();
+        let machine_key = P256Keypair::generate();
+        let hh_pub = household_key.public();
+        let hh_id = household_rs::derive_household_id(&hh_pub);
+        let m_pub = machine_key.public();
+        let m_id = household_rs::derive_machine_id(&m_pub);
+        let record = HouseholdRecord {
+            version: HouseholdRecord::SCHEMA_VERSION,
+            hh_id: hh_id.clone(),
+            hh_pub,
+            name: "Lifecycle Test Home".into(),
+            created_at: 1,
+            shamir_k: 1,
+            shamir_n: 1,
+            members: vec![m_id.clone()],
+            is_follower: false,
+        };
+        let cert = household_rs::MachineCert::sign(
+            &household_key as &dyn IdentityKey,
+            &m_pub,
+            &SignOptions {
+                hh_id: hh_id.clone(),
+                hostname: "lifecycle-test".into(),
+                platform: Platform::Macos,
+                joined_at: 1,
+            },
+        )
+        .expect("machine cert");
+
+        std::fs::create_dir_all(household_rs::storage::household_dir(state_dir))
+            .expect("household dir");
+        household_rs::storage::atomic_write_cbor(
+            &household_rs::storage::household_record_path(state_dir),
+            &record,
+        )
+        .expect("household record");
+        household_rs::machine_cert::save_self_cert(state_dir, &cert).expect("self cert");
+        let lifecycle = HouseholdLifecycleLock::open_verified(state_dir).expect("lifecycle");
+        let guard = lifecycle.lock_exclusive().expect("lifecycle guard");
+        let generation = guard
+            .ensure_lifecycle_generation()
+            .expect("lifecycle generation");
+        bootstrap_state::persist_ready_under_lifecycle(&guard, state_dir, generation)
+            .expect("bootstrap state");
+
+        (temp, hh_id.to_string(), m_id.to_string())
+    }
+
+    #[test]
+    fn lifecycle_shared_must_drain_before_teardown_can_rename() {
+        let (temp, hh_id, m_id) = installed_household();
+        let state_dir = temp.path().to_path_buf();
+        let lifecycle = HouseholdLifecycleLock::open_verified(&state_dir).expect("lifecycle");
+        let shared = lifecycle.lock_shared().expect("shared");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker_state_dir = state_dir.clone();
+
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).expect("started");
+            let result = teardown_household_on_disk(&worker_state_dir, &hh_id, &m_id);
+            done_tx.send(result).expect("done");
+        });
+        started_rx.recv().expect("worker started");
+        assert!(
+            done_rx.recv_timeout(StdDuration::from_millis(100)).is_err(),
+            "teardown acquired exclusive while a lifecycle-shared operation was live"
+        );
+        assert!(
+            household_rs::storage::household_dir(&state_dir).is_dir(),
+            "household was renamed before the shared operation drained"
+        );
+
+        drop(shared);
+        assert!(matches!(
+            done_rx
+                .recv_timeout(StdDuration::from_secs(5))
+                .expect("teardown did not finish after shared dropped")
+                .expect("teardown transaction"),
+            HouseholdTeardownDiskOutcome::Detached { .. }
+        ));
+        worker.join().expect("worker join");
+        assert!(!household_rs::storage::household_dir(&state_dir).exists());
+        assert_eq!(
+            bootstrap_state::load(&state_dir).expect("load state"),
+            BootstrapState::Uninitialized
+        );
+    }
+
+    #[test]
+    fn detached_cleanup_guard_blocks_next_lifecycle_writer_until_cleanup_fsync() {
+        let (temp, hh_id, m_id) = installed_household();
+        let state_dir = temp.path().to_path_buf();
+        let guard = match teardown_household_on_disk(&state_dir, &hh_id, &m_id)
+            .expect("detach household")
+        {
+            HouseholdTeardownDiskOutcome::Detached { guard } => guard,
+            HouseholdTeardownDiskOutcome::Recovered { .. } => panic!("fresh fixture recovered"),
+            HouseholdTeardownDiskOutcome::DetachedNeedsRecovery { error, .. } => {
+                panic!("fresh fixture became indeterminate: {error}")
+            }
+        };
+        let contender_dir = state_dir.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let contender = std::thread::spawn(move || {
+            let lifecycle =
+                HouseholdLifecycleLock::open_verified(&contender_dir).expect("contender open");
+            started_tx.send(()).expect("started");
+            let _next = lifecycle.lock_exclusive().expect("contender exclusive");
+            acquired_tx.send(()).expect("acquired");
+        });
+        started_rx.recv().expect("contender started");
+        assert!(
+            acquired_rx
+                .recv_timeout(StdDuration::from_millis(100))
+                .is_err(),
+            "a second lifecycle writer entered while the detached cleanup guard was live"
+        );
+
+        assert!(guard.remove_tearing_down().expect("cleanup + root fsync"));
+        drop(guard);
+        acquired_rx
+            .recv_timeout(StdDuration::from_secs(5))
+            .expect("contender stayed blocked after cleanup guard dropped");
+        contender.join().expect("contender join");
+    }
+
+    #[test]
+    fn failed_state_persist_keeps_breadcrumb_and_retry_recovers_it() {
+        let (temp, hh_id, m_id) = installed_household();
+        let state_dir = temp.path();
+        // `bootstrap_state::persist` writes `identity.tmp`. A directory at
+        // that exact path deterministically fails the state commit after the
+        // household rename, modelling a crash/fault in that window.
+        let blocked_tmp = state_dir.join("identity.tmp");
+        std::fs::create_dir(&blocked_tmp).expect("block state tmp");
+
+        let (guard, error) = match teardown_household_on_disk(state_dir, &hh_id, &m_id)
+            .expect("post-rename failure must retain the lifecycle guard")
+        {
+            HouseholdTeardownDiskOutcome::DetachedNeedsRecovery { guard, error } => (guard, error),
+            HouseholdTeardownDiskOutcome::Detached { .. } => {
+                panic!("blocked state commit unexpectedly succeeded")
+            }
+            HouseholdTeardownDiskOutcome::Recovered { .. } => panic!("fresh fixture recovered"),
+        };
+        assert!(error.to_string().contains("persist bootstrap state"));
+        assert!(!household_rs::storage::household_dir(state_dir).exists());
+        assert!(state_dir.join("household.tearing-down").is_dir());
+        assert_eq!(
+            bootstrap_state::load(state_dir).expect("old state remains readable"),
+            BootstrapState::Ready
+        );
+
+        // The indeterminate path retains lifecycle-exclusive until the caller
+        // has removed every in-memory authority surface and initiated its
+        // deterministic fail-stop. A restart cannot recover beneath it.
+        let contender_dir = state_dir.to_path_buf();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let contender = std::thread::spawn(move || {
+            let lifecycle =
+                HouseholdLifecycleLock::open_verified(&contender_dir).expect("contender lifecycle");
+            let _write = lifecycle.lock_exclusive().expect("contender exclusive");
+            acquired_tx.send(()).expect("acquired");
+        });
+        assert!(
+            acquired_rx
+                .recv_timeout(StdDuration::from_millis(100))
+                .is_err(),
+            "post-rename failure released lifecycle authority before fail-close"
+        );
+
+        std::fs::remove_dir(&blocked_tmp).expect("unblock state tmp");
+        drop(guard);
+        acquired_rx
+            .recv_timeout(StdDuration::from_secs(5))
+            .expect("contender stayed blocked after retained guard dropped");
+        contender.join().expect("contender join");
+        assert!(matches!(
+            teardown_household_on_disk(state_dir, &hh_id, &m_id).expect("recover retry"),
+            HouseholdTeardownDiskOutcome::Recovered { .. }
+        ));
+        assert!(!state_dir.join("household.tearing-down").exists());
+        assert_eq!(
+            bootstrap_state::load(state_dir).expect("recovered state"),
+            BootstrapState::Uninitialized
+        );
+    }
+
+    #[test]
+    fn two_household_candidates_fail_closed_without_deleting_either() {
+        let (temp, hh_id, m_id) = installed_household();
+        let state_dir = temp.path();
+        std::fs::create_dir(state_dir.join("household.tearing-down")).expect("second candidate");
+
+        let error = teardown_household_on_disk(state_dir, &hh_id, &m_id)
+            .expect_err("ambiguous authority must fail closed");
+        assert!(
+            error.to_string().contains("refusing to choose authority"),
+            "unexpected error: {error}"
+        );
+        assert!(household_rs::storage::household_dir(state_dir).is_dir());
+        assert!(state_dir.join("household.tearing-down").is_dir());
+        assert_eq!(
+            bootstrap_state::load(state_dir).expect("state unchanged"),
+            BootstrapState::Ready
+        );
+    }
+
+    #[test]
+    fn final_disk_identity_recheck_precedes_rename() {
+        let (temp, _hh_id, m_id) = installed_household();
+        let state_dir = temp.path();
+        let error = teardown_household_on_disk(state_dir, "hh_wrong", &m_id)
+            .expect_err("wrong household must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(household_rs::storage::household_dir(state_dir).is_dir());
+        assert!(!state_dir.join("household.tearing-down").exists());
+    }
+
+    #[test]
+    fn teardown_transfers_exclusive_to_cleanup_after_in_memory_publication() {
+        let source = include_str!("handlers_bootstrap.rs");
+        let start = source
+            .find("pub async fn post_teardown(")
+            .expect("post_teardown");
+        let end = source[start..]
+            .find("\n}\n\n/// `POST /bootstrap/accept-household`")
+            .expect("post_teardown end")
+            + start;
+        let body = &source[start..end];
+        let clear = body.find("state.household.clear().await;").expect("clear");
+        let publish = body
+            .find("*state.bootstrap.write().await = BootstrapState::Uninitialized;")
+            .expect("bootstrap publish");
+        let cleanup = body
+            .find("let _cleanup = tokio::task::spawn_blocking(move ||")
+            .expect("guard-owning cleanup");
+        assert!(clear < cleanup && publish < cleanup);
+        assert!(body[cleanup..].contains("lifecycle_guard.remove_tearing_down()"));
+        assert!(
+            !body.contains("remove_dir_all("),
+            "fixed-name cleanup must stay fd-bound and lifecycle-exclusive"
+        );
+    }
+
+    /// Child entrypoint for the subprocess crash matrix below. With no env it
+    /// is a harmless no-op in an ordinary test run; the parent invokes this
+    /// exact test with a stage and exits the process without running Drop.
+    #[test]
+    fn teardown_crash_worker() {
+        let Ok(stage) = std::env::var(CRASH_STAGE_ENV) else {
+            return;
+        };
+        let state_dir = PathBuf::from(std::env::var(CRASH_STATE_DIR_ENV).expect("state dir"));
+        let hh_id = std::env::var(CRASH_HH_ID_ENV).expect("hh id");
+        let m_id = std::env::var(CRASH_M_ID_ENV).expect("m id");
+        let (guard, recovered) =
+            acquire_recovered_lifecycle_exclusive(&state_dir).expect("child lifecycle exclusive");
+        assert!(!recovered, "fresh child fixture unexpectedly recovered");
+        verify_installed_household_for_teardown(&state_dir, &hh_id, &m_id)
+            .expect("child authority recheck");
+
+        match stage.as_str() {
+            "before_rename" => {}
+            "after_rename_before_root_fsync" => {
+                std::fs::rename(
+                    household_rs::storage::household_dir(&state_dir),
+                    state_dir.join("household.tearing-down"),
+                )
+                .expect("raw rename before crash");
+            }
+            "after_root_fsync_before_uninitialized" => {
+                assert!(
+                    guard
+                        .rename_household_to_tearing_down()
+                        .expect("durable rename")
+                );
+            }
+            "after_uninitialized_before_cleanup" => {
+                assert!(
+                    guard
+                        .rename_household_to_tearing_down()
+                        .expect("durable rename")
+                );
+                persist_uninitialized_durably(&guard, &state_dir).expect("durable uninitialized");
+            }
+            other => panic!("unknown crash stage {other}"),
+        }
+
+        // Deliberately bypass destructors, including the lifecycle guard. The
+        // OS must release flock and a fresh process must converge from disk.
+        std::process::exit(CRASH_EXIT);
+    }
+
+    #[test]
+    fn subprocess_crash_matrix_converges_under_exclusive_before_reuse() {
+        let worker_name =
+            "handlers_bootstrap::household_teardown_lifecycle_tests::teardown_crash_worker";
+        for (stage, expected_recovery) in [
+            ("before_rename", false),
+            ("after_rename_before_root_fsync", true),
+            ("after_root_fsync_before_uninitialized", true),
+            ("after_uninitialized_before_cleanup", true),
+        ] {
+            let (temp, hh_id, m_id) = installed_household();
+            let output = std::process::Command::new(std::env::current_exe().expect("current exe"))
+                .args(["--exact", worker_name, "--nocapture", "--test-threads=1"])
+                .env(CRASH_STAGE_ENV, stage)
+                .env(CRASH_STATE_DIR_ENV, temp.path())
+                .env(CRASH_HH_ID_ENV, &hh_id)
+                .env(CRASH_M_ID_ENV, &m_id)
+                .output()
+                .expect("spawn crash worker");
+            assert_eq!(
+                output.status.code(),
+                Some(CRASH_EXIT),
+                "stage={stage}; stdout={}; stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            let outcome = teardown_household_on_disk(temp.path(), &hh_id, &m_id)
+                .unwrap_or_else(|error| panic!("stage={stage}: recovery failed: {error}"));
+            assert_eq!(
+                matches!(&outcome, HouseholdTeardownDiskOutcome::Recovered { .. }),
+                expected_recovery,
+                "stage={stage}"
+            );
+            drop(outcome);
+            assert_eq!(
+                bootstrap_state::load(temp.path()).expect("final bootstrap state"),
+                BootstrapState::Uninitialized,
+                "stage={stage}"
+            );
+            assert!(!household_rs::storage::household_dir(temp.path()).exists());
+            if expected_recovery {
+                assert!(!temp.path().join("household.tearing-down").exists());
+            }
         }
     }
 }
@@ -3150,9 +3913,9 @@ mod tests {
             bootstrap: Arc::new(RwLock::new(bs)),
             household: HouseholdState::loaded(Arc::new(loaded)),
             state_dir: td.path().to_path_buf(),
-            pair_device_window: Arc::new(PairDeviceWindow::with_persistence(
-                td.path().to_path_buf(),
-            )),
+            pair_device_window: Arc::new(
+                PairDeviceWindow::with_persistence(td.path().to_path_buf()).unwrap(),
+            ),
             pair_machine_window: Arc::new(PairMachineWindow::new_in_memory()),
             started_at: Instant::now(),
             setup_invitation_cache: crate::setup_invitation::new_cache(),
@@ -3812,7 +4575,10 @@ mod tests {
     async fn pair_device_uri_none_window_proceeds_and_opens_token() {
         let (state, _td) = make_state_with_identity(BootstrapState::NamedAwaitingPair);
         let window = Arc::clone(&state.pair_device_window);
-        assert!(window.current_token().await.is_none(), "precondition: no window");
+        assert!(
+            window.current_token().await.is_none(),
+            "precondition: no window"
+        );
         let app = bootstrap_router(state);
         let resp = app.oneshot(pair_device_uri_request()).await.unwrap();
         assert_eq!(resp.status(), HStatus::OK);
@@ -3840,18 +4606,30 @@ mod tests {
         assert_eq!(resp.status(), HStatus::OK);
         let body = decode_pair_device_uri_ok(resp).await;
         assert!(
-            body.pair_device_uri.contains(&format!("&nonce={existing_nonce}")),
+            body.pair_device_uri
+                .contains(&format!("&nonce={existing_nonce}")),
             "must echo the already-open window's nonce, not mint a new one: {}",
             body.pair_device_uri
         );
         let still = window.current_token().await.expect("window still open");
-        assert_eq!(still.nonce.as_b64(), existing_nonce, "nonce must not be re-minted");
+        assert_eq!(
+            still.nonce.as_b64(),
+            existing_nonce,
+            "nonce must not be re-minted"
+        );
     }
 
     #[tokio::test]
     async fn pair_device_uri_success_response_shape_and_contents() {
         let (state, _td) = make_state_with_identity(BootstrapState::NamedAwaitingPair);
-        let hh_id = state.household.current().await.unwrap().record.hh_id.to_string();
+        let hh_id = state
+            .household
+            .current()
+            .await
+            .unwrap()
+            .record
+            .hh_id
+            .to_string();
         let window = Arc::clone(&state.pair_device_window);
         let app = bootstrap_router(state);
         let resp = app.oneshot(pair_device_uri_request()).await.unwrap();
@@ -3861,7 +4639,11 @@ mod tests {
         assert_eq!(body.hh_id, hh_id);
         assert_eq!(body.house_name, "Reissue Home");
         assert!(!body.host_label.is_empty());
-        assert_eq!(body.hh_pub.len(), 33, "hh_pub must be exactly 33 bytes (SEC1 compressed)");
+        assert_eq!(
+            body.hh_pub.len(),
+            33,
+            "hh_pub must be exactly 33 bytes (SEC1 compressed)"
+        );
         assert!(
             body.pair_device_uri
                 .starts_with("soyeht://household/pair-device?"),

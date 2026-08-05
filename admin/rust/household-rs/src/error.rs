@@ -66,6 +66,12 @@ pub enum StorageError {
     #[error("permission denied at {path}: {hint}")]
     PermissionDenied { path: PathBuf, hint: String },
 
+    /// A semantic rename was issued, but its parent-directory durability
+    /// barrier failed. The destination may already contain the new value;
+    /// callers must re-read/reconcile and must not run no-effect rollback.
+    #[error("storage effect may have taken effect at {path}: {hint}")]
+    MayHaveTakenEffect { path: PathBuf, hint: String },
+
     #[error("encode/decode failure: {0}")]
     Encoding(#[from] HouseholdError),
 }
@@ -77,6 +83,7 @@ impl StorageError {
             Self::Io { .. } => "storage.io",
             Self::OutOfSpace { .. } => "storage.out_of_space",
             Self::PermissionDenied { .. } => "storage.permission_denied",
+            Self::MayHaveTakenEffect { .. } => "storage.may_have_taken_effect",
             Self::Encoding(_) => "storage.encoding",
         }
     }
@@ -86,7 +93,8 @@ impl StorageError {
         match self {
             Self::Io { hint, .. }
             | Self::OutOfSpace { hint, .. }
-            | Self::PermissionDenied { hint, .. } => hint.clone(),
+            | Self::PermissionDenied { hint, .. }
+            | Self::MayHaveTakenEffect { hint, .. } => hint.clone(),
             Self::Encoding(e) => e.to_string(),
         }
     }

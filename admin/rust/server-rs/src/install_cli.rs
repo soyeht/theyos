@@ -24,22 +24,288 @@ use crate::bonjour_browser::SOYEHT_HOUSEHOLD_SERVICE;
 use crate::bonjour_publisher::{
     PairMachineBonjourRole, PublishParams, publish_candidate_joiner_bonjour,
 };
-use crate::handlers_pair_machine::{PreHouseholdRouterState, pre_household_router};
+use crate::handlers_pair_machine::{
+    PreHouseholdRouterState, PreHouseholdRuntimeSignal, pre_household_router,
+};
 use crate::household_bootstrap::resolve_household_state_dir;
 use crate::household_listener::{InterfaceClass, enumerate_bind_targets};
 use household_rs::keys::P256PublicKey;
 use household_rs::machine_cert::Platform;
 use household_rs::pair_device::PairDeviceWindow;
 use household_rs::pair_machine::{
-    JoinTransport, PairMachineState, PairMachineWindow, PrepareCandidateOpts, prepare_candidate,
+    JoinTransport, PairMachineState, PairMachineWindow, PrepareCandidateOpts,
+    prepare_candidate_under_lifecycle,
+};
+use household_rs::{
+    BootstrapError,
+    household_lifecycle::{HouseholdLifecycleLock, LifecycleWriteGuard},
 };
 use mdns_sd::ServiceDaemon;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
+
+const INSTALL_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(30);
+const PRE_HOUSEHOLD_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug)]
+enum InstallCliError {
+    Bootstrap(BootstrapError),
+    Other(String),
+}
+
+impl From<BootstrapError> for InstallCliError {
+    fn from(error: BootstrapError) -> Self {
+        Self::Bootstrap(error)
+    }
+}
+
+struct MintedPairDeviceWindow {
+    uri: String,
+    expires_at_unix: u64,
+    host_fallback: Option<String>,
+}
+
+enum FreshInstallOutcome {
+    AlreadyInstalled,
+    HouseholdNameRequired,
+    InvalidHostname(usize),
+    PairDevice(MintedPairDeviceWindow),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PairMachineWaitOutcome {
+    RestartRequired,
+    AckDelivered,
+    Failed,
+}
+
+enum ColdTerminalRecovery {
+    /// A terminal G1 install is active. The ordinary daemon owns the exact
+    /// supervised replay listener in both RestartRequired and Ready, so a cold
+    /// invocation must start it immediately instead of making daemon liveness
+    /// depend on another Ack arriving within a finite CLI timeout.
+    ReadyForDaemon,
+}
+
+fn report_install_error(error: InstallCliError) -> i32 {
+    match error {
+        InstallCliError::Bootstrap(error) => household_rs::bootstrap::log_error(&error),
+        InstallCliError::Other(error) => eprintln!("error: {error}"),
+    }
+    1
+}
+
+/// Replace this process with a cold invocation using the same executable,
+/// arguments, and inherited environment. Successful `exec` never returns;
+/// every return value is therefore a hard restart failure.
+#[cfg(unix)]
+fn cold_reexec_current_process() -> std::io::Error {
+    use std::os::unix::process::CommandExt as _;
+
+    let executable = match std::env::current_exe() {
+        Ok(executable) => executable,
+        Err(error) => return error,
+    };
+    let mut command = std::process::Command::new(executable);
+    command.args(std::env::args_os().skip(1));
+    command.exec()
+}
+
+/// Replace a cold terminal-install process with the ordinary daemon.
+///
+/// The daemon itself owns the exact terminal-only replay endpoint. Starting it
+/// immediately is therefore required even when the retained Ack has not yet
+/// been retried: otherwise a transient bind/serve timeout in this CLI would
+/// strand both the Ack and the durable Phase-3 outbox. The successful path
+/// never returns; any return is a fail-stop install failure.
+#[cfg(unix)]
+fn cold_exec_daemon_current_process() -> std::io::Error {
+    use std::os::unix::process::CommandExt as _;
+
+    let executable = match std::env::current_exe() {
+        Ok(executable) => executable,
+        Err(error) => return error,
+    };
+    daemon_exec_command(executable.as_path()).exec()
+}
+
+#[cfg(not(unix))]
+fn cold_exec_daemon_current_process() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "cold daemon exec is not implemented on this platform",
+    )
+}
+
+fn daemon_exec_command(executable: &Path) -> std::process::Command {
+    // Deliberately no arguments: carrying `install --pair-machine` forward
+    // would start a third replay process instead of the ordinary daemon.
+    std::process::Command::new(executable)
+}
+
+fn launch_daemon_for_cold_terminal(launch: impl FnOnce() -> std::io::Error) -> i32 {
+    let error = launch();
+    tracing::error!(
+        stage = "pair_machine.cold_daemon_exec_failed",
+        error = %error,
+        "terminal install is durable but the installed daemon did not start"
+    );
+    eprintln!("error: failed to start the installed daemon for terminal replay: {error}");
+    1
+}
+
+#[cfg(not(unix))]
+fn cold_reexec_current_process() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "cold re-exec is not implemented on this platform",
+    )
+}
+
+fn acquire_install_lifecycle_exclusive_blocking(
+    state_dir: &Path,
+) -> Result<LifecycleWriteGuard, InstallCliError> {
+    let lifecycle = HouseholdLifecycleLock::open_verified(state_dir).map_err(|error| {
+        InstallCliError::Other(format!("failed to open household lifecycle: {error}"))
+    })?;
+    let deadline = Instant::now()
+        .checked_add(INSTALL_LIFECYCLE_TIMEOUT)
+        .ok_or_else(|| InstallCliError::Other("household lifecycle deadline overflow".into()))?;
+    let guard = lifecycle.lock_exclusive_until(deadline).map_err(|error| {
+        InstallCliError::Other(format!("failed to acquire household lifecycle: {error}"))
+    })?;
+    let recovered =
+        household_rs::bootstrap::recover_interrupted_household_teardown_under_lifecycle(
+            &guard, state_dir,
+        )
+        .map_err(|error| {
+            InstallCliError::Other(format!(
+                "failed to recover interrupted household teardown: {error}"
+            ))
+        })?;
+    if recovered {
+        return Err(InstallCliError::Other(
+            "recovered an interrupted household teardown; refusing this stale install invocation"
+                .into(),
+        ));
+    }
+    Ok(guard)
+}
+
+async fn acquire_install_lifecycle_exclusive(
+    state_dir: &Path,
+) -> Result<LifecycleWriteGuard, InstallCliError> {
+    let state_dir = state_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || acquire_install_lifecycle_exclusive_blocking(&state_dir))
+        .await
+        .map_err(|error| {
+            InstallCliError::Other(format!("household lifecycle worker failed: {error}"))
+        })?
+}
+
+fn pair_device_host_fallback() -> Option<String> {
+    let port = crate::household_bootstrap::household_port_from_env();
+    pick_addr_for_transport(JoinTransport::Lan, port)
+        .or_else(|| crate::tailnet_address::current_tailnet_ipv4().map(|ip| format!("{ip}:{port}")))
+}
+
+async fn prepare_reissued_pair_device_window(
+    state_dir: &Path,
+    policy: household_rs::KeyBackingPolicy,
+    host_fallback: Option<String>,
+) -> Result<MintedPairDeviceWindow, InstallCliError> {
+    let guard = acquire_install_lifecycle_exclusive(state_dir).await?;
+    let loaded = household_rs::bootstrap::try_load_existing_under_lifecycle(
+        &guard, state_dir, policy,
+    )?
+    .ok_or_else(|| {
+        InstallCliError::Other(
+            "--reissue-pair-qr requires an already-bootstrapped install; run `theyos install --household-name <name>` first"
+                .into(),
+        )
+    })?;
+    let m_cert_fp = household_rs::machine_cert::fingerprint(&loaded.cert).map_err(|error| {
+        InstallCliError::Other(format!("cannot fingerprint this machine's cert: {error}"))
+    })?;
+    let (uri, expires_at_unix) = mint_pair_device_uri(
+        &guard,
+        state_dir,
+        &loaded.record.hh_pub,
+        Some(&loaded.record.name),
+        host_fallback.clone(),
+        &m_cert_fp,
+    )
+    .await
+    .map_err(InstallCliError::Other)?;
+    drop(guard);
+    Ok(MintedPairDeviceWindow {
+        uri,
+        expires_at_unix,
+        host_fallback,
+    })
+}
+
+async fn prepare_fresh_install(
+    state_dir: &Path,
+    household_name: Option<String>,
+    hostname_label: Option<String>,
+    policy: household_rs::KeyBackingPolicy,
+    host_fallback: Option<String>,
+) -> Result<FreshInstallOutcome, InstallCliError> {
+    let guard = acquire_install_lifecycle_exclusive(state_dir).await?;
+    if household_rs::bootstrap::try_load_existing_under_lifecycle(&guard, state_dir, policy)?
+        .is_some()
+    {
+        return Ok(FreshInstallOutcome::AlreadyInstalled);
+    }
+
+    let Some(household_name) = household_name else {
+        return Ok(FreshInstallOutcome::HouseholdNameRequired);
+    };
+    if let Some(label) = &hostname_label
+        && (label.is_empty() || label.len() > 255)
+    {
+        return Ok(FreshInstallOutcome::InvalidHostname(label.len()));
+    }
+
+    let loaded = household_rs::bootstrap::bootstrap_or_load_under_lifecycle(
+        &guard,
+        state_dir,
+        household_rs::BootstrapOpts {
+            household_name,
+            hostname_label,
+        },
+        policy,
+    )?;
+    let m_cert_fp = household_rs::machine_cert::fingerprint(&loaded.cert).map_err(|error| {
+        InstallCliError::Other(format!("cannot fingerprint this machine's cert: {error}"))
+    })?;
+    let (uri, expires_at_unix) = mint_pair_device_uri(
+        &guard,
+        state_dir,
+        &loaded.record.hh_pub,
+        Some(&loaded.record.name),
+        host_fallback.clone(),
+        &m_cert_fp,
+    )
+    .await
+    .map_err(InstallCliError::Other)?;
+    drop(guard);
+    info!(
+        stage = "bootstrap.complete",
+        hh_id = %loaded.record.hh_id,
+        name = %loaded.record.name,
+    );
+    Ok(FreshInstallOutcome::PairDevice(MintedPairDeviceWindow {
+        uri,
+        expires_at_unix,
+        host_fallback,
+    }))
+}
 
 /// Entry point for `theyos install …`. Returns the process exit code.
 pub async fn run(args: &[String]) -> i32 {
@@ -129,94 +395,39 @@ pub async fn run(args: &[String]) -> i32 {
     }
 
     if reissue_pair_qr {
-        return match household_rs::try_load_existing(&state_dir, key_policy) {
-            Ok(Some(loaded)) => match household_rs::machine_cert::fingerprint(&loaded.cert) {
-                Ok(m_cert_fp) => {
-                    emit_fresh_pair_device_window(
-                        &state_dir,
-                        &loaded.record.hh_pub,
-                        Some(&loaded.record.name),
-                        &m_cert_fp,
-                    )
-                    .await
-                }
-                // Resolved before any window is minted, so a reissue that
-                // cannot pin leaves the existing window exactly as it was.
-                Err(e) => {
-                    eprintln!("error: cannot fingerprint this machine's cert: {e}");
-                    1
-                }
-            },
-            Ok(None) => {
-                eprintln!(
-                    "error: --reissue-pair-qr requires an already-bootstrapped install. \
-                    Run `theyos install --household-name <name>` first."
-                );
-                1
-            }
-            Err(e) => {
-                household_rs::bootstrap::log_error(&e);
-                1
-            }
+        let host_fallback = pair_device_host_fallback();
+        return match prepare_reissued_pair_device_window(&state_dir, key_policy, host_fallback)
+            .await
+        {
+            Ok(minted) => emit_minted_pair_device_window(minted),
+            Err(error) => report_install_error(error),
         };
     }
 
-    match household_rs::try_load_existing(&state_dir, key_policy) {
-        Ok(Some(_loaded)) => 0,
-        Ok(None) => {
-            let Some(name) = household_name else {
-                eprintln!(
-                    "error: fresh install requires --household-name <name>. \
-                    Re-run as `theyos install --household-name \"Sample Home\"`."
-                );
-                return 2;
-            };
-            if let Some(label) = &hostname_label {
-                if label.is_empty() || label.len() > 255 {
-                    eprintln!(
-                        "error: --hostname-label must be 1..=255 bytes (got {} bytes)",
-                        label.len()
-                    );
-                    return 2;
-                }
-            }
-            let opts = household_rs::BootstrapOpts {
-                household_name: name,
-                hostname_label,
-            };
-            match household_rs::bootstrap_or_load(&state_dir, opts, key_policy) {
-                Ok(loaded) => {
-                    info!(
-                        stage = "bootstrap.complete",
-                        hh_id = %loaded.record.hh_id,
-                        name = %loaded.record.name,
-                    );
-                    match household_rs::machine_cert::fingerprint(&loaded.cert) {
-                        Ok(m_cert_fp) => {
-                            emit_fresh_pair_device_window(
-                                &state_dir,
-                                &loaded.record.hh_pub,
-                                Some(&loaded.record.name),
-                                &m_cert_fp,
-                            )
-                            .await
-                        }
-                        Err(e) => {
-                            eprintln!("error: cannot fingerprint this machine's cert: {e}");
-                            1
-                        }
-                    }
-                }
-                Err(e) => {
-                    household_rs::bootstrap::log_error(&e);
-                    1
-                }
-            }
+    let host_fallback = pair_device_host_fallback();
+    match prepare_fresh_install(
+        &state_dir,
+        household_name,
+        hostname_label,
+        key_policy,
+        host_fallback,
+    )
+    .await
+    {
+        Ok(FreshInstallOutcome::AlreadyInstalled) => 0,
+        Ok(FreshInstallOutcome::HouseholdNameRequired) => {
+            eprintln!(
+                "error: fresh install requires --household-name <name>. \
+                Re-run as `theyos install --household-name \"Sample Home\"`."
+            );
+            2
         }
-        Err(e) => {
-            household_rs::bootstrap::log_error(&e);
-            1
+        Ok(FreshInstallOutcome::InvalidHostname(length)) => {
+            eprintln!("error: --hostname-label must be 1..=255 bytes (got {length} bytes)");
+            2
         }
+        Ok(FreshInstallOutcome::PairDevice(minted)) => emit_minted_pair_device_window(minted),
+        Err(error) => report_install_error(error),
     }
 }
 
@@ -244,30 +455,41 @@ fn print_usage() {
 /// `current_tailnet_ipv4` itself) so callers can resolve a LAN-first address
 /// that works with Tailscale OFF. Returns `(uri, expires_at_unix)`.
 ///
-/// Reused by the install CLI's [`emit_fresh_pair_device_window`] and by the
-/// engine's in-process `POST /bootstrap/pair-device/reissue` route. The
-/// reissue route mints on the SHARED `Arc<PairDeviceWindow>` instead (for
-/// liveness), but renders via the same `to_uri_with_host_and_name` path.
+/// The caller must retain the same lifecycle-exclusive transaction that
+/// established the household identity supplied below; the guard parameter
+/// makes that coupling explicit and rejects a different state root.
+///
+/// The engine's in-process reissue route mints on its shared
+/// `Arc<PairDeviceWindow>` instead (for liveness), but renders via the same
+/// `to_uri_with_host_and_name` path.
 /// `m_cert_fp` is required and must come from the caller's already-validated
 /// `MachineCert` — the helper deliberately cannot fetch one itself, so no
 /// caller can render a QR off a cert that was merely decodable rather than
 /// admitted.
 pub(crate) async fn mint_pair_device_uri(
+    lifecycle_guard: &LifecycleWriteGuard,
     state_dir: &Path,
     hh_pub: &P256PublicKey,
     household_name: Option<&str>,
     host_fallback: Option<String>,
     m_cert_fp: &[u8; 32],
 ) -> Result<(String, u64), String> {
+    lifecycle_guard
+        .verify_state_root(state_dir)
+        .map_err(|error| format!("pair-device lifecycle binding changed: {error}"))?;
     let ttl = Duration::from_secs(crate::household_bootstrap::pair_window_ttl_secs_from_env(
         "THEYOS_PAIR_DEVICE_TTL_SECS",
     ));
     // The fingerprint arrives resolved, so minting is the last fallible step:
     // this helper persists a window snapshot, and failing after that would
     // leave a live window behind an error return.
-    let window = PairDeviceWindow::with_persistence(state_dir.to_path_buf());
+    let window = PairDeviceWindow::with_persistence_under_lifecycle(
+        state_dir.to_path_buf(),
+        lifecycle_guard,
+    )
+    .map_err(|e| format!("failed to open pair-device namespace: {e}"))?;
     let token = window
-        .mint_token(ttl, None)
+        .mint_token_under_lifecycle(ttl, None, lifecycle_guard)
         .await
         .map_err(|e| format!("failed to mint pair token: {e}"))?;
     let uri = token.to_uri_with_host_and_name(
@@ -279,43 +501,15 @@ pub(crate) async fn mint_pair_device_uri(
     Ok((uri, token.expires_at_unix))
 }
 
-/// Mint a fresh pair-receiving window, persist it via `PairDeviceWindow`, and
-/// render the QR to stdout. Returns a process exit code (0 on success,
-/// 1 on render failure).
-async fn emit_fresh_pair_device_window(
-    state_dir: &Path,
-    hh_pub: &P256PublicKey,
-    household_name: Option<&str>,
-    m_cert_fp: &[u8; 32],
-) -> i32 {
-    // Resolve a reachable host fallback for the URI so peers whose Bonjour
-    // implementation does not interoperate with the engine's mDNS publisher
-    // (observed cross-platform with `mdns-sd` 0.10/0.13 → macOS/iOS
-    // NWBrowser) can connect directly. Bonjour discovery remains the gold
-    // path when it works; the `host` field is consulted as a fallback only.
-    // LAN-first: prefer an RFC1918 address (works with Tailscale OFF), then
-    // fall back to the Tailnet IPv4.
-    let port = crate::household_bootstrap::household_port_from_env();
-    let host_fallback = pick_addr_for_transport(JoinTransport::Lan, port).or_else(|| {
-        crate::tailnet_address::current_tailnet_ipv4().map(|ip| format!("{ip}:{port}"))
-    });
-
-    let (uri, expires_at_unix) = match mint_pair_device_uri(
-        state_dir,
-        hh_pub,
-        household_name,
-        host_fallback.clone(),
-        m_cert_fp,
-    )
-    .await
-    {
-        Ok(pair) => pair,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return 1;
-        }
-    };
-
+/// Render a pair-device window that was already minted and durably persisted
+/// while the install lifecycle transaction was held. This function performs
+/// only observability/UI work, after the lifecycle guard has been released.
+fn emit_minted_pair_device_window(minted: MintedPairDeviceWindow) -> i32 {
+    let MintedPairDeviceWindow {
+        uri,
+        expires_at_unix,
+        host_fallback,
+    } = minted;
     info!(
         stage = "pair_device_window.opened",
         source = "install",
@@ -353,31 +547,113 @@ async fn emit_fresh_pair_device_window(
 /// pre-household `local/seed` endpoint can serve the same bytes back to M1
 /// (Story 2), and prints the `soyeht://household/pair-machine?…` QR alongside
 /// the 6-word BIP-39 fingerprint that the owner iPhone will render.
+/// Resolve a retained G1 terminal install before any fresh-network discovery.
+///
+/// Both terminal states converge immediately to the ordinary daemon, which
+/// supervises replay on the address signed into the original JoinRequest.
+/// Re-enumerating interfaces during a cold exec could silently authorize a
+/// different coordinate, so this path validates the exact persisted socket
+/// address before exec and the daemon repeats that validation at startup.
+async fn load_cold_terminal_replay(
+    state_dir: &Path,
+    policy: household_rs::KeyBackingPolicy,
+) -> Result<Option<ColdTerminalRecovery>, InstallCliError> {
+    let guard = acquire_install_lifecycle_exclusive(state_dir).await?;
+    crate::handlers_pair_machine::recover_candidate_install_under_lifecycle(
+        state_dir, &guard, policy,
+    )
+    .await
+    .map_err(InstallCliError::Other)?;
+    let loaded =
+        household_rs::bootstrap::try_load_existing_under_lifecycle(&guard, state_dir, policy)?;
+    let Some(loaded) = loaded else {
+        return Ok(None);
+    };
+    let bootstrap = household_rs::bootstrap_state::load(state_dir).map_err(|error| {
+        InstallCliError::Other(format!(
+            "failed to read cold-replay bootstrap state: {error}"
+        ))
+    })?;
+    let active_terminal = household_rs::household_install_transaction::load_active_finalize_terminal_result_under_lifecycle(&guard)
+        .map_err(|error| InstallCliError::Other(format!("failed to inspect retained finalize result: {error}")))?;
+    if let Some(terminal) = active_terminal.as_ref()
+        && (loaded.record.hh_id != *terminal.hh_id() || loaded.cert.m_id != *terminal.m_id())
+    {
+        return Err(InstallCliError::Other(
+            "retained finalize result differs from the installed local identity".into(),
+        ));
+    }
+    if active_terminal.is_none() {
+        return Err(InstallCliError::Other(format!(
+            "this machine is already a member of household {} ({}); refusing to mint a candidate keypair",
+            loaded.record.name, loaded.record.hh_id
+        )));
+    }
+    if !matches!(
+        bootstrap,
+        household_rs::bootstrap_state::BootstrapState::PairMachineInstallRestartRequired
+            | household_rs::bootstrap_state::BootstrapState::Ready
+    ) {
+        return Err(InstallCliError::Other(format!(
+            "retained pair-machine terminal result has invalid bootstrap state {}",
+            bootstrap.as_str()
+        )));
+    }
+    let delivery = household_rs::household_install_transaction::load_finalize_ack_delivery_under_lifecycle(&guard)
+        .map_err(|error| InstallCliError::Other(format!("failed to inspect finalize delivery boundary: {error}")))?;
+    match (&bootstrap, &delivery, active_terminal.as_ref()) {
+        (
+            household_rs::bootstrap_state::BootstrapState::Ready,
+            household_rs::household_install_transaction::FinalizeAckDeliveryRecoveryOutcome::MayHaveTakenEffect(delivered),
+            Some(active),
+        ) if delivered.as_ref() == active => {}
+        (
+            household_rs::bootstrap_state::BootstrapState::PairMachineInstallRestartRequired,
+            household_rs::household_install_transaction::FinalizeAckDeliveryRecoveryOutcome::Absent,
+            Some(_),
+        ) => {}
+        (
+            household_rs::bootstrap_state::BootstrapState::PairMachineInstallRestartRequired,
+            household_rs::household_install_transaction::FinalizeAckDeliveryRecoveryOutcome::MayHaveTakenEffect(delivered),
+            Some(active),
+        ) if delivered.as_ref() == active => {}
+        _ => {
+            return Err(InstallCliError::Other(
+                "bootstrap state and exact finalize delivery boundary diverged".into(),
+            ));
+        }
+    }
+    // Validate the exact listener coordinate before replacing this process.
+    // The daemon repeats this check under its own startup lifecycle guard and
+    // owns the current-generation PairMachineWindow plus supervised listener.
+    let (addr, _) = crate::handlers_pair_machine::exact_terminal_replay_endpoint(
+        active_terminal
+            .as_ref()
+            .expect("active terminal was checked above"),
+    )
+    .map_err(InstallCliError::Other)?;
+    addr.parse::<SocketAddr>().map_err(|error| {
+        InstallCliError::Other(format!("terminal replay address is invalid: {error}"))
+    })?;
+    Ok(Some(ColdTerminalRecovery::ReadyForDaemon))
+}
+
 async fn run_pair_machine(
     state_dir: &Path,
     transport: JoinTransport,
     hostname_label: Option<&str>,
     policy: household_rs::KeyBackingPolicy,
 ) -> i32 {
-    // Refuse to run as a candidate on a machine that already holds a
-    // household identity. The Phase 3 candidate path mints fresh
-    // identity material; allowing it on a machine that is already a
-    // household member would invalidate the existing membership without
-    // operator awareness.
-    match household_rs::try_load_existing(state_dir, policy) {
-        Ok(Some(loaded)) => {
-            eprintln!(
-                "error: this machine is already a member of household {} ({}). \
-                 Refusing to mint a candidate keypair.",
-                loaded.record.name, loaded.record.hh_id
-            );
-            return 1;
+    // A successful G0 install re-execs this exact CLI invocation. Detect the
+    // retained G1 result before platform, hostname, clock, or interface
+    // discovery. Cold replay must never require a currently discoverable
+    // interface and must never mint a second key, window, or QR.
+    match load_cold_terminal_replay(state_dir, policy).await {
+        Ok(Some(ColdTerminalRecovery::ReadyForDaemon)) => {
+            return launch_daemon_for_cold_terminal(cold_exec_daemon_current_process);
         }
         Ok(None) => {}
-        Err(e) => {
-            household_rs::bootstrap::log_error(&e);
-            return 1;
-        }
+        Err(error) => return report_install_error(error),
     }
 
     // Resolve a reachable address for the requested transport.
@@ -421,14 +697,6 @@ async fn run_pair_machine(
         return 1;
     };
 
-    let window = match PairMachineWindow::with_persistence(state_dir.to_path_buf()) {
-        Ok(w) => w,
-        Err(e) => {
-            eprintln!("error: failed to load pair-machine window state: {e}");
-            return 1;
-        }
-    };
-
     let opts = PrepareCandidateOpts {
         state_dir: state_dir.to_path_buf(),
         transport,
@@ -447,12 +715,43 @@ async fn run_pair_machine(
         now_unix,
     };
 
-    let prepared = match prepare_candidate(&window, opts).await {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("error: failed to prepare candidate keypair / JoinRequest: {e}");
-            return 1;
+    // The candidate's key material and persistent window are one lifecycle
+    // transaction. Address/platform/hostname discovery happened above; the
+    // guard is released before mDNS probing, QR rendering, listener bind, or
+    // the ceremony long-poll below.
+    let prepared_transaction: Result<_, InstallCliError> = async {
+        let guard = acquire_install_lifecycle_exclusive(state_dir).await?;
+        if let Some(loaded) = household_rs::bootstrap::try_load_existing_under_lifecycle(
+            &guard, state_dir, policy,
+        )? {
+            return Err(InstallCliError::Other(format!(
+                "this machine is already a member of household {} ({}); refusing to mint a candidate keypair",
+                loaded.record.name, loaded.record.hh_id
+            )));
         }
+        let window = PairMachineWindow::with_persistence_under_lifecycle(
+            state_dir.to_path_buf(),
+            &guard,
+        )
+        .map_err(|error| {
+            InstallCliError::Other(format!(
+                "failed to load pair-machine window state: {error}"
+            ))
+        })?;
+        let prepared = prepare_candidate_under_lifecycle(&window, opts, &guard)
+            .await
+            .map_err(|error| {
+                InstallCliError::Other(format!(
+                    "failed to prepare candidate keypair / JoinRequest: {error}"
+                ))
+            })?;
+        drop(guard);
+        Ok((window, prepared))
+    }
+    .await;
+    let (window, prepared) = match prepared_transaction {
+        Ok(prepared) => prepared,
+        Err(error) => return report_install_error(error),
     };
     let lan_discovery_unavailable =
         transport == JoinTransport::Lan && !probe_mdns_available().await;
@@ -509,19 +808,26 @@ async fn run_pair_machine(
             return 1;
         }
     };
+    let (runtime_signal, mut runtime_signal_rx) =
+        tokio::sync::watch::channel(PreHouseholdRuntimeSignal::Running);
     let router = pre_household_router(PreHouseholdRouterState {
         window: Arc::clone(&window),
         state_dir: state_dir.to_path_buf(),
         key_policy: policy,
-        // The CLI install path has no daemon bootstrap state machine —
-        // the candidate process is itself the pre-household phase, so
-        // `local_finalize_handler` falls through to its window-state
-        // checks without an extra bootstrap-state revalidation.
+        // The CLI install path has no daemon bootstrap state machine. The
+        // dedicated runtime signal is the only success notification allowed
+        // to escape after terminal G0→G1 rotation.
         bootstrap: None,
+        runtime_signal: Some(runtime_signal),
     });
-    let listener_handle = tokio::spawn(async move {
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut listener_handle = tokio::spawn(async move {
         if let Err(e) =
-            core_rs::phase0_axum_serve!(listener, router, connect_info = std::net::SocketAddr).await
+            core_rs::phase0_axum_serve!(listener, router, connect_info = std::net::SocketAddr)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
         {
             warn!(stage = "pair_machine.listener_exited", error = %e);
         }
@@ -589,59 +895,85 @@ async fn run_pair_machine(
     println!("Listening on {bind_addr} for the founder's join-finalize request…");
     println!();
 
-    // Block until the window transitions to a terminal state (Committed
-    // or Aborted), or the TTL expires.
-    let exit_code = wait_for_window_terminal(&window, prepared.ttl_unix).await;
+    // The successful install commit rotates the lifecycle from G0 to G1.
+    // This process still owns G0-scoped handles, so success is communicated on
+    // a dedicated control-plane channel rather than by mutating the stale
+    // PairMachineWindow to Committed.
+    let outcome =
+        wait_for_window_terminal(&window, &mut runtime_signal_rx, prepared.ttl_unix).await;
 
-    // Tear down the publisher first so peers see the goodbye records,
-    // then cancel the listener task.
+    // Tear down the publisher first so peers see the goodbye records. Then
+    // stop accepting new connections but let the in-flight terminal response
+    // drain completely; aborting here can cut the typed 503/Ack body after the
+    // handler has already committed its durable state.
     if let Some(h) = bonjour_handle {
         h.shutdown().await;
     }
-    listener_handle.abort();
-    let _ = listener_handle.await;
-
-    if exit_code == 0 {
-        println!();
-        println!(
-            "{}",
-            crate::handlers_pair_machine::POST_COMMIT_REDUNDANCY_NOTICE
-        );
-        println!();
-        info!(
-            stage = "pair_machine.listener_swap",
-            "candidate committed; starting household listener"
-        );
-        // Install CLI runs without a SharedState — skip mounting the
-        // household-namespaced Claw Store routes here. Identity/snapshot/
-        // pair-device/bootstrap remain available; the main daemon picks up
-        // and provides Claws once it boots with full state.
-        crate::household_bootstrap::bootstrap_household(None).await;
-        info!(
-            stage = "pair_machine.listener_swap",
-            "household listener is now serving"
-        );
-        println!("Household listener is running. Press Ctrl-C to stop.");
-        crate::shutdown::shutdown_signal().await;
+    let _ = shutdown_tx.send(());
+    if tokio::time::timeout(PRE_HOUSEHOLD_DRAIN_TIMEOUT, &mut listener_handle)
+        .await
+        .is_err()
+    {
+        listener_handle.abort();
+        let _ = listener_handle.await;
+        eprintln!("error: pre-household listener did not drain the terminal response in time");
+        return 1;
     }
-    exit_code
+
+    match outcome {
+        PairMachineWaitOutcome::RestartRequired => {
+            println!();
+            println!("Household installation committed. Restarting the service is required.");
+            println!();
+            info!(
+                stage = "pair_machine.restart_required",
+                "terminal G1 result is durable; all G0 capabilities have been dropped"
+            );
+            let error = cold_reexec_current_process();
+            tracing::error!(
+                stage = "pair_machine.cold_reexec_failed",
+                error = %error,
+                "terminal result remains fail-stop; refusing a successful install exit"
+            );
+            eprintln!("error: failed to cold-restart the install process: {error}");
+            1
+        }
+        PairMachineWaitOutcome::AckDelivered => 0,
+        PairMachineWaitOutcome::Failed => 1,
+    }
 }
 
-/// Wait until the candidate's `PairMachineWindow` reaches a terminal
-/// state (Committed or Aborted) or its wall-clock TTL expires.
-///
-/// Returns 0 on a clean commit, 1 on Aborted / TTL expiry — the install
-/// command's exit code surface for the caller (operator or NixOS module).
-async fn wait_for_window_terminal(window: &PairMachineWindow, ttl_unix: u64) -> i32 {
+/// Wait until the install rotates to G1 and requests a cold restart, the
+/// candidate window aborts, or its wall-clock TTL expires.
+async fn wait_for_window_terminal(
+    window: &PairMachineWindow,
+    runtime_signal: &mut tokio::sync::watch::Receiver<PreHouseholdRuntimeSignal>,
+    ttl_unix: u64,
+) -> PairMachineWaitOutcome {
     let mut rx = window.subscribe();
     loop {
+        match *runtime_signal.borrow() {
+            PreHouseholdRuntimeSignal::RestartRequired => {
+                return PairMachineWaitOutcome::RestartRequired;
+            }
+            PreHouseholdRuntimeSignal::AckDeliveryStarted => {
+                return PairMachineWaitOutcome::AckDelivered;
+            }
+            PreHouseholdRuntimeSignal::Running => {}
+        }
         let snap = window.snapshot().await;
         match snap.state {
-            PairMachineState::Committed => return 0,
+            PairMachineState::Committed => {
+                eprintln!();
+                eprintln!(
+                    "error: stale G0 window reported Committed without a durable restart signal."
+                );
+                return PairMachineWaitOutcome::Failed;
+            }
             PairMachineState::Aborted => {
                 eprintln!();
                 eprintln!("error: ceremony aborted (owner declined or TTL expired).");
-                return 1;
+                return PairMachineWaitOutcome::Failed;
             }
             _ => {}
         }
@@ -654,23 +986,31 @@ async fn wait_for_window_terminal(window: &PairMachineWindow, ttl_unix: u64) -> 
         if now_secs >= ttl_unix {
             eprintln!();
             eprintln!("error: ceremony timed out (TTL elapsed before the founder approved).");
-            return 1;
+            return PairMachineWaitOutcome::Failed;
         }
         let until_expiry = Duration::from_secs(ttl_unix - now_secs);
         tokio::select! {
+            biased;
+            changed = runtime_signal.changed() => {
+                if changed.is_err() {
+                    eprintln!();
+                    eprintln!("error: restart signal channel closed unexpectedly.");
+                    return PairMachineWaitOutcome::Failed;
+                }
+            }
             changed = rx.changed() => {
                 if changed.is_err() {
                     // Sender dropped — window state can no longer
                     // change. Treat as an internal abort.
                     eprintln!();
                     eprintln!("error: window state channel closed unexpectedly.");
-                    return 1;
+                    return PairMachineWaitOutcome::Failed;
                 }
             }
             () = tokio::time::sleep(until_expiry) => {
                 eprintln!();
                 eprintln!("error: ceremony timed out (TTL elapsed before the founder approved).");
-                return 1;
+                return PairMachineWaitOutcome::Failed;
             }
         }
     }
@@ -752,6 +1092,371 @@ fn lan_fallback_prompt(lan_discovery_unavailable: bool) -> Option<&'static str> 
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn lifecycle_recovery_refuses_the_stale_install_invocation() {
+        let state_dir = tempfile::tempdir().unwrap();
+        household_rs::bootstrap_or_load(
+            state_dir.path(),
+            household_rs::BootstrapOpts {
+                household_name: "Interrupted Install".into(),
+                hostname_label: Some("interrupted-install".into()),
+            },
+            household_rs::KeyBackingPolicy::ForceSoftware,
+        )
+        .expect("bootstrap identity");
+
+        let guard = acquire_install_lifecycle_exclusive(state_dir.path())
+            .await
+            .unwrap();
+        assert!(guard.rename_household_to_tearing_down().unwrap());
+        drop(guard);
+
+        let error = acquire_install_lifecycle_exclusive(state_dir.path())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, InstallCliError::Other(message) if message.contains("refusing this stale install invocation"))
+        );
+        assert!(!state_dir.path().join("household").exists());
+        assert!(!state_dir.path().join("household.tearing-down").exists());
+    }
+
+    #[tokio::test]
+    async fn cold_replay_uses_only_the_exact_persisted_join_request_address() {
+        use axum::{body::to_bytes, extract::State};
+        use household_rs::pair_machine::{
+            CeremonyInputs, CeremonyTxn, JoinResponseUnsigned, PeerEntry, join_request_hash,
+        };
+        use serde_bytes::ByteBuf;
+        use zeroize::Zeroizing;
+
+        core_rs::env::set_test_env("THEYOS_FORCE_SOFTWARE_KEYS", "1");
+        let founder_dir = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let address_probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let exact_socket = address_probe.local_addr().unwrap();
+        drop(address_probe);
+        let exact_address = exact_socket.to_string();
+        let founder = household_rs::bootstrap_or_load(
+            founder_dir.path(),
+            household_rs::BootstrapOpts {
+                household_name: "Cold replay founder".into(),
+                hostname_label: Some("cold-replay-founder".into()),
+            },
+            household_rs::KeyBackingPolicy::ForceSoftware,
+        )
+        .unwrap();
+
+        let guard = acquire_install_lifecycle_exclusive(state_dir.path())
+            .await
+            .unwrap();
+        let window = Arc::new(
+            PairMachineWindow::with_persistence_under_lifecycle(
+                state_dir.path().to_path_buf(),
+                &guard,
+            )
+            .unwrap(),
+        );
+        let g0 = window.snapshot().await.lifecycle_generation.unwrap();
+        let prepared = prepare_candidate_under_lifecycle(
+            &window,
+            PrepareCandidateOpts {
+                state_dir: state_dir.path().to_path_buf(),
+                transport: JoinTransport::Lan,
+                addr: exact_address.clone(),
+                hostname: "cold-replay".into(),
+                platform: Platform::LinuxNix,
+                policy: household_rs::KeyBackingPolicy::ForceSoftware,
+                ttl: Duration::from_secs(300),
+                now_unix: 1_800_000_000,
+            },
+            &guard,
+        )
+        .await
+        .unwrap();
+        drop(guard);
+
+        let txn = CeremonyTxn::prepare(CeremonyInputs {
+            hh_priv: Zeroizing::new(
+                *founder
+                    .hh_priv
+                    .as_ref()
+                    .and_then(|key| key.as_software_secret())
+                    .unwrap(),
+            ),
+            hh_id: founder.record.hh_id.clone(),
+            hh_pub_sec1: *founder.record.hh_pub.as_bytes(),
+            m1_priv_scalar: Zeroizing::new(*founder.m_priv.as_software_secret().unwrap()),
+            m1_pub_sec1: *founder.cert.m_pub.as_bytes(),
+            m1_id: founder.cert.m_id.to_string(),
+            candidate_m_pub_sec1: prepared.m_pub_sec1,
+            candidate_hostname: prepared.join_request.hostname.clone(),
+            candidate_platform: prepared.join_request.platform.clone(),
+            joined_at: 1_800_000_001,
+            state_dir: founder_dir.path().to_path_buf(),
+            existing_record: founder.record.clone(),
+            policy: household_rs::KeyBackingPolicy::ForceSoftware,
+        })
+        .unwrap();
+        let join_response = JoinResponseUnsigned {
+            version: 1,
+            join_request_hash: ByteBuf::from(
+                join_request_hash(&prepared.join_request_cbor).to_vec(),
+            ),
+            machine_cert: txn.candidate_cert().clone(),
+            encrypted_shard: txn.peer_encrypted_shard().clone(),
+            household_record: txn.new_household_record().clone(),
+            peer_list: vec![PeerEntry {
+                m_id: founder.cert.m_id.to_string(),
+                m_pub: ByteBuf::from(founder.cert.m_pub.as_bytes().to_vec()),
+                hostname: founder.cert.hostname.clone(),
+                tailscale_addr: None,
+                machine_cert: Some(founder.cert.clone()),
+            }],
+            push_token_seed: None,
+        }
+        .sign(founder.m_priv.as_ref())
+        .unwrap();
+        let join_response_bytes = join_response.to_canonical_bytes().unwrap();
+        window
+            .pin_household_anchor(
+                founder.record.hh_id.to_string(),
+                *founder.record.hh_pub.as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        let first = crate::handlers_pair_machine::local_finalize_handler(
+            State(PreHouseholdRouterState {
+                window: Arc::clone(&window),
+                state_dir: state_dir.path().to_path_buf(),
+                key_policy: household_rs::KeyBackingPolicy::ForceSoftware,
+                bootstrap: None,
+                runtime_signal: None,
+            }),
+            join_response_bytes.clone().into(),
+        )
+        .await;
+        assert_eq!(first.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        to_bytes(first.into_body(), 65_536).await.unwrap();
+        drop(window);
+
+        // This is a real G0 committed install followed by the production
+        // rotation and cold loader. No test mutates a snapshot into Committed.
+        // RestartRequired must launch the ordinary daemon immediately: the
+        // daemon's supervised terminal-only listener, not a 300-second CLI
+        // wait, owns both the retained Ack and the Phase-3 outbox liveness.
+        assert!(matches!(
+            load_cold_terminal_replay(
+                state_dir.path(),
+                household_rs::KeyBackingPolicy::ForceSoftware,
+            )
+            .await
+            .unwrap()
+            .expect("active cold terminal replay"),
+            ColdTerminalRecovery::ReadyForDaemon
+        ));
+        let guard = acquire_install_lifecycle_exclusive(state_dir.path())
+            .await
+            .unwrap();
+        let cold_window = Arc::new(
+            PairMachineWindow::with_persistence_under_lifecycle(
+                state_dir.path().to_path_buf(),
+                &guard,
+            )
+            .unwrap(),
+        );
+        let cold_snapshot = cold_window.snapshot().await;
+        assert_eq!(cold_snapshot.state, PairMachineState::Idle);
+        assert_ne!(cold_snapshot.lifecycle_generation.unwrap(), g0);
+        drop(guard);
+
+        // Model the daemon that starts immediately in RestartRequired. Its
+        // exact listener remains available across the indistinguishable cut
+        // where Ready persisted but the first Ack body was not drained. It
+        // exposes only finalize, never the full household/LAN router.
+        let bootstrap = Arc::new(tokio::sync::RwLock::new(
+            household_rs::bootstrap_state::BootstrapState::PairMachineInstallRestartRequired,
+        ));
+        let (listener, terminal_router) =
+            crate::household_bootstrap::bind_terminal_replay_listener(
+                exact_socket,
+                PreHouseholdRouterState {
+                    window: Arc::clone(&cold_window),
+                    state_dir: state_dir.path().to_path_buf(),
+                    key_policy: household_rs::KeyBackingPolicy::ForceSoftware,
+                    bootstrap: Some(Arc::clone(&bootstrap)),
+                    runtime_signal: None,
+                },
+            )
+            .await
+            .unwrap();
+        let shutdown_state_dir = state_dir.path().to_path_buf();
+        let shutdown_bootstrap = Arc::clone(&bootstrap);
+        let server = tokio::spawn(async move {
+            core_rs::phase0_axum_serve!(
+                listener,
+                terminal_router,
+                connect_info = std::net::SocketAddr
+            )
+            .with_graceful_shutdown(
+                crate::household_bootstrap::wait_until_terminal_replay_is_inactive(
+                    shutdown_state_dir,
+                    exact_socket,
+                    JoinTransport::Lan,
+                    shutdown_bootstrap,
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let client = reqwest::Client::new();
+        crate::failure_injection::arm(
+            crate::failure_injection::InjectionPoint::M2AfterAckDeliveryBreadcrumb,
+            crate::failure_injection::InjectionAction::early_reject(
+                "crash after durable delivery boundary",
+            ),
+        );
+        let pre_flush_cut = client
+            .post(format!("http://{exact_socket}/pair-machine/local/finalize"))
+            .header("content-type", "application/cbor")
+            .body(join_response_bytes.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(pre_flush_cut.status(), reqwest::StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            *bootstrap.read().await,
+            household_rs::bootstrap_state::BootstrapState::PairMachineInstallRestartRequired
+        );
+        let delivery_guard = acquire_install_lifecycle_exclusive(state_dir.path())
+            .await
+            .unwrap();
+        let active = household_rs::household_install_transaction::load_active_finalize_terminal_result_under_lifecycle(&delivery_guard)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            household_rs::household_install_transaction::load_finalize_ack_delivery_under_lifecycle(&delivery_guard)
+                .unwrap(),
+            household_rs::household_install_transaction::FinalizeAckDeliveryRecoveryOutcome::MayHaveTakenEffect(ref retained)
+                if retained.as_ref() == &active
+        ));
+        drop(delivery_guard);
+
+        crate::failure_injection::arm(
+            crate::failure_injection::InjectionPoint::M2BeforeAckEncode,
+            crate::failure_injection::InjectionAction::early_reject(
+                "crash after durable Ready before body",
+            ),
+        );
+        let post_ready_pre_body_cut = client
+            .post(format!("http://{exact_socket}/pair-machine/local/finalize"))
+            .header("content-type", "application/cbor")
+            .body(join_response_bytes.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            post_ready_pre_body_cut.status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            *bootstrap.read().await,
+            household_rs::bootstrap_state::BootstrapState::Ready
+        );
+
+        let replay = client
+            .post(format!("http://{exact_socket}/pair-machine/local/finalize"))
+            .header("content-type", "application/cbor")
+            .body(join_response_bytes)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), reqwest::StatusCode::OK);
+        let retained_ack =
+            household_rs::pair_machine::FinalizeAck::for_machine_cert(&join_response.machine_cert)
+                .unwrap()
+                .to_canonical_bytes()
+                .unwrap();
+        assert_eq!(
+            replay.bytes().await.unwrap().as_ref(),
+            retained_ack.as_slice()
+        );
+        let post_flush_guard = acquire_install_lifecycle_exclusive(state_dir.path())
+            .await
+            .unwrap();
+        assert!(matches!(
+            household_rs::household_install_transaction::load_finalize_ack_delivery_under_lifecycle(&post_flush_guard)
+                .unwrap(),
+            household_rs::household_install_transaction::FinalizeAckDeliveryRecoveryOutcome::MayHaveTakenEffect(_)
+        ), "a completed local HTTP write is still not proof that the peer processed the Ack");
+        drop(post_flush_guard);
+        assert!(matches!(
+            load_cold_terminal_replay(
+                state_dir.path(),
+                household_rs::KeyBackingPolicy::ForceSoftware,
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            ColdTerminalRecovery::ReadyForDaemon
+        ));
+        assert_eq!(
+            client
+                .get(format!("http://{exact_socket}/pair-machine/local/seed"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            client
+                .get(format!("http://{exact_socket}/identity"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+        *bootstrap.write().await = household_rs::bootstrap_state::BootstrapState::Uninitialized;
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn cold_terminal_launches_an_argument_free_daemon_that_is_reachable() {
+        use std::io::{Read as _, Write as _};
+
+        let command = daemon_exec_command(Path::new("/test/theyos"));
+        assert!(
+            command.get_args().next().is_none(),
+            "daemon exec must not inherit install --pair-machine arguments"
+        );
+
+        let (addr_tx, addr_rx) = std::sync::mpsc::sync_channel(1);
+        let rc = launch_daemon_for_cold_terminal(move || {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            addr_tx.send(listener.local_addr().unwrap()).unwrap();
+            std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.write_all(b"daemon-ready").unwrap();
+            });
+            // A real exec never returns. Returning here deliberately exercises
+            // the production fail-stop branch after proving the launch hook
+            // established a reachable terminal listener.
+            std::io::Error::other("test launcher returned")
+        });
+        assert_eq!(rc, 1);
+        let addr = addr_rx.recv().unwrap();
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"daemon-ready");
+    }
+
     #[test]
     fn sanitize_hostname_lowercases_and_strips() {
         assert_eq!(sanitize_hostname("Studio Linux"), "studio-linux");
@@ -815,7 +1520,11 @@ mod tests {
     async fn mint_pair_device_uri_includes_host_when_some() {
         let state_dir = tempfile::tempdir().unwrap();
         let hh_pub = test_hh_pub();
+        let guard = acquire_install_lifecycle_exclusive(state_dir.path())
+            .await
+            .unwrap();
         let (uri, expires_at_unix) = mint_pair_device_uri(
+            &guard,
             state_dir.path(),
             &hh_pub,
             Some("Reissue Test Home"),
@@ -839,13 +1548,17 @@ mod tests {
             "host fallback must be present: uri={uri}"
         );
 
-        // expires_at_unix matches the persisted snapshot's expiry.
-        let snap: Option<household_rs::pair_device::PairDeviceWindowSnapshot> =
-            household_rs::storage::read_optional_cbor(
-                &household_rs::storage::pair_device_window_path(state_dir.path()),
-            )
-            .expect("read snapshot");
-        let snap = snap.expect("snapshot present");
+        // expires_at_unix matches the current generation-scoped snapshot.
+        // The legacy unscoped storage path is intentionally never consulted.
+        let window = PairDeviceWindow::with_persistence_under_lifecycle(
+            state_dir.path().to_path_buf(),
+            &guard,
+        )
+        .expect("open current pair-device namespace");
+        let snap = window
+            .read_persisted_snapshot_under_lifecycle(&guard)
+            .expect("read snapshot")
+            .expect("snapshot present");
         assert_eq!(snap.expires_at_unix, expires_at_unix);
     }
 
@@ -853,7 +1566,11 @@ mod tests {
     async fn mint_pair_device_uri_omits_host_when_none() {
         let state_dir = tempfile::tempdir().unwrap();
         let hh_pub = test_hh_pub();
+        let guard = acquire_install_lifecycle_exclusive(state_dir.path())
+            .await
+            .unwrap();
         let (uri, _expires) = mint_pair_device_uri(
+            &guard,
             state_dir.path(),
             &hh_pub,
             Some("Reissue Test Home"),
@@ -867,5 +1584,32 @@ mod tests {
             "host must be omitted when None: uri={uri}"
         );
         assert!(uri.contains("v=1") && uri.contains("&nonce="), "uri={uri}");
+    }
+
+    #[tokio::test]
+    async fn pair_device_mint_rejects_a_guard_for_another_state_root() {
+        let guarded_state = tempfile::tempdir().unwrap();
+        let target_state = tempfile::tempdir().unwrap();
+        let hh_pub = test_hh_pub();
+        let guard = acquire_install_lifecycle_exclusive(guarded_state.path())
+            .await
+            .unwrap();
+
+        let error = mint_pair_device_uri(
+            &guard,
+            target_state.path(),
+            &hh_pub,
+            Some("Wrong Root"),
+            None,
+            &TEST_M_CERT_FP,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("lifecycle binding changed"));
+        assert!(
+            !household_rs::storage::pair_device_window_path(target_state.path()).exists(),
+            "a mismatched lifecycle guard must reject before publishing a window"
+        );
     }
 }

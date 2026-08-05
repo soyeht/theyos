@@ -10,7 +10,11 @@
 //! A later process therefore never treats a merely visible post-rename record
 //! as proof of durability; it first rewrites the same canonical bytes until
 //! they are committed.
-//! The lock inode is hard-linked inside the household as a durable anchor.
+//! The ledger lock inode is hard-linked inside the household as a durable
+//! anchor. A separate empty lifecycle lock in the stable state root is held
+//! shared across every complete ledger transaction. Teardown/install hold it
+//! exclusive, so the final binding check cannot be followed by a detached
+//! dirfd write.
 //! Every record operation is relative to retained root, household, and store
 //! directory descriptors. The complete root→household→store chain and lock
 //! binding are checked before and after locking, so a detached household
@@ -48,6 +52,11 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::cbor;
+#[cfg(test)]
+use crate::household_lifecycle::HOUSEHOLD_TEARDOWN_BREADCRUMB;
+use crate::household_lifecycle::{
+    HouseholdLifecycleLock, HouseholdLifecycleLockError, LifecycleReadGuard,
+};
 use crate::ids::{HouseholdId, MachineId};
 use crate::storage::HOUSEHOLD_SUBDIR;
 
@@ -76,6 +85,11 @@ const EXT4_SUPER_MAGIC: i64 = 0x0000_EF53;
 const XFS_SUPER_MAGIC: i64 = 0x5846_5342;
 #[cfg(any(test, target_os = "linux"))]
 const BTRFS_SUPER_MAGIC: i64 = 0x9123_683E;
+#[cfg(any(test, target_os = "linux"))]
+const LINUX_RENAME_KNOWN_NO_EFFECT_FILESYSTEMS: [i64; 3] =
+    [EXT4_SUPER_MAGIC, XFS_SUPER_MAGIC, BTRFS_SUPER_MAGIC];
+#[cfg(any(test, target_os = "macos"))]
+const MACOS_RENAME_KNOWN_NO_EFFECT_FILESYSTEMS: [&[u8]; 1] = [b"apfs"];
 #[cfg(test)]
 const TMPFS_SUPER_MAGIC: i64 = 0x0102_1994;
 #[cfg(test)]
@@ -314,6 +328,9 @@ pub enum MeshIntentNonceCommitStage {
     ReadbackMismatch,
     CleanMarkerWrite,
     CleanMarkerSync,
+    /// CLEAN is durable, but the lifecycle or household binding changed
+    /// before the result could be returned. The semantic effect may exist.
+    PostCommitBinding,
 }
 
 impl MeshIntentNonceCommitStage {
@@ -334,7 +351,8 @@ impl MeshIntentNonceCommitStage {
             | Self::Readback
             | Self::ReadbackMismatch
             | Self::CleanMarkerWrite
-            | Self::CleanMarkerSync => true,
+            | Self::CleanMarkerSync
+            | Self::PostCommitBinding => true,
         }
     }
 }
@@ -473,6 +491,7 @@ struct LedgerInner {
     state_dir: File,
     household_dir: File,
     store_dir: File,
+    lifecycle: HouseholdLifecycleLock,
     lock_file: Mutex<File>,
     worker_tx: mpsc::SyncSender<WorkerRequest>,
     #[cfg(test)]
@@ -570,7 +589,19 @@ impl MeshIntentNonceLedger {
         if !HouseholdId::is_well_formed(target_hh_id.as_str()) {
             return Err(MeshIntentNonceLedgerOpenError::InvalidIdentity);
         }
-        let (state_dir, household_dir, store_dir) = open_store_dirs(state_dir.as_ref())?;
+        // `open_verified` unconditionally syncs both the stable lock file and
+        // its state-root parent, including retries where the lock is already
+        // visible. No usable ledger escapes before that dirent is durable.
+        let lifecycle = HouseholdLifecycleLock::open_verified(state_dir.as_ref())
+            .map_err(map_lifecycle_to_open)?;
+        let lifecycle_deadline = Instant::now()
+            .checked_add(config.lock_timeout)
+            .ok_or(MeshIntentNonceLedgerOpenError::LockTimeout)?;
+        let lifecycle_guard = lifecycle
+            .lock_shared_until(lifecycle_deadline)
+            .map_err(map_lifecycle_to_open)?;
+        let state_dir = lifecycle.clone_state_dir().map_err(map_lifecycle_to_open)?;
+        let (state_dir, household_dir, store_dir) = open_store_dirs(state_dir)?;
         let authority_id = ledger_authority_id(&state_dir, &household_dir, &store_dir)?;
         let mut registry = process_ledger_registry()
             .lock()
@@ -591,7 +622,7 @@ impl MeshIntentNonceLedger {
                 return Err(MeshIntentNonceLedgerOpenError::UnsafePath);
             }
             let ledger = Self { inner: existing };
-            ledger.initialize_or_recover()?;
+            ledger.initialize_or_recover(lifecycle_guard)?;
             return Ok(ledger);
         }
 
@@ -605,6 +636,7 @@ impl MeshIntentNonceLedger {
                 state_dir,
                 household_dir,
                 store_dir,
+                lifecycle,
                 lock_file: Mutex::new(lock_file),
                 worker_tx,
                 #[cfg(test)]
@@ -615,7 +647,7 @@ impl MeshIntentNonceLedger {
                 queue_waiters_for_test: std::sync::atomic::AtomicUsize::new(0),
             }),
         };
-        ledger.initialize_or_recover()?;
+        ledger.initialize_or_recover(lifecycle_guard)?;
         spawn_worker(worker_rx)?;
         registry.insert(authority_id, Arc::downgrade(&ledger.inner));
         Ok(ledger)
@@ -827,8 +859,18 @@ impl MeshIntentNonceLedger {
         }
     }
 
-    fn initialize_or_recover(&self) -> Result<(), MeshIntentNonceLedgerOpenError> {
-        let mut guard = self.acquire(None).map_err(map_unavailable_to_open)?;
+    fn initialize_or_recover(
+        &self,
+        lifecycle: LifecycleReadGuard,
+    ) -> Result<(), MeshIntentNonceLedgerOpenError> {
+        // `open` already holds lifecycle-shared before it takes the process
+        // registry mutex. Reuse that exact guard so initialization follows
+        // the single lock order lifecycle -> registry -> ledger; reacquiring
+        // lifecycle here could wait behind an exclusive waiter that itself
+        // cannot proceed until our first shared guard is released.
+        let mut guard = self
+            .acquire_after_lifecycle(lifecycle, None)
+            .map_err(map_unavailable_to_open)?;
         let marker = read_marker(&mut guard).map_err(map_open_io)?;
         let visible_record = read_optional_record(&self.inner.store_dir, RECORD_FILENAME)
             .map_err(map_unavailable_to_open)?;
@@ -905,16 +947,6 @@ impl MeshIntentNonceLedger {
         &self,
         control: Option<&MeshIntentNonceConsumeControl>,
     ) -> Result<LedgerLockGuard<'_>, MeshIntentNonceUnavailable> {
-        if !verify_authority_binding(
-            &self.inner.state_dir,
-            &self.inner.household_dir,
-            &self.inner.store_dir,
-        ) {
-            return Err(MeshIntentNonceUnavailable::UnsafePath);
-        }
-        if let Some(reason) = control.and_then(abort_reason) {
-            return Err(reason);
-        }
         let configured_deadline = Instant::now()
             .checked_add(self.inner.config.lock_timeout)
             .ok_or(MeshIntentNonceUnavailable::LockTimeout)?;
@@ -927,6 +959,51 @@ impl MeshIntentNonceLedger {
             } else {
                 MeshIntentNonceUnavailable::LockTimeout
             };
+        let lifecycle = self
+            .inner
+            .lifecycle
+            .lock_shared_until(deadline)
+            .map_err(map_lifecycle_to_unavailable)?;
+        self.acquire_after_lifecycle_with_deadline(lifecycle, control, deadline, timeout_reason)
+    }
+
+    fn acquire_after_lifecycle(
+        &self,
+        lifecycle: LifecycleReadGuard,
+        control: Option<&MeshIntentNonceConsumeControl>,
+    ) -> Result<LedgerLockGuard<'_>, MeshIntentNonceUnavailable> {
+        let configured_deadline = Instant::now()
+            .checked_add(self.inner.config.lock_timeout)
+            .ok_or(MeshIntentNonceUnavailable::LockTimeout)?;
+        let deadline = control.map_or(configured_deadline, |ceremony| {
+            ceremony.deadline.min(configured_deadline)
+        });
+        let timeout_reason =
+            if control.is_some_and(|ceremony| ceremony.deadline <= configured_deadline) {
+                MeshIntentNonceUnavailable::DeadlineExceeded
+            } else {
+                MeshIntentNonceUnavailable::LockTimeout
+            };
+        self.acquire_after_lifecycle_with_deadline(lifecycle, control, deadline, timeout_reason)
+    }
+
+    fn acquire_after_lifecycle_with_deadline(
+        &self,
+        lifecycle: LifecycleReadGuard,
+        control: Option<&MeshIntentNonceConsumeControl>,
+        deadline: Instant,
+        timeout_reason: MeshIntentNonceUnavailable,
+    ) -> Result<LedgerLockGuard<'_>, MeshIntentNonceUnavailable> {
+        if !verify_authority_binding(
+            &self.inner.state_dir,
+            &self.inner.household_dir,
+            &self.inner.store_dir,
+        ) {
+            return Err(MeshIntentNonceUnavailable::UnsafePath);
+        }
+        if let Some(reason) = control.and_then(abort_reason) {
+            return Err(reason);
+        }
         let guard = loop {
             if let Some(reason) = control.and_then(abort_reason) {
                 return Err(reason);
@@ -953,7 +1030,10 @@ impl MeshIntentNonceLedger {
             }
             match guard.try_lock_exclusive() {
                 Ok(()) => {
-                    let locked = LedgerLockGuard { file: guard };
+                    let locked = LedgerLockGuard {
+                        file: guard,
+                        lifecycle,
+                    };
                     if !verify_authority_binding(
                         &self.inner.state_dir,
                         &self.inner.household_dir,
@@ -1097,6 +1177,17 @@ impl MeshIntentNonceLedger {
                     MeshIntentNonceCommitStage::CleanMarkerSync,
                 ) {
                     MeshIntentNonceConsumeOutcome::MayHaveTakenEffect { stage }
+                } else if fail_injection::take(MeshIntentNonceCommitStage::PostCommitBinding)
+                    || !guard.lifecycle.binding_is_current()
+                    || !verify_authority_binding(
+                        &self.inner.state_dir,
+                        &self.inner.household_dir,
+                        &self.inner.store_dir,
+                    )
+                {
+                    MeshIntentNonceConsumeOutcome::MayHaveTakenEffect {
+                        stage: MeshIntentNonceCommitStage::PostCommitBinding,
+                    }
                 } else {
                     MeshIntentNonceConsumeOutcome::Committed { generation }
                 }
@@ -1161,6 +1252,34 @@ fn map_open_errno(error: Errno) -> MeshIntentNonceLedgerOpenError {
     }
 }
 
+fn map_lifecycle_to_open(error: HouseholdLifecycleLockError) -> MeshIntentNonceLedgerOpenError {
+    match error {
+        HouseholdLifecycleLockError::UnsafePath => MeshIntentNonceLedgerOpenError::UnsafePath,
+        HouseholdLifecycleLockError::UnsupportedFilesystem => {
+            MeshIntentNonceLedgerOpenError::UnsupportedFilesystem
+        }
+        HouseholdLifecycleLockError::LockTimeout => MeshIntentNonceLedgerOpenError::LockTimeout,
+        HouseholdLifecycleLockError::RecoveryRequired => {
+            MeshIntentNonceLedgerOpenError::RecoveryRequired
+        }
+        HouseholdLifecycleLockError::Io => MeshIntentNonceLedgerOpenError::Io,
+    }
+}
+
+fn map_lifecycle_to_unavailable(error: HouseholdLifecycleLockError) -> MeshIntentNonceUnavailable {
+    match error {
+        HouseholdLifecycleLockError::UnsafePath => MeshIntentNonceUnavailable::UnsafePath,
+        HouseholdLifecycleLockError::UnsupportedFilesystem => {
+            MeshIntentNonceUnavailable::UnsupportedFilesystem
+        }
+        HouseholdLifecycleLockError::LockTimeout => MeshIntentNonceUnavailable::LockTimeout,
+        HouseholdLifecycleLockError::RecoveryRequired => {
+            MeshIntentNonceUnavailable::RecoveryRequired
+        }
+        HouseholdLifecycleLockError::Io => MeshIntentNonceUnavailable::Io,
+    }
+}
+
 fn entry_id(key: &StoredKeyV1) -> Result<String, ()> {
     let canonical = cbor::to_canonical_vec(key).map_err(|_| ())?;
     let mut hasher = Sha256::new();
@@ -1170,6 +1289,7 @@ fn entry_id(key: &StoredKeyV1) -> Result<String, ()> {
 
 struct LedgerLockGuard<'a> {
     file: MutexGuard<'a, File>,
+    lifecycle: LifecycleReadGuard,
 }
 
 impl Drop for LedgerLockGuard<'_> {
@@ -1178,17 +1298,7 @@ impl Drop for LedgerLockGuard<'_> {
     }
 }
 
-fn open_store_dirs(
-    state_path: &Path,
-) -> Result<(File, File, File), MeshIntentNonceLedgerOpenError> {
-    let state_dir = File::from(
-        rustix::fs::open(
-            state_path,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(map_open_errno)?,
-    );
+fn open_store_dirs(state_dir: File) -> Result<(File, File, File), MeshIntentNonceLedgerOpenError> {
     // The named household is the production teardown boundary. Retain its
     // parent descriptor so every operation can prove that this exact
     // household directory is still installed there.
@@ -1280,7 +1390,7 @@ fn validate_supported_persistent_filesystem(
         .map(|byte| byte.to_ne_bytes()[0])
         .take_while(|byte| *byte != 0)
         .collect();
-    if name == b"apfs" {
+    if macos_filesystem_is_allowlisted(&name) {
         Ok(())
     } else {
         Err(MeshIntentNonceLedgerOpenError::UnsupportedFilesystem)
@@ -1300,11 +1410,13 @@ fn validate_supported_persistent_filesystem(
 }
 
 #[cfg(any(test, target_os = "linux"))]
-const fn linux_filesystem_is_allowlisted(fs_type: i64) -> bool {
-    matches!(
-        fs_type,
-        EXT4_SUPER_MAGIC | XFS_SUPER_MAGIC | BTRFS_SUPER_MAGIC
-    )
+fn linux_filesystem_is_allowlisted(fs_type: i64) -> bool {
+    LINUX_RENAME_KNOWN_NO_EFFECT_FILESYSTEMS.contains(&fs_type)
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn macos_filesystem_is_allowlisted(fs_type: &[u8]) -> bool {
+    MACOS_RENAME_KNOWN_NO_EFFECT_FILESYSTEMS.contains(&fs_type)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -2332,14 +2444,14 @@ mod tests {
 
         let installed = temp.path().join(HOUSEHOLD_SUBDIR);
         let detached = temp.path().join("household.tearing-down");
-        fs::rename(&installed, &detached).unwrap();
+        let lifecycle = HouseholdLifecycleLock::open_verified(temp.path()).unwrap();
+        {
+            let teardown = lifecycle.lock_exclusive().unwrap();
+            assert!(teardown.rename_household_to_tearing_down().unwrap());
+        }
         let detached_record = detached.join(STORE_SUBDIR).join(RECORD_FILENAME);
         let old_bytes = fs::read(&detached_record).unwrap();
 
-        prepare_household(temp.path());
-        let replacement =
-            MeshIntentNonceLedger::open(temp.path(), household('c'), config(4)).unwrap();
-        assert!(!Arc::ptr_eq(&old.inner, &replacement.inner));
         assert_eq!(
             old.consume(
                 &key(0x74),
@@ -2347,10 +2459,27 @@ mod tests {
                 floor(100),
                 &ceremony_control(),
             ),
-            unavailable(MeshIntentNonceUnavailable::UnsafePath),
+            unavailable(MeshIntentNonceUnavailable::RecoveryRequired),
             "a live pre-teardown handle must not write into the detached household"
         );
         assert_eq!(fs::read(&detached_record).unwrap(), old_bytes);
+        assert_eq!(
+            MeshIntentNonceLedger::open(temp.path(), household('c'), config(4))
+                .err()
+                .unwrap(),
+            MeshIntentNonceLedgerOpenError::RecoveryRequired,
+            "a replacement must not install over an unresolved teardown breadcrumb"
+        );
+
+        {
+            let recovery = lifecycle.lock_exclusive().unwrap();
+            assert!(recovery.remove_tearing_down().unwrap());
+            prepare_household(temp.path());
+            recovery.sync_state_root().unwrap();
+        }
+        let replacement =
+            MeshIntentNonceLedger::open(temp.path(), household('c'), config(4)).unwrap();
+        assert!(!Arc::ptr_eq(&old.inner, &replacement.inner));
 
         assert!(matches!(
             replacement.consume(
@@ -2375,9 +2504,126 @@ mod tests {
         );
 
         drop(old);
-        fs::remove_dir_all(&detached).unwrap();
         assert!(!detached.exists(), "the old household authority is gone");
         assert_eq!(replacement.target_household_id(), &household('c'));
+    }
+
+    #[test]
+    fn lifecycle_exclusive_cannot_rename_after_postcheck_until_clean_commit_finishes() {
+        let temp = TempDir::new().unwrap();
+        let ledger = open_at(temp.path(), 4);
+        let lifecycle = HouseholdLifecycleLock::open_verified(temp.path()).unwrap();
+        let block = TestWorkerBlock::new();
+        ledger.install_worker_block_for_test(block.clone());
+        let worker_ledger = ledger.clone();
+        let worker = thread::spawn(move || {
+            worker_ledger.consume(
+                &key(0x76),
+                &evidence(MeshIntentChannel::Dev, 0x76, 700),
+                floor(100),
+                &ceremony_control(),
+            )
+        });
+
+        // This hook is after acquire's final binding check and DIRTY marker,
+        // immediately before atomic_replace. The lifecycle read guard must
+        // still be alive here.
+        block.entered.wait();
+        assert_eq!(
+            lifecycle
+                .lock_exclusive_until(Instant::now() + Duration::from_millis(50))
+                .unwrap_err(),
+            HouseholdLifecycleLockError::LockTimeout
+        );
+        assert!(temp.path().join(HOUSEHOLD_SUBDIR).exists());
+
+        block.release.wait();
+        assert!(matches!(
+            worker.join().unwrap(),
+            MeshIntentNonceConsumeOutcome::Committed { .. }
+        ));
+        let teardown = lifecycle.lock_exclusive().unwrap();
+        assert!(teardown.rename_household_to_tearing_down().unwrap());
+        assert!(!temp.path().join(HOUSEHOLD_SUBDIR).exists());
+    }
+
+    #[test]
+    fn worker_queued_behind_teardown_never_writes_the_detached_household() {
+        let temp = TempDir::new().unwrap();
+        let ledger = open_at(temp.path(), 4);
+        let lifecycle = HouseholdLifecycleLock::open_verified(temp.path()).unwrap();
+        let teardown = lifecycle.lock_exclusive().unwrap();
+        let worker_ledger = ledger.clone();
+        let worker = thread::spawn(move || {
+            worker_ledger.consume(
+                &key(0x77),
+                &evidence(MeshIntentChannel::Dev, 0x77, 700),
+                floor(100),
+                &ceremony_control(),
+            )
+        });
+
+        assert!(teardown.rename_household_to_tearing_down().unwrap());
+        let detached_record = temp
+            .path()
+            .join(HOUSEHOLD_TEARDOWN_BREADCRUMB)
+            .join(STORE_SUBDIR)
+            .join(RECORD_FILENAME);
+        let before = fs::read(&detached_record).unwrap();
+        drop(teardown);
+
+        assert_eq!(
+            worker.join().unwrap(),
+            unavailable(MeshIntentNonceUnavailable::RecoveryRequired)
+        );
+        assert_eq!(fs::read(detached_record).unwrap(), before);
+    }
+
+    #[test]
+    fn lifecycle_substitution_after_postcheck_downgrades_committed_to_indeterminate() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let ledger = open_at(temp.path(), 4);
+        let block = TestWorkerBlock::new();
+        ledger.install_worker_block_for_test(block.clone());
+        let worker_ledger = ledger.clone();
+        let worker = thread::spawn(move || {
+            worker_ledger.consume(
+                &key(0x78),
+                &evidence(MeshIntentChannel::Dev, 0x78, 700),
+                floor(100),
+                &ceremony_control(),
+            )
+        });
+
+        block.entered.wait();
+        let lock_path = temp
+            .path()
+            .join(crate::household_lifecycle::HOUSEHOLD_LIFECYCLE_LOCK_FILENAME);
+        fs::remove_file(&lock_path).unwrap();
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(lock_path)
+            .unwrap();
+        block.release.wait();
+
+        assert_eq!(
+            worker.join().unwrap(),
+            MeshIntentNonceConsumeOutcome::MayHaveTakenEffect {
+                stage: MeshIntentNonceCommitStage::PostCommitBinding,
+            }
+        );
+        let bytes = fs::read(store_path(temp.path()).join(RECORD_FILENAME)).unwrap();
+        let record: LedgerRecordV1 = cbor::from_canonical_slice_strict(&bytes).unwrap();
+        assert_eq!(
+            record.entries.len(),
+            1,
+            "the downgrade must not claim no effect"
+        );
     }
 
     #[test]
@@ -2436,6 +2682,7 @@ mod tests {
             MeshIntentNonceCommitStage::ReadbackMismatch,
             MeshIntentNonceCommitStage::CleanMarkerWrite,
             MeshIntentNonceCommitStage::CleanMarkerSync,
+            MeshIntentNonceCommitStage::PostCommitBinding,
         ];
 
         for (index, stage) in stages.into_iter().enumerate() {
@@ -2574,7 +2821,10 @@ mod tests {
         for marker in [Vec::new(), MARKER_INITIALIZING[..5].to_vec()] {
             let temp = TempDir::new().unwrap();
             prepare_household(temp.path());
-            let (state_dir, household_dir, store_dir) = open_store_dirs(temp.path()).unwrap();
+            let lifecycle = HouseholdLifecycleLock::open_verified(temp.path()).unwrap();
+            let _lifecycle_guard = lifecycle.lock_shared().unwrap();
+            let state_dir = lifecycle.clone_state_dir().unwrap();
+            let (state_dir, household_dir, store_dir) = open_store_dirs(state_dir).unwrap();
             let (mut lock_file, created) = open_lock_file(&store_dir).unwrap();
             assert!(created);
             verify_or_create_lock_anchor(&household_dir, &store_dir, &lock_file, created).unwrap();
@@ -2634,13 +2884,26 @@ mod tests {
     }
 
     #[test]
-    fn linux_filesystem_allowlist_excludes_tmpfs_nfs_and_unknown_families() {
+    fn rename_known_no_effect_filesystem_allowlist_is_exact_and_review_gated() {
+        // `MeshIntentNonceCommitStage::Rename => KnownNoEffect` is sound only
+        // for this measured set. This exact-equality assertion deliberately
+        // makes any allowlist expansion edit the test and revisit that outcome
+        // classification; mere membership tests would let an unsafe addition
+        // pass silently.
+        assert_eq!(
+            LINUX_RENAME_KNOWN_NO_EFFECT_FILESYSTEMS,
+            [EXT4_SUPER_MAGIC, XFS_SUPER_MAGIC, BTRFS_SUPER_MAGIC]
+        );
+        assert_eq!(MACOS_RENAME_KNOWN_NO_EFFECT_FILESYSTEMS, [b"apfs"]);
         assert!(linux_filesystem_is_allowlisted(EXT4_SUPER_MAGIC));
         assert!(linux_filesystem_is_allowlisted(XFS_SUPER_MAGIC));
         assert!(linux_filesystem_is_allowlisted(BTRFS_SUPER_MAGIC));
+        assert!(macos_filesystem_is_allowlisted(b"apfs"));
         assert!(!linux_filesystem_is_allowlisted(TMPFS_SUPER_MAGIC));
         assert!(!linux_filesystem_is_allowlisted(NFS_SUPER_MAGIC));
         assert!(!linux_filesystem_is_allowlisted(i64::MAX));
+        assert!(!macos_filesystem_is_allowlisted(b"hfs"));
+        assert!(!macos_filesystem_is_allowlisted(b"nfs"));
     }
 
     #[test]

@@ -7,13 +7,46 @@ use household_rs::device_admission::{
     owner_person_cert_digest,
 };
 use household_rs::pop::RequestSigningContext;
-use household_rs::{DeviceId, HouseholdAuthState, P256Signature, PersonId};
+use household_rs::{
+    DeviceId, HouseholdAuthState, HouseholdRecord, P256Signature, PersonId,
+    household_lifecycle::{HouseholdLifecycleLock, LifecycleReadGuard},
+};
+use std::path::Path;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
 
 use crate::household_state::HouseholdState;
 
 const TIMESTAMP_TOLERANCE_SECS: u64 = 60;
+
+/// Acquire lifecycle-shared and prove that disk still contains the exact
+/// household record whose in-memory authority a blocking operation is about
+/// to use.
+///
+/// This function blocks on a cross-process flock and must be called only from
+/// `spawn_blocking` (or an already-synchronous worker). Retaining the returned
+/// guard prevents teardown/replace from renaming `household/` until the caller
+/// finishes all path-based I/O. Exact record equality prevents a stale daemon
+/// from operating on a replacement household after it finally acquires the
+/// lock.
+pub(crate) fn acquire_exact_household_lifecycle(
+    state_dir: &Path,
+    expected: &HouseholdRecord,
+) -> Result<LifecycleReadGuard, &'static str> {
+    let lifecycle =
+        HouseholdLifecycleLock::open_verified(state_dir).map_err(|_| "lifecycle_open_failed")?;
+    let guard = lifecycle
+        .lock_shared()
+        .map_err(|_| "lifecycle_shared_failed")?;
+    let observed: Option<HouseholdRecord> = household_rs::storage::read_optional_cbor(
+        &household_rs::storage::household_record_path(state_dir),
+    )
+    .map_err(|_| "household_record_read_failed")?;
+    if observed.as_ref() != Some(expected) {
+        return Err("household_record_changed");
+    }
+    Ok(guard)
+}
 
 #[derive(Debug, Clone)]
 pub struct SoyehtPoP {
@@ -680,9 +713,12 @@ pub async fn authorize_roster_read(
 
     let snapshot = {
         let state_dir = state_dir.to_path_buf();
+        let record = identity.record.clone();
         let hh_id = identity.record.hh_id.clone();
         let hh_pub = identity.record.hh_pub.clone();
         match tokio::task::spawn_blocking(move || {
+            let _lifecycle = acquire_exact_household_lifecycle(&state_dir, &record)
+                .map_err(|_| DeviceAdmissionError::Unavailable)?;
             HouseholdDeviceAdmissionAuthorityV1::new(&state_dir, hh_id, hh_pub).live_snapshot()
         })
         .await
@@ -789,4 +825,69 @@ fn authority_unavailable(reason: &'static str) -> RosterReadAuthError {
         "device admission authority unavailable"
     );
     RosterReadAuthError::AuthorityUnavailable
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use household_rs::ids::{derive_household_id, derive_machine_id};
+    use household_rs::keys::{IdentityKey, P256Keypair};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn record(name: &str) -> HouseholdRecord {
+        let household = P256Keypair::generate();
+        let machine = P256Keypair::generate();
+        HouseholdRecord {
+            version: HouseholdRecord::SCHEMA_VERSION,
+            hh_id: derive_household_id(&household.public()),
+            hh_pub: household.public(),
+            name: name.into(),
+            created_at: 1,
+            shamir_k: 1,
+            shamir_n: 1,
+            members: vec![derive_machine_id(&machine.public())],
+            is_follower: false,
+        }
+    }
+
+    #[test]
+    fn exact_household_guard_blocks_replace_and_rejects_a_stale_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = record("first");
+        household_rs::storage::atomic_write_cbor(
+            &household_rs::storage::household_record_path(temp.path()),
+            &first,
+        )
+        .unwrap();
+
+        let guard = acquire_exact_household_lifecycle(temp.path(), &first).unwrap();
+        let contender_dir = temp.path().to_path_buf();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let contender = std::thread::spawn(move || {
+            let lifecycle = HouseholdLifecycleLock::open_verified(&contender_dir).unwrap();
+            let _write = lifecycle.lock_exclusive().unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+        assert!(
+            acquired_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "teardown/replacement entered while a path-based authority read was live"
+        );
+        drop(guard);
+        acquired_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        contender.join().unwrap();
+
+        let second = record("second");
+        household_rs::storage::atomic_write_cbor(
+            &household_rs::storage::household_record_path(temp.path()),
+            &second,
+        )
+        .unwrap();
+        assert_eq!(
+            acquire_exact_household_lifecycle(temp.path(), &first).unwrap_err(),
+            "household_record_changed"
+        );
+    }
 }

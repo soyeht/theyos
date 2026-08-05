@@ -73,6 +73,7 @@ impl HouseholdExposurePolicy {
                 InterfaceClass::Loopback | InterfaceClass::Lan | InterfaceClass::Tailscale
             ),
             BootstrapState::NamedAwaitingPair
+            | BootstrapState::PairMachineInstallRestartRequired
             | BootstrapState::Ready
             | BootstrapState::Recovering => {
                 matches!(

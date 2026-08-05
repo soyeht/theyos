@@ -41,8 +41,13 @@ pub enum InjectionPoint {
     /// M2's `local/finalize` hits this after the founder-cert staged
     /// file has been written but before `staged.commit()` runs.
     M2AfterFounderCertStaged,
-    /// M2's `local/finalize` hits this immediately before `FinalizeAck`
-    /// is encoded onto the response stream.
+    /// A cold-G1 exact retry of M2's `local/finalize` hits this immediately
+    /// after the exact `MayHaveTakenEffect` delivery breadcrumb is durable but
+    /// before Ready or any response body is exposed.
+    M2AfterAckDeliveryBreadcrumb,
+    /// A cold-G1 exact retry of M2's `local/finalize` hits this immediately
+    /// before the retained `FinalizeAck` bytes are delivered. The initial G0
+    /// commit never reaches this point; it returns `restart_required`.
     M2BeforeAckEncode,
     /// M1's `owner_approve_handler` hits this after `finalize_with_m2`
     /// returns Ok and before `commit_preserve_on_error` runs (between
