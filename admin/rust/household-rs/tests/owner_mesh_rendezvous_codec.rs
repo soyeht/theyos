@@ -415,7 +415,13 @@ fn r1a7_enumerates_linked_targets_and_proves_zero_production_callers() {
             .iter()
             .filter(|target| target.kind == "test")
             .count(),
-        156 // 146 + 2 R0a Fatia N + 1 B0a roster-currency + 2 device-key-rs S1 integration targets + 5 mesh-session composition targets
+        // 152 + 4. The old arithmetic here (146 + 2 + 1 + 2 + 5) summed to the
+        // right total by two errors that cancel: the base was 152 in the tree,
+        // not the 151 those terms add to, and the composition adds 4 test
+        // targets, not 5. Decomposing by kind is what exposed both -- the
+        // total assertion fires first and hides the sub-counters, and one
+        // wrong count is visible where two that cancel are not.
+        156
     );
     assert_eq!(
         targets

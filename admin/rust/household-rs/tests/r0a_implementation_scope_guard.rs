@@ -386,7 +386,7 @@ fn r0a_n_ratchet_names_new_targets() {
     for needle in [
         "assert_eq!(targets.len(), 206",
         "filter(|target| target.kind == \"test\")",
-        "146 + 2 R0a Fatia N + 1 B0a roster-currency + 2 device-key-rs S1 integration targets + 5 mesh-session composition targets",
+        "right total by two errors that cancel: the base was 152 in the tree,",
         "name == \"caveat_narrowing\"",
         "path == \"household-rs/tests/caveat_narrowing.rs\"",
         "name == \"r0a_implementation_scope_guard\"",
@@ -483,11 +483,7 @@ fn r0a_d2a_tests_stay_inline_and_off_the_cargo_target_ratchet() {
     let ratchet_path = ["owner_mesh_", "rendezvous_codec.rs"].concat();
     let r1a7 = read(package_dir().join("tests").join(ratchet_path));
     assert!(r1a7.contains("assert_eq!(targets.len(), 206"));
-    assert!(
-        r1a7.contains(
-            "156 // 146 + 2 R0a Fatia N + 1 B0a roster-currency + 2 device-key-rs S1 integration targets + 5 mesh-session composition targets"
-        )
-    );
+    assert!(r1a7.contains("right total by two errors that cancel: the base was 152 in the tree,"));
 
     // Coverage ratchet: counts the `#[test]` attribute itself, not any `fn`, so
     // helper functions cannot pad the number. Lower bounds, so a later slice may
