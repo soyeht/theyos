@@ -691,6 +691,31 @@ fn router_from_owner_auth_with_router_state(
     let household =
         HouseholdState::loaded_with_owner_auth(Arc::clone(&identity), Some(Arc::new(owner_auth)));
     let broadcaster = OwnerEventsBroadcaster::new();
+    // `household/` must exist before the log is opened. The B-2 hardening
+    // replaced a path-based `create_dir_all` with an fd-relative
+    // `openat(state_dir, "household", O_DIRECTORY)` + `mkdirat`, which OPENS the
+    // parent rather than creating it. The old call incidentally fabricated
+    // `household/` on demand, and this harness depended on that without anyone
+    // noticing -- fixtures that never call `bootstrap_or_load` used to work.
+    //
+    // Created here, in the single place every router fixture is built, rather
+    // than in each test: if every test has to remember, the next one that
+    // forgets fails the same way and the cause looks mysterious again.
+    //
+    // Production is unaffected and was verified so: the sole production caller
+    // opens the log only when a household is already loaded, and a loaded
+    // household implies `household/` exists because the record lives inside it.
+    std::fs::create_dir_all(td.path().join("household")).unwrap();
+    // And the record itself: opening the log verifies the household binding
+    // against `household/household_record.cbor`. Persisting the identity this
+    // fixture already claims to run with makes the on-disk state COHERENT with
+    // the router being built -- previously the fixture ran against a household
+    // record that existed only in memory.
+    household_rs::storage::atomic_write_cbor(
+        &household_rs::storage::household_record_path(td.path()),
+        &identity.record,
+    )
+    .unwrap();
     let lifecycle = HouseholdLifecycleLock::open_verified(td.path()).unwrap();
     let lifecycle_guard = lifecycle.lock_exclusive().unwrap();
     let event_log = OwnerEventLog::open_with_broadcaster_under_lifecycle(
