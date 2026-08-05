@@ -17,11 +17,17 @@ async fn phase3_machine_join_remote() {
         PairMachineState::Committed
     );
 
+    let founder_read = ceremony
+        .founder
+        .lifecycle
+        .lock_shared()
+        .expect("lock lifecycle shared");
     let committed_events = ceremony
         .founder
         .event_log
-        .read_since(0)
+        .read_since(&founder_read, 0)
         .expect("read owner events");
+    drop(founder_read);
     assert_eq!(committed_events.len(), 2);
     assert_eq!(committed_events[1].cursor, 2);
     assert_eq!(

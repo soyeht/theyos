@@ -15,6 +15,7 @@ use axum::middleware::Next;
 use axum::response::Response;
 use axum::{Router, middleware, routing};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
+use household_rs::household_lifecycle::HouseholdLifecycleLock;
 use household_rs::keys::{IdentityKey, P256Keypair, P256PublicKey, verify_signature};
 use household_rs::machine_cert::Platform;
 use household_rs::owner_events::{
@@ -93,6 +94,10 @@ pub struct FounderHarness {
     /// stage `JoinRequest`s against the same in-process founder window
     /// the HTTP router writes into.
     pub pair_state: PairMachineRouterState,
+    /// Stored so call sites elsewhere can `lock_shared()` to call
+    /// `event_log.read_since`, same pattern as `server-rs`'s own
+    /// `founder.lifecycle.lock_shared()`.
+    pub lifecycle: HouseholdLifecycleLock,
 }
 
 pub struct CandidateHarness {
@@ -212,9 +217,18 @@ pub fn founder_harness_with_tailnet_resolver(
     let window =
         Arc::new(PairMachineWindow::with_persistence(dir.path().to_path_buf()).expect("m1 window"));
     let broadcaster = OwnerEventsBroadcaster::new();
-    let event_log =
-        OwnerEventLog::open_with_broadcaster(dir.path().to_path_buf(), broadcaster.clone())
-            .expect("owner event log");
+    let lifecycle = HouseholdLifecycleLock::open_verified(dir.path()).expect("open lifecycle lock");
+    let lifecycle_guard = lifecycle
+        .lock_exclusive()
+        .expect("lock lifecycle exclusive");
+    let event_log = OwnerEventLog::open_with_broadcaster_under_lifecycle(
+        &lifecycle_guard,
+        dir.path().to_path_buf(),
+        &identity.record.hh_id.to_string(),
+        broadcaster.clone(),
+    )
+    .expect("owner event log");
+    drop(lifecycle_guard);
 
     let pair_state = PairMachineRouterState {
         window: Arc::clone(&window),
@@ -264,6 +278,7 @@ pub fn founder_harness_with_tailnet_resolver(
         event_log,
         router,
         pair_state,
+        lifecycle,
     }
 }
 
@@ -275,6 +290,7 @@ pub fn rebuild_founder_router_from_disk(
             .expect("reload founder identity")
             .expect("founder identity exists"),
     );
+    let expected_hh_id = identity.record.hh_id.to_string();
     let household =
         HouseholdState::loaded_with_owner_auth(identity, Some(Arc::clone(&founder.owner.auth)));
     let window = Arc::new(
@@ -282,9 +298,19 @@ pub fn rebuild_founder_router_from_disk(
             .expect("reload pair-machine window"),
     );
     let broadcaster = OwnerEventsBroadcaster::new();
-    let event_log =
-        OwnerEventLog::open_with_broadcaster(founder.dir.path().to_path_buf(), broadcaster.clone())
-            .expect("reload owner event log");
+    let lifecycle =
+        HouseholdLifecycleLock::open_verified(founder.dir.path()).expect("open lifecycle lock");
+    let lifecycle_guard = lifecycle
+        .lock_exclusive()
+        .expect("lock lifecycle exclusive");
+    let event_log = OwnerEventLog::open_with_broadcaster_under_lifecycle(
+        &lifecycle_guard,
+        founder.dir.path().to_path_buf(),
+        &expected_hh_id,
+        broadcaster.clone(),
+    )
+    .expect("reload owner event log");
+    drop(lifecycle_guard);
     let pair_state = PairMachineRouterState {
         window: Arc::clone(&window),
         household: household.clone(),
@@ -379,6 +405,7 @@ async fn candidate_harness_with_optional_tailnet_hint(
         state_dir: dir.path().to_path_buf(),
         key_policy: KeyBackingPolicy::ForceSoftware,
         bootstrap: None,
+        runtime_signal: None,
     });
     let router = if let Some(ip) = tailnet_ip {
         let value = HeaderValue::from_str(&format!("{ip}:{}", addr.port()))

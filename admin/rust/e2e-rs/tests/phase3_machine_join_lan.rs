@@ -185,7 +185,15 @@ async fn phase3_machine_join_lan() {
         PairMachineState::Committed
     );
 
-    let final_events = founder.event_log.read_since(0).expect("read owner events");
+    let founder_read = founder
+        .lifecycle
+        .lock_shared()
+        .expect("lock lifecycle shared");
+    let final_events = founder
+        .event_log
+        .read_since(&founder_read, 0)
+        .expect("read owner events");
+    drop(founder_read);
     assert_eq!(final_events.len(), 2);
     assert_eq!(final_events[1].cursor, 2);
     assert_eq!(final_events[1].event_type, OwnerEventType::MachineJoined);

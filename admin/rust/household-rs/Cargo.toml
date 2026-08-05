@@ -16,6 +16,11 @@ default = []
 # from this workspace, see admin/rust/Cargo.toml) is a legitimate edge,
 # household-rs never depends on the facade crate itself.
 mesh-session-runtime = ["dep:mesh-session-core-rs"]
+# Lane R (@ilia, 2026-08-05): escape hatches a test needs but production
+# code must never reach, gated by name rather than left `pub` by default.
+# Same discipline as `D1MembershipKey::new_for_test`
+# (`mesh-session-core-rs`'s own `test-support` feature).
+test-support = []
 
 [dependencies]
 serde         = { workspace = true }

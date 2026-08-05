@@ -31,6 +31,7 @@ use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use axum::routing;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
 use household_rs::HouseholdRecord;
+use household_rs::household_lifecycle::HouseholdLifecycleLock;
 use household_rs::keys::{IdentityKey, P256Keypair};
 use household_rs::machine_cert::Platform;
 use household_rs::owner_events::{OwnerEventLog, OwnerEventsBroadcaster};
@@ -134,9 +135,18 @@ fn build_founder_rig(pair_owner: bool) -> FounderRig {
     let window =
         Arc::new(PairMachineWindow::with_persistence(dir.path().to_path_buf()).expect("window"));
     let broadcaster = OwnerEventsBroadcaster::new();
-    let event_log =
-        OwnerEventLog::open_with_broadcaster(dir.path().to_path_buf(), broadcaster.clone())
-            .expect("event log");
+    let lifecycle = HouseholdLifecycleLock::open_verified(dir.path()).expect("open lifecycle lock");
+    let lifecycle_guard = lifecycle
+        .lock_exclusive()
+        .expect("lock lifecycle exclusive");
+    let event_log = OwnerEventLog::open_with_broadcaster_under_lifecycle(
+        &lifecycle_guard,
+        dir.path().to_path_buf(),
+        &identity.record.hh_id.to_string(),
+        broadcaster.clone(),
+    )
+    .expect("event log");
+    drop(lifecycle_guard);
     let pair_state = PairMachineRouterState {
         window: Arc::clone(&window),
         household,

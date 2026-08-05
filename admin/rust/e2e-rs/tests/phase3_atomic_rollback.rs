@@ -142,6 +142,7 @@ async fn candidate_harness_with_ttl(ttl: Duration) -> CandidateHarness {
         state_dir: dir.path().to_path_buf(),
         key_policy: KeyBackingPolicy::ForceSoftware,
         bootstrap: None,
+        runtime_signal: None,
     });
     let served_router = router.clone();
     let server = tokio::spawn(async move {

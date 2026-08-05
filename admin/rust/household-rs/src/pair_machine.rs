@@ -595,6 +595,36 @@ impl PairMachineWindow {
             .read_pair_machine_under_lifecycle(lifecycle)
     }
 
+    /// Test-only: overwrite the durable snapshot for this handle's exact
+    /// lifecycle generation, through the same scoped namespace and the
+    /// same lifecycle guard production writes go through — never a raw
+    /// path, never `atomic_write_cbor` called directly against a
+    /// hand-built location. Exists so tests that need to simulate time
+    /// passing on an already-committed window (e.g. an expired grace
+    /// period) produce that state through the real write path instead of
+    /// reaching around it.
+    ///
+    /// `test-support`-gated, same discipline as
+    /// `D1MembershipKey::new_for_test`: an escape hatch a test needs is
+    /// still a capability, and capabilities get a named gate rather than
+    /// a wider default visibility.
+    #[cfg(feature = "test-support")]
+    pub fn write_persisted_snapshot_under_lifecycle_for_test(
+        &self,
+        snapshot: &PairMachineWindowSnapshot,
+        lifecycle: &crate::household_lifecycle::LifecycleWriteGuard,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .namespace
+            .as_ref()
+            .ok_or_else(|| {
+                StorageError::Encoding(HouseholdError::InvalidRecord(
+                    "in-memory pair-machine window has no durable snapshot".into(),
+                ))
+            })?
+            .write_pair_machine_under_lifecycle(snapshot, lifecycle)
+    }
+
     /// Clear an interrupted staged snapshot in this exact generation.
     pub fn clear_staged_snapshot_under_lifecycle(
         &self,

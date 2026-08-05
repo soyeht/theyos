@@ -2803,10 +2803,16 @@ mod tests {
         );
     }
 
-    // This loopback-only test needs the raw serve primitive so it can observe
-    // Hyper draining the response body during graceful shutdown. It does not
-    // expose a production listener or a Product A route.
-    #[allow(clippy::disallowed_methods)]
+    // This loopback-only test observes Hyper draining the response body
+    // during graceful shutdown. It goes through the shared choke-point
+    // wrapper (`core_rs::product_a_phase0::serve`), not the raw `axum::serve`
+    // primitive: the phase0 gate permits `#[allow(clippy::disallowed_methods)]`
+    // in exactly one file (core-rs/src/product_a_phase0.rs), so a second
+    // occurrence here trips it and silently stops exercising the
+    // module-crossing negative control for the Product A boundary. The
+    // wrapper only intercepts `/api/v1/mobile/claw-vpn*` paths; this test's
+    // route is `/terminal`, so the swap does not change what the test
+    // observes.
     async fn signaled_response_survives_immediate_tcp_graceful_shutdown(
         status: StatusCode,
         body: Vec<u8>,
@@ -2830,7 +2836,7 @@ mod tests {
         );
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
-            axum::serve(listener, app)
+            core_rs::product_a_phase0::serve(listener, app)
                 .with_graceful_shutdown(async move {
                     let _ = shutdown_rx.await;
                 })
