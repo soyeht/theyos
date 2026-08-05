@@ -128,6 +128,15 @@ impl<H: RevocableMeshSession> D1Admission for RegistryD1Admission<'_, H> {
 /// the actual registry call is a thin, no-branching delegation that
 /// needs no duplicate coverage here, but the DECISION this adapter makes
 /// about each outcome does.
+///
+/// (@zain) The delegation is not tested by construction — its thinness
+/// is a property of the current code, not an invariant. If a future
+/// edit adds a branch inside `reserve_pending`'s own call sites (an
+/// `if` on the snapshot/registry outcome, an extra `map_err`), these
+/// pure-function tests stay green and that new branch goes unexercised:
+/// they cover the callee, not the call site. Same shape as `cce11a86`'s
+/// gap, mirrored — there it was the call site pinned and the callee
+/// untested; here it is the reverse.
 #[derive(Debug)]
 enum PreauthorizeAction {
     Retry,
