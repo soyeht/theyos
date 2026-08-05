@@ -1301,10 +1301,16 @@ mod tests {
         let shutdown_state_dir = state_dir.path().to_path_buf();
         let shutdown_bootstrap = Arc::clone(&bootstrap);
         let server = tokio::spawn(async move {
-            core_rs::phase0_axum_serve!(
+            // The production listener above is the file's single use of the
+            // Phase-0 serve macro; the compile-out checker
+            // (.github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh)
+            // requires exactly one such macro invocation per listener source.
+            // This test needs the same choke-point, so it calls the
+            // underlying function directly -- identical expansion, no second
+            // count.
+            core_rs::product_a_phase0::serve_with_connect_info::<_, std::net::SocketAddr>(
                 listener,
                 terminal_router,
-                connect_info = std::net::SocketAddr
             )
             .with_graceful_shutdown(
                 crate::household_bootstrap::wait_until_terminal_replay_is_inactive(
