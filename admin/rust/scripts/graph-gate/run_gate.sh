@@ -123,8 +123,20 @@ cat "$OUT/offsurface-default.out"
 echo
 echo "=== PHASE 3: feature matrix (compiled, --all-targets) ==="
 
+# The AUTHORITATIVE clippy row: this is byte-for-byte what
+# .github/workflows/backend-ci.yml runs (`cargo clippy --workspace -- -D
+# warnings`, no `--all-targets`). Cite THIS one when reporting "the gate".
+run c0-clippy-ci-equivalent cargo clippy --offline --workspace -- -D warnings
+
+# The `--all-targets` row is a DIFFERENT question and is declared debt, not the
+# gate: CI's own comment records that `--all-targets` exits 101 across
+# core-rs/server-rs/vmrunner-rs/e2e-rs on default features because it has never
+# linted test code. Reporting it as "the gate" makes a permanently-red signal
+# that masks real regressions -- which is exactly how a lifecycle clippy
+# regression stayed hidden. Kept because it answers "is a test-target caller
+# broken", but never conflated with the row above.
 run c0-check-default    cargo check   --offline --workspace --all-targets
-run c0-clippy-default   cargo clippy  --offline --workspace --all-targets -- -D warnings
+run c0-clippy-alltargets-debt cargo clippy --offline --workspace --all-targets -- -D warnings
 run c1-check-mesh       cargo check   --offline -p keystore-rs --all-targets --features mesh-session
 run c1-clippy-mesh      cargo clippy  --offline -p keystore-rs --all-targets --features mesh-session -- -D warnings
 run c2-clippy-meshtests cargo clippy  --offline -p keystore-rs --all-targets \
