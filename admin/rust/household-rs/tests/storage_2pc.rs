@@ -10,8 +10,8 @@ use household_rs::keys::P256Keypair;
 use household_rs::storage::{
     STAGED_SUFFIX, clear_phase3_finalize_ack_marker, detect_orphan_staged_files, household_dir,
     household_record_path, load_state_dir, machine_cert_for, machine_certs_dir,
-    phase3_finalize_ack_marker_exists, phase3_finalize_ack_marker_path, stage_commit_files,
-    staged_path_for, write_phase3_finalize_ack_marker,
+    phase3_finalize_ack_marker_exists, phase3_finalize_ack_marker_path, staged_path_for,
+    write_phase3_finalize_ack_marker,
 };
 use tempfile::tempdir;
 
@@ -19,49 +19,11 @@ fn payload(b: u8) -> Vec<u8> {
     vec![b; 16]
 }
 
-#[test]
-fn stage_then_commit_promotes_all_files() {
-    let td = tempdir().unwrap();
-    fs::create_dir_all(household_dir(td.path())).unwrap();
-    let a = household_dir(td.path()).join("a.cbor");
-    let b = household_dir(td.path()).join("b.cbor");
-    let staged = stage_commit_files(&[(a.clone(), payload(0xA1)), (b.clone(), payload(0xB2))])
-        .expect("stage");
-    assert!(staged_path_for(&a).exists());
-    assert!(staged_path_for(&b).exists());
-    staged.commit().expect("commit");
-    assert!(a.exists());
-    assert!(b.exists());
-    assert!(!staged_path_for(&a).exists());
-    assert!(!staged_path_for(&b).exists());
-    assert_eq!(fs::read(&a).unwrap(), payload(0xA1));
-    assert_eq!(fs::read(&b).unwrap(), payload(0xB2));
-}
-
-#[test]
-fn stage_then_rollback_removes_staged_files() {
-    let td = tempdir().unwrap();
-    fs::create_dir_all(household_dir(td.path())).unwrap();
-    let a = household_dir(td.path()).join("a.cbor");
-    let staged = stage_commit_files(&[(a.clone(), payload(0xC3))]).expect("stage");
-    assert!(staged_path_for(&a).exists());
-    staged.rollback();
-    assert!(!staged_path_for(&a).exists());
-    assert!(!a.exists());
-}
-
-#[test]
-fn dropping_uncommitted_staged_commit_cleans_up() {
-    let td = tempdir().unwrap();
-    fs::create_dir_all(household_dir(td.path())).unwrap();
-    let a = household_dir(td.path()).join("a.cbor");
-    {
-        let _staged = stage_commit_files(&[(a.clone(), payload(0xD4))]).expect("stage");
-        assert!(staged_path_for(&a).exists());
-        // Drop without commit — best-effort cleanup runs.
-    }
-    assert!(!staged_path_for(&a).exists());
-}
+// The four tests that called `stage_commit_files` DIRECTLY now live in
+// `src/storage.rs`'s unit-test module, because that function is `pub(crate)`
+// and an integration target is a separate crate that can only reach `pub`
+// items. Nothing was dropped: assertions moved verbatim. What remains here
+// is the recovery coverage, which goes through public entry points.
 
 /// R5.7 regression — `recover_partial_phase3_commit` MUST roll
 /// FORWARD when the household record has already been promoted to
@@ -419,46 +381,8 @@ fn finalize_ack_marker_lifecycle_is_idempotent() {
     assert!(!phase3_finalize_ack_marker_exists(td.path()));
 }
 
-/// R7.1 regression — `StagedCommit::commit_preserve_on_error` MUST
-/// leave `.staged` siblings on disk when partial promotion fails.
-/// Plain `commit()` (and the destructor that runs on commit-error)
-/// would unlink the surviving `.staged`, destroying the recovery
-/// evidence the finalize-intent marker is supposed to protect.
-#[test]
-fn staged_commit_preserve_on_error_keeps_remaining_staged_on_failure() {
-    let td = tempdir().unwrap();
-    fs::create_dir_all(household_dir(td.path())).unwrap();
-    let a = household_dir(td.path()).join("a.cbor");
-    let b = household_dir(td.path()).join("b.cbor");
-    // Block `b`'s rename target by pre-creating a directory at the
-    // final path. fs::rename(file → dir) fails with "Is a directory"
-    // (or similar) on POSIX, simulating any mid-loop rename failure.
-    fs::create_dir(&b).unwrap();
-
-    let staged = stage_commit_files(&[(a.clone(), payload(0xA1)), (b.clone(), payload(0xB2))])
-        .expect("stage");
-    let staged_a = staged_path_for(&a);
-    let staged_b = staged_path_for(&b);
-    assert!(staged_a.exists());
-    assert!(staged_b.exists());
-
-    // Partial failure: a was promoted (rename consumed `staged_a`),
-    // b's rename failed.
-    let result = staged.commit_preserve_on_error();
-    assert!(result.is_err());
-
-    // `a` ended up at its final path (rename succeeded for the first
-    // item) — its `.staged` is gone because `fs::rename` consumes it.
-    assert!(a.is_file());
-    assert!(!staged_a.exists());
-    // `b`'s `.staged` MUST survive — preserve_on_error disarmed
-    // both the explicit rollback AND the Drop cleanup.
-    assert!(
-        staged_b.exists(),
-        "preserve_on_error MUST leave `.staged` on disk so boot-time \
-         recovery can find it via the phase3_finalize_ack.marker",
-    );
-}
+// R7.1 (`commit_preserve_on_error` must leave `.staged` on disk after a
+// partial promotion) also moved to `src/storage.rs` — it stages directly.
 
 /// R7.NB2 regression — the stale-marker sweep in `load_state_dir`
 /// MUST clear `phase3_finalize_ack.marker` whenever the on-disk

@@ -1283,7 +1283,9 @@ pub fn staged_path_for(path: &Path) -> PathBuf {
 /// still cache-only. A power loss in that window leaks the inode
 /// invisibly: `detect_orphan_staged_files` would not see it on the
 /// next boot, and the file content would never be reclaimed.
-pub fn stage_commit_files(items: &[(PathBuf, Vec<u8>)]) -> Result<StagedCommit, StorageError> {
+pub(crate) fn stage_commit_files(
+    items: &[(PathBuf, Vec<u8>)],
+) -> Result<StagedCommit, StorageError> {
     use std::collections::HashSet;
     let mut staged = Vec::with_capacity(items.len());
     let mut parents_to_fsync: HashSet<PathBuf> = HashSet::new();
@@ -1583,6 +1585,103 @@ mod tests {
 
     #[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
     struct Tiny(u32, String);
+
+    // -- 2PC staging: moved here from tests/storage_2pc.rs --------------
+    //
+    // These four exercise `stage_commit_files` DIRECTLY, so they had to be
+    // unit tests once that function became `pub(crate)`: an integration
+    // target is a separate crate and can only reach `pub` items. They were
+    // always unit-level — they drive the staging primitive itself, not a
+    // recovery scenario — so this is where they belonged. The ten recovery
+    // tests that remain in `tests/storage_2pc.rs` go through public entry
+    // points and are unaffected.
+    //
+    // Assertions are unchanged from the integration file; only the module
+    // and the import path moved.
+
+    fn payload(b: u8) -> Vec<u8> {
+        vec![b; 16]
+    }
+
+    #[test]
+    fn stage_then_commit_promotes_all_files() {
+        let td = tempdir().unwrap();
+        fs::create_dir_all(household_dir(td.path())).unwrap();
+        let a = household_dir(td.path()).join("a.cbor");
+        let b = household_dir(td.path()).join("b.cbor");
+        let staged = stage_commit_files(&[(a.clone(), payload(0xA1)), (b.clone(), payload(0xB2))])
+            .expect("stage");
+        assert!(staged_path_for(&a).exists());
+        assert!(staged_path_for(&b).exists());
+        staged.commit().expect("commit");
+        assert!(a.exists());
+        assert!(b.exists());
+        assert!(!staged_path_for(&a).exists());
+        assert!(!staged_path_for(&b).exists());
+        assert_eq!(fs::read(&a).unwrap(), payload(0xA1));
+        assert_eq!(fs::read(&b).unwrap(), payload(0xB2));
+    }
+
+    #[test]
+    fn stage_then_rollback_removes_staged_files() {
+        let td = tempdir().unwrap();
+        fs::create_dir_all(household_dir(td.path())).unwrap();
+        let a = household_dir(td.path()).join("a.cbor");
+        let staged = stage_commit_files(&[(a.clone(), payload(0xC3))]).expect("stage");
+        assert!(staged_path_for(&a).exists());
+        staged.rollback();
+        assert!(!staged_path_for(&a).exists());
+        assert!(!a.exists());
+    }
+
+    #[test]
+    fn dropping_uncommitted_staged_commit_cleans_up() {
+        let td = tempdir().unwrap();
+        fs::create_dir_all(household_dir(td.path())).unwrap();
+        let a = household_dir(td.path()).join("a.cbor");
+        {
+            let _staged = stage_commit_files(&[(a.clone(), payload(0xD4))]).expect("stage");
+            assert!(staged_path_for(&a).exists());
+            // Drop without commit — best-effort cleanup runs.
+        }
+        assert!(!staged_path_for(&a).exists());
+    }
+
+    #[test]
+    fn staged_commit_preserve_on_error_keeps_remaining_staged_on_failure() {
+        let td = tempdir().unwrap();
+        fs::create_dir_all(household_dir(td.path())).unwrap();
+        let a = household_dir(td.path()).join("a.cbor");
+        let b = household_dir(td.path()).join("b.cbor");
+        // Block `b`'s rename target by pre-creating a directory at the
+        // final path. fs::rename(file → dir) fails with "Is a directory"
+        // (or similar) on POSIX, simulating any mid-loop rename failure.
+        fs::create_dir(&b).unwrap();
+
+        let staged = stage_commit_files(&[(a.clone(), payload(0xA1)), (b.clone(), payload(0xB2))])
+            .expect("stage");
+        let staged_a = staged_path_for(&a);
+        let staged_b = staged_path_for(&b);
+        assert!(staged_a.exists());
+        assert!(staged_b.exists());
+
+        // Partial failure: a was promoted (rename consumed `staged_a`),
+        // b's rename failed.
+        let result = staged.commit_preserve_on_error();
+        assert!(result.is_err());
+
+        // `a` ended up at its final path (rename succeeded for the first
+        // item) — its `.staged` is gone because `fs::rename` consumes it.
+        assert!(a.is_file());
+        assert!(!staged_a.exists());
+        // `b`'s `.staged` MUST survive — preserve_on_error disarmed
+        // both the explicit rollback AND the Drop cleanup.
+        assert!(
+            staged_b.exists(),
+            "preserve_on_error MUST leave `.staged` on disk so boot-time \
+             recovery can find it via the phase3_finalize_ack.marker",
+        );
+    }
 
     #[test]
     fn atomic_round_trip() {
