@@ -261,6 +261,7 @@ fn pair_machine_txt_does_not_leak_obsolete_state() {
         pinned_hh_pub: None,
         pinned_hh_id: None,
         approval_claim: None,
+        lifecycle_generation: None,
     };
 
     let txt = HouseholdBonjour::txt_for_state(&params, None, Some(&snap));

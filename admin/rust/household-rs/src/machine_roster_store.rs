@@ -1001,6 +1001,47 @@ pub struct MachineRosterCoordinator {
     clock: Arc<dyn ClockSource>,
 }
 
+/// Household-bound trusted wall-clock floor minted only while the
+/// [`MachineRosterCoordinator`] holds and validates roster clock authority.
+///
+/// Downstream code cannot manufacture a high floor to erase nonce replay
+/// history:
+///
+/// ```compile_fail
+/// use household_rs::{ids::HouseholdId, mesh_intent_nonce_ledger::TrustedWallFloor};
+/// let hh = HouseholdId::parse(format!("hh_{}", "a".repeat(52))).unwrap();
+/// let forged = TrustedWallFloor::from_roster_observation(hh, u64::MAX);
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrustedWallFloor {
+    hh_id: HouseholdId,
+    unix_seconds: u64,
+}
+
+impl TrustedWallFloor {
+    fn from_roster_observation(hh_id: HouseholdId, unix_seconds: u64) -> Self {
+        Self {
+            hh_id,
+            unix_seconds,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(hh_id: HouseholdId, unix_seconds: u64) -> Self {
+        Self::from_roster_observation(hh_id, unix_seconds)
+    }
+
+    #[must_use]
+    pub const fn household_id(&self) -> &HouseholdId {
+        &self.hh_id
+    }
+
+    #[must_use]
+    pub const fn unix_seconds(&self) -> u64 {
+        self.unix_seconds
+    }
+}
+
 impl MachineRosterCoordinator {
     pub fn from_validated_household(
         state_dir: &Path,
@@ -1631,6 +1672,20 @@ impl MachineRosterCoordinator {
     /// helper (RED-R21 pins that the two never diverge), then projects a
     /// `RosterSnapshotView` instead of a per-machine currency result.
     pub fn current_snapshot(&self) -> Result<RosterSnapshotView, RosterSnapshotError> {
+        self.current_snapshot_with_trusted_wall_floor()
+            .map(|(snapshot, _floor)| snapshot)
+    }
+
+    /// Capture the accepted roster and the same durable trusted wall floor
+    /// under one `RosterLock` acquisition.
+    ///
+    /// The opaque floor is the only production token accepted by the mesh
+    /// intent nonce ledger for retention. Keeping its constructor private to
+    /// this coordinator module prevents other crate code from forging a
+    /// far-future floor and pruning live replay entries.
+    pub fn current_snapshot_with_trusted_wall_floor(
+        &self,
+    ) -> Result<(RosterSnapshotView, TrustedWallFloor), RosterSnapshotError> {
         let lock = RosterLock::acquire(&self.state_dir, &self.hh_id)?;
         let mut latch = self
             .latch
@@ -1674,7 +1729,30 @@ impl MachineRosterCoordinator {
         };
 
         let data = admit_current_accepted_data(&current_state, &query_ctx)?;
-        Ok(RosterSnapshotView::project(&self.hh_id, data))
+        Ok((
+            RosterSnapshotView::project(&self.hh_id, data),
+            TrustedWallFloor::from_roster_observation(self.hh_id.clone(), floor),
+        ))
+    }
+
+    /// Open the unique durable mesh-intent nonce authority bound to this
+    /// coordinator's validated household and state directory.
+    ///
+    /// Callers cannot choose either coordinate independently; doing so could
+    /// split one household's replay authority across directories or use a
+    /// trusted wall floor minted for a different household.
+    pub fn open_mesh_intent_nonce_ledger(
+        &self,
+        config: crate::mesh_intent_nonce_ledger::MeshIntentNonceLedgerConfig,
+    ) -> Result<
+        crate::mesh_intent_nonce_ledger::MeshIntentNonceLedger,
+        crate::mesh_intent_nonce_ledger::MeshIntentNonceLedgerOpenError,
+    > {
+        crate::mesh_intent_nonce_ledger::MeshIntentNonceLedger::open(
+            &self.state_dir,
+            self.hh_id.clone(),
+            config,
+        )
     }
 
     fn rederive_current_state(
@@ -4608,6 +4686,29 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let rig = make_coord_rig_at(dir.path(), clock);
         (rig, dir)
+    }
+
+    #[test]
+    fn nonce_ledger_factory_binds_coordinator_state_and_household() {
+        use std::num::NonZeroUsize;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+
+        let clock = TestClock::new(vec![]);
+        let (rig, dir) = make_coord_rig(clock);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let household_dir = crate::storage::household_dir(dir.path());
+        std::fs::create_dir(&household_dir).unwrap();
+        std::fs::set_permissions(household_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = crate::mesh_intent_nonce_ledger::MeshIntentNonceLedgerConfig::new(
+            NonZeroUsize::new(8).unwrap(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let ledger = rig.coord.open_mesh_intent_nonce_ledger(config).unwrap();
+        let reopened = rig.coord.open_mesh_intent_nonce_ledger(config).unwrap();
+        assert_eq!(ledger.target_household_id(), &rig.coord.hh_id);
+        assert!(ledger.shares_process_worker_with(&reopened));
     }
 
     #[test]

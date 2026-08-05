@@ -2457,6 +2457,7 @@ dependencies = [
  "qrcode",
  "rand 0.8.6",
  "rusqlite",
+ "rustix 0.38.44",
  "rustls-pki-types",
  "rustls-webpki 0.103.13",
  "security-framework",

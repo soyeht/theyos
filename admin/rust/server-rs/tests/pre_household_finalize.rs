@@ -88,6 +88,7 @@ async fn fixture() -> Fixture {
         state_dir: m2_dir.path().to_path_buf(),
         key_policy: KeyBackingPolicy::ForceSoftware,
         bootstrap: None,
+        runtime_signal: None,
     });
     Fixture {
         _m1_dir: m1_dir,
@@ -165,6 +166,20 @@ async fn post_finalize(router: Router, body: Vec<u8>) -> (StatusCode, Vec<u8>) {
     (status, bytes)
 }
 
+fn cold_g1_router(fixture: &Fixture) -> Router {
+    let window =
+        Arc::new(PairMachineWindow::with_persistence(fixture.m2_dir.path().to_path_buf()).unwrap());
+    pre_household_router(PreHouseholdRouterState {
+        window,
+        state_dir: fixture.m2_dir.path().to_path_buf(),
+        key_policy: KeyBackingPolicy::ForceSoftware,
+        bootstrap: Some(Arc::new(tokio::sync::RwLock::new(
+            household_rs::bootstrap_state::load(fixture.m2_dir.path()).unwrap(),
+        ))),
+        runtime_signal: None,
+    })
+}
+
 async fn get_seed(router: Router, nonce_short: &str) -> (StatusCode, Vec<u8>) {
     let uri = format!("/pair-machine/local/seed?nonce={nonce_short}");
     let resp = router
@@ -203,8 +218,13 @@ async fn local_finalize_commits_candidate_state() {
     let m1_id = f.join_response.peer_list[0].m_id.clone();
     let m2_id = f.join_response.machine_cert.m_id.to_string();
 
-    let (status, bytes) = post_finalize(f.router, f.join_response_bytes).await;
+    let (status, restart_body) =
+        post_finalize(f.router.clone(), f.join_response_bytes.clone()).await;
 
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!restart_body.is_empty());
+    assert_ne!(f.window.snapshot().await.state, PairMachineState::Committed);
+    let (status, bytes) = post_finalize(cold_g1_router(&f), f.join_response_bytes.clone()).await;
     assert_eq!(status, StatusCode::OK);
     let ack: FinalizeAck = household_rs::cbor::from_canonical_slice(&bytes).unwrap();
     assert_eq!(ack.version, 1);
@@ -231,7 +251,6 @@ async fn local_finalize_commits_candidate_state() {
         household_rs::bootstrap_state::load(f.m2_dir.path()).unwrap(),
         household_rs::bootstrap_state::BootstrapState::Ready
     );
-    assert_eq!(f.window.snapshot().await.state, PairMachineState::Committed);
     assert!(!household_rs::storage::legacy_machine_cert_path(f.m2_dir.path()).exists());
 }
 
@@ -241,14 +260,23 @@ async fn local_finalize_is_idempotent_for_concurrent_same_response() {
 
     let (first, second) = tokio::join!(
         post_finalize(f.router.clone(), f.join_response_bytes.clone()),
-        post_finalize(f.router, f.join_response_bytes)
+        post_finalize(f.router.clone(), f.join_response_bytes.clone())
     );
     let (status1, bytes1) = first;
     let (status2, bytes2) = second;
 
-    assert_eq!(status1, StatusCode::OK);
-    assert_eq!(status2, StatusCode::OK);
+    assert_eq!(status1, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(status2, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(bytes1, bytes2);
+
+    let (cold_status, cold_ack) =
+        post_finalize(cold_g1_router(&f), f.join_response_bytes.clone()).await;
+    assert_eq!(cold_status, StatusCode::OK);
+    let expected_ack = FinalizeAck::for_machine_cert(&f.join_response.machine_cert)
+        .unwrap()
+        .to_canonical_bytes()
+        .unwrap();
+    assert_eq!(cold_ack, expected_ack);
 }
 
 #[tokio::test]
@@ -337,7 +365,7 @@ async fn local_finalize_rejects_unsigned_push_token_seed_mutation() {
 async fn local_finalize_rejects_mutated_response_after_commit() {
     let f = fixture().await;
     let (status, _) = post_finalize(f.router.clone(), f.join_response_bytes.clone()).await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 
     let mut mutated = f.join_response_bytes;
     let last = mutated.len() - 1;
@@ -481,6 +509,7 @@ async fn fixture_without_anchor_with_bootstrap(
         state_dir: m2_dir.path().to_path_buf(),
         key_policy: KeyBackingPolicy::ForceSoftware,
         bootstrap: bootstrap_state,
+        runtime_signal: None,
     });
     (
         Fixture {
@@ -534,9 +563,10 @@ async fn local_anchor_pins_household_for_finalize() {
     );
     assert_eq!(snap.pinned_hh_id.as_deref(), Some(m1.record.hh_id.as_str()));
 
-    // Now finalize must succeed because the anchor is pinned to M1.
+    // The anchored finalize commits durably but the G0 router must require a
+    // cold restart before any Ack is exposed.
     let (status, _) = post_finalize(f.router, f.join_response_bytes).await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]

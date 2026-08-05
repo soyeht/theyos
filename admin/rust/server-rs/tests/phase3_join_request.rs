@@ -8,11 +8,12 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
 use axum::{Router, routing::post};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
+use household_rs::household_lifecycle::HouseholdLifecycleLock;
 use household_rs::keys::{IdentityKey, P256Keypair, P256PublicKey};
 use household_rs::owner_events::{OwnerEventLog, OwnerEventsBroadcaster};
 use household_rs::pair_machine::{
     JoinRequest, JoinTransport, PairMachineState, PairMachineWindow, PairMachineWindowSnapshot,
-    PrepareCandidateOpts, pair_machine_window_path, prepare_candidate,
+    PrepareCandidateOpts, prepare_candidate,
 };
 use household_rs::person_cert::{PersonCert, SignOwnerOptions};
 use household_rs::pop::RequestSigningContext;
@@ -93,8 +94,16 @@ fn router_with_loaded_identity(
     let household = HouseholdState::loaded_with_owner_auth(Arc::clone(identity), Some(owner_auth));
     let window = Arc::new(PairMachineWindow::with_persistence(state_dir.to_path_buf()).unwrap());
     let broadcaster = OwnerEventsBroadcaster::new();
-    let event_log =
-        OwnerEventLog::open_with_broadcaster(state_dir.to_path_buf(), broadcaster.clone()).unwrap();
+    let lifecycle = HouseholdLifecycleLock::open_verified(state_dir).unwrap();
+    let write = lifecycle.lock_exclusive().unwrap();
+    let event_log = OwnerEventLog::open_with_broadcaster_under_lifecycle(
+        &write,
+        state_dir.to_path_buf(),
+        &identity.record.hh_id.to_string(),
+        broadcaster.clone(),
+    )
+    .unwrap();
+    drop(write);
 
     let state = PairMachineRouterState {
         window: Arc::clone(&window),
@@ -145,24 +154,36 @@ fn write_committed_snapshot(
 ) {
     let request: JoinRequest = household_rs::cbor::from_canonical_slice(join_request_cbor).unwrap();
     let m_pub_arr: [u8; 33] = request.m_pub.as_ref().try_into().unwrap();
-    let snap = PairMachineWindowSnapshot {
-        version: 1,
-        state: PairMachineState::Committed,
-        m_pub: Some(request.m_pub.clone()),
-        nonce: Some(request.nonce.clone()),
-        expiry: Some(expiry),
-        transport: Some(request.transport),
-        addr_hint: Some(request.addr),
-        fingerprint: Some(household_rs::fingerprint::fingerprint(&m_pub_arr)),
-        owner_event_cursor: Some(1),
-        cached_join_request: Some(ByteBuf::from(join_request_cbor.to_vec())),
-        cached_response: Some(ByteBuf::from(cached_response)),
-        anchor_secret: None,
-        pinned_hh_pub: None,
-        pinned_hh_id: None,
-        approval_claim: None,
-    };
-    household_rs::storage::atomic_write_cbor(&pair_machine_window_path(state_dir), &snap).unwrap();
+    let lifecycle = HouseholdLifecycleLock::open_verified(state_dir).unwrap();
+    let write = lifecycle.lock_exclusive().unwrap();
+    let generation = write.ensure_lifecycle_generation().unwrap();
+    let window =
+        PairMachineWindow::with_persistence_under_lifecycle(state_dir.to_path_buf(), &write)
+            .unwrap();
+    let mut snap = PairMachineWindowSnapshot::idle();
+    snap.state = PairMachineState::Committed;
+    snap.m_pub = Some(request.m_pub.clone());
+    snap.nonce = Some(request.nonce.clone());
+    snap.expiry = Some(expiry);
+    snap.transport = Some(request.transport);
+    snap.addr_hint = Some(request.addr);
+    snap.fingerprint = Some(household_rs::fingerprint::fingerprint(&m_pub_arr));
+    snap.owner_event_cursor = Some(1);
+    snap.cached_join_request = Some(ByteBuf::from(join_request_cbor.to_vec()));
+    snap.cached_response = Some(ByteBuf::from(cached_response));
+    snap.lifecycle_generation = Some(ByteBuf::from(generation.token_bytes().to_vec()));
+    let snapshot_bytes = household_rs::cbor::to_canonical_vec(&snap).unwrap();
+    let marker = state_dir.join(".phase3-join-request-test-window-commit");
+    window
+        .stage_commit_under_lifecycle(
+            &write,
+            Vec::new(),
+            snapshot_bytes,
+            (marker, b"test-only-window-commit\n".to_vec()),
+        )
+        .unwrap()
+        .commit()
+        .unwrap();
 }
 
 fn candidate_machine_id(join_request_cbor: &[u8]) -> household_rs::MachineId {
@@ -211,13 +232,15 @@ async fn replay_within_grace_returns_cached_response_bytes() {
     let td = tempfile::tempdir().unwrap();
     let body = build_signed_request_bytes(td.path()).await;
     let cached_response = vec![0xa1, 0x61, b'v', 0x01];
+    let identity = Arc::new(bootstrap(td.path()));
+    let (owner_auth, person) = owner_auth_for(&identity);
     write_committed_snapshot(
         td.path(),
         &body,
         cached_response.clone(),
         unix_now().saturating_add(300),
     );
-    let (router, _window, person) = router_with_state(td.path());
+    let (router, _window) = router_with_loaded_identity(td.path(), &identity, owner_auth);
 
     let (status, resp_bytes) = post_cbor(router, body, Some(&person)).await;
 
@@ -230,15 +253,14 @@ async fn replay_within_grace_precedes_post_shamir_membership_gates() {
     let td = tempfile::tempdir().unwrap();
     let body = build_signed_request_bytes(td.path()).await;
     let cached_response = vec![0xa1, 0x61, b'v', 0x01];
+    let mut identity = bootstrap(td.path());
+    let (owner_auth, person) = owner_auth_for(&identity);
     write_committed_snapshot(
         td.path(),
         &body,
         cached_response.clone(),
         unix_now().saturating_add(300),
     );
-
-    let mut identity = bootstrap(td.path());
-    let (owner_auth, person) = owner_auth_for(&identity);
     identity.record.shamir_k = 2;
     identity.record.shamir_n = 2;
     identity.record.members.push(candidate_machine_id(&body));
@@ -257,13 +279,15 @@ async fn replay_after_grace_returns_generic_401() {
     let td = tempfile::tempdir().unwrap();
     let body = build_signed_request_bytes(td.path()).await;
     let cached_response = vec![0xa1, 0x61, b'v', 0x01];
+    let identity = Arc::new(bootstrap(td.path()));
+    let (owner_auth, person) = owner_auth_for(&identity);
     write_committed_snapshot(
         td.path(),
         &body,
         cached_response,
         unix_now().saturating_sub(61),
     );
-    let (router, _window, person) = router_with_state(td.path());
+    let (router, _window) = router_with_loaded_identity(td.path(), &identity, owner_auth);
 
     let (status, resp_bytes) = post_cbor(router, body, Some(&person)).await;
 
@@ -366,8 +390,16 @@ async fn missing_owner_auth_returns_generic_401() {
     let household = HouseholdState::loaded(Arc::clone(&identity));
     let window = Arc::new(PairMachineWindow::with_persistence(td.path().to_path_buf()).unwrap());
     let broadcaster = OwnerEventsBroadcaster::new();
-    let event_log =
-        OwnerEventLog::open_with_broadcaster(td.path().to_path_buf(), broadcaster.clone()).unwrap();
+    let lifecycle = HouseholdLifecycleLock::open_verified(td.path()).unwrap();
+    let write = lifecycle.lock_exclusive().unwrap();
+    let event_log = OwnerEventLog::open_with_broadcaster_under_lifecycle(
+        &write,
+        td.path().to_path_buf(),
+        &identity.record.hh_id.to_string(),
+        broadcaster.clone(),
+    )
+    .unwrap();
+    drop(write);
     let state = PairMachineRouterState {
         window,
         household,

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
+use household_rs::household_lifecycle::HouseholdLifecycleLock;
 use household_rs::keys::{IdentityKey, P256Keypair};
 use household_rs::machine_cert::Platform;
 use household_rs::owner_events::{OwnerEventLog, OwnerEventPayload, OwnerEventsBroadcaster};
@@ -63,6 +64,7 @@ struct FounderHarness {
     state: PairMachineRouterState,
     window: Arc<PairMachineWindow>,
     event_log: Arc<OwnerEventLog>,
+    lifecycle: HouseholdLifecycleLock,
     _identity: Arc<household_rs::LoadedIdentity>,
 }
 
@@ -72,8 +74,16 @@ fn founder_harness() -> FounderHarness {
     let owner_auth = Arc::new(owner_auth_for(&identity));
     let household = HouseholdState::loaded_with_owner_auth(Arc::clone(&identity), Some(owner_auth));
     let broadcaster = OwnerEventsBroadcaster::new();
-    let event_log =
-        OwnerEventLog::open_with_broadcaster(td.path().to_path_buf(), broadcaster.clone()).unwrap();
+    let lifecycle = HouseholdLifecycleLock::open_verified(td.path()).unwrap();
+    let write = lifecycle.lock_exclusive().unwrap();
+    let event_log = OwnerEventLog::open_with_broadcaster_under_lifecycle(
+        &write,
+        td.path().to_path_buf(),
+        &identity.record.hh_id.to_string(),
+        broadcaster.clone(),
+    )
+    .unwrap();
+    drop(write);
     let window = Arc::new(PairMachineWindow::with_persistence(td.path().to_path_buf()).unwrap());
     let state = PairMachineRouterState {
         window: Arc::clone(&window),
@@ -87,6 +97,7 @@ fn founder_harness() -> FounderHarness {
         state,
         window,
         event_log,
+        lifecycle,
         _identity: identity,
     }
 }
@@ -123,6 +134,7 @@ async fn candidate_harness(hostname: &str) -> CandidateHarness {
         state_dir: td.path().to_path_buf(),
         key_policy: KeyBackingPolicy::ForceSoftware,
         bootstrap: None,
+        runtime_signal: None,
     });
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
@@ -187,7 +199,8 @@ async fn published_joiner_with_correct_household_is_fetched_and_staged() {
         snap.cached_join_request.unwrap().as_ref(),
         candidate.prepared.join_request_cbor
     );
-    assert_eq!(founder.event_log.read_since(0).unwrap().len(), 1);
+    let read = founder.lifecycle.lock_shared().unwrap();
+    assert_eq!(founder.event_log.read_since(&read, 0).unwrap().len(), 1);
     browser.abort();
 }
 
@@ -218,7 +231,8 @@ async fn published_joiner_with_wrong_household_is_ignored() {
         founder.window.snapshot().await.state,
         PairMachineState::Idle
     );
-    assert!(founder.event_log.read_since(0).unwrap().is_empty());
+    let read = founder.lifecycle.lock_shared().unwrap();
+    assert!(founder.event_log.read_since(&read, 0).unwrap().is_empty());
     browser.abort();
 }
 
@@ -239,7 +253,8 @@ async fn spoofed_txt_surfaces_fetched_join_request_fingerprint() {
     .unwrap();
 
     wait_for_window_state(&founder.window, PairMachineState::AwaitingOwner).await;
-    let events = founder.event_log.read_since(0).unwrap();
+    let read = founder.lifecycle.lock_shared().unwrap();
+    let events = founder.event_log.read_since(&read, 0).unwrap();
     assert_eq!(events.len(), 1);
     let OwnerEventPayload::JoinRequest(payload) = &events[0].payload else {
         panic!("expected join-request owner event");

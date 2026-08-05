@@ -577,7 +577,9 @@ struct TrackedPid {
 
 impl TrackedPid {
     fn snapshot(pid: i32) -> Self {
-        let identity = u32::try_from(pid).ok().and_then(core_rs::os::process_identity);
+        let identity = u32::try_from(pid)
+            .ok()
+            .and_then(core_rs::os::process_identity);
         Self { pid, identity }
     }
 }
@@ -1043,9 +1045,7 @@ impl PtyManager {
     }
 
     fn read_max_local_sessions_env() -> usize {
-        Self::parse_max_local_sessions(
-            std::env::var("THEYOS_MAX_LOCAL_SESSIONS").ok().as_deref(),
-        )
+        Self::parse_max_local_sessions(std::env::var("THEYOS_MAX_LOCAL_SESSIONS").ok().as_deref())
     }
 
     /// Pure parser for the local-session-count cap env var. Returns the
@@ -1079,7 +1079,9 @@ impl PtyManager {
 
     fn read_orphan_log_max_age_env() -> u64 {
         Self::parse_orphan_log_max_age(
-            std::env::var("THEYOS_ORPHAN_LOG_MAX_AGE_SECS").ok().as_deref(),
+            std::env::var("THEYOS_ORPHAN_LOG_MAX_AGE_SECS")
+                .ok()
+                .as_deref(),
         )
     }
 
@@ -1487,9 +1489,7 @@ mod tests {
     impl Read for FlakyReader {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
             match self.0.pop_front() {
-                Some(FlakyStep::Interrupted) => {
-                    Err(io::Error::from(io::ErrorKind::Interrupted))
-                }
+                Some(FlakyStep::Interrupted) => Err(io::Error::from(io::ErrorKind::Interrupted)),
                 Some(FlakyStep::Data(data)) => {
                     let n = data.len().min(buf.len());
                     buf[..n].copy_from_slice(&data[..n]);
@@ -1844,8 +1844,14 @@ mod tests {
 
     #[test]
     fn parse_max_bytes_clamps_up_to_the_floor() {
-        assert_eq!(PtyManager::parse_max_bytes(Some("0")), MIN_CONV_LOG_MAX_BYTES);
-        assert_eq!(PtyManager::parse_max_bytes(Some("12345")), MIN_CONV_LOG_MAX_BYTES);
+        assert_eq!(
+            PtyManager::parse_max_bytes(Some("0")),
+            MIN_CONV_LOG_MAX_BYTES
+        );
+        assert_eq!(
+            PtyManager::parse_max_bytes(Some("12345")),
+            MIN_CONV_LOG_MAX_BYTES
+        );
         assert_eq!(
             PtyManager::parse_max_bytes(Some(&(MIN_CONV_LOG_MAX_BYTES - 1).to_string())),
             MIN_CONV_LOG_MAX_BYTES
@@ -1941,8 +1947,7 @@ mod tests {
     /// `close_local` reaps it near-instantly instead of leaving it to sleep
     /// out its full duration).
     fn sleep_spec(secs: &str) -> LocalSpawnSpec {
-        let sleep_bin =
-            core_rs::os::which_binary("sleep").expect("sleep must exist for this test");
+        let sleep_bin = core_rs::os::which_binary("sleep").expect("sleep must exist for this test");
         LocalSpawnSpec {
             argv: vec![sleep_bin.to_string_lossy().into_owned(), secs.to_string()],
             cwd: None,
@@ -2042,10 +2047,7 @@ mod tests {
             "must remove exactly the orphaned log, not the live one"
         );
         assert!(!orphan_path.exists(), "orphaned log must be removed");
-        assert!(
-            live_log_path.exists(),
-            "live session's log must survive GC"
-        );
+        assert!(live_log_path.exists(), "live session's log must survive GC");
 
         mgr.close_local("live-conv").unwrap();
     }

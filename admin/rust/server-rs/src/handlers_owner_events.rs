@@ -9,7 +9,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::{
     body::Bytes,
@@ -19,6 +19,7 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
 use household_rs::caveats::Operation;
+use household_rs::household_lifecycle::{HouseholdLifecycleLock, LifecycleWriteGuard};
 use household_rs::owner_approval_v2::{
     AddCredentialContextInput, OwnerApprovalContextV2, OwnerApprovalV2, OwnerApprovalV2Error,
     OwnerOperation, PairMachineTrustedContextInput, ProvisionRecoveryCodeContextInput,
@@ -105,6 +106,284 @@ pub const SECURE_UPGRADE_CHALLENGE_TTL_SECS_ENV: &str = "THEYOS_SECURE_UPGRADE_C
 
 const SECURE_UPGRADE_DEFAULT_CHALLENGE_TTL_SECS: u64 = 300;
 const SECURE_UPGRADE_APP_ATTEST_REPLAY_DIR: &str = "secure_upgrade_app_attest_replay";
+const OWNER_EVENTS_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn owner_events_lifecycle_error(stage: &'static str, error: impl std::fmt::Display) -> String {
+    format!("{stage}: {error}")
+}
+
+/// Enter the short lifecycle-exclusive commit window for an owner-authority
+/// mutation.
+///
+/// Callers already hold `BOOTSTRAP_MUTATION_LOCK`; all network, prompt, RP,
+/// and signing work must finish before this helper is called. Recovering a
+/// prior teardown deliberately rejects the stale request instead of applying
+/// it to the now-uninitialized state root.
+fn acquire_owner_events_lifecycle_exclusive_blocking(
+    state_dir: &FsPath,
+) -> Result<LifecycleWriteGuard, String> {
+    let lifecycle = HouseholdLifecycleLock::open_verified(state_dir)
+        .map_err(|error| owner_events_lifecycle_error("open owner-events lifecycle", error))?;
+    let deadline = Instant::now()
+        .checked_add(OWNER_EVENTS_LIFECYCLE_TIMEOUT)
+        .ok_or_else(|| "owner-events lifecycle deadline overflow".to_string())?;
+    let guard = lifecycle
+        .lock_exclusive_until(deadline)
+        .map_err(|error| owner_events_lifecycle_error("acquire owner-events lifecycle", error))?;
+    Ok(guard)
+}
+
+fn recover_owner_events_lifecycle_or_reject(
+    guard: &LifecycleWriteGuard,
+    state_dir: &FsPath,
+) -> Result<(), String> {
+    let recovered =
+        household_rs::bootstrap::recover_interrupted_household_teardown_under_lifecycle(
+            guard, state_dir,
+        )
+        .map_err(|error| owner_events_lifecycle_error("recover interrupted teardown", error))?;
+    if recovered {
+        return Err("recovered an interrupted teardown; refusing stale owner mutation".to_string());
+    }
+    Ok(())
+}
+
+/// Append through the long-lived log only while the exact lifecycle
+/// generation it was opened for is retained shared. All filesystem/flock I/O
+/// runs on the blocking pool; async handlers never perform log I/O directly.
+async fn append_owner_event_with_shared_lifecycle(
+    state: &OwnerEventsRouterState,
+    identity: Arc<household_rs::LoadedIdentity>,
+    event_type: OwnerEventType,
+    payload: OwnerEventPayload,
+) -> Result<OwnerEvent, String> {
+    let state_dir = state.state_dir.clone();
+    let event_log = Arc::clone(&state.event_log);
+    tokio::task::spawn_blocking(move || {
+        let lifecycle = HouseholdLifecycleLock::open_verified(&state_dir)
+            .map_err(|error| format!("open owner-event lifecycle: {error}"))?;
+        let guard = lifecycle
+            .lock_shared()
+            .map_err(|error| format!("acquire owner-event lifecycle shared: {error}"))?;
+        event_log
+            .append(
+                &guard,
+                &identity.cert.m_id.to_string(),
+                identity.m_priv.as_ref(),
+                event_type,
+                payload,
+            )
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("owner-event append worker failed: {error}"))?
+}
+
+/// Reconcile the manifest-retained `MachineJoined` outbox before startup may
+/// publish listeners, or from an exact handler retry after local promotion.
+///
+/// The exact candidate certificate in the signed `JoinResponse` supplies the
+/// event payload. The log method uses candidate `m_id` as an idempotency key,
+/// stabilizes an ambiguous existing tail, and rejects any conflicting event.
+/// This function deliberately leaves the manifest in place. Startup must
+/// first repair any Phase-3-specific fail-stop bootstrap breadcrumb and only
+/// then durably clear the outbox; that ordering makes a crash between those
+/// steps retryable without leaving generic `Recovering` permanently latched.
+pub(crate) fn reconcile_phase3_machine_joined_outbox_under_lifecycle(
+    state_dir: &FsPath,
+    lifecycle: &LifecycleWriteGuard,
+    identity: &household_rs::LoadedIdentity,
+    event_log: &OwnerEventLog,
+) -> Result<bool, String> {
+    let Some(manifest) = household_rs::storage::read_phase3_recovery_manifest(state_dir)
+        .map_err(|error| format!("read Phase-3 terminal outbox: {error}"))?
+    else {
+        return Ok(false);
+    };
+    if manifest.hh_id() != identity.record.hh_id.as_str()
+        || manifest.founder_m_id() != identity.cert.m_id.as_str()
+    {
+        return Err("Phase-3 terminal outbox identity binding mismatch".into());
+    }
+    let response: household_rs::pair_machine::JoinResponse =
+        household_rs::cbor::from_canonical_slice_strict(manifest.exact_join_response())
+            .map_err(|error| format!("decode Phase-3 terminal outbox response: {error}"))?;
+    if response.machine_cert.m_id.as_str() != manifest.candidate_m_id()
+        || response.household_record != identity.record
+        || !identity
+            .record
+            .members
+            .contains(&response.machine_cert.m_id)
+    {
+        return Err("Phase-3 terminal outbox candidate/record binding mismatch".into());
+    }
+    event_log
+        .append_machine_joined_exactly_once_under_lifecycle_write(
+            lifecycle,
+            identity.cert.m_id.as_str(),
+            identity.m_priv.as_ref(),
+            MachineJoinedPayload {
+                m_pub: ByteBuf::from(response.machine_cert.m_pub.as_bytes().to_vec()),
+                m_id: response.machine_cert.m_id.to_string(),
+                hostname: response.machine_cert.hostname,
+                joined_at: response.machine_cert.joined_at,
+            },
+        )
+        .map_err(|error| format!("append Phase-3 MachineJoined outbox: {error}"))?;
+    Ok(true)
+}
+
+async fn read_owner_events_with_shared_lifecycle(
+    state: &OwnerEventsRouterState,
+    since: u64,
+) -> Result<Vec<OwnerEvent>, String> {
+    let state_dir = state.state_dir.clone();
+    let event_log = Arc::clone(&state.event_log);
+    tokio::task::spawn_blocking(move || {
+        let lifecycle = HouseholdLifecycleLock::open_verified(&state_dir)
+            .map_err(|error| format!("open owner-event lifecycle: {error}"))?;
+        let guard = lifecycle
+            .lock_shared()
+            .map_err(|error| format!("acquire owner-event lifecycle shared: {error}"))?;
+        event_log
+            .read_since(&guard, since)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("owner-event read worker failed: {error}"))?
+}
+
+async fn acquire_owner_events_lifecycle_exclusive(
+    state_dir: &FsPath,
+) -> Result<LifecycleWriteGuard, String> {
+    let state_dir = state_dir.to_path_buf();
+    let waiter_state_dir = state_dir.clone();
+    let guard = tokio::task::spawn_blocking(move || {
+        acquire_owner_events_lifecycle_exclusive_blocking(&waiter_state_dir)
+    })
+    .await
+    .map_err(|error| owner_events_lifecycle_error("join owner-events lifecycle waiter", error))??;
+    recover_owner_events_lifecycle_or_reject(&guard, state_dir.as_path())?;
+    Ok(guard)
+}
+
+/// Re-read both durable identity authorities while lifecycle-exclusive and
+/// require an exact match with the identity used to construct the mutation.
+fn verify_installed_identity_under_lifecycle(
+    guard: &LifecycleWriteGuard,
+    state_dir: &FsPath,
+    expected_record: &household_rs::HouseholdRecord,
+    expected_cert: &household_rs::MachineCert,
+) -> Result<(), String> {
+    guard
+        .verify_state_root(state_dir)
+        .map_err(|error| owner_events_lifecycle_error("verify owner-events state root", error))?;
+    let record: household_rs::HouseholdRecord = household_rs::storage::read_optional_cbor(
+        &household_rs::storage::household_record_path(state_dir),
+    )
+    .map_err(|error| owner_events_lifecycle_error("read installed household record", error))?
+    .ok_or_else(|| "installed household record is absent".to_string())?;
+    let cert = household_rs::machine_cert::load_self_cert(state_dir)
+        .map_err(|error| owner_events_lifecycle_error("read installed machine cert", error))?
+        .ok_or_else(|| "installed machine cert is absent".to_string())?;
+    if &record != expected_record || &cert != expected_cert {
+        return Err(
+            "installed household identity changed before owner mutation commit".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn durably_remove_phase3_staged_after_definite_reject(
+    state_dir: &FsPath,
+    candidate_m_id: &str,
+) -> Result<(), String> {
+    let finals = [
+        household_rs::storage::machine_cert_for(state_dir, candidate_m_id),
+        household_rs::pair_machine::shamir_self_shard_path(state_dir),
+        household_rs::storage::household_record_path(state_dir),
+    ];
+    let staged = finals
+        .iter()
+        .map(|path| household_rs::storage::staged_path_for(path))
+        .collect::<Vec<_>>();
+    for path in &staged {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "remove rejected Phase-3 staged artifact {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    let mut parents = staged
+        .iter()
+        .filter_map(|path| path.parent().map(FsPath::to_path_buf))
+        .collect::<Vec<_>>();
+    parents.sort();
+    parents.dedup();
+    for parent in parents {
+        fs::File::open(&parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|error| {
+                format!(
+                    "stabilize rejected Phase-3 staged absence {}: {error}",
+                    parent.display()
+                )
+            })?;
+    }
+    Ok(())
+}
+
+/// Commit an already-built owner authority and publish the same value to the
+/// live state without a teardown/replacement gap.
+async fn persist_owner_auth_under_lifecycle(
+    state: &OwnerEventsRouterState,
+    expected_identity: &household_rs::LoadedIdentity,
+    next_auth: &household_rs::HouseholdAuthState,
+) -> Result<LifecycleWriteGuard, String> {
+    let lifecycle_guard = acquire_owner_events_lifecycle_exclusive(&state.state_dir).await?;
+    verify_installed_identity_under_lifecycle(
+        &lifecycle_guard,
+        &state.state_dir,
+        &expected_identity.record,
+        &expected_identity.cert,
+    )?;
+    if let Err(error) = next_auth.save(&state.state_dir) {
+        if matches!(
+            error,
+            household_rs::owner_auth::OwnerAuthError::Storage(
+                household_rs::StorageError::MayHaveTakenEffect { .. }
+            )
+        ) {
+            // Rewrite the exact same authority while the lifecycle guard is
+            // still retained. A successful retry supplies the missing parent
+            // barrier and writes the diagnostic owner-cert projection. Never
+            // roll back or substitute different bytes after an indeterminate
+            // rename.
+            if let Err(retry_error) = next_auth.save(&state.state_dir) {
+                state.household.clear().await;
+                return Err(owner_events_lifecycle_error(
+                    "stabilize indeterminate owner authority; live household cleared",
+                    retry_error,
+                ));
+            }
+        } else {
+            return Err(owner_events_lifecycle_error(
+                "persist owner authority",
+                error,
+            ));
+        }
+    }
+    state
+        .household
+        .set_owner_auth(Arc::new(next_auth.clone()))
+        .await;
+    Ok(lifecycle_guard)
+}
 
 #[derive(Clone)]
 pub struct OwnerEventsRouterState {
@@ -2365,7 +2644,7 @@ struct GenericError<'a> {
 
 enum FinalizeAttempt {
     Acked(Box<CeremonyTxn>, Box<FinalizeWithM2Outcome>),
-    DefiniteFailure(CeremonyError),
+    DefiniteFailure(Box<CeremonyTxn>, CeremonyError),
     AmbiguousFailure(CeremonyError),
 }
 
@@ -2450,7 +2729,7 @@ pub async fn owner_events_long_poll(
     };
 
     if state.event_log.cursor_head() > since {
-        return owner_events_since_response(&state, since);
+        return owner_events_since_response(&state, since).await;
     }
 
     let mut subscription = state.event_broadcaster.subscribe();
@@ -2458,7 +2737,7 @@ pub async fn owner_events_long_poll(
     // Close the race where an append lands after the initial head check but
     // before this request subscribes to the broadcaster.
     if state.event_log.cursor_head() > since {
-        return owner_events_since_response(&state, since);
+        return owner_events_since_response(&state, since).await;
     }
 
     let timeout = tokio::time::sleep(state.long_poll_timeout);
@@ -2482,12 +2761,12 @@ pub async fn owner_events_long_poll(
             received = subscription.receiver_mut().recv() => {
                 match received {
                     Ok(event) if event.cursor > since => {
-                        return owner_events_since_response(&state, since);
+                        return owner_events_since_response(&state, since).await;
                     }
                     Ok(_) => {}
                     Err(RecvError::Lagged(_)) => {
                         if state.event_log.cursor_head() > since {
-                            return owner_events_since_response(&state, since);
+                            return owner_events_since_response(&state, since).await;
                         }
                     }
                     Err(RecvError::Closed) => {
@@ -2515,8 +2794,8 @@ fn decode_since_cursor(uri: &Uri) -> Result<u64, ()> {
     household_rs::cbor::from_canonical_slice::<u64>(&bytes).map_err(|_| ())
 }
 
-fn owner_events_since_response(state: &OwnerEventsRouterState, since: u64) -> Response {
-    let events = match state.event_log.read_since(since) {
+async fn owner_events_since_response(state: &OwnerEventsRouterState, since: u64) -> Response {
+    let events = match read_owner_events_with_shared_lifecycle(state, since).await {
         Ok(events) => events,
         Err(e) => {
             tracing::error!(
@@ -2731,13 +3010,12 @@ pub async fn secure_upgrade_app_attest_finish_handler(
     if let Err(e) = next_auth.verify(&identity.record, now) {
         return reject_secure_upgrade("owner_auth_verify_failed", Some(e.to_string()));
     }
-    if let Err(e) = next_auth.save(&state.state_dir) {
-        return reject_secure_upgrade("owner_auth_save_failed", Some(e.to_string()));
-    }
-    state
-        .household
-        .set_owner_auth(Arc::new(next_auth.clone()))
-        .await;
+    let owner_lifecycle_guard =
+        match persist_owner_auth_under_lifecycle(&state, &identity, &next_auth).await {
+            Ok(guard) => guard,
+            Err(e) => return reject_secure_upgrade("owner_auth_save_failed", Some(e)),
+        };
+    drop(owner_lifecycle_guard);
     let response = SecureUpgradeFinishResponse {
         version: 1,
         owner_auth_tier: owner_person_cert
@@ -3823,16 +4101,16 @@ pub async fn owner_webauthn_revoke_credential_finish_handler(
         );
     }
 
-    if let Err(e) = next_auth.save(&state.state_dir) {
-        return reject_owner_webauthn_revoke_credential_finish(
-            "authority_save_failed",
-            Some(e.to_string()),
-        );
-    }
-    state
-        .household
-        .set_owner_auth(Arc::new(next_auth.clone()))
-        .await;
+    let owner_lifecycle_guard =
+        match persist_owner_auth_under_lifecycle(&state, &identity, &next_auth).await {
+            Ok(guard) => guard,
+            Err(e) => {
+                return reject_owner_webauthn_revoke_credential_finish(
+                    "authority_save_failed",
+                    Some(e),
+                );
+            }
+        };
     if let Err(e) = verify_or_update_owner_webauthn_authority_anchor(
         anchor.keystore.as_ref(),
         &next_auth.owner_webauthn,
@@ -3845,6 +4123,7 @@ pub async fn owner_webauthn_revoke_credential_finish_handler(
             Some(e.to_string()),
         );
     }
+    drop(owner_lifecycle_guard);
     let bytes =
         household_rs::cbor::to_canonical_vec(&OwnerWebauthnRevokeCredentialFinishResponse {
             version: 1,
@@ -4100,16 +4379,16 @@ pub async fn owner_webauthn_add_credential_finish_handler(
         );
     }
 
-    if let Err(e) = next_auth.save(&state.state_dir) {
-        return reject_owner_webauthn_add_credential_finish(
-            "add_credential_authority_save_failed",
-            Some(e.to_string()),
-        );
-    }
-    state
-        .household
-        .set_owner_auth(Arc::new(next_auth.clone()))
-        .await;
+    let owner_lifecycle_guard =
+        match persist_owner_auth_under_lifecycle(&state, &identity, &next_auth).await {
+            Ok(guard) => guard,
+            Err(e) => {
+                return reject_owner_webauthn_add_credential_finish(
+                    "add_credential_authority_save_failed",
+                    Some(e),
+                );
+            }
+        };
     if let Err(e) = verify_or_update_owner_webauthn_authority_anchor(
         anchor.keystore.as_ref(),
         &next_auth.owner_webauthn,
@@ -4122,6 +4401,7 @@ pub async fn owner_webauthn_add_credential_finish_handler(
             Some(e.to_string()),
         );
     }
+    drop(owner_lifecycle_guard);
 
     let bytes = household_rs::cbor::to_canonical_vec(&OwnerWebauthnAddCredentialFinishResponse {
         version: 1,
@@ -4666,16 +4946,16 @@ pub async fn owner_webauthn_recovery_consume_finish_handler(
         );
     }
 
-    if let Err(e) = next_auth.save(&state.state_dir) {
-        return reject_owner_webauthn_recovery(
-            "recovery_consume_authority_save_failed",
-            Some(e.to_string()),
-        );
-    }
-    state
-        .household
-        .set_owner_auth(Arc::new(next_auth.clone()))
-        .await;
+    let owner_lifecycle_guard =
+        match persist_owner_auth_under_lifecycle(&state, &identity, &next_auth).await {
+            Ok(guard) => guard,
+            Err(e) => {
+                return reject_owner_webauthn_recovery(
+                    "recovery_consume_authority_save_failed",
+                    Some(e),
+                );
+            }
+        };
     if let Err(e) = verify_or_update_owner_webauthn_authority_anchor(
         webauthn_anchor.keystore.as_ref(),
         &next_auth.owner_webauthn,
@@ -4699,6 +4979,7 @@ pub async fn owner_webauthn_recovery_consume_finish_handler(
             Some(e.to_string()),
         );
     }
+    drop(owner_lifecycle_guard);
 
     let response = match recovery_consume_finish_response(&next_auth, &identity, credential_id) {
         Ok(response) => response,
@@ -4862,13 +5143,11 @@ pub async fn owner_webauthn_recovery_finish_handler(
         return reject_owner_webauthn_recovery("recovery_verify_failed", Some(e.to_string()));
     }
 
-    if let Err(e) = next_auth.save(&state.state_dir) {
-        return reject_owner_webauthn_recovery("authority_save_failed", Some(e.to_string()));
-    }
-    state
-        .household
-        .set_owner_auth(Arc::new(next_auth.clone()))
-        .await;
+    let owner_lifecycle_guard =
+        match persist_owner_auth_under_lifecycle(&state, &identity, &next_auth).await {
+            Ok(guard) => guard,
+            Err(e) => return reject_owner_webauthn_recovery("authority_save_failed", Some(e)),
+        };
     if let Err(e) = advance_owner_webauthn_recovery_anchor_after_commit(
         anchor.keystore.as_ref(),
         &next_auth.owner_webauthn_recovery,
@@ -4880,6 +5159,7 @@ pub async fn owner_webauthn_recovery_finish_handler(
             Some(e.to_string()),
         );
     }
+    drop(owner_lifecycle_guard);
     let bytes = household_rs::cbor::to_canonical_vec(&OwnerWebauthnRecoveryFinishResponse {
         version: 1,
         recovery_code: recovery_code.to_string(),
@@ -5229,16 +5509,16 @@ pub async fn owner_webauthn_registration_finish_handler(
     // `household_auth_state.cbor` is the durable log commit point. Advance the
     // rollback anchor only after this file is safely persisted, otherwise the
     // next boot could see an anchor ahead of the log and fail closed.
-    if let Err(e) = next_auth.save(&state.state_dir) {
-        return reject_owner_webauthn_registration("authority_save_failed", Some(e.to_string()));
-    }
     // Keep in-memory owner auth aligned with the durable commit before any
-    // post-save anchor failure can return. A retry must see the committed
-    // credential and fail closed instead of re-enrolling against stale memory.
-    state
-        .household
-        .set_owner_auth(Arc::new(next_auth.clone()))
-        .await;
+    // post-save anchor failure can return. The lifecycle-exclusive helper also
+    // prevents a teardown/replacement from splitting this disk/memory pair.
+    let owner_lifecycle_guard =
+        match persist_owner_auth_under_lifecycle(&state, &identity, &next_auth).await {
+            Ok(guard) => guard,
+            Err(e) => {
+                return reject_owner_webauthn_registration("authority_save_failed", Some(e));
+            }
+        };
     if let Err(e) =
         write_owner_webauthn_initial_enrollment_marker(&state.state_dir, &pending_marker)
     {
@@ -5256,6 +5536,7 @@ pub async fn owner_webauthn_registration_finish_handler(
     if let Err(e) = clear_owner_webauthn_initial_enrollment_marker(&state.state_dir) {
         return reject_owner_webauthn_registration("anchor_marker_clear_failed", Some(e));
     }
+    drop(owner_lifecycle_guard);
     let bytes = household_rs::cbor::to_canonical_vec(&OwnerWebauthnRegistrationFinishResponse {
         version: 1,
         credential_id,
@@ -5913,7 +6194,89 @@ pub async fn owner_approve_handler(
             return unauthenticated_response();
         }
     };
-    let txn = match CeremonyTxn::prepare(CeremonyInputs {
+    // Bind staging and the single recovery manifest to the exact live
+    // lifecycle. The guard is released before any network I/O, but no staged
+    // artifact or manifest can be built against an identity that teardown has
+    // already replaced.
+    let pre_dispatch_lifecycle_guard =
+        match acquire_owner_events_lifecycle_exclusive(&state.state_dir).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                tracing::warn!(
+                    stage = "owner_events.approve.rejected",
+                    reason = "pre_dispatch_lifecycle_unavailable",
+                    error = %error,
+                );
+                drop(mutation_guard);
+                abort_with_cancel_event(
+                    &state,
+                    &identity,
+                    window_data.active_m_pub.clone(),
+                    "prepare_failed",
+                )
+                .await;
+                return unauthenticated_response();
+            }
+        };
+    if let Err(error) = verify_installed_identity_under_lifecycle(
+        &pre_dispatch_lifecycle_guard,
+        &state.state_dir,
+        &identity.record,
+        &identity.cert,
+    ) {
+        tracing::warn!(
+            stage = "owner_events.approve.rejected",
+            reason = "pre_dispatch_identity_changed",
+            error = %error,
+        );
+        drop(pre_dispatch_lifecycle_guard);
+        drop(mutation_guard);
+        abort_with_cancel_event(
+            &state,
+            &identity,
+            window_data.active_m_pub.clone(),
+            "prepare_failed",
+        )
+        .await;
+        return unauthenticated_response();
+    }
+    let lifecycle_generation = match pre_dispatch_lifecycle_guard.lifecycle_generation() {
+        Ok(Some(generation)) => generation,
+        Ok(None) => {
+            tracing::warn!(
+                stage = "owner_events.approve.rejected",
+                reason = "pre_dispatch_lifecycle_generation_missing",
+            );
+            drop(pre_dispatch_lifecycle_guard);
+            drop(mutation_guard);
+            return unauthenticated_response();
+        }
+        Err(error) => {
+            tracing::warn!(
+                stage = "owner_events.approve.rejected",
+                reason = "pre_dispatch_lifecycle_generation_read_failed",
+                error = %error,
+            );
+            drop(pre_dispatch_lifecycle_guard);
+            drop(mutation_guard);
+            return unauthenticated_response();
+        }
+    };
+    if window_data
+        .snapshot
+        .lifecycle_generation
+        .as_ref()
+        .is_none_or(|value| value.as_ref() != lifecycle_generation.token_bytes())
+    {
+        tracing::warn!(
+            stage = "owner_events.approve.rejected",
+            reason = "pre_dispatch_window_generation_changed",
+        );
+        drop(pre_dispatch_lifecycle_guard);
+        drop(mutation_guard);
+        return unauthenticated_response();
+    }
+    let mut txn = match CeremonyTxn::prepare(CeremonyInputs {
         hh_priv: Zeroizing::new(hh_priv),
         hh_id: identity.record.hh_id.clone(),
         hh_pub_sec1: *identity.record.hh_pub.as_bytes(),
@@ -5935,6 +6298,8 @@ pub async fn owner_approve_handler(
                 reason = "ceremony_prepare_failed",
                 error = %e,
             );
+            drop(pre_dispatch_lifecycle_guard);
+            drop(mutation_guard);
             abort_with_cancel_event(
                 &state,
                 &identity,
@@ -5945,7 +6310,6 @@ pub async fn owner_approve_handler(
             return unauthenticated_response();
         }
     };
-    drop(mutation_guard);
     let addr = window_data
         .snapshot
         .addr_hint
@@ -5958,51 +6322,26 @@ pub async fn owner_approve_handler(
         crate::household_bootstrap::household_port_from_env(),
         state.founder_tailnet_resolver,
     );
-    // T073: persist the JoinResponse bytes we are about to POST so
-    // boot-time `recover_phase3_ceremony` can re-POST them after a
-    // crash. `HH_priv` is destroyed during commit, so the
-    // encrypted-shard-for-M2 inside `JoinResponse` cannot be
-    // reconstructed post-crash. Build the response here using the same
-    // options finalize_with_m2 will use.
     let cached_join_request_bytes = window_data.cached_join_request.to_vec();
-    let pending_response_bytes = {
-        let opts_for_build = FinalizeWithM2Options {
-            addr: &addr,
-            join_request_cbor: &cached_join_request_bytes,
-            founder_cert: &identity.cert,
-            founder_tailscale_addr: founder_tailscale_addr.clone(),
-            push_token_seed: push_token_seed.clone(),
-            response_signer: identity.m_priv.as_ref(),
-        };
-        match txn.build_join_response(&opts_for_build) {
-            Ok(jr) => match jr.to_canonical_bytes() {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    tracing::warn!(
-                        stage = "owner_events.approve.rejected",
-                        reason = "join_response_canonical_encode_failed",
-                        error = %e,
-                    );
-                    let _ =
-                        household_rs::storage::clear_phase3_finalize_ack_marker(&state.state_dir);
-                    txn.rollback();
-                    abort_with_cancel_event(
-                        &state,
-                        &identity,
-                        window_data.active_m_pub.clone(),
-                        "prepare_failed",
-                    )
-                    .await;
-                    return unauthenticated_response();
-                }
-            },
-            Err(e) => {
+    let manifest_options = FinalizeWithM2Options {
+        addr: &addr,
+        join_request_cbor: &cached_join_request_bytes,
+        founder_cert: &identity.cert,
+        founder_tailscale_addr,
+        push_token_seed,
+        response_signer: identity.m_priv.as_ref(),
+    };
+    let manifest =
+        match txn.build_phase3_recovery_manifest(&manifest_options, &lifecycle_generation) {
+            Ok(manifest) => manifest,
+            Err(error) => {
                 tracing::warn!(
                     stage = "owner_events.approve.rejected",
-                    reason = "join_response_build_failed",
-                    error = %e,
+                    reason = "phase3_recovery_manifest_build_failed",
+                    error = %error,
                 );
-                let _ = household_rs::storage::clear_phase3_finalize_ack_marker(&state.state_dir);
+                drop(pre_dispatch_lifecycle_guard);
+                drop(mutation_guard);
                 txn.rollback();
                 abort_with_cancel_event(
                     &state,
@@ -6013,123 +6352,124 @@ pub async fn owner_approve_handler(
                 .await;
                 return unauthenticated_response();
             }
-        }
-    };
-    if let Err(e) = household_rs::storage::write_phase3_pending_join_response(
-        &state.state_dir,
-        &pending_response_bytes,
-    ) {
-        tracing::warn!(
-            stage = "owner_events.approve.rejected",
-            reason = "phase3_pending_join_response_write_failed",
-            error = %e,
-            hint = "refusing to launch finalize_with_m2 without durable JoinResponse copy",
-        );
-        txn.rollback();
-        abort_with_cancel_event(
-            &state,
-            &identity,
-            window_data.active_m_pub.clone(),
-            "prepare_failed",
-        )
-        .await;
-        return unauthenticated_response();
-    }
-    // R7.2/R7.3: write the recovery-driver intent pin BEFORE invoking
-    // `finalize_with_m2`. The marker says "M1 has launched a join
-    // ceremony with this candidate; if the boot path observes a
-    // pre-Shamir record AND this marker is durable, recovery MUST
-    // preserve `.staged` and dispatch T073/T074's two-state probe
-    // instead of rolling back". Writing it AFTER `finalize_with_m2`
-    // (the previous R6.1 placement) leaves two split-brain windows:
-    //   (a) crash between `finalize_with_m2 Ok` and the marker
-    //       fsync+rename becoming durable;
-    //   (b) FinalizeAck network response lost in flight (M2's
-    //       `staged.commit()` Ok'd, packet dropped) — the Err arm
-    //       below would have returned 401 with no marker on disk.
-    // Both leave M2 committed, M1 rolled back.
-    //
-    // The pending JoinResponse is durable before the marker, so a boot
-    // that observes the marker also has the bytes needed to re-POST
-    // finalize. A crash before this marker leaves only ordinary staged
-    // files; boot-time recovery rolls them back and reload clears the
-    // owner-approval claim as stale.
-    let candidate_m_id_str = txn.candidate_cert().m_id.to_string();
-    if let Err(e) = household_rs::storage::write_phase3_finalize_ack_marker(
-        &state.state_dir,
-        &candidate_m_id_str,
-    ) {
-        tracing::warn!(
-            stage = "owner_events.approve.rejected",
-            reason = "phase3_finalize_ack_marker_write_failed",
-            error = %e,
-            hint = "refusing to launch finalize_with_m2 without durable intent pin",
-        );
-        // The txn has not contacted M2 yet; explicit rollback unlinks
-        // the staged set cleanly with no residue.
-        let _ = household_rs::storage::clear_phase3_pending_join_response(&state.state_dir);
-        txn.rollback();
-        abort_with_cancel_event(
-            &state,
-            &identity,
-            window_data.active_m_pub.clone(),
-            "prepare_failed",
-        )
-        .await;
-        return unauthenticated_response();
-    }
-    let identity_for_finalize = Arc::clone(&identity);
-    let finalized = tokio::task::spawn_blocking(move || {
-        let finalize_opts = FinalizeWithM2Options {
-            addr: &addr,
-            join_request_cbor: &cached_join_request_bytes,
-            founder_cert: &identity_for_finalize.cert,
-            founder_tailscale_addr,
-            push_token_seed,
-            response_signer: identity_for_finalize.m_priv.as_ref(),
         };
-        match txn.finalize_with_m2(&finalize_opts) {
+    match household_rs::storage::write_phase3_recovery_manifest(
+        &pre_dispatch_lifecycle_guard,
+        &state.state_dir,
+        &manifest,
+    ) {
+        Ok(()) => {}
+        Err(household_rs::StorageError::MayHaveTakenEffect { .. }) => {
+            tracing::error!(
+                stage = "owner_events.approve.partially_committed",
+                reason = "phase3_manifest_durability_indeterminate",
+                hint = "no finalize POST was launched; exact manifest and staged artifacts are retained for boot stabilization",
+            );
+            drop(pre_dispatch_lifecycle_guard);
+            drop(mutation_guard);
+            txn.preserve_staged_for_recovery();
+            return internal_error_response();
+        }
+        Err(error) => {
+            tracing::warn!(
+                stage = "owner_events.approve.rejected",
+                reason = "phase3_recovery_manifest_write_failed",
+                error = %error,
+            );
+            drop(pre_dispatch_lifecycle_guard);
+            drop(mutation_guard);
+            txn.rollback();
+            abort_with_cancel_event(
+                &state,
+                &identity,
+                window_data.active_m_pub.clone(),
+                "prepare_failed",
+            )
+            .await;
+            return unauthenticated_response();
+        }
+    }
+    // From this exact point the manifest is durable recovery authority.
+    // Disarm rollback-on-Drop before the transaction can cross a task/panic or
+    // launch the remote POST.
+    txn.arm_manifest_recovery();
+    drop(pre_dispatch_lifecycle_guard);
+    drop(mutation_guard);
+    let manifest_for_finalize = manifest.clone();
+    let finalize_addr = addr.clone();
+    let finalized = tokio::task::spawn_blocking(move || {
+        match txn.finalize_manifest_with_m2(&finalize_addr, &manifest_for_finalize) {
             Ok(outcome) => FinalizeAttempt::Acked(Box::new(txn), Box::new(outcome)),
             Err(e) if e.is_ambiguous_finalize_outcome() => {
                 txn.preserve_staged_for_recovery();
                 FinalizeAttempt::AmbiguousFailure(e)
             }
-            Err(e) => {
-                txn.rollback();
-                FinalizeAttempt::DefiniteFailure(e)
-            }
+            Err(e) => FinalizeAttempt::DefiniteFailure(Box::new(txn), e),
         }
     })
     .await;
     let (txn, finalize) = match finalized {
         Ok(FinalizeAttempt::Acked(txn, outcome)) => (*txn, *outcome),
-        Ok(FinalizeAttempt::DefiniteFailure(e)) => {
+        Ok(FinalizeAttempt::DefiniteFailure(txn, e)) => {
             tracing::warn!(
                 stage = "owner_events.approve.rejected",
                 reason = "m2_finalize_failed",
                 error = %e,
             );
-            // The blocking task already rolled back the M1 staged set.
-            // This arm is only for a definitive local/build error or a
-            // generic 401-style reject from M2 before it returned an ack.
-            if let Err(clear_err) =
-                household_rs::storage::clear_phase3_finalize_ack_marker(&state.state_dir)
-            {
-                tracing::warn!(
-                    stage = "owner_events.approve.finalize_ack_marker_clear_failed",
-                    reason = "after_finalize_with_m2_err",
-                    error = %clear_err,
+            // A complete strict reject proves the remote request had no
+            // effect. The manifest remains cleanup authority until every
+            // staged artifact is durably absent. Only then may its own
+            // absence be committed. Reversing that order could leave orphaned
+            // staged authority with no record that authorizes cleanup.
+            let cleanup_guard =
+                match acquire_owner_events_lifecycle_exclusive(&state.state_dir).await {
+                    Ok(guard)
+                        if guard
+                            .lifecycle_generation()
+                            .ok()
+                            .flatten()
+                            .as_ref()
+                            .is_some_and(|generation| {
+                                generation.token_bytes() == manifest.lifecycle_generation()
+                            }) =>
+                    {
+                        guard
+                    }
+                    Ok(_) | Err(_) => {
+                        txn.preserve_staged_for_recovery();
+                        return internal_error_response();
+                    }
+                };
+            // The durable manifest already disarmed rollback-on-Drop before
+            // the POST. Consume the transaction without relying on its now
+            // intentionally empty staged handle; cleanup below is explicit
+            // and remains lifecycle-exclusive.
+            txn.preserve_staged_for_recovery();
+            if let Err(cleanup_error) = durably_remove_phase3_staged_after_definite_reject(
+                &state.state_dir,
+                manifest.candidate_m_id(),
+            ) {
+                tracing::error!(
+                    stage = "owner_events.approve.staged_cleanup_failed",
+                    reason = "after_definite_finalize_reject_manifest_retained",
+                    error = %cleanup_error,
                 );
+                drop(cleanup_guard);
+                return internal_error_response();
             }
-            if let Err(clear_err) =
-                household_rs::storage::clear_phase3_pending_join_response(&state.state_dir)
-            {
-                tracing::warn!(
-                    stage = "owner_events.approve.pending_join_response_clear_failed",
-                    reason = "after_finalize_with_m2_err",
-                    error = %clear_err,
+            if let Err(clear_error) = household_rs::storage::clear_phase3_recovery_manifest(
+                &cleanup_guard,
+                &state.state_dir,
+            ) {
+                tracing::error!(
+                    stage = "owner_events.approve.manifest_clear_failed",
+                    reason = "after_definite_finalize_reject_staged_absence_committed",
+                    error = %clear_error,
                 );
+                drop(cleanup_guard);
+                return internal_error_response();
             }
+            drop(cleanup_guard);
             abort_with_cancel_event(
                 &state,
                 &identity,
@@ -6154,10 +6494,9 @@ pub async fn owner_approve_handler(
                 reason = "m2_finalize_task_failed",
                 error = %e,
             );
-            // Unknown outcome: keep the marker. If the blocking task
-            // panicked before preserving the staged set, recovery may
-            // have less evidence than desired, but clearing the marker
-            // here would make a possible M2 commit strictly worse.
+            // Unknown outcome: keep the manifest. Staged rollback was
+            // synchronously disarmed before this task was spawned, so even a
+            // panic retains the exact recovery evidence.
             return internal_error_response();
         }
     };
@@ -6219,72 +6558,82 @@ pub async fn owner_approve_handler(
             | crate::failure_injection::Outcome::Continue => {}
         }
     }
-    // From this point forward, M2 has already returned `FinalizeAck` and
-    // therefore committed cert+shard+record on its side. We must NOT
-    // rollback or surface `unauthenticated` for failures past this line —
-    // that would create a split-brain (M2 committed, M1 not). Instead we
-    // log at ERROR + return `internal_error_response` (500) and rely on
-    // three safeguards:
-    //   1. `.staged` files left on disk by `CeremonyTxn::prepare` MUST
-    //      survive the failure. R7.1: `commit_preserve_on_error()` is
-    //      the variant that disarms `StagedCommit::Drop`'s automatic
-    //      `.staged` cleanup on commit error. The plain `commit()`
-    //      would have unlinked them via the destructor, defeating
-    //      recovery.
-    //   2. The `phase3_finalize_ack.marker` file written BEFORE
-    //      `finalize_with_m2` (R7.2/R7.3) pins the "in-flight ceremony"
-    //      state on disk. Boot-time `recover_partial_phase3_commit`
-    //      checks for it and refuses to roll back the `.staged` set
-    //      even when the on-disk record is still pre-Shamir.
-    //   3. `commit_preserve_on_error`'s post-promote cleanup primitives
-    //      (keystore destroy, sole-shard unlink) are idempotent, so
-    //      retrying them on next boot is safe.
-    // T073/T074 will add the explicit `recover_phase3_ceremony` boot path
-    // that drives these to completion (see `contracts/shamir-transition.md`
-    // §"Recovery on M1 boot"). Until then the marker + staged files remain
-    // and an operator can hand-finish via the existing primitives. The 500
-    // wire surface is contracted in `contracts/owner-events.md`.
-    // T064: post-rename hook synchronously consults the
-    // failure-injection registry between staged.commit (step 12) and
-    // sole-shard unlink + keystore destroy (step 13). Production
-    // builds compile this hook to a constant `Continue` (the
-    // closure body is `cfg`-gated; the closure itself is always
-    // passed but is a no-op when the feature is off).
-    let post_rename_hook = || -> household_rs::pair_machine::PostRenameHookOutcome {
-        #[cfg(any(test, feature = "failure-injection"))]
-        {
-            match crate::failure_injection::apply_sync(
-                crate::failure_injection::InjectionPoint::M1AfterStagedRename,
-            ) {
-                crate::failure_injection::Outcome::EarlyReject(msg) => {
-                    return household_rs::pair_machine::PostRenameHookOutcome::EarlyReject(msg);
-                }
-                crate::failure_injection::Outcome::Skip
-                | crate::failure_injection::Outcome::Continue => {}
+    // From this point forward M2 has returned the exact manifest-bound Ack.
+    // The single manifest remains the authority for every local roll-forward
+    // step and, after promotion, for the terminal MachineJoined outbox. No
+    // failure past this line may roll back or clear it.
+    let post_ack_mutation_guard = crate::bootstrap_mutation_lock::BOOTSTRAP_MUTATION_LOCK
+        .lock()
+        .await;
+    let post_ack_lifecycle_guard =
+        match acquire_owner_events_lifecycle_exclusive(&state.state_dir).await {
+            Ok(guard) => guard,
+            Err(e) => {
+                tracing::error!(
+                    stage = "owner_events.approve.partially_committed",
+                    reason = "post_ack_lifecycle_unavailable",
+                    error = %e,
+                    hint = "M2 acked; preserving manifest-bound staged files for boot recovery",
+                );
+                txn.preserve_staged_for_recovery();
+                return internal_error_response();
             }
-        }
-        household_rs::pair_machine::PostRenameHookOutcome::Continue
-    };
-    if let Err(e) = txn.commit_preserve_on_error_with_hook(post_rename_hook) {
+        };
+    if let Err(e) = verify_installed_identity_under_lifecycle(
+        &post_ack_lifecycle_guard,
+        &state.state_dir,
+        &identity.record,
+        &identity.cert,
+    ) {
         tracing::error!(
             stage = "owner_events.approve.partially_committed",
-            reason = "m1_commit_failed_after_m2_ack",
+            reason = "post_ack_identity_changed",
             error = %e,
-            hint = "M2 acked; sole-shard + .staged + finalize intent marker left for boot recovery",
+            hint = "M2 acked; preserving manifest-bound staged files for boot recovery",
+        );
+        txn.preserve_staged_for_recovery();
+        return internal_error_response();
+    }
+    let recovery_namespace =
+        match household_rs::pair_window_namespace::PairWindowNamespaceV2::current_under_lifecycle(
+            state.state_dir.clone(),
+            &post_ack_lifecycle_guard,
+        ) {
+            Ok(namespace) => namespace,
+            Err(error) => {
+                tracing::error!(
+                    stage = "owner_events.approve.partially_committed",
+                    reason = "manifest_namespace_unavailable",
+                    error = %error,
+                );
+                txn.preserve_staged_for_recovery();
+                return internal_error_response();
+            }
+        };
+    txn.preserve_staged_for_recovery();
+    if let Err(e) = household_rs::pair_machine::finish_phase3_manifest_under_lifecycle(
+        &state.state_dir,
+        &recovery_namespace,
+        &post_ack_lifecycle_guard,
+        manifest.clone(),
+    )
+    .await
+    {
+        tracing::error!(
+            stage = "owner_events.approve.partially_committed",
+            reason = "m1_manifest_finish_failed_after_m2_ack",
+            error = %e,
+            hint = "M2 acked; exact manifest + remaining staged artifacts retained for boot recovery",
         );
         return internal_error_response();
     }
     // T064: failure-injection crash point — fires after
-    // `commit_preserve_on_error` returns Ok (staged renames + sole-shard
-    // unlink + keystore destroy all done) and BEFORE the marker is
-    // cleared / `OwnerEvent{type=machine-joined}` is appended. A
+    // exact manifest finish returns Ok and BEFORE
+    // `OwnerEvent{type=machine-joined}` is appended. A
     // registered Panic models "M1 crash between 2PC step 13 (sole-shard
     // unlink) and step 14 (event-log append)". On reboot, M1 has a
-    // post-Shamir record on disk; boot-time
-    // `clear_stale_phase3_marker_if_post_shamir` removes the marker
-    // and the household is fully committed. The missing
-    // `machine-joined` event is reconciled by the iPhone's next
-    // owner-events long-poll, which observes the post-commit state.
+    // post-Shamir record on disk and the manifest remains the durable outbox;
+    // startup/retry appends the exact event before clearing it.
     #[cfg(any(test, feature = "failure-injection"))]
     {
         match crate::failure_injection::apply(
@@ -6299,49 +6648,29 @@ pub async fn owner_approve_handler(
             | crate::failure_injection::Outcome::Continue => {}
         }
     }
-    // R6.1: ceremony fully committed — the post-Shamir record is durable
-    // on disk, so boot-time recovery would correctly roll forward any
-    // residual `.staged`. The marker is no longer protective; clear it
-    // best-effort. R7.NB2: failures here are also covered by
-    // `recover_partial_phase3_commit`'s unconditional post-Shamir clear,
-    // so the marker is guaranteed to be cleaned up on next boot.
-    if let Err(e) = household_rs::storage::clear_phase3_finalize_ack_marker(&state.state_dir) {
-        tracing::warn!(
-            stage = "owner_events.approve.finalize_ack_marker_clear_failed",
-            error = %e,
-            hint = "post-Shamir record on disk; boot-time recovery clears the marker on next start",
-        );
-    }
-    if let Err(e) = household_rs::storage::clear_phase3_pending_join_response(&state.state_dir) {
-        tracing::warn!(
-            stage = "owner_events.approve.pending_join_response_clear_failed",
-            error = %e,
-            hint = "post-Shamir record on disk; boot-time recovery clears the pending JoinResponse on next start",
-        );
-    }
-    // Reload `LoadedIdentity` from disk: the on-disk record now has
+    // Reload `LoadedIdentity` under the same lifecycle transaction: the
+    // on-disk record now has
     // `shamir_n=2` and the keystore custody of HH_priv has been
     // destroyed. `try_load_existing` will deliver `hh_priv: None`.
     // Swap it into the shared `HouseholdState` so subsequent requests
     // see the post-Shamir household and `founder_stage_join_request`'s
     // `shamir_n == 1` gate refuses any further add-machine attempts on
     // the now-stale single-machine path. (B6.)
-    match household_rs::try_load_existing(&state.state_dir, state.key_backing_policy) {
-        Ok(Some(reloaded)) => {
-            state.household.set_loaded(Arc::new(reloaded)).await;
-        }
-        Ok(None) | Err(_) => {
-            // The reload should never fail post-commit (we just wrote
-            // those files). Log and continue — the next handler that
-            // observes the stale `HouseholdState` will fail closed via
-            // its own gates. We do NOT return an error here because the
-            // ceremony itself succeeded.
-            tracing::error!(
-                stage = "owner_events.approve.identity_reload_failed",
-                hint = "post-commit identity unavailable; next request will refresh from disk on the slow path",
-            );
-        }
-    }
+    let Ok(Some(reloaded)) = household_rs::bootstrap::try_load_existing_under_lifecycle(
+        &post_ack_lifecycle_guard,
+        &state.state_dir,
+        state.key_backing_policy,
+    ) else {
+        // Disk is already authoritative and cannot be rolled back. Refuse
+        // to publish the committed window alongside a stale pre-Shamir
+        // in-memory identity; boot recovery will reload the durable state.
+        tracing::error!(
+            stage = "owner_events.approve.identity_reload_failed",
+            hint = "post-commit identity unavailable; refusing stale in-memory publication",
+        );
+        return internal_error_response();
+    };
+    state.household.set_loaded(Arc::new(reloaded)).await;
     if let Err(e) = state
         .window
         .enter_committed(finalize.join_response_bytes.clone())
@@ -6365,27 +6694,61 @@ pub async fn owner_approve_handler(
         cursor = cursor,
         candidate_m_id = %candidate_cert.m_id,
     );
-    if let Err(e) = state.event_log.append(
-        &identity.cert.m_id.to_string(),
-        identity.m_priv.as_ref(),
-        OwnerEventType::MachineJoined,
-        OwnerEventPayload::MachineJoined(MachineJoinedPayload {
-            m_pub: ByteBuf::from(candidate_cert.m_pub.as_bytes().to_vec()),
-            m_id: candidate_cert.m_id.to_string(),
-            hostname: candidate_cert.hostname.clone(),
-            joined_at: candidate_cert.joined_at,
-        }),
-    ) {
-        // The household is committed; only the audit-log append failed.
-        // Return 500 so the iPhone knows the ceremony succeeded but the
-        // event-log signal was lost — the next long-poll observes the
-        // post-commit state (membership=2) and reconciles.
-        tracing::error!(
-            stage = "owner_events.approve.event_append_failed",
-            reason = "machine_joined_event_append_failed_after_commit",
-            error = %e,
-        );
-        return internal_error_response();
+    let machine_joined_log = Arc::clone(&state.event_log);
+    let machine_joined_identity = Arc::clone(&identity);
+    let machine_joined_payload = MachineJoinedPayload {
+        m_pub: ByteBuf::from(candidate_cert.m_pub.as_bytes().to_vec()),
+        m_id: candidate_cert.m_id.to_string(),
+        hostname: candidate_cert.hostname.clone(),
+        joined_at: candidate_cert.joined_at,
+    };
+    let outbox_state_dir = state.state_dir.clone();
+    let append_result = tokio::task::spawn_blocking(move || {
+        machine_joined_log.append_machine_joined_exactly_once_under_lifecycle_write(
+            &post_ack_lifecycle_guard,
+            &machine_joined_identity.cert.m_id.to_string(),
+            machine_joined_identity.m_priv.as_ref(),
+            machine_joined_payload,
+        )?;
+        Ok::<_, household_rs::owner_events::EventError>(
+            household_rs::storage::clear_phase3_recovery_manifest(
+                &post_ack_lifecycle_guard,
+                &outbox_state_dir,
+            ),
+        )
+    })
+    .await;
+    drop(post_ack_mutation_guard);
+    match append_result {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(error))) => {
+            // The event is durable and already published, but the outbox
+            // absence was not committed. A retry/startup scan reuses the same
+            // event and retries only the durable clear.
+            dispatch_owner_event_tickle_if_idle(state.state_dir.clone(), &state.event_broadcaster);
+            tracing::error!(
+                stage = "owner_events.approve.outbox_clear_failed",
+                error = %error,
+            );
+            return internal_error_response();
+        }
+        Ok(Err(error)) => {
+            tracing::error!(
+                stage = "owner_events.approve.event_append_failed",
+                reason = "machine_joined_event_append_failed_after_commit",
+                error = %error,
+                hint = "exact manifest retained; startup/retry reconciles without duplication",
+            );
+            return internal_error_response();
+        }
+        Err(error) => {
+            tracing::error!(
+                stage = "owner_events.approve.event_append_worker_failed",
+                error = %error,
+                hint = "exact manifest retained; startup/retry reconciles without duplication",
+            );
+            return internal_error_response();
+        }
     }
     dispatch_owner_event_tickle_if_idle(state.state_dir.clone(), &state.event_broadcaster);
 
@@ -6475,15 +6838,16 @@ pub async fn owner_decline_handler(
         );
         return unauthenticated_response();
     }
-    let event = state.event_log.append(
-        &identity.cert.m_id.to_string(),
-        identity.m_priv.as_ref(),
+    let event = append_owner_event_with_shared_lifecycle(
+        &state,
+        Arc::clone(&identity),
         OwnerEventType::JoinCancelled,
         OwnerEventPayload::JoinCancelled(JoinCancelledPayload {
             m_pub: m_pub.clone(),
             reason: "declined".into(),
         }),
-    );
+    )
+    .await;
     if let Err(e) = event {
         tracing::warn!(
             stage = "owner_events.decline.rejected",
@@ -6505,7 +6869,7 @@ pub async fn owner_decline_handler(
 
 async fn abort_with_cancel_event(
     state: &OwnerEventsRouterState,
-    identity: &household_rs::LoadedIdentity,
+    identity: &Arc<household_rs::LoadedIdentity>,
     m_pub: ByteBuf,
     reason: &'static str,
 ) {
@@ -6517,15 +6881,17 @@ async fn abort_with_cancel_event(
         );
         return;
     }
-    match state.event_log.append(
-        &identity.cert.m_id.to_string(),
-        identity.m_priv.as_ref(),
+    match append_owner_event_with_shared_lifecycle(
+        state,
+        Arc::clone(identity),
         OwnerEventType::JoinCancelled,
         OwnerEventPayload::JoinCancelled(JoinCancelledPayload {
             m_pub,
             reason: reason.into(),
         }),
-    ) {
+    )
+    .await
+    {
         Ok(_) => {
             dispatch_owner_event_tickle_if_idle(state.state_dir.clone(), &state.event_broadcaster);
             // Positive observability gate (T093) — the ceremony was
@@ -6818,6 +7184,160 @@ mod tests {
     };
     use std::net::Ipv4Addr;
 
+    fn bootstrap_lifecycle_test_identity(state_dir: &FsPath) -> household_rs::LoadedIdentity {
+        household_rs::bootstrap_or_load(
+            state_dir,
+            household_rs::BootstrapOpts {
+                household_name: "Owner Events Lifecycle Home".to_string(),
+                hostname_label: Some("owner-events-lifecycle-host".to_string()),
+            },
+            household_rs::KeyBackingPolicy::ForceSoftware,
+        )
+        .expect("bootstrap lifecycle test identity")
+    }
+
+    #[test]
+    fn owner_authority_commit_revalidates_exact_record_and_cert() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let identity = bootstrap_lifecycle_test_identity(state_dir.path());
+        let guard = acquire_owner_events_lifecycle_exclusive_blocking(state_dir.path())
+            .expect("acquire lifecycle");
+
+        verify_installed_identity_under_lifecycle(
+            &guard,
+            state_dir.path(),
+            &identity.record,
+            &identity.cert,
+        )
+        .expect("exact identity matches");
+
+        let mut stale_record = identity.record.clone();
+        stale_record.name.push_str(" stale");
+        let error = verify_installed_identity_under_lifecycle(
+            &guard,
+            state_dir.path(),
+            &stale_record,
+            &identity.cert,
+        )
+        .expect_err("stale identity must not authorize owner mutation");
+        assert!(error.contains("identity changed"));
+    }
+
+    #[test]
+    fn interrupted_teardown_is_recovered_but_stale_owner_mutation_is_rejected() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let _identity = bootstrap_lifecycle_test_identity(state_dir.path());
+        let lifecycle =
+            HouseholdLifecycleLock::open_verified(state_dir.path()).expect("open lifecycle");
+        let guard = lifecycle.lock_exclusive().expect("lock lifecycle");
+        assert!(
+            guard
+                .rename_household_to_tearing_down()
+                .expect("detach household")
+        );
+        drop(guard);
+
+        let recovered_guard = acquire_owner_events_lifecycle_exclusive_blocking(state_dir.path())
+            .expect("reacquire lifecycle for recovery");
+        let error = recover_owner_events_lifecycle_or_reject(&recovered_guard, state_dir.path())
+            .expect_err("recovered teardown must reject stale request");
+        assert!(error.contains("recovered an interrupted teardown"));
+        assert!(!state_dir.path().join("household").exists());
+        assert!(!state_dir.path().join("household.tearing-down").exists());
+    }
+
+    #[test]
+    fn owner_authority_guard_blocks_same_household_teardown_until_anchor_finishes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let _identity = bootstrap_lifecycle_test_identity(state_dir.path());
+        let owner_guard = acquire_owner_events_lifecycle_exclusive_blocking(state_dir.path())
+            .expect("owner mutation lifecycle");
+        let anchor_finished = Arc::new(AtomicBool::new(false));
+        let contender_saw_anchor = Arc::clone(&anchor_finished);
+        let contender_path = state_dir.path().to_path_buf();
+        let (attempting_tx, attempting_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let contender = std::thread::spawn(move || {
+            let lifecycle = HouseholdLifecycleLock::open_verified(&contender_path)
+                .expect("open teardown contender lifecycle");
+            attempting_tx.send(()).expect("signal contender attempt");
+            let _teardown_guard = lifecycle
+                .lock_exclusive()
+                .expect("teardown contender acquires after owner mutation");
+            acquired_tx
+                .send(contender_saw_anchor.load(Ordering::Acquire))
+                .expect("signal contender acquisition");
+        });
+
+        attempting_rx.recv().expect("contender started");
+        assert!(
+            acquired_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "same-household teardown must not enter before the anchor side effect"
+        );
+        // Model the last authority-coupled anchor/marker side effect while the
+        // finish handler still owns the lifecycle guard.
+        anchor_finished.store(true, Ordering::Release);
+        drop(owner_guard);
+        assert!(
+            acquired_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("teardown enters after guard drop"),
+            "teardown observed acquisition before the anchor side effect"
+        );
+        contender.join().expect("teardown contender");
+    }
+
+    #[test]
+    fn every_owner_authority_finish_uses_the_lifecycle_commit_helper() {
+        let source = include_str!("handlers_owner_events.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("owner-events test module boundary")
+            .0;
+        assert_eq!(
+            production
+                .matches("persist_owner_auth_under_lifecycle(&state, &identity, &next_auth).await")
+                .count(),
+            6,
+            "all six owner-authority finish handlers must share the exact lifecycle commit path"
+        );
+        assert_eq!(
+            production.matches("drop(owner_lifecycle_guard)").count(),
+            6,
+            "each finish handler must retain and explicitly release its lifecycle guard"
+        );
+    }
+
+    #[test]
+    fn post_ack_commit_holds_lifecycle_through_reload_and_window_publication() {
+        let source = include_str!("handlers_owner_events.rs");
+        let commit_window = source
+            .split_once("The remote finalize is complete before either lock is acquired")
+            .expect("post-ACK lifecycle commit window")
+            .1;
+        let ordered = [
+            "BOOTSTRAP_MUTATION_LOCK",
+            "acquire_owner_events_lifecycle_exclusive",
+            "verify_installed_identity_under_lifecycle",
+            "commit_preserve_on_error_with_hook",
+            "try_load_existing_under_lifecycle",
+            "set_loaded",
+            "enter_committed",
+            "drop(post_ack_lifecycle_guard)",
+        ];
+        let mut remainder = commit_window;
+        for marker in ordered {
+            let (_, after) = remainder
+                .split_once(marker)
+                .unwrap_or_else(|| panic!("missing or out-of-order post-ACK marker: {marker}"));
+            remainder = after;
+        }
+    }
+
     fn household_id() -> HouseholdId {
         HouseholdId::parse(format!("hh_{}", "a".repeat(52))).unwrap()
     }
@@ -6906,6 +7426,7 @@ mod tests {
             pinned_hh_pub: None,
             pinned_hh_id: None,
             approval_claim: None,
+            lifecycle_generation: None,
         }
     }
 

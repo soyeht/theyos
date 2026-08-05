@@ -1,13 +1,13 @@
 //! T005 + T005a regression tests for the one-shot file-layout migrations
 //! exposed by `storage::load_state_dir`:
 //!
-//! - `pair_window.cbor` → `pair_device_window.cbor`
+//! - raw pre-generation pair-window files are discarded without adoption
 //! - `machine_cert.cbor` (root of `household/`) → `machine_certs/<m_id>.cbor`
 //!   plus the new `self_m_id` marker file.
 
 use std::fs;
 
-use household_rs::pair_device::{PairDeviceWindowSnapshot, PairNonce};
+use household_rs::pair_device::{PairDeviceWindow, PairNonce};
 use household_rs::storage::{
     HOUSEHOLD_SUBDIR, household_dir, legacy_machine_cert_path, legacy_pair_window_path,
     load_state_dir, machine_cert_for, machine_certs_dir, pair_device_window_path,
@@ -15,62 +15,59 @@ use household_rs::storage::{
 };
 use tempfile::tempdir;
 
-fn fake_pair_window_snapshot() -> PairDeviceWindowSnapshot {
-    PairDeviceWindowSnapshot {
+#[derive(serde::Serialize)]
+struct LegacyPairDeviceWindowSnapshot {
+    version: u8,
+    nonce_b64: String,
+    expires_at_unix: u64,
+    p_id_hint: Option<String>,
+}
+
+#[test]
+fn every_raw_pair_window_is_discarded_without_adoption() {
+    let td = tempdir().unwrap();
+    fs::create_dir_all(household_dir(td.path())).unwrap();
+
+    let raw_paths = [
+        legacy_pair_window_path(td.path()),
+        pair_device_window_path(td.path()),
+        household_dir(td.path()).join("pair_machine_window.cbor"),
+    ];
+    for path in &raw_paths {
+        fs::write(path, b"legacy authority must not be adopted").unwrap();
+    }
+
+    let outcome = load_state_dir(td.path()).unwrap();
+    assert!(outcome.discarded_legacy_pair_windows);
+    assert!(raw_paths.iter().all(|path| !path.exists()));
+}
+
+#[test]
+fn valid_legacy_pair_device_snapshot_is_not_adopted_by_current_namespace() {
+    let td = tempdir().unwrap();
+    fs::create_dir_all(household_dir(td.path())).unwrap();
+    let legacy = LegacyPairDeviceWindowSnapshot {
         version: 1,
         nonce_b64: PairNonce::random().as_b64(),
         expires_at_unix: 9_999_999_999,
         p_id_hint: None,
-    }
-}
-
-#[test]
-fn pair_window_rename_is_a_noop_when_target_already_exists() {
-    let td = tempdir().unwrap();
-    fs::create_dir_all(household_dir(td.path())).unwrap();
-
-    let snap = fake_pair_window_snapshot();
-    household_rs::storage::atomic_write_cbor(&pair_device_window_path(td.path()), &snap).unwrap();
-    // Stage a stale legacy file alongside.
-    fs::write(legacy_pair_window_path(td.path()), b"\x00").unwrap();
+    };
+    household_rs::storage::atomic_write_cbor(&legacy_pair_window_path(td.path()), &legacy).unwrap();
 
     let outcome = load_state_dir(td.path()).unwrap();
-    assert!(!outcome.migrated_pair_device_window);
-    // Stale legacy must have been deleted; new path untouched.
+    assert!(outcome.discarded_legacy_pair_windows);
+    let current = PairDeviceWindow::with_persistence(td.path().to_path_buf()).unwrap();
+    assert_eq!(current.read_persisted_snapshot().unwrap(), None);
     assert!(!legacy_pair_window_path(td.path()).exists());
-    let still: PairDeviceWindowSnapshot = read_optional_cbor(&pair_device_window_path(td.path()))
-        .unwrap()
-        .unwrap();
-    assert_eq!(still, snap);
-}
-
-#[test]
-fn pair_window_rename_migrates_legacy_file() {
-    let td = tempdir().unwrap();
-    fs::create_dir_all(household_dir(td.path())).unwrap();
-
-    let snap = fake_pair_window_snapshot();
-    household_rs::storage::atomic_write_cbor(&legacy_pair_window_path(td.path()), &snap).unwrap();
-    assert!(legacy_pair_window_path(td.path()).exists());
     assert!(!pair_device_window_path(td.path()).exists());
-
-    let outcome = load_state_dir(td.path()).unwrap();
-    assert!(outcome.migrated_pair_device_window);
-    assert!(!legacy_pair_window_path(td.path()).exists());
-
-    let migrated: PairDeviceWindowSnapshot =
-        read_optional_cbor(&pair_device_window_path(td.path()))
-            .unwrap()
-            .unwrap();
-    assert_eq!(migrated, snap);
 }
 
 #[test]
-fn pair_window_rename_is_noop_on_fresh_state_dir() {
+fn raw_pair_window_discard_is_noop_on_fresh_state_dir() {
     let td = tempdir().unwrap();
     fs::create_dir_all(household_dir(td.path())).unwrap();
     let outcome = load_state_dir(td.path()).unwrap();
-    assert!(!outcome.migrated_pair_device_window);
+    assert!(!outcome.discarded_legacy_pair_windows);
     assert!(outcome.migrated_self_machine_cert.is_none());
 }
 
@@ -126,7 +123,7 @@ fn test_machine_cert_layout_migration() {
     // Re-running is idempotent.
     let again = load_state_dir(td.path()).unwrap();
     assert!(again.migrated_self_machine_cert.is_none());
-    assert!(!again.migrated_pair_device_window);
+    assert!(!again.discarded_legacy_pair_windows);
 }
 
 #[test]

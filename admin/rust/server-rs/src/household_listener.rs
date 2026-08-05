@@ -72,6 +72,27 @@ impl HouseholdExposurePolicy {
                 class,
                 InterfaceClass::Loopback | InterfaceClass::Lan | InterfaceClass::Tailscale
             ),
+            // An interrupted install gets its OWN arm, and deliberately the
+            // narrowest one. `allows` is a function of the state alone -- it
+            // cannot see which state we arrived from -- so this set has to be
+            // safe from *every* legal predecessor. The transition table admits
+            // `Uninitialized | ReadyForNaming | NamedAwaitingPair` into this
+            // state, whose sets are {Loopback, Lan, Tailscale} and
+            // {Loopback, Tailscale, Mesh}. Their intersection is
+            // {Loopback, Tailscale}, and that is what this arm may grant.
+            //
+            // Sharing `Ready`'s arm was measurably wrong, not merely untidy: a
+            // household that never completed onboarding gained `Mesh` on
+            // entering this state, applied by the 60 s `sync_interface_targets`
+            // refresh without the router ever restarting. The or-pattern let a
+            // new variant inherit `Ready`'s exposure with nobody deciding it.
+            //
+            // Rule, so the next variant does not repeat this: entering
+            // `PairMachineInstallRestartRequired` must never widen the exposed
+            // class set relative to any legal predecessor.
+            BootstrapState::PairMachineInstallRestartRequired => {
+                matches!(class, InterfaceClass::Loopback | InterfaceClass::Tailscale)
+            }
             BootstrapState::NamedAwaitingPair
             | BootstrapState::Ready
             | BootstrapState::Recovering => {
@@ -880,7 +901,56 @@ async fn sync_exposure_policy(bootstrap: &Arc<RwLock<BootstrapState>>, bound: &B
 /// Spawn one `axum::serve` per bind target. Returns the set of addresses
 /// that actually bound, so the Bonjour publisher can advertise only what's
 /// reachable. Servers run in background tasks owned by tokio.
+/// Proof that the caller is process startup, not a request handler.
+///
+/// A pair-machine reexec must never reopen the household router, "not even
+/// transitively". That was previously argued by reading the reexec path and
+/// seeing no router call, and then by a test that swept source text for call
+/// sites. Both are weaker than they look: the first says nothing about a path
+/// added later, and the second was defeated in review by a second caller in an
+/// already-listed file, by a one-line `#[cfg(test)]` item, and by an import
+/// alias. A brace-counting text classifier is not a control.
+///
+/// So the restriction is a type instead. This struct has a private field, no
+/// `Clone`, no `Copy`, no `Default`, and no public constructor, so it cannot be
+/// built outside this module. [`ProcessStartupToken::claim`] is the only way to
+/// obtain one and succeeds exactly once per process. A handler cannot fabricate
+/// it and cannot claim it after `main` has, so a handler-reachable call to
+/// [`spawn_household_listeners`] does not compile — no sweep required.
+///
+/// Scope, so nobody reads more into this than it proves: this governs *starting*
+/// listeners. It does not claim bootstrap state has no effect on exposure. It
+/// does, by design — [`refresh_loop`] polls the bootstrap state on a timer and
+/// re-filters bind targets through [`HouseholdExposurePolicy`], so a reexec that
+/// commits `Ready` changes what an already-running listener exposes within one
+/// poll interval. That belongs to the exposure-policy arms, which are pinned by
+/// their own decision guard.
+pub struct ProcessStartupToken(());
+
+static STARTUP_TOKEN_CLAIMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+impl ProcessStartupToken {
+    /// Claim the process-wide startup token.
+    ///
+    /// Returns `None` if it has already been claimed, so a second claim from
+    /// anywhere — including a handler that reached this function at runtime —
+    /// cannot manufacture startup authority.
+    pub fn claim() -> Option<Self> {
+        STARTUP_TOKEN_CLAIMED
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .ok()
+            .map(|_| Self(()))
+    }
+}
+
 pub async fn spawn_household_listeners(
+    _startup: &ProcessStartupToken,
     router: Router,
     port: u16,
     bootstrap: Arc<RwLock<BootstrapState>>,
