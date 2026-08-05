@@ -3293,6 +3293,7 @@ dependencies = [
  "keystore-rs",
  "mesh-session-core-rs",
  "static_assertions",
+ "trybuild",
 ]
 
 [[package]]

@@ -1,0 +1,34 @@
+warning: unreachable statement
+  --> tests/compile-fail/channel_mapping_is_exhaustive.rs:12:5
+   |
+11 |       let channel: mesh_session_core_rs::auth_state_machine::ExpectedChannel = todo!();
+   |                                                                                ------- any code following this expression is unreachable
+12 | /     let _: household_rs::mesh_intent_nonce_ledger::MeshIntentChannel = match channel {
+13 | |         mesh_session_core_rs::auth_state_machine::ExpectedChannel::Dev => {
+14 | |             household_rs::mesh_intent_nonce_ledger::MeshIntentChannel::Dev
+15 | |         }
+16 | |     };
+   | |______^ unreachable statement
+   |
+   = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+error[E0004]: non-exhaustive patterns: `ExpectedChannel::Release` not covered
+  --> tests/compile-fail/channel_mapping_is_exhaustive.rs:12:78
+   |
+12 |     let _: household_rs::mesh_intent_nonce_ledger::MeshIntentChannel = match channel {
+   |                                                                              ^^^^^^^ pattern `ExpectedChannel::Release` not covered
+   |
+note: `ExpectedChannel` defined here
+  --> $WORKSPACE/mesh-session-core-rs/src/auth_state_machine.rs
+   |
+   | pub enum ExpectedChannel {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^
+   |     Dev,
+   |     Release,
+   |     ------- not covered
+   = note: the matched value is of type `ExpectedChannel`
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern or an explicit pattern as shown
+   |
+15 ~         },
+16 +         ExpectedChannel::Release => todo!()
+   |
