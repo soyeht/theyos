@@ -1978,8 +1978,19 @@ mod tests {
                 // the assertion compares the guard against itself -- the same
                 // `include_str!` self-reference that made the post-ACK guard
                 // pass against an empty handler.
+                //
+                // Partition at the test MODULE, not at the first `#[cfg(test)]`.
+                // Splitting on the attribute happens to work in this file --
+                // it has exactly one at column 0, and that one is the module --
+                // but the recipe is unsafe to copy: `mesh_intent_nonce_ledger.rs`
+                // has seven at column 0, the first on line 55, so the same split
+                // would keep 54 lines as "production", find nothing, and pass
+                // green having measured no code at all. A guard reading its own
+                // file fails by matching itself; a guard cut at the wrong
+                // boundary fails by reading nothing, and only the first is
+                // visible in the output.
                 let text = text
-                    .split_once("\n#[cfg(test)]")
+                    .split_once("\n#[cfg(test)]\nmod tests")
                     .map_or(text.as_str(), |(p, _)| p);
                 for line in text.lines() {
                     if !line.contains("ProcessStartupToken") {
@@ -1999,6 +2010,21 @@ mod tests {
             }
         }
         found.sort();
+
+        // Control on the partition itself (@khai): a guard whose production
+        // half does not contain the definition it measures is broken whatever
+        // number it returns. In `mesh_intent_nonce_ledger.rs` both partitions
+        // happen to yield zero -- the wrong cut by discarding the definition,
+        // the right cut because there genuinely is no production call -- so the
+        // count alone cannot tell a working instrument from a broken one.
+        assert!(
+            found
+                .iter()
+                .any(|line| line.contains("pub struct ProcessStartupToken(())")),
+            "the production half must contain the definition being measured; \
+             if it does not, the partition cut in the wrong place and every \
+             count below is measuring the wrong text"
+        );
 
         let expected = [
             "household_bootstrap.rs: startup: &household_listener::ProcessStartupToken,",
