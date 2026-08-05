@@ -359,14 +359,41 @@ fn r1a7_enumerates_linked_targets_and_proves_zero_production_callers() {
     // ships its tests as inline `mod tests` rather than files under `tests/`.
     // device-key-rs DOES ship files under `tests/` (device_static,
     // s1_design_guards), so members moves by one and targets moves by two.
-    assert_eq!(members.len(), 30, "workspace member inventory changed");
+    //
+    // +1 `mesh-session-runtime-rs` (D6 runtime facade). Derived, not bumped: it
+    // joins as a REAL member rather than staying standalone, because a crate
+    // outside the workspace is not built by `--workspace` and therefore has no
+    // CI at all. It declares no `[[bin]]`/`[[test]]`/`[[example]]` and ships no
+    // `src/main.rs`, `src/bin/`, `tests/` or `examples/`, so by
+    // `enumerate_workspace_targets`'s own rule it contributes ZERO targets --
+    // members moves by one and targets does not move for it.
+    assert_eq!(members.len(), 31, "workspace member inventory changed");
     assert!(
         members
             .iter()
             .any(|member| member == "m1-household-mesh-smoke-rs")
     );
     let targets = enumerate_workspace_targets(&rust_root, &members);
-    assert_eq!(targets.len(), 201, "Cargo target inventory changed");
+    // 201 + 5. DERIVED FROM MEASUREMENT, then explained -- not summed. The
+    // composition adds seven files under `tests/`, of which exactly five are
+    // enumerated targets:
+    //
+    //   household-rs/tests/compile_fail_peer_expectation.rs      (lifecycle)
+    //   household-rs/tests/compile_fail_pending_admission.rs     (integration)
+    //   household-rs/tests/compile_fail_fixture_coverage.rs      (orphan gate)
+    //   household-rs/tests/workspace_msrv_invariant.rs           (MSRV floor)
+    //   server-rs/tests/khai_b3_exposure_decision_guard.rs       (B-3 exposure)
+    //
+    // The other two, `mesh-session-control-model-rs/tests/{cas_multiprocess,
+    // model_invariants}.rs`, do NOT count: that crate is in the workspace's
+    // `exclude` list, so it is not a member and `enumerate_workspace_targets`
+    // never walks it. `mesh-session-runtime-rs` joins as a member but declares
+    // no explicit targets and ships no `tests/`, so it adds zero here.
+    //
+    // Every arithmetic prediction of this number made during composition was
+    // wrong (206, then 207, by two different routes). The value below is what
+    // the enumerator reported; the list above is why.
+    assert_eq!(targets.len(), 206, "Cargo target inventory changed");
     assert_eq!(
         targets.iter().filter(|target| target.kind == "bin").count(),
         50
@@ -376,7 +403,7 @@ fn r1a7_enumerates_linked_targets_and_proves_zero_production_callers() {
             .iter()
             .filter(|target| target.kind == "test")
             .count(),
-        151 // 146 + 2 R0a Fatia N + 1 B0a roster-currency + 2 device-key-rs S1 integration targets
+        156 // 146 + 2 R0a Fatia N + 1 B0a roster-currency + 2 device-key-rs S1 integration targets + 5 mesh-session composition targets
     );
     assert_eq!(
         targets
