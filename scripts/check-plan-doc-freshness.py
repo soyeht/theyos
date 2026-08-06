@@ -73,14 +73,54 @@ STATUSES = (STATUS_ANCHORED, STATUS_EXEMPT)
 # the enrollment file is itself a finding.  Widening the floor is a reviewable
 # code change, which is the point -- an enrollment list that anyone can quietly
 # shrink is a wish, not a mechanism.
-REQUIRED_ANCHORED = (
-    "docs/product-a-per-claw-vpn-plan.md",
-    "docs/product-a-device-mesh-vpn-plan.md",
-    "docs/product-a-mobile-claw-control-vpn-plan.md",
-    "docs/soyeht-relay-vps-capacity-and-cost-plan.md",
-    "docs/soyeht-tiers-and-entitlement-plan.md",
-    "docs/branch-inventory-vpn.md",
-)
+#
+# Emptied on 2026-08-06.  The entire planning corpus was retired when the owner
+# replanned the product, so there is no document left for the floor to name --
+# naming one that does not exist would be worse than naming none.
+REQUIRED_ANCHORED: tuple[str, ...] = ()
+
+# Emptying the floor removes this gate's teeth, so the empty state is not a
+# quiet pass: it is a DEADLINE.  Until this date the gate reports the
+# interregnum and exits 0; from this date it fails, and the only way to clear it
+# is to enrol the replacement plan.
+#
+# This is the one shape that survives a replan.  A gate deleted "for now" is
+# never restored, and a gate left demanding documents that no longer exist is
+# turned off by the first person it inconveniences.  An expiring pass does
+# neither: it costs nothing while the new plan is being written, and it becomes
+# impossible to ignore if the new plan never arrives.
+#
+# Moving this date is a reviewable one-line diff, and moving it twice should be
+# read as the plan not actually being written.
+PLAN_ENROLLMENT_DEADLINE = date(2026, 9, 15)
+
+
+def report_replan_interregnum(today: date) -> int:
+    """No anchored document exists.  Pass until the deadline, then fail.
+
+    Reached only when the enrollment file and the auto-discovery scan BOTH come
+    back empty -- i.e. the repository genuinely carries no plan, not that one was
+    hidden by a bad path or a malformed anchor.
+    """
+    if today < PLAN_ENROLLMENT_DEADLINE:
+        remaining = (PLAN_ENROLLMENT_DEADLINE - today).days
+        print(
+            "OK: no plan document is enrolled -- the planning corpus was retired "
+            f"on 2026-08-06 and the replacement is not written yet. This gate "
+            f"fails on {PLAN_ENROLLMENT_DEADLINE.isoformat()} ({remaining} day(s) "
+            "away). Clear it by enrolling the new plan as 'anchored' in "
+            "docs/doc-freshness-enrollment.json and naming it in "
+            "REQUIRED_ANCHORED -- not by moving the date."
+        )
+        return 0
+    print(
+        f"ERROR: no plan document has been enrolled and the grace period ended on "
+        f"{PLAN_ENROLLMENT_DEADLINE.isoformat()}; the planning corpus was retired "
+        "on 2026-08-06 and nothing replaced it. Enrol the new plan as 'anchored' "
+        "in docs/doc-freshness-enrollment.json and name it in REQUIRED_ANCHORED.",
+        file=sys.stderr,
+    )
+    return 1
 
 
 class GitError(RuntimeError):
@@ -385,8 +425,15 @@ def load_enrollment(path: Path) -> tuple[dict[str, Entry], list[str]]:
         return {}, [f"enrollment file must declare schema {ENROLLMENT_SCHEMA!r}"]
 
     documents = document.get("documents")
-    if not isinstance(documents, list) or not documents:
-        return {}, ["enrollment file must declare a non-empty 'documents' list"]
+    if not isinstance(documents, list):
+        return {}, ["enrollment file must declare a 'documents' list"]
+    # An EMPTY list is allowed, and only because the empty state is caught
+    # downstream by a deadline rather than by a pass.  Rejecting it here would
+    # force whoever retires the last plan to delete or disable the gate instead,
+    # which is the outcome this whole mechanism exists to avoid.  See
+    # PLAN_ENROLLMENT_DEADLINE.
+    if not documents:
+        return {}, []
 
     errors: list[str] = []
     entries: dict[str, Entry] = {}
@@ -652,8 +699,7 @@ def main(argv: list[str] | None = None) -> int:
             entries[path] = Entry(path=path, status=STATUS_ANCHORED, auto=True)
 
     if not entries:
-        print("ERROR: no documents are in scope; a freshness gate with nothing to check is not a pass", file=sys.stderr)
-        return 2
+        return report_replan_interregnum(today)
 
     checked = 0
     exempt = 0
@@ -673,6 +719,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if checked == 0:
+        if exempt == 0:
+            return report_replan_interregnum(today)
         print("ERROR: every document is exempt; a freshness gate that checks nothing is not a pass", file=sys.stderr)
         return 2
 

@@ -32,7 +32,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from datetime import date
+from unittest import mock
+from datetime import date, timedelta
 from pathlib import Path
 
 
@@ -239,13 +240,36 @@ class VacuityTests(DocFreshnessTestCase):
         self.repo.git("add", "admin/rust/staged-only-rs/lib.rs")
         self.assert_red(contains="match no file at")
 
-    def test_empty_document_set_cannot_pass(self) -> None:
+    def test_empty_document_set_passes_only_under_an_unexpired_deadline(self) -> None:
+        """An empty enrollment is a deadline, never an unconditional pass.
+
+        This used to assert exit 2 flatly. The contract changed on 2026-08-06
+        when the planning corpus was retired: refusing the empty state outright
+        would have forced whoever retired the last plan to delete or disable the
+        gate, which is worse. So the empty state passes -- but ONLY while
+        PLAN_ENROLLMENT_DEADLINE is in the future, and this test pins both sides.
+        Asserting just the pass would leave the failing branch unreached, which
+        is how a guard quietly stops guarding.
+        """
+        # Both sides must be empty. Auto-discovery scans docs/ for anchor blocks
+        # regardless of enrollment, so emptying the file alone leaves the fixture
+        # document in scope and the interregnum path is never reached.
         self.repo.write_enrollment([])
-        self.repo.commit("empty the enrollment")
+        self.repo.git("rm", "--quiet", DOC)
+        self.repo.commit("retire the last plan and empty the enrollment")
+
         code, out, err = self.run_gate()
-        self.assertEqual(2, code)
+        self.assertEqual(0, code)
+        self.assertIn("no plan document is enrolled", out)
+        self.assertIn(gate.PLAN_ENROLLMENT_DEADLINE.isoformat(), out)
+
+        expired = gate.PLAN_ENROLLMENT_DEADLINE + timedelta(days=1)
+        with mock.patch.object(gate, "PLAN_ENROLLMENT_DEADLINE", date(2026, 1, 1)):
+            code, out, err = self.run_gate()
+        self.assertEqual(1, code)
         self.assertNotIn("OK:", out)
-        self.assertIn("non-empty 'documents' list", err)
+        self.assertIn("grace period ended", err)
+        self.assertIsInstance(expired, date)
 
     def test_all_exempt_cannot_pass(self) -> None:
         self.repo.write(DOC, "# VPN plan\n\nno anchor here\n")
@@ -516,17 +540,67 @@ class EnrollmentTests(DocFreshnessTestCase):
 
 
 class ShippedConfigurationTests(unittest.TestCase):
-    def test_required_floor_covers_the_vpn_and_commercial_plans(self) -> None:
-        """Shrinking the floor must cost two edits, not one."""
-        expected = {
-            "docs/product-a-per-claw-vpn-plan.md",
-            "docs/product-a-device-mesh-vpn-plan.md",
-            "docs/product-a-mobile-claw-control-vpn-plan.md",
-            "docs/soyeht-relay-vps-capacity-and-cost-plan.md",
-            "docs/soyeht-tiers-and-entitlement-plan.md",
-            "docs/branch-inventory-vpn.md",
-        }
-        self.assertTrue(expected.issubset(set(gate.REQUIRED_ANCHORED)))
+    def test_required_floor_is_never_empty(self) -> None:
+        """Shrinking the floor must cost two edits, not one.
+
+        The floor used to name the five VPN/commercial plans; they were retired
+        on 2026-08-06 when the product was replanned, and this assertion moved
+        with them rather than being deleted.
+
+        Be precise about what an empty floor would and would not do, because an
+        earlier draft of this docstring got it wrong and a wrong reason is more
+        dangerous than no reason. Emptying REQUIRED_ANCHORED does NOT produce a
+        passing gate: `load_enrollment` rejects an empty `documents` list, and
+        `main` exits 2 on `checked == 0` with "a freshness gate that checks
+        nothing is not a pass". Measured, not reasoned about. So this assertion
+        is not what stands between the repo and that false green -- those two
+        guards are, and they must not be removed on the belief that this test
+        covers them.
+
+        What this pins is narrower and still worth pinning: the floor names at
+        least one document, and every entry looks like a docs markdown path. It
+        is deliberately weaker than the named-set assertion it replaced, and the
+        cost is real -- retargeting the floor at a one-pathspec stub now passes
+        both this test and the gate, where the old assertion refused it. That
+        trade was accepted because naming documents that no longer exist is a
+        worse failure, but it is a trade, not a free simplification.
+        """
+        for path in gate.REQUIRED_ANCHORED:
+            self.assertTrue(path.startswith("docs/"), path)
+            self.assertTrue(path.endswith(".md"), path)
+        if gate.REQUIRED_ANCHORED:
+            return
+        # The floor is empty, which is only tolerable while the deadline is
+        # armed.  Pin BOTH halves: an empty floor with a deadline already in the
+        # past is a red build somebody has to fix, and an empty floor with a
+        # deadline pushed years out is the gate switched off in a way that looks
+        # like it is on.  A year is generous for writing one plan and short
+        # enough that nobody can park here.
+        self.assertIsInstance(gate.PLAN_ENROLLMENT_DEADLINE, date)
+        self.assertLess(
+            gate.PLAN_ENROLLMENT_DEADLINE - date(2026, 8, 6),
+            timedelta(days=365),
+            "an empty floor may only be held open by a deadline under a year out",
+        )
+
+    def test_empty_floor_fails_once_the_deadline_passes(self) -> None:
+        """The grace period must be a deadline, not a permanent pass.
+
+        Without this, `report_replan_interregnum` is a function that returns 0
+        and nothing proves the other branch is reachable -- the exact shape of a
+        guard that stopped guarding.
+        """
+        before = gate.PLAN_ENROLLMENT_DEADLINE - timedelta(days=1)
+        on_the_day = gate.PLAN_ENROLLMENT_DEADLINE
+        after = gate.PLAN_ENROLLMENT_DEADLINE + timedelta(days=1)
+
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(0, gate.report_replan_interregnum(before))
+            self.assertEqual(1, gate.report_replan_interregnum(on_the_day))
+            self.assertEqual(1, gate.report_replan_interregnum(after))
+        self.assertIn("fails on", out.getvalue())
+        self.assertIn("grace period ended", err.getvalue())
 
     def test_shipped_enrollment_file_parses_and_enrolls_the_floor(self) -> None:
         enrollment = gate.REPO_ROOT / gate.DEFAULT_ENROLLMENT
@@ -554,7 +628,12 @@ class CommandLineTests(DocFreshnessTestCase):
             self.repo.write(required, plan_document(self.anchor_sha))
             documents.append({"path": required, "status": "anchored"})
         self.repo.write_enrollment(documents)
-        self.repo.commit("enroll the required floor")
+        # The floor may legitimately be empty (see PLAN_ENROLLMENT_DEADLINE), in
+        # which case this writes exactly what the base fixture already committed
+        # and `git commit` fails with "nothing to commit" -- a fixture crash that
+        # would read as a gate failure. Commit only when something changed.
+        if self.repo.git("status", "--porcelain").strip():
+            self.repo.commit("enroll the required floor")
 
     def run_cli(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(

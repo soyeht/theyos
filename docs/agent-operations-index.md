@@ -65,16 +65,23 @@ name, relay endpoint, local path, secret or key — in any file, PR or screensho
 
 ## 3. Where the code is, and the cross-repo hazard
 
-| track | plan | one-line state |
-|---|---|---|
-| VPN to a claw | `docs/product-a-per-claw-vpn-plan.md` | datapath observed on a dev host; not activated |
-| the same, from an iPhone | `docs/product-a-mobile-claw-control-vpn-plan.md` | Rust FFI shaped for `NEPacketTunnel`; no iOS client yet |
-| VPN device ↔ device | `docs/product-a-device-mesh-vpn-plan.md` | large codebase, most of it outside the build graph |
-| free / paid boundary | `docs/soyeht-tiers-and-entitlement-plan.md` | seam designed, pricing undecided |
-| relay capacity and cost | `docs/soyeht-relay-vps-capacity-and-cost-plan.md` | one small VPS serves Share today |
-| Share (shipped) | `docs/share-foundation-boundary-map.md` | in `main` |
+**There is no plan document here, and that is deliberate.** The whole planning
+corpus — 37 plan, design, follow-up and execution-artifact documents — was
+deleted on 2026-08-06 because the product is being replanned. A superseded plan
+an agent still reads is worse than none: it reads as current, it is specific, and
+it sends work somewhere the owner already abandoned. **Finding no plan is the
+answer, not a broken checkout** — ask the owner rather than inferring one from
+code, a branch name or git history. They survive at `origin/main@74f5c0e7`
+(`git show 74f5c0e7:docs/<name>.md`); read them, never resume them.
+`MEASURED 2026-08-06 origin/main@74f5c0e7`
 
-Cross-repo protocol contract: `docs/household-protocol.md`.
+The absence has a deadline, not a shrug: `check-plan-doc-freshness.py` passes
+with nothing enrolled only until `PLAN_ENROLLMENT_DEADLINE`, then fails. Enrol
+the new plan as `anchored` in `docs/doc-freshness-enrollment.json`, name it in
+`REQUIRED_ANCHORED`, replace this section — and do not move the date. Still live,
+and not plans: `share-foundation-boundary-map.md`, `household-protocol.md` (cited
+by nine Rust sources), and the contracts under `owner-mesh-rendezvous/`,
+`owner-site-a2-dataplane/` and `contracts/`.
 
 **The macOS and iOS applications are not in this repository.** Zero `.swift` and
 zero `.xcodeproj` files are tracked here `MEASURED 2026-08-06 origin/main@e60bad85`.
@@ -168,15 +175,15 @@ than 30 days, when a pending date has passed, when a marker is malformed, and
 when the file carries no measured claim at all. **The fix for a red is to
 re-measure and restate the date — never to bump the date.**
 
-Today's four instances, all the same failure:
+Instances, all the same failure, none red at the time: a stale iOS pin; a
+month-old status header with seven false assertions; a branch named after shipped
+work whose merge would have deleted 1,594 lines; grants recorded only in
+transcripts. Each was a number nobody re-evaluated, with nothing able to age.
 
-1. An iOS pin six weeks stale, covering a crate that did not exist at the pin.
-2. A 200-line status header a month old, seven of its assertions measurably false.
-3. A branch named after shipped work whose merge would have deleted 1,594 lines.
-4. Operational grants recorded only in transcripts, re-asked after every reset.
-
-None of them was red. That is the whole problem: each was a number nobody
-re-evaluated, and nothing existed that could age.
+The sharpest came last. An end-to-end test built its session on a hardcoded
+future timestamp while the code re-read the real clock, so it could only pass in
+a ten-minute window in 2027 — and CI compiled it every push, ran it never.
+**Compiling a test proves it type-checks; running it proves what it asserts.**
 
 ## 7. Test profile for Product A
 

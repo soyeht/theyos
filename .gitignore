@@ -111,3 +111,6 @@ Library/Logs/theyos/
 *.dSYM/
 *.profdata
 *.profraw
+
+# CD-209 test residue; a test writes this and never cleans it up
+.cd209-testtmp/

@@ -4,6 +4,15 @@
     "Documents whose measured claims about code are gated by",
     "scripts/check-plan-doc-freshness.py.",
     "",
+    "EMPTY ON PURPOSE, 2026-08-06. The whole planning corpus was retired when the",
+    "owner replanned the product. There is no plan to enrol yet.",
+    "",
+    "This is not a disabled gate. check-plan-doc-freshness.py treats the empty",
+    "state as a DEADLINE: it passes until PLAN_ENROLLMENT_DEADLINE and fails after,",
+    "so a replan that never produces a plan becomes a red build rather than a",
+    "silence. Clear it by enrolling the new plan here as 'anchored' AND naming it",
+    "in REQUIRED_ANCHORED -- not by moving the date.",
+    "",
     "status 'anchored': the document must carry a <!-- doc-freshness-anchor -->",
     "block naming the commit it was measured at and the pathspecs it claims to",
     "describe. The gate fails when commits touching those paths landed after the",
@@ -15,39 +24,7 @@
     "exemption on purpose.",
     "",
     "Any markdown file under docs/ that carries an anchor block is checked whether",
-    "or not it is listed here, so opting in costs one edit. The reverse is not",
-    "true: the documents in REQUIRED_ANCHORED inside the script must appear here",
-    "as 'anchored', and removing one is itself a finding.",
-    "",
-    "Documents with neither an anchor nor an entry are not checked. That is the",
-    "migration: the gate starts at the six documents that carry measured claims",
-    "about live code and grows by enrollment, rather than reddening every markdown",
-    "file in the repository on day one."
+    "or not it is listed here, so opting in costs one edit."
   ],
-  "documents": [
-    {
-      "path": "docs/product-a-per-claw-vpn-plan.md",
-      "status": "anchored"
-    },
-    {
-      "path": "docs/product-a-device-mesh-vpn-plan.md",
-      "status": "anchored"
-    },
-    {
-      "path": "docs/product-a-mobile-claw-control-vpn-plan.md",
-      "status": "anchored"
-    },
-    {
-      "path": "docs/soyeht-relay-vps-capacity-and-cost-plan.md",
-      "status": "anchored"
-    },
-    {
-      "path": "docs/soyeht-tiers-and-entitlement-plan.md",
-      "status": "anchored"
-    },
-    {
-      "path": "docs/branch-inventory-vpn.md",
-      "status": "anchored"
-    }
-  ]
+  "documents": []
 }
