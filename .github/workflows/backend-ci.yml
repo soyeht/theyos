@@ -29,7 +29,14 @@ jobs:
   build-and-test-linux:
     name: Build & Test (Rust / Linux)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 50, not 30: three phase3_atomic_rollback tests each wait out the full
+    # production RECOVERY_TIMEOUT (~300s) because a launched finalize POST
+    # retries against an unreachable M2 before owner_approve_handler returns —
+    # documented in 6476673a and tracked as its own follow-up. At 30 the job was
+    # cancelled mid-suite, which reads as a failure but measured nothing. Raise
+    # the ceiling rather than shorten the budget: the wait is what those tests
+    # prove. Drop this back when the retry policy becomes injectable.
+    timeout-minutes: 50
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -150,7 +157,9 @@ jobs:
   build-and-test-macos:
     name: Build & Test (Rust / macOS)
     runs-on: macos-15
-    timeout-minutes: 30
+    # Same reason as the Linux job above: the ~300s×3 RECOVERY_TIMEOUT wait in
+    # phase3_atomic_rollback is what those tests prove, not overhead to trim.
+    timeout-minutes: 50
     steps:
       - name: Checkout
         uses: actions/checkout@v5
