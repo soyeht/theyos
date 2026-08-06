@@ -1,0 +1,53 @@
+{
+  "schema": "doc_freshness_enrollment_v1",
+  "_comment": [
+    "Documents whose measured claims about code are gated by",
+    "scripts/check-plan-doc-freshness.py.",
+    "",
+    "status 'anchored': the document must carry a <!-- doc-freshness-anchor -->",
+    "block naming the commit it was measured at and the pathspecs it claims to",
+    "describe. The gate fails when commits touching those paths landed after the",
+    "anchor. Clearing the finding means re-measuring and advancing 'sha:'; editing",
+    "the document does not clear it.",
+    "",
+    "status 'exempt': a dated, reasoned, EXPIRING escape hatch for a document that",
+    "is being migrated. An expired exemption is a failure. There is no permanent",
+    "exemption on purpose.",
+    "",
+    "Any markdown file under docs/ that carries an anchor block is checked whether",
+    "or not it is listed here, so opting in costs one edit. The reverse is not",
+    "true: the documents in REQUIRED_ANCHORED inside the script must appear here",
+    "as 'anchored', and removing one is itself a finding.",
+    "",
+    "Documents with neither an anchor nor an entry are not checked. That is the",
+    "migration: the gate starts at the six documents that carry measured claims",
+    "about live code and grows by enrollment, rather than reddening every markdown",
+    "file in the repository on day one."
+  ],
+  "documents": [
+    {
+      "path": "docs/product-a-per-claw-vpn-plan.md",
+      "status": "anchored"
+    },
+    {
+      "path": "docs/product-a-device-mesh-vpn-plan.md",
+      "status": "anchored"
+    },
+    {
+      "path": "docs/product-a-mobile-claw-control-vpn-plan.md",
+      "status": "anchored"
+    },
+    {
+      "path": "docs/soyeht-relay-vps-capacity-and-cost-plan.md",
+      "status": "anchored"
+    },
+    {
+      "path": "docs/soyeht-tiers-and-entitlement-plan.md",
+      "status": "anchored"
+    },
+    {
+      "path": "docs/branch-inventory-vpn.md",
+      "status": "anchored"
+    }
+  ]
+}

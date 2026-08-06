@@ -1,0 +1,149 @@
+name: Repo Hygiene
+
+# Four gates against one failure mode: a number nobody re-evaluates, which stays
+# green while it rots. Each was written after that failure had already cost real
+# time, and each was proved able to go RED by breaking its own guard and watching
+# the test fail.
+#
+# DELIBERATELY NOT A REQUIRED CHECK, and this is a design decision, not an
+# oversight. Three of these four gates are RED against `main` today — that is the
+# point of building them, and making them required on day one would either block
+# every PR or, far more likely, get them switched off within a week. They report
+# first. Promotion to required happens per gate, once its findings are at zero,
+# and each promotion is its own reviewed change.
+#
+# The gates emit no absolute paths, no hostnames, no addresses and no account
+# identifiers: this repository is public and the cross-repo gate reads a checkout
+# whose location must never reach the log.
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  # A stale pin does not rot on a PR — it rots on the days when nobody opens one.
+  # An event-driven-only schedule cannot observe that, so this gate also runs on a
+  # clock.
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: repo-hygiene-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hygiene:
+    name: Repo hygiene gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout theyos
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          # Every gate here measures DISTANCE — commits behind, days behind, a
+          # doc's anchor against the commits that landed after it. A shallow
+          # clone makes each of those unanswerable, and the gates correctly
+          # refuse to guess: they exit 3 (cannot evaluate) rather than pass.
+          fetch-depth: 0
+
+      # Public read. The pin gate needs the consumer's Cargo.toml and pin files
+      # to answer "is the pin still telling the truth?" — without this checkout it
+      # exits 3 rather than reporting a false clean.
+      - name: Checkout soyeht-ios (consumer)
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: soyeht/soyeht-ios
+          path: .consumer/soyeht-ios
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      # continue-on-error per step, and a summary step that names the reds at the
+      # end: one gate going red must not hide the other three. A fail-fast job
+      # turns one breakage into N cycles of discovering the next one.
+      - name: Gate — cross-repo pin freshness
+        id: pin
+        continue-on-error: true
+        run: uv run scripts/check-cross-repo-pin-freshness.py --consumer-repo .consumer/soyeht-ios
+
+      - name: Gate — plan document freshness
+        id: docs
+        continue-on-error: true
+        run: uv run scripts/check-plan-doc-freshness.py
+
+      - name: Gate — branch hygiene
+        id: branches
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: uv run scripts/check-branch-hygiene.py
+
+      - name: Gate — agent operations index
+        id: index
+        continue-on-error: true
+        run: uv run scripts/check-agent-operations-index.py
+
+      - name: Gate self-tests
+        continue-on-error: true
+        run: |
+          set +e
+          rc=0
+          for t in scripts/test_check_cross_repo_pin_freshness.py \
+                   scripts/test_check_plan_doc_freshness.py \
+                   scripts/test_check_branch_hygiene.py \
+                   scripts/test_check_agent_operations_index.py; do
+            echo "::group::${t}"
+            uv run "${t}" || rc=1
+            echo "::endgroup::"
+          done
+          exit $rc
+
+      # A gate whose own outcome is invisible in the run summary is a gate nobody
+      # reads.
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "| gate | outcome |"
+            echo "|---|---|"
+            echo "| cross-repo pin freshness | ${{ steps.pin.outcome }} |"
+            echo "| plan document freshness | ${{ steps.docs.outcome }} |"
+            echo "| branch hygiene | ${{ steps.branches.outcome }} |"
+            echo "| agent operations index | ${{ steps.index.outcome }} |"
+            echo ""
+            echo "This job is NOT a required check, so a red here does not block a merge."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # NOT REQUIRED and ALWAYS GREEN are different things, and the first version
+      # of this workflow confused them: `continue-on-error` on every step made the
+      # job pass even with a gate red, so the check row was permanently green and
+      # nobody would ever have looked at it. A gate that cannot show red is not a
+      # gate.
+      #
+      # The per-step `continue-on-error` above stays — it is there so one red gate
+      # does not hide the other three, which is a different problem. This step
+      # restores the signal: the job goes red when any gate did, while the check
+      # remains non-required so a red never blocks a merge. Removing this step to
+      # "get CI green" removes the entire point of the workflow.
+      - name: Fail the job if any gate went red
+        if: always()
+        run: |
+          failed=""
+          [ "${{ steps.pin.outcome }}" = "failure" ] && failed="${failed} cross-repo-pin-freshness"
+          [ "${{ steps.docs.outcome }}" = "failure" ] && failed="${failed} plan-doc-freshness"
+          [ "${{ steps.branches.outcome }}" = "failure" ] && failed="${failed} branch-hygiene"
+          [ "${{ steps.index.outcome }}" = "failure" ] && failed="${failed} agent-operations-index"
+          if [ -n "${failed}" ]; then
+            echo "::error::red gates:${failed} — see the step logs above. This check is not required; it reports."
+            exit 1
+          fi
+          echo "all four gates green"
