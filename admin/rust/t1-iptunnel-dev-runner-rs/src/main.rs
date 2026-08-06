@@ -1026,9 +1026,78 @@ mod dev_datapath {
         }
     }
 
+    /// D3: the server's allocation must be the one this client is running on.
+    ///
+    /// Both sides are parameters, so the decision is entirely here and the
+    /// caller only supplies what it received and what it configured. That
+    /// matters: the failure this closes is not a missing comparison, it is a
+    /// comparison that ran between two LOCAL values — the runner's own fresh
+    /// registry against its own config file — and therefore could not fail.
+    ///
+    /// Refuses rather than reconfigures. This runner has already opened its
+    /// interface and installed routes by the time the frame arrives, so a
+    /// mismatch is a session that must not continue. The real client
+    /// reconfigures instead, applying settings before returning the session, and
+    /// that asymmetry is why the invariant reads "the client honours the
+    /// server's allocation" rather than "the client checks it".
+    // `pub(super)` and no wider: the decision belongs to this module, but its
+    // test lives outside it. Leaving it private would push the test to assert on
+    // the caller instead, which is how a check ends up proven by a positive path
+    // that could not fail.
+    pub(super) fn served_allocation_matches_configured(
+        served: &household_rs::claw_share_data_tunnel::MeshIpv4,
+        configured: super::ClawVpnSessionAddrs,
+    ) -> Result<()> {
+        // Both parse in the live path: `route_scope_violation` returns
+        // `AddrNotIpv4` / `PeerNotIpv4` otherwise, and the caller bails on it
+        // first. Handling the error arm anyway keeps this a refusal rather than
+        // a panic if that guard is ever narrowed, and makes the function total
+        // so a test can exercise it without a well-formed frame.
+        let (Ok(device), Ok(claw)) = (
+            served.addr.parse::<std::net::Ipv4Addr>(),
+            served.peer.parse::<std::net::Ipv4Addr>(),
+        ) else {
+            bail!("dev datapath received NetworkSettings with unparseable addresses");
+        };
+        let device_matches = device == configured.device();
+        let claw_matches = claw == configured.claw();
+        if device_matches && claw_matches {
+            return Ok(());
+        }
+        // Redaction discipline: name WHICH side disagreed, never the addresses.
+        // Printing them would leak the pool topology this type is redacted to
+        // protect, and an operator needs the fact, not the values.
+        bail!(
+            "dev datapath: server allocation does not match the configured session \
+             (device_matches={device_matches}, claw_matches={claw_matches}); the client \
+             would have run on its own address instead of the server's"
+        );
+    }
+
+    /// Pipe the target session, and hold the server's allocation to the one the
+    /// client actually configured.
+    ///
+    /// `configured` is the address pair this runner brought up its own datapath
+    /// on. It is passed in — rather than the frame being consumed for its shape
+    /// alone — because the invariant D3 names is a comparison, and a comparison
+    /// needs both sides. Before this, the only equality check in the runner was
+    /// `session.addrs() != config.addrs`: its own fresh registry against its own
+    /// config file. Two LOCAL values. The server's allocation never entered it,
+    /// so a green run attested that two independently configured allocators had
+    /// agreed — which they will, whenever they are handed the same session index
+    /// and the same pool, and which says nothing about whether the client would
+    /// have honoured a different answer.
+    ///
+    /// They can differ in practice: the server allocates from
+    /// `ClawVpnSessionRegistry`, taking a reused index off `free_session_indices`
+    /// or the next one, against an env-configured pool; this runner allocates
+    /// from a compile-time pool at an index given on the command line. A prior or
+    /// concurrent session on the serving claw shifts the server's index and not
+    /// the client's.
     async fn pipe_target_session_to_tunnel<S>(
         stream: S,
         mut target_session: TargetSession,
+        configured: super::ClawVpnSessionAddrs,
     ) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
@@ -1095,10 +1164,33 @@ mod dev_datapath {
                                     "dev datapath received NetworkSettings violating route scope: {violation}"
                                 );
                             }
+                            // D3: the SERVER's allocation must be the one this
+                            // client is running on. Route scope above says the
+                            // frame is well-shaped; it says nothing about whether
+                            // it describes THIS session. Without this, a datapath
+                            // that came up on a locally computed address and one
+                            // that honoured the server are indistinguishable from
+                            // the outside, and a green T1/T2 attests only that two
+                            // independently configured allocators agreed.
+                            //
+                            // Fail closed rather than reconfigure: this runner has
+                            // already opened its interface and installed routes by
+                            // the time the frame arrives, so a mismatch is a
+                            // session that must not continue, not one to fix up.
+                            // The real client reconfigures instead — it applies
+                            // settings before returning the session — and that
+                            // asymmetry is why the invariant is stated as "the
+                            // client honours the server's allocation" and not "the
+                            // client checks it".
+                            served_allocation_matches_configured(
+                                &settings.mesh_ipv4,
+                                configured,
+                            )?;
                             // Follow the module's address-redaction discipline: log
                             // only the non-sensitive prefix length.
                             eprintln!(
-                                "dev datapath: VPN NetworkSettings received (prefix_len={})",
+                                "dev datapath: VPN NetworkSettings received and matches the \
+                                 configured session (prefix_len={})",
                                 settings.mesh_ipv4.prefix_len
                             );
                         }
@@ -1157,7 +1249,8 @@ mod dev_datapath {
             session_ack.session_id_present(),
             session_ack.mesh_ipv6_present()
         );
-        let pipe_result = pipe_target_session_to_tunnel(stream, target_session).await;
+        let pipe_result =
+            pipe_target_session_to_tunnel(stream, target_session, config.addrs).await;
         let runtime_report = runtime_handle
             .await
             .map_err(|_| anyhow!("dev datapath runtime join failed"))??;
@@ -2161,7 +2254,7 @@ mod tests {
         use std::collections::BTreeMap;
         use std::net::{Ipv4Addr, SocketAddr};
         use std::path::PathBuf;
-        use std::sync::{Arc, Mutex};
+        use std::sync::{Arc, Mutex, OnceLock};
         use std::time::Duration;
 
         use household_rs::LoadedIdentity;
@@ -2195,7 +2288,7 @@ mod tests {
         use server_rs::claw_share_rendezvous_stream_relay_listener::{
             RendezvousStreamRelayListenerConfig, serve_rendezvous_stream_relay,
         };
-        use server_rs::claw_share_session_clock::AdmissionInstant;
+        use server_rs::claw_share_session_clock::{AdmissionInstant, wall_now_secs};
         use server_rs::claw_vpn_dev_config::ClawVpnDevConfig;
         use server_rs::claw_vpn_interface_route_plan::{
             ClawVpnInterfaceName, ClawVpnInterfaceRoutePlatform, ClawVpnInterfaceRouteToolPaths,
@@ -2219,6 +2312,48 @@ mod tests {
         use std::os::unix::net::UnixDatagram;
         use tokio::net::TcpListener;
         use tokio::task::JoinHandle;
+
+        /// The single wall reading this two-ended test builds its whole session on.
+        ///
+        /// Every other test in this file is pure: it feeds `NOW` in and asserts on
+        /// what comes out, and never reaches a clock that reads the host. This one
+        /// drives the REAL responder, and `SessionClock::live_now` deliberately
+        /// re-reads the host wall clock instead of deriving it from the admission
+        /// anchor — that direct re-read is how it catches suspend and forward jumps
+        /// (theyos#336). A fixed constant therefore cannot satisfy it from both
+        /// sides at once:
+        ///
+        /// - a value in the past trips `wall >= not_after`  -> `SignedExpiryPassed`
+        /// - a value in the future trips `wall < accepted_at` -> `WallRegressed`
+        ///
+        /// The outer `NOW` (`1_800_000_000`, 2027-01-15) is the second case: it is
+        /// dated ahead of any host that runs this today, so `live_now` read a wall
+        /// BELOW `accepted_at`, called it a regression and failed the responder
+        /// closed with `ClockUnusable` before it ever served. The device end then
+        /// saw only the EOF that left behind, which is why the failure surfaced as
+        /// a Noise handshake error at the far end from its cause.
+        /// `MEASURED 2026-08-06 origin/main@74f5c0e7`
+        ///
+        /// Note the shape of the trap: that constant would satisfy BOTH bounds
+        /// during the 600 seconds after it, so this test is not permanently red —
+        /// it would pass for one ten-minute window in 2027 and fail on either
+        /// side. Deriving the reading instead of dating it removes the window
+        /// entirely rather than moving it.
+        ///
+        /// Read ONCE per process: `created_at`, `joined_at`, the offer's signed
+        /// bound and the admission anchor must share a single instant, or two
+        /// reads straddling a second boundary make `not_after` disagree with the
+        /// admission it is checked against.
+        fn session_now() -> u64 {
+            static SESSION_NOW: OnceLock<u64> = OnceLock::new();
+            *SESSION_NOW.get_or_init(|| {
+                wall_now_secs("t1_runner.two_ended_datapath_test").expect(
+                    "host wall clock must be plausible to drive the real responder; \
+                     a clock below MIN_PLAUSIBLE_UNIX_SECS fails this test closed \
+                     rather than silently admitting an unusable session",
+                )
+            })
+        }
 
         const GROUP_ID: &str = "group-alpha";
         const GROUP_NAME: &str = "Group Alpha";
@@ -2294,8 +2429,8 @@ mod tests {
                     RelayStreamResource::IpTunnel,
                     relay_endpoint.clone(),
                     noise_keypair.public_key().clone(),
-                    NOW + 600,
-                    NOW,
+                    session_now() + 600,
+                    session_now(),
                     &owner as &dyn IdentityKey,
                 )
                 .expect("mint group IpTunnel offer");
@@ -2367,15 +2502,15 @@ mod tests {
                     // This site opens a single stream, so the reopen budget is
                     // never the thing under test.
                     Arc::new(ReopenStreamLimiter::new(ReopenLimiterConfig::default())),
-                    || Some(NOW),
+                    || Some(session_now()),
                 );
                 // The fixed synthetic clock is usable by construction, so the seam
                 // returns `Some`. Pairing goes through the public production-ordered
                 // `capture_with`, which anchors BEFORE reading the wall; the
                 // late-anchor `from_seam_wall` seam is `cfg(test)` inside server-rs
                 // and is deliberately not reachable from this crate.
-                let admission =
-                    AdmissionInstant::capture_with(|| Some(NOW)).expect("plausible test clock");
+                let admission = AdmissionInstant::capture_with(|| Some(session_now()))
+                    .expect("plausible test clock");
                 let claw_task = tokio::spawn(async move {
                     serve_relay_stream_responder_reverse_connect_binding(
                         reverse_config(relay_addr),
@@ -2401,7 +2536,7 @@ mod tests {
                     &offer,
                     &device,
                     &config,
-                    NOW,
+                    session_now(),
                     bounded_runtime_config(16),
                     move |_config, context, relay| {
                         assert_eq!(context.addrs(), addrs);
@@ -2560,7 +2695,7 @@ mod tests {
                 hh_id: derive_household_id(&root.public()),
                 hh_pub: root.public(),
                 name: "claw-dev".to_string(),
-                created_at: NOW,
+                created_at: session_now(),
                 shamir_k: 1,
                 shamir_n: 1,
                 members: vec![derive_machine_id(owner_pub)],
@@ -2576,7 +2711,7 @@ mod tests {
                     hh_id: derive_household_id(&root.public()),
                     hostname: "claw-dev-mac-alpha".to_string(),
                     platform: Platform::Macos,
-                    joined_at: NOW,
+                    joined_at: session_now(),
                 },
             )
             .expect("sign machine cert")
@@ -2625,9 +2760,14 @@ mod tests {
             let policy = RelayStreamTrustContextRefreshPolicy::new(Duration::from_secs(3_600), 3)
                 .expect("trust refresh policy");
             let runtime =
-                RelayStreamTrustContextRuntime::load(&household, &MeshLogStore::new(), NOW, policy)
-                    .await
-                    .expect("load trust runtime");
+                RelayStreamTrustContextRuntime::load(
+                    &household,
+                    &MeshLogStore::new(),
+                    session_now(),
+                    policy,
+                )
+                .await
+                .expect("load trust runtime");
             RelayStreamAdmission::new(Arc::new(runtime))
         }
 
@@ -2782,6 +2922,96 @@ mod tests {
         ) -> Vec<JoinHandle<Result<(), String>>> {
             std::mem::take(&mut *handles.lock().expect("runtime handles lock"))
         }
+    }
+
+    /// D3, the load-bearing half: a server allocation that disagrees with the
+    /// configured session must FAIL, not be accepted or silently corrected.
+    ///
+    /// The defect this pins is subtle because the runner already had an equality
+    /// check — `session.addrs() != config.addrs` — comparing its own fresh
+    /// registry against its own config file. Two LOCAL values, computed from the
+    /// same pool and the same session index, so it could not fail. A green
+    /// T1/T2 therefore attested only that two independently configured
+    /// allocators agreed, never that the client would honour a different answer
+    /// from the server.
+    ///
+    /// The three mismatch cases are separate because they fail for different
+    /// reasons: the server can move the device address, the claw address, or
+    /// both. A check that only compared one of them would pass two of these.
+    #[cfg(feature = "dev_t1_datapath")]
+    #[test]
+    fn served_allocation_that_disagrees_with_the_configured_session_fails_closed() {
+        use dev_datapath::served_allocation_matches_configured;
+        use household_rs::claw_share_data_tunnel::MeshIpv4;
+
+        let configured = ClawVpnSessionAddrs::try_new(
+            Ipv4Addr::new(198, 18, 0, 2),
+            Ipv4Addr::new(198, 18, 0, 3),
+        )
+        .expect("configured pair");
+
+        let mesh = |addr: &str, peer: &str| MeshIpv4 {
+            addr: addr.into(),
+            prefix_len: 30,
+            peer: peer.into(),
+        };
+
+        // Positive control FIRST: without it, every assertion below could pass
+        // because the function rejects everything.
+        served_allocation_matches_configured(&mesh("198.18.0.2", "198.18.0.3"), configured)
+            .expect("the server's own allocation must be accepted");
+
+        for (case, served) in [
+            // The realistic one: a prior session on the serving claw shifted the
+            // server's index, so both addresses moved together.
+            ("both moved", mesh("198.18.0.6", "198.18.0.7")),
+            // Only the device moved.
+            ("device moved", mesh("198.18.0.6", "198.18.0.3")),
+            // Only the claw moved.
+            ("claw moved", mesh("198.18.0.2", "198.18.0.7")),
+        ] {
+            let err = served_allocation_matches_configured(&served, configured)
+                .expect_err(case)
+                .to_string();
+            assert!(
+                err.contains("does not match the configured session"),
+                "{case}: wrong refusal: {err}"
+            );
+            // Redaction: the refusal names which side disagreed, never a value.
+            assert!(
+                !err.contains("198.18."),
+                "{case}: refusal echoed an address: {err}"
+            );
+        }
+    }
+
+    /// An address the frame carries but cannot be parsed is a refusal, not a
+    /// panic. The live path bails on `route_scope_violation` first, so this arm
+    /// is unreachable there today — it exists so narrowing that guard later
+    /// cannot turn a malformed frame into a crash.
+    #[cfg(feature = "dev_t1_datapath")]
+    #[test]
+    fn served_allocation_with_unparseable_addresses_is_refused() {
+        use dev_datapath::served_allocation_matches_configured;
+        use household_rs::claw_share_data_tunnel::MeshIpv4;
+
+        let configured = ClawVpnSessionAddrs::try_new(
+            Ipv4Addr::new(198, 18, 0, 2),
+            Ipv4Addr::new(198, 18, 0, 3),
+        )
+        .expect("configured pair");
+        let err = served_allocation_matches_configured(
+            &MeshIpv4 {
+                addr: "not-an-address".into(),
+                prefix_len: 30,
+                peer: "198.18.0.3".into(),
+            },
+            configured,
+        )
+        .expect_err("unparseable addr must be refused")
+        .to_string();
+        assert!(err.contains("unparseable addresses"), "{err}");
+        assert!(!err.contains("not-an-address"), "refusal echoed the value: {err}");
     }
 
     #[cfg(feature = "dev_t1_datapath")]

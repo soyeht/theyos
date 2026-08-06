@@ -147,6 +147,28 @@ jobs:
         # it compiles, and this step exits 101 while the default `cargo test`
         # above still exits 0. The step is the only thing that sees it.
         run: cd admin/rust && cargo test -p household-rs --features mesh-session-runtime --test compile_fail_peer_expectation -- --test-threads=1 2>&1
+      - name: Feature-gated datapath tests (dev_t1_datapath)
+        # The clippy step above COMPILES everything behind `dev_t1_datapath`;
+        # it does not RUN any of it. `cargo test --workspace` uses default
+        # features (`default = []`), so it never sees these targets either.
+        # Between the two, 11 tests were named in the source, type-checked on
+        # every push, and executed nowhere -- including the only end-to-end
+        # proof that packets traverse the relay in BOTH directions, and the
+        # two guards this PR adds that a served allocation matches the
+        # configured session.
+        #
+        # That gap is not hypothetical. The two-ended datapath test was failing
+        # closed with `ClockUnusable`: its synthetic `NOW` sits ~161 days ahead
+        # of the host clock, while `SessionClock::live_now` deliberately
+        # re-reads the real wall to catch suspend and forward jumps, so the
+        # live reading came in BELOW `accepted_at` and was refused as a wall
+        # regression. Nothing in CI could observe that, so nothing did.
+        # Compiling a test proves it type-checks; only running it proves the
+        # thing it asserts.
+        #
+        # Measured before adding: restore the synthetic constant and this step
+        # exits 101 while every other step in this job still exits 0.
+        run: cd admin/rust && cargo test -p t1-iptunnel-dev-runner-rs --features dev_t1_datapath --locked -- --test-threads=1 2>&1
       - name: APNS dispatcher opacity lint (Constitution III source-level gate)
         # Third leg of the three-layer "no household metadata reaches the
         # push provider" enforcement stack (compile-time API shape +
@@ -238,6 +260,28 @@ jobs:
         # it compiles, and this step exits 101 while the default `cargo test`
         # above still exits 0. The step is the only thing that sees it.
         run: cd admin/rust && cargo test -p household-rs --features mesh-session-runtime --test compile_fail_peer_expectation -- --test-threads=1 2>&1
+      - name: Feature-gated datapath tests (dev_t1_datapath)
+        # The clippy step above COMPILES everything behind `dev_t1_datapath`;
+        # it does not RUN any of it. `cargo test --workspace` uses default
+        # features (`default = []`), so it never sees these targets either.
+        # Between the two, 11 tests were named in the source, type-checked on
+        # every push, and executed nowhere -- including the only end-to-end
+        # proof that packets traverse the relay in BOTH directions, and the
+        # two guards this PR adds that a served allocation matches the
+        # configured session.
+        #
+        # That gap is not hypothetical. The two-ended datapath test was failing
+        # closed with `ClockUnusable`: its synthetic `NOW` sits ~161 days ahead
+        # of the host clock, while `SessionClock::live_now` deliberately
+        # re-reads the real wall to catch suspend and forward jumps, so the
+        # live reading came in BELOW `accepted_at` and was refused as a wall
+        # regression. Nothing in CI could observe that, so nothing did.
+        # Compiling a test proves it type-checks; only running it proves the
+        # thing it asserts.
+        #
+        # Measured before adding: restore the synthetic constant and this step
+        # exits 101 while every other step in this job still exits 0.
+        run: cd admin/rust && cargo test -p t1-iptunnel-dev-runner-rs --features dev_t1_datapath --locked -- --test-threads=1 2>&1
       - name: APNS dispatcher opacity lint (Constitution III source-level gate)
         # Third leg of the three-layer "no household metadata reaches the
         # push provider" enforcement stack (compile-time API shape +
