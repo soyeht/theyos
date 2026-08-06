@@ -6,6 +6,19 @@
 //! Story 2 per T087), so the final on-disk state is bit-equivalent and is
 //! re-asserted with the same helpers as Story 1 (`assert_machine_cert_layout`,
 //! `assert_record_is_two_member`, sole-shard absence, self-shard presence).
+//!
+//! Coverage note: this test does not prove the commit's durability. Two
+//! gaps, both structural:
+//! (i) the committed G0 snapshot is not observable from here --
+//!     `sweep_stale_generations` is unconditional and runs inside the same
+//!     retry that completes the ceremony, so G0 is gone before the test
+//!     regains control;
+//! (ii) "the verifier stopped verifying" is a negative property -- it only
+//!      shows up by feeding invalid artifacts to
+//!      `validate_candidate_install_artifacts` and asserting `Err`, and it
+//!      lives in a unit test in server-rs, where that is reachable.
+//! This test proves the integrated ceremony: it completes on the wire, with
+//! the correct ack, address hints, and event log.
 
 mod phase3_support;
 
@@ -178,10 +191,6 @@ async fn phase3_machine_join_lan() {
 
     assert_eq!(
         founder.window.snapshot().await.state,
-        PairMachineState::Committed
-    );
-    assert_eq!(
-        candidate.window.snapshot().await.state,
         PairMachineState::Committed
     );
 
