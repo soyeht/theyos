@@ -71,13 +71,12 @@ deleted on 2026-08-06 because the product is being replanned. A superseded plan
 an agent still reads is worse than none: it reads as current, it is specific, and
 it sends work somewhere the owner already abandoned. **Finding no plan is the
 answer, not a broken checkout** — ask the owner rather than inferring one from
-code, a branch name or git history. They survive at `origin/main@74f5c0e7`
-(`git show 74f5c0e7:docs/<name>.md`); read them, never resume them.
-`MEASURED 2026-08-06 origin/main@74f5c0e7`
+code, a branch name or git history. They survive at `origin/main@74f5c0e7`;
+read them, never resume them. `MEASURED 2026-08-06 origin/main@74f5c0e7`
 
-The absence has a deadline, not a shrug: `check-plan-doc-freshness.py` passes
-with nothing enrolled only until `PLAN_ENROLLMENT_DEADLINE`, then fails. Enrol
-the new plan as `anchored` in `docs/doc-freshness-enrollment.json`, name it in
+The absence has a deadline: `check-plan-doc-freshness.py` passes with nothing
+enrolled only until `PLAN_ENROLLMENT_DEADLINE`, then fails. Enrol the new plan as
+`anchored` in `docs/doc-freshness-enrollment.json`, name it in
 `REQUIRED_ANCHORED`, replace this section — and do not move the date. Still live,
 and not plans: `share-foundation-boundary-map.md`, `household-protocol.md` (cited
 by nine Rust sources), and the contracts under `owner-mesh-rendezvous/`,
@@ -97,14 +96,6 @@ surface is `admin/contracts/cross-repo/v1/ios_ffi_boundary_v1.json`; the gate
 below reads it. Measured 2026-08-06 against `origin/main@e60bad85`: the surface
 pin is 6 days behind and carries the VPN FFI; the two data pins are 20–22 days
 behind and disagree with it.
-
-**Method warning, and the reason this paragraph is short.** An earlier revision
-here said that pin was 858 commits and six weeks behind. The number came from a
-clone sitting on a **local `main` 17 commits behind `origin/main`**, reading a
-dependency form the consumer had already stopped using — and a gate was designed
-around it. Before quoting any cross-repo pin: confirm the clone's HEAD against
-`origin/main`, and confirm *which file* the consumer reads it from today. Paths
-in the other repository do not belong here; the manifest holds them.
 
 ## 4. Gates that keep this from happening again
 
@@ -127,7 +118,10 @@ Four mistakes have each cost real time here.
 - **Measuring the working tree and calling it `main`.** Local checkouts sit on
   old branches and linked worktrees sit on detached heads. Use
   `git show origin/main:<path>` and `git grep <pattern> origin/main -- <paths>`,
-  and state which tree every number came from.
+  and state which tree every number came from. This is how the cross-repo pin
+  above was once reported as 858 commits behind: a clone on a local `main` 17
+  commits stale, reading a dependency form the consumer had already abandoned —
+  and a gate was designed around the wrong number.
 - **Counting code nothing builds.** `admin/rust/Cargo.toml` carries an `exclude`
   list — `mesh-session-control-model-rs` and `mesh-session-core-rs` are not
   workspace members. Check `exclude`, check each crate's `[features] default`,
@@ -175,15 +169,13 @@ than 30 days, when a pending date has passed, when a marker is malformed, and
 when the file carries no measured claim at all. **The fix for a red is to
 re-measure and restate the date — never to bump the date.**
 
-Instances, all the same failure, none red at the time: a stale iOS pin; a
-month-old status header with seven false assertions; a branch named after shipped
-work whose merge would have deleted 1,594 lines; grants recorded only in
-transcripts. Each was a number nobody re-evaluated, with nothing able to age.
-
-The sharpest came last. An end-to-end test built its session on a hardcoded
-future timestamp while the code re-read the real clock, so it could only pass in
-a ten-minute window in 2027 — and CI compiled it every push, ran it never.
-**Compiling a test proves it type-checks; running it proves what it asserts.**
+Instances, none red at the time: a stale iOS pin; a month-old header with seven
+false assertions; a branch whose merge would have deleted 1,594 lines; grants
+recorded only in transcripts. The sharpest: an end-to-end test built on a
+hardcoded future timestamp while the code re-read the real clock, so it could
+only pass in a ten-minute window in 2027 — CI compiled it every push and ran it
+never. **Compiling a test proves it type-checks; running it proves what it
+asserts.**
 
 ## 7. Test profile for Product A
 
