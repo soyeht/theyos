@@ -876,6 +876,32 @@ impl ClawSession {
                 "duplicate frame".into(),
             ));
         }
+        // Client-side route scope, enforced HERE because this is the last place
+        // it can be. Everything above checks the frame's *provenance* — that a
+        // handshake happened, that the session id matches, that this is the
+        // first such frame. None of them looks at the addresses, so without
+        // this call a well-provenanced frame carrying `prefix_len = 0` reached
+        // `VpnNetworkSettings` unexamined, and the consumer that installs a
+        // route from it is a NetworkExtension in another repository — past the
+        // point where anything in this workspace can still say no.
+        //
+        // `route_scope_violation` is the neutral rule that travels with
+        // `MeshIpv4` itself (`tunnel_wire_rs`, re-exported through `dt`), so
+        // this consumer rejects the same set the dev runner does — default
+        // route, prefix > 32, non-IPv4 addr or peer, peer equal to addr, peer
+        // outside the prefix — rather than an open-coded subset that drifts
+        // from it. The server enforces the same invariant in
+        // `build_vpn_mesh_ipv4` before the session opens; this is the client
+        // half, and a client that trusts the server to have checked is a client
+        // with no check.
+        if let Some(violation) = ns.mesh_ipv4.route_scope_violation() {
+            // The violation variant names a topology property, not an address:
+            // safe to surface, and it is what makes a failure diagnosable
+            // without logging the addresses this type is redacted to protect.
+            return Err(BridgeError::NetworkSettingsInvalid(format!(
+                "route scope: {violation}"
+            )));
+        }
         inner.network_settings = Some(VpnNetworkSettings {
             addr: ns.mesh_ipv4.addr,
             prefix_len: ns.mesh_ipv4.prefix_len,
@@ -1227,6 +1253,102 @@ mod tests {
         assert!(session.clone().network_settings().await.is_none());
         // The rejection must not echo the offending id.
         assert!(!err.to_string().contains("not-the-acked-session"));
+    }
+
+    /// Fail-closed: route scope is enforced HERE, on a frame whose provenance is
+    /// otherwise perfect.
+    ///
+    /// The frames below carry the live session id, arrive after a real
+    /// handshake, and are the first of their kind — so every check that existed
+    /// before this one passes them. The defect they pin was exactly that: a
+    /// frame could be impeccably provenanced and still describe a default route,
+    /// and `prefix_len` was copied into `VpnNetworkSettings` verbatim. The
+    /// consumer that installs a route from it is a NetworkExtension in another
+    /// repository, so this is the last place the answer can be no.
+    ///
+    /// Each case is a DIFFERENT violation, not the same one five times: a
+    /// consumer that only rejected `prefix_len == 0` would pass four of them.
+    #[tokio::test]
+    async fn network_settings_violating_route_scope_fail_closed() {
+        for (case, mesh) in [
+            // The whole point: a default route captures every destination.
+            (
+                "default route",
+                dt::MeshIpv4 {
+                    addr: "10.42.0.2".into(),
+                    prefix_len: 0,
+                    peer: "10.42.0.3".into(),
+                },
+            ),
+            (
+                "prefix longer than an IPv4 address",
+                dt::MeshIpv4 {
+                    addr: "10.42.0.2".into(),
+                    prefix_len: 33,
+                    peer: "10.42.0.3".into(),
+                },
+            ),
+            (
+                "addr is not IPv4",
+                dt::MeshIpv4 {
+                    addr: "not-an-address".into(),
+                    prefix_len: 30,
+                    peer: "10.42.0.3".into(),
+                },
+            ),
+            (
+                "peer equals addr",
+                dt::MeshIpv4 {
+                    addr: "10.42.0.2".into(),
+                    prefix_len: 30,
+                    peer: "10.42.0.2".into(),
+                },
+            ),
+            // Subtlest of the five, and the reason for reusing the neutral rule
+            // rather than open-coding a prefix check: the prefix is sane and
+            // both addresses parse, but they are not on the same link.
+            (
+                "peer outside the prefix",
+                dt::MeshIpv4 {
+                    addr: "10.42.0.2".into(),
+                    prefix_len: 30,
+                    peer: "10.42.7.9".into(),
+                },
+            ),
+        ] {
+            let port = start_loopback_vpn_server(pool_allocation()).await;
+            let session = connected_session(port).await;
+            let acked = session.inner.lock().await.session_id.clone().unwrap();
+
+            let Err(err) = session
+                .accept_network_settings(dt::NetworkSettings {
+                    mesh_ipv4: mesh,
+                    mtu: 1280,
+                    session_id: acked,
+                })
+                .await
+            else {
+                panic!("{case}: must be refused");
+            };
+            assert!(
+                matches!(err, BridgeError::NetworkSettingsInvalid(_)),
+                "{case}: wrong error variant, so a caller matching on \
+                 NetworkSettingsInvalid would not see this as a settings refusal"
+            );
+            // Nothing stored: a rejected frame must leave no allocation behind,
+            // or a later reader sees settings that were never accepted.
+            assert!(
+                session.clone().network_settings().await.is_none(),
+                "{case}: refused frame still stored an allocation"
+            );
+            // Addresses are redacted in Debug for a reason; a rejection message
+            // must not reintroduce them.
+            let msg = err.to_string();
+            assert!(
+                !msg.contains("10.42.") && !msg.contains("not-an-address"),
+                "{case}: rejection echoed an address: {msg}"
+            );
+        }
     }
 
     /// Fail-closed: a second frame cannot overwrite an accepted allocation.
