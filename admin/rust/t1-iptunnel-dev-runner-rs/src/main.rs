@@ -22,6 +22,7 @@ use household_rs::claw_share_data_tunnel::{
 use household_rs::claw_share_relay_stream_contract::{
     RelayStreamAudience, RelayStreamExpectedPath, RelayStreamOfferContract, RelayStreamResource,
 };
+use household_rs::claw_vpn::{CLAW_VPN_MIN_INTERFACE_MTU, CLAW_VPN_V1_INNER_MTU};
 use household_rs::claw_share_relay_stream_endpoint::parse_relay_endpoint;
 use household_rs::claw_share_relay_stream_noise::{
     RelayStreamNoiseAsyncStream, RelayStreamNoiseFramed,
@@ -44,6 +45,22 @@ const DEV_SOFTWARE_KEYS_ENV: &str = "THEYOS_FORCE_SOFTWARE_KEYS";
 const DEV_PUBLIC_RELAY_ACK: &str = "dev-host public relay dial allowed; no production activation";
 const DEV_RUNNER_SESSION_CONFIG_SCHEMA: &str = "t1-dev-runner-device-session-v1";
 const DEV_RUNNER_SESSION_CONFIG_SCOPE: &str = "dev-host T1-T4 only";
+/// The MTU range a consumer may configure, derived from the pump rather than
+/// restated.
+///
+/// The upper bound is [`CLAW_VPN_V1_INNER_MTU`] because a configured interface
+/// hands the pump packets up to its own MTU: accepting more than the pump
+/// forwards is accepting a configuration that silently drops. This read
+/// `1280..=9000` at three separate sites while the pump dropped above 1250, so
+/// every value the system accepted was a dropping one — an empty set of valid
+/// MTUs, spelled as three permissive-looking range checks.
+///
+/// Deriving it means the next change to either bound moves both.
+fn dev_runner_mtu_accepted(mtu: u16) -> bool {
+    let mtu = usize::from(mtu);
+    (CLAW_VPN_MIN_INTERFACE_MTU..=CLAW_VPN_V1_INNER_MTU).contains(&mtu)
+}
+
 const DEV_RUNNER_CLAW_ROUTE_PREFIX_LEN: u8 = 32;
 
 #[derive(Parser, Debug)]
@@ -154,8 +171,9 @@ enum Command {
         /// Session index used to derive the point-to-point address pair.
         #[arg(long, default_value_t = 0)]
         session_index: u32,
-        /// Inner MTU written to the config (1280..=9000).
-        #[arg(long, default_value_t = 1400)]
+        /// Inner MTU written to the config. Accepted range is derived from the
+        /// pump — see `dev_runner_mtu_accepted`.
+        #[arg(long, default_value_t = CLAW_VPN_V1_INNER_MTU as u16)]
         mtu: u16,
         /// Output path for the generated private config file.
         #[arg(long)]
@@ -348,7 +366,7 @@ fn validate_session_config_bytes(bytes: &[u8]) -> Result<ValidatedDevRunnerSessi
         bail!("dev session config claw_route_prefix_len must be 32");
     }
     let mtu = required_u16(object, "mtu")?;
-    if !(1280..=9000).contains(&mtu) {
+    if !dev_runner_mtu_accepted(mtu) {
         bail!("dev session config mtu invalid");
     }
 
@@ -437,7 +455,7 @@ fn validate_session_ack(ack: TunnelAck) -> Result<DevRunnerSessionAck> {
         bail!("IpTunnel session ack mesh address invalid");
     }
 
-    if !(1280..=9000).contains(&mtu) {
+    if !dev_runner_mtu_accepted(mtu) {
         bail!("IpTunnel session ack mtu invalid");
     }
 
@@ -731,7 +749,7 @@ fn generate_device_session_config_bytes(
     session_index: u32,
     mtu: u16,
 ) -> Result<Vec<u8>> {
-    if !(1280..=9000).contains(&mtu) {
+    if !dev_runner_mtu_accepted(mtu) {
         bail!("dev session config mtu invalid");
     }
     let pool = ClawVpnIpv4Pool::try_new(pool_network, pool_prefix_len)

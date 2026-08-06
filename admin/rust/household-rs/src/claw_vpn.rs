@@ -13,10 +13,51 @@ use crate::claw_share_data_tunnel::TunnelFrame;
 use crate::keys::P256PublicKey;
 use sha2::{Digest, Sha256};
 
-/// Conservative v1 inner MTU from the plan. The future runtime can lower this
-/// per path, but this shared contract keeps oversized packets from becoming
-/// unbounded stream payloads.
-pub const CLAW_VPN_V1_INNER_MTU: usize = 1250;
+/// Smallest interface MTU any consumer may configure.
+///
+/// Not a preference: RFC 8200 §5 makes 1280 the minimum link MTU for IPv6, and
+/// `NEPacketTunnelNetworkSettings` on the client side rejects anything below it.
+/// Every validator in this workspace already used 1280 as its floor; naming it
+/// here stops the next one from picking a different number.
+pub const CLAW_VPN_MIN_INTERFACE_MTU: usize = 1280;
+
+/// Largest inner packet the pump forwards. Above this it drops, counted.
+///
+/// **This is the same quantity as the interface MTU, seen from the other end**,
+/// and that is why it must not be smaller than
+/// [`CLAW_VPN_MIN_INTERFACE_MTU`]. It was 1250 while nothing consumed it, and
+/// then three independent sites started requiring `1280..=9000` — the dev
+/// runner's config validator, its session-ack validator, and the iOS
+/// `NEPacketTunnelNetworkSettings` builder — while the server announced 1280.
+/// The result was an empty set: **every MTU the system accepted exceeded the
+/// threshold at which the pump silently dropped.** An interface configured at
+/// 1280 hands up 1280-byte packets and 30 bytes of every full-size one went to
+/// a drop counter.
+///
+/// A compile-time assertion below pins the two together, so raising the floor
+/// without raising this fails the build rather than reopening the gap. Raising
+/// this is safe (the pump forwards more); lowering it below the floor is the
+/// defect and is now unrepresentable.
+///
+/// **Why 1400 and not 1280.** Setting it to the floor would leave exactly one
+/// legal MTU, and the value the system actually produced was 1400 — the dev
+/// runner's generator default, which every accepting validator allowed. 1400
+/// keeps that working and leaves `1280..=1400` as a real range. The original
+/// 1250 came from the plan as "conservative pending path measurements", written
+/// when the transport was still open; it is TCP over the relay, which segments
+/// on its own, so the inner MTU is not bounded by a path MTU the way a datagram
+/// tunnel's would be. Revisit with a measurement, not with a smaller guess.
+pub const CLAW_VPN_V1_INNER_MTU: usize = 1400;
+
+// The invariant, not a comment about it: a configured interface hands the pump
+// packets up to its own MTU, so a pump that forwards less than the smallest
+// configurable interface drops traffic no operator can avoid by configuration.
+const _: () = assert!(
+    CLAW_VPN_V1_INNER_MTU >= CLAW_VPN_MIN_INTERFACE_MTU,
+    "the pump must forward at least the smallest interface MTU a consumer can \
+     configure, or every valid configuration silently drops full-size packets"
+);
+
 pub const CLAW_VPN_DEFAULT_MAX_SESSIONS_PER_MEMBER_CLAW: usize = 1;
 const IPV4_MIN_HEADER_LEN: usize = 20;
 const IPV4_VERSION: u8 = 4;
