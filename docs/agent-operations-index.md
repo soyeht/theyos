@@ -59,11 +59,9 @@ for it to be shared — do not reconstruct it from guesses.
 | `Claw-M` / `Claw-L` | a macOS claw, a Linux claw |
 | `Mesh-C` | the mesh control plane (discovery, authorization, offers, revocation) |
 | `Member-M1`, `Member-M2`, … | distinct household members |
-| the dev host, the canary host | the two LAN Linux hosts |
 
 Never a real hostname, IP outside documentation ranges, device name, account
-name, relay endpoint, local path, secret or key — in any file, PR, issue or
-screenshot.
+name, relay endpoint, local path, secret or key — in any file, PR or screenshot.
 
 ## 3. Where the code is, and the cross-repo hazard
 
@@ -82,15 +80,24 @@ Cross-repo protocol contract: `docs/household-protocol.md`.
 zero `.xcodeproj` files are tracked here `MEASURED 2026-08-06 origin/main@e60bad85`.
 They live in **`github.com/soyeht/soyeht-ios`**.
 
-**Live hazard — two pins, neither covering the FFI.** The iOS repo pins this one
-by commit, and `.github/workflows/contracts-cross-repo-sync.yml` compares one
-contract fixture across the two repos at a *different* pin held in the iOS repo's
-own `cross-repo-contract.sha`. Neither pin covers `claw-share-bridge-rs`,
-which carries the VPN FFI. Consequence: a ratchet landed here can sit unshipped
-in the app for weeks with nothing red. Today's instance: household-rs pinned at
-`MEASURED 2026-08-06 soyeht-ios@39524164` (six weeks behind), a fixture pin at
-`MEASURED 2026-08-06 soyeht-ios@87d524bb`, and the crate carrying the FFI did not
-exist at either. Do not treat "CI is green" as "the app has it".
+**Live hazard — three pins, and the one that matters is not in `Cargo.toml`.**
+The iOS repo takes `household-rs` as a **path** dependency on an ignored vendored
+checkout; the immutable rev lives in a shell variable in its FFI build script,
+and two further pins govern **data**, not the compiled surface — so
+`.github/workflows/contracts-cross-repo-sync.yml` can be green while saying
+nothing about the FFI. The authoritative list of pins and which one governs the
+surface is `admin/contracts/cross-repo/v1/ios_ffi_boundary_v1.json`; the gate
+below reads it. Measured 2026-08-06 against `origin/main@e60bad85`: the surface
+pin is 6 days behind and carries the VPN FFI; the two data pins are 20–22 days
+behind and disagree with it.
+
+**Method warning, and the reason this paragraph is short.** An earlier revision
+here said that pin was 858 commits and six weeks behind. The number came from a
+clone sitting on a **local `main` 17 commits behind `origin/main`**, reading a
+dependency form the consumer had already stopped using — and a gate was designed
+around it. Before quoting any cross-repo pin: confirm the clone's HEAD against
+`origin/main`, and confirm *which file* the consumer reads it from today. Paths
+in the other repository do not belong here; the manifest holds them.
 
 ## 4. Gates that keep this from happening again
 
@@ -101,10 +108,10 @@ Each is a `scripts/check-*.py` with a co-located `scripts/test_*.py`, run with
 
 | gate | goes red when |
 |---|---|
-| `scripts/check-agent-operations-index.py` | this index is untracked, over-long, has a dead link, leaks a value, or carries a claim that has aged out |
-| `scripts/check-cross-repo-ffi-pin.py` `PENDING 2026-08-14` | the iOS repo's pin of this repo predates a contract or FFI change the app must carry |
-| `scripts/check-doc-status-freshness.py` `PENDING 2026-08-14` | a document's status header is older than the code it claims to describe |
-| `scripts/check-branch-inventory-drift.py` `PENDING 2026-08-14` | a branch whose name claims shipped work is behind `main`, so merging it would delete shipped code |
+| `check-agent-operations-index.py` | this index is untracked, over-long, has a dead link, leaks a value, or carries a claim that has aged out |
+| `check-cross-repo-pin-freshness.py` | a consumer's pin is off-ancestry, too far behind in days or commits, predates an FFI surface change, or disagrees with the consumer's other pins |
+| `check-plan-doc-freshness.py` | a plan's measured anchor is older than the code it claims to describe |
+| `check-branch-hygiene.py` | a branch is behind `main` on files it touches, so merging it would delete shipped code |
 
 ## 5. Measuring this repo without getting it wrong
 

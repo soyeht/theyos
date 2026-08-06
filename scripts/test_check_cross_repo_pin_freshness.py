@@ -411,6 +411,72 @@ class GateTests(unittest.TestCase):
 
     # ── (d) pin agreement ───────────────────────────────────────────────────
 
+    def test_shell_assigned_rev_is_read_from_the_build_script(self) -> None:
+        """The pin that governs the surface can live in a shell script.
+
+        This kind exists because the real consumer moved it there: its
+        `Cargo.toml` declares a path dependency on a vendored checkout, and the
+        immutable rev is assigned in the script that populates it. A gate that
+        only parsed `Cargo.toml` read a dependency form the consumer no longer
+        used and reported a rev weeks staler than the live one.
+        """
+        repo = Path(self.repo["repo"])
+        tip = head(repo)
+        consumer = make_consumer(self.root, tip)
+        write(
+            consumer,
+            "Scripts/build.sh",
+            f'#!/usr/bin/env bash\nset -euo pipefail\nSOURCE_REV="{tip}"\n',
+        )
+        pins = [
+            {"name": "vendored-source-rev", "path": "Scripts/build.sh",
+             "kind": "shell-assigned-rev", "variable": "SOURCE_REV",
+             "governs_ffi_surface": False},
+        ]
+        report = self.harness.run(
+            manifest_path=make_manifest(self.root, pins=pins), consumer_root=consumer,
+            target_rev=tip, now=T0,
+        )
+        self.assertEqual([], report.errors)
+
+    def test_shell_assigned_rev_rejects_an_ambiguous_assignment(self) -> None:
+        """Two assignments is malformed input, not a value to pick from.
+
+        Reading the first (or the last) would make the gate's answer depend on
+        line order in somebody else's script.
+        """
+        repo = Path(self.repo["repo"])
+        tip = head(repo)
+        consumer = make_consumer(self.root, tip)
+        write(
+            consumer,
+            "Scripts/build.sh",
+            f'SOURCE_REV="{tip}"\nSOURCE_REV="{self.repo["base"]}"\n',
+        )
+        with self.assertRaises(checker.Malformed):
+            checker.read_pin(
+                consumer,
+                {"name": "p", "path": "Scripts/build.sh",
+                 "kind": "shell-assigned-rev", "variable": "SOURCE_REV"},
+            )
+
+    def test_shell_assigned_rev_absent_variable_cannot_evaluate(self) -> None:
+        """A script that stopped assigning the variable must not read as clean.
+
+        This is the shape the whole gate exists to refuse: an input that went
+        away is an unanswered question, never a pass.
+        """
+        repo = Path(self.repo["repo"])
+        tip = head(repo)
+        consumer = make_consumer(self.root, tip)
+        write(consumer, "Scripts/build.sh", "#!/usr/bin/env bash\nset -euo pipefail\n")
+        with self.assertRaises(checker.Malformed):
+            checker.read_pin(
+                consumer,
+                {"name": "p", "path": "Scripts/build.sh",
+                 "kind": "shell-assigned-rev", "variable": "SOURCE_REV"},
+            )
+
     def test_pins_spread_too_far_apart_are_named(self) -> None:
         repo = Path(self.repo["repo"])
         run_git(repo, "commit", "-q", "--allow-empty", "-m", "later",

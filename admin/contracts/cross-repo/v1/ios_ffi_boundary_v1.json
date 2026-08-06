@@ -24,12 +24,12 @@
       ],
       "pins": [
         {
-          "name": "ffi-cargo-rev",
-          "path": "Native/RelayStreamGuestFFI/Cargo.toml",
-          "kind": "cargo-git-rev",
-          "dependency": "household-rs",
+          "name": "vendored-source-rev",
+          "path": "Native/RelayStreamGuestFFI/Scripts/build-relay-stream-guest-ffi-xcframework.sh",
+          "kind": "shell-assigned-rev",
+          "variable": "SOURCE_REV",
           "governs_ffi_surface": true,
-          "note": "The git rev the consumer actually compiles against. This is the pin the FFI surface check is measured on."
+          "note": "The immutable theyos rev the build script vendors into .vendor/theyos and compiles household-rs from. This is the pin the FFI surface check is measured on. It is NOT in Cargo.toml: the consumer's manifest declares a path dependency on the vendored checkout, so the rev lives in the script that populates it, and buildinfo.json records it as source_rev."
         },
         {
           "name": "contract-fixture-sha",

@@ -452,6 +452,47 @@ def parse_keyed_rev(text: str, key: str, label: str) -> str:
     return found[0]
 
 
+def parse_shell_assigned_rev(text: str, variable: str, label: str) -> str:
+    """A rev assigned to a shell variable, e.g. `SOURCE_REV="c81144ba..."`.
+
+    This kind exists because the pin that actually governs the compiled surface
+    moved OUT of `Cargo.toml`. The consumer switched `household-rs` to a
+    `path = ".vendor/theyos/..."` dependency populated by its build script, and
+    the immutable revision moved into that script. A gate that only knew how to
+    read `Cargo.toml` was left reading a dependency form the consumer no longer
+    uses, and reported a rev 42 days stale when the live one was 6 — the failure
+    mode of a gate is not only missing a defect, it is confidently measuring a
+    thing that has moved.
+
+    Quoting is optional and both quote styles are accepted, because a shell
+    assignment is written by hand; anything else about the line is rejected
+    rather than guessed at.
+    """
+    found = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        # `export FOO=...` is the same assignment; anything else before the name
+        # (a function call, a conditional) is not, and must not match.
+        if stripped.startswith("export "):
+            stripped = stripped[len("export ") :].lstrip()
+        name, _, value = stripped.partition("=")
+        if name.strip() != variable:
+            continue
+        value = value.strip()
+        # Strip ONE matching pair of quotes. An unbalanced quote is malformed
+        # input, not something to normalise away.
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        found.append(value)
+    if len(found) != 1:
+        raise Malformed(
+            f"{label} must assign {variable} exactly once, found {len(found)}"
+        )
+    return found[0]
+
+
 def read_pin(consumer_root: Path, pin: dict[str, object]) -> str:
     name = str(pin.get("name", "<unnamed>"))
     rel = pin.get("path")
@@ -481,6 +522,13 @@ def read_pin(consumer_root: Path, pin: dict[str, object]) -> str:
         if not isinstance(key, str) or not key:
             raise Malformed(f"{label} declares kind keyed-rev without a key")
         rev = parse_keyed_rev(text, key, label)
+    elif kind == "shell-assigned-rev":
+        variable = pin.get("variable")
+        if not isinstance(variable, str) or not variable:
+            raise Malformed(
+                f"{label} declares kind shell-assigned-rev without a variable"
+            )
+        rev = parse_shell_assigned_rev(text, variable, label)
     else:
         raise Malformed(f"{label} declares unknown pin kind {kind}")
 
