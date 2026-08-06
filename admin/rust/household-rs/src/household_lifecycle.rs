@@ -1240,19 +1240,59 @@ mod tests {
         lifecycle.lock_shared().unwrap();
     }
 
-    #[test]
-    fn named_lock_substitution_after_open_fails_closed() {
-        let temp = TempDir::new().unwrap();
-        let lifecycle = HouseholdLifecycleLock::open_verified(temp.path()).unwrap();
-        let lock_path = temp.path().join(HOUSEHOLD_LIFECYCLE_LOCK_FILENAME);
-        fs::remove_file(&lock_path).unwrap();
+    /// Point `lock_path` at a different file, leaving the original inode
+    /// unlinked but intact.
+    ///
+    /// The obvious spelling — `remove_file` then `create_new` at the same path
+    /// — lets the kernel hand the new file the inode the old one just freed.
+    /// Both tests below detect the swap by an `st_dev`/`st_ino` comparison, but
+    /// not the same one:
+    ///
+    /// - `lock_shared` uses [`Self::file_matches_expected`] — the freshly opened
+    ///   lock against the identity `open_verified` memorised.
+    /// - the write guard uses `binding_is_current`, whose `named_lock_matches`
+    ///   is called with the fd the guard is *already holding* — the path as it
+    ///   is now against the file opened before the swap.
+    ///
+    /// In both, one side predates the substitution, which is exactly why they
+    /// can see it. (`named_lock_matches` against a file just opened *from* the
+    /// path it stats compares a value with itself and never detects anything;
+    /// only the held-fd caller gives it two different instants.)
+    ///
+    /// Only the first is actually exposed to inode reuse, and the difference is
+    /// what makes this helper worth having. `open_verified` keeps `state_dir`
+    /// open but stores the lock as bare `lock_dev`/`lock_ino` — nothing holds
+    /// that inode, so `remove_file` frees it and the replacement can be handed
+    /// the same number. The write guard, by contrast, is still holding an open
+    /// file on the lock, which pins the inode and rules the reuse out.
+    ///
+    /// So the second test is deterministic today for a reason that lives in
+    /// `lock_exclusive`, not in its own setup. Routing both through this helper
+    /// keeps it that way if that ever changes, and costs nothing now.
+    ///
+    /// Creating the substitute while the original is still linked forces a
+    /// distinct inode — two simultaneously-linked files cannot share one on any
+    /// local filesystem — and `rename` swaps it in atomically. That makes the
+    /// mismatch an invariant of the setup rather than a property of the
+    /// allocator.
+    fn substitute_lock_file(dir: &Path, lock_path: &Path) {
+        let substitute = dir.join("substitute-lock.tmp");
         OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(lock_path)
+            .open(&substitute)
             .unwrap();
+        fs::rename(&substitute, lock_path).unwrap();
+    }
+
+    #[test]
+    fn named_lock_substitution_after_open_fails_closed() {
+        let temp = TempDir::new().unwrap();
+        let lifecycle = HouseholdLifecycleLock::open_verified(temp.path()).unwrap();
+        let lock_path = temp.path().join(HOUSEHOLD_LIFECYCLE_LOCK_FILENAME);
+        substitute_lock_file(temp.path(), &lock_path);
         assert_eq!(
             lifecycle.lock_shared().unwrap_err(),
             HouseholdLifecycleLockError::UnsafePath
@@ -1265,14 +1305,7 @@ mod tests {
         let lifecycle = HouseholdLifecycleLock::open_verified(temp.path()).unwrap();
         let write = lifecycle.lock_exclusive().unwrap();
         let lock_path = temp.path().join(HOUSEHOLD_LIFECYCLE_LOCK_FILENAME);
-        fs::remove_file(&lock_path).unwrap();
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(lock_path)
-            .unwrap();
+        substitute_lock_file(temp.path(), &lock_path);
         assert_eq!(
             write.sync_state_root().unwrap_err(),
             HouseholdLifecycleLockError::UnsafePath
