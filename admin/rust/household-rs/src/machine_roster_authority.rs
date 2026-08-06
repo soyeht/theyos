@@ -1672,57 +1672,673 @@ pub(crate) fn historical_reapply_next(
 
 // ─── Currency derivation (internal only) ────────────────────────────────────
 
+/// Shared prefix of `derive_machine_currency`: clock → terminal chain →
+/// owner authority → stale, stopping before the per-machine lookup. Exists
+/// so `current_snapshot()` (`machine_roster_store.rs`) and
+/// `derive_machine_currency` below run through the identical admissibility
+/// check and cannot silently diverge — see RED-R21.
+pub(crate) fn admit_current_accepted_data<'a>(
+    state: &'a AcceptedRosterChainState,
+    ctx: &AdmissionContext<'_>,
+) -> Result<&'a AcceptedRosterData, UnavailableReason> {
+    if !ctx.clock_available {
+        return Err(UnavailableReason::ClockStateUnavailable);
+    }
+    match state {
+        AcceptedRosterChainState::NoGenesis => Err(UnavailableReason::NoGenesis),
+        AcceptedRosterChainState::CheckpointForkConflict { .. } => {
+            Err(UnavailableReason::CheckpointForkConflict)
+        }
+        AcceptedRosterChainState::EventForkConflict { .. } => {
+            Err(UnavailableReason::EventForkConflict)
+        }
+        AcceptedRosterChainState::Accepted(data) => {
+            if !ctx.owner_available_for_currency(&data.owner_cert_fingerprint) {
+                return Err(UnavailableReason::OwnerAuthorityUnavailable);
+            }
+            if ctx.authority.effective_now > data.not_after {
+                return Err(UnavailableReason::CheckpointStale);
+            }
+            Ok(data)
+        }
+    }
+}
+
 pub(crate) fn derive_machine_currency(
     state: &AcceptedRosterChainState,
     m_id: &MachineId,
     ctx: &AdmissionContext<'_>,
 ) -> MachineCurrencyResult {
-    // T: Priority: clock → terminal chain → owner authority → stale → per-machine
-    if !ctx.clock_available {
-        return MachineCurrencyResult::Unavailable {
-            reason: UnavailableReason::ClockStateUnavailable,
+    let data = match admit_current_accepted_data(state, ctx) {
+        Ok(data) => data,
+        Err(reason) => return MachineCurrencyResult::Unavailable { reason },
+    };
+    if let Some(rev) = data.tombstones.iter().find(|r| r.m_id == *m_id) {
+        return MachineCurrencyResult::Revoked {
+            tombstone: Box::new(rev.clone()),
         };
     }
-    match state {
-        AcceptedRosterChainState::NoGenesis => MachineCurrencyResult::Unavailable {
-            reason: UnavailableReason::NoGenesis,
-        },
-        AcceptedRosterChainState::CheckpointForkConflict { .. } => {
-            MachineCurrencyResult::Unavailable {
-                reason: UnavailableReason::CheckpointForkConflict,
-            }
-        }
-        AcceptedRosterChainState::EventForkConflict { .. } => MachineCurrencyResult::Unavailable {
-            reason: UnavailableReason::EventForkConflict,
-        },
-        AcceptedRosterChainState::Accepted(data) => {
-            let active = &data.active;
-            let tombstones = &data.tombstones;
-            let not_after = &data.not_after;
-            let owner_cert_fingerprint = &data.owner_cert_fingerprint;
-            if !ctx.owner_available_for_currency(owner_cert_fingerprint) {
-                return MachineCurrencyResult::Unavailable {
-                    reason: UnavailableReason::OwnerAuthorityUnavailable,
-                };
-            }
-            if ctx.authority.effective_now > *not_after {
-                return MachineCurrencyResult::Unavailable {
-                    reason: UnavailableReason::CheckpointStale,
-                };
-            }
-            if let Some(rev) = tombstones.iter().find(|r| r.m_id == *m_id) {
-                return MachineCurrencyResult::Revoked {
-                    tombstone: Box::new(rev.clone()),
-                };
-            }
-            if let Some(member) = active.iter().find(|m| m.m_id == *m_id) {
-                return MachineCurrencyResult::Active {
-                    member: Box::new(member.clone()),
-                };
-            }
-            MachineCurrencyResult::NotListed
+    if let Some(member) = data.active.iter().find(|m| m.m_id == *m_id) {
+        return MachineCurrencyResult::Active {
+            member: Box::new(member.clone()),
+        };
+    }
+    MachineCurrencyResult::NotListed
+}
+
+// ─── Roster snapshot view (D-1, B-ROSTER-ADAPTER v2 CFX-1/CFX-2) ────────────
+//
+// Projection of `AcceptedRosterData` exposed outside household-rs: exactly
+// the four `checkpoint_*` fields Proof-R/Proof-I v6 sign
+// (`checkpoint_hash`, `checkpoint_sequence`, `checkpoint_event_head`,
+// `not_after`), plus `hh_id`/`active`/`revoked_m_ids`. Everything else on
+// `AcceptedRosterData` (`epoch`, `prev_checkpoint_hash`, `event_sequence`,
+// `predecessor_*`, `owner_cert_fingerprint`, `genesis_basis`) does not cross
+// this boundary.
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RosterMemberView {
+    m_id: MachineId,
+    m_pub: P256PublicKey,
+    machine_cert_fingerprint: [u8; 32],
+}
+
+impl RosterMemberView {
+    #[must_use]
+    pub fn m_id(&self) -> &MachineId {
+        &self.m_id
+    }
+
+    #[must_use]
+    pub fn m_pub(&self) -> &P256PublicKey {
+        &self.m_pub
+    }
+
+    #[must_use]
+    pub fn machine_cert_fingerprint(&self) -> [u8; 32] {
+        self.machine_cert_fingerprint
+    }
+}
+
+impl From<&MachineRosterMemberV1> for RosterMemberView {
+    fn from(member: &MachineRosterMemberV1) -> Self {
+        Self {
+            m_id: member.m_id.clone(),
+            m_pub: member.m_pub.clone(),
+            machine_cert_fingerprint: member.machine_cert_fingerprint,
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RosterSnapshotView {
+    hh_id: HouseholdId,
+    checkpoint_hash: [u8; 32],
+    checkpoint_sequence: u64,
+    checkpoint_event_head: [u8; 32],
+    not_after: u64,
+    active: Vec<RosterMemberView>,
+    revoked_m_ids: Vec<MachineId>,
+}
+
+impl RosterSnapshotView {
+    pub(crate) fn project(hh_id: &HouseholdId, data: &AcceptedRosterData) -> Self {
+        Self {
+            hh_id: hh_id.clone(),
+            checkpoint_hash: data.checkpoint_hash,
+            checkpoint_sequence: data.checkpoint_sequence,
+            checkpoint_event_head: data.event_head_hash,
+            not_after: data.not_after,
+            active: data.active.iter().map(RosterMemberView::from).collect(),
+            revoked_m_ids: data.tombstones.iter().map(|r| r.m_id.clone()).collect(),
+        }
+    }
+
+    #[must_use]
+    pub fn hh_id(&self) -> &HouseholdId {
+        &self.hh_id
+    }
+
+    #[must_use]
+    pub fn checkpoint_hash(&self) -> [u8; 32] {
+        self.checkpoint_hash
+    }
+
+    #[must_use]
+    pub fn checkpoint_sequence(&self) -> u64 {
+        self.checkpoint_sequence
+    }
+
+    #[must_use]
+    pub fn checkpoint_event_head(&self) -> [u8; 32] {
+        self.checkpoint_event_head
+    }
+
+    #[must_use]
+    pub fn not_after(&self) -> u64 {
+        self.not_after
+    }
+
+    #[must_use]
+    pub fn lookup_active(&self, m_id: &MachineId) -> Option<&RosterMemberView> {
+        self.active.iter().find(|m| m.m_id == *m_id)
+    }
+
+    #[must_use]
+    pub fn is_revoked(&self, m_id: &MachineId) -> bool {
+        self.revoked_m_ids.iter().any(|r| r == m_id)
+    }
+
+    #[must_use]
+    pub fn revoked_m_ids(&self) -> &[MachineId] {
+        &self.revoked_m_ids
+    }
+
+    pub fn active_m_ids(&self) -> impl Iterator<Item = &MachineId> + '_ {
+        self.active.iter().map(RosterMemberView::m_id)
+    }
+
+    #[must_use]
+    pub fn is_active(&self, m_id: &MachineId) -> bool {
+        self.lookup_active(m_id).is_some() && !self.is_revoked(m_id)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RosterSnapshotError {
+    #[error("not initialized")]
+    NotInitialized,
+    #[error("latch poisoned")]
+    LatchPoisoned,
+    #[error(transparent)]
+    Io(#[from] crate::machine_roster_store::RosterStoreError),
+    #[error("clock state unavailable")]
+    ClockStateUnavailable,
+    #[error("no genesis")]
+    NoGenesis,
+    #[error("checkpoint fork conflict")]
+    CheckpointForkConflict,
+    #[error("event fork conflict")]
+    EventForkConflict,
+    #[error("owner authority unavailable")]
+    OwnerAuthorityUnavailable,
+    #[error("checkpoint stale")]
+    CheckpointStale,
+}
+
+impl From<UnavailableReason> for RosterSnapshotError {
+    fn from(reason: UnavailableReason) -> Self {
+        match reason {
+            UnavailableReason::ClockStateUnavailable => Self::ClockStateUnavailable,
+            UnavailableReason::NoGenesis => Self::NoGenesis,
+            UnavailableReason::CheckpointForkConflict => Self::CheckpointForkConflict,
+            UnavailableReason::EventForkConflict => Self::EventForkConflict,
+            UnavailableReason::OwnerAuthorityUnavailable => Self::OwnerAuthorityUnavailable,
+            UnavailableReason::CheckpointStale => Self::CheckpointStale,
+        }
+    }
+}
+
+// ─── Peer expectation (D-1, B-ROSTER-ADAPTER v2 CFX-4, erratum1) ────────────
+//
+// erratum1 (`daisy-b-roster-adapter-v2-erratum1.0f8b9952…`) blocks this on
+// D-9: no authenticated source for `selected_m_id` exists or is measured
+// yet, so no PUBLIC production constructor exists for `PeerExpectation` —
+// not even for the `LocalOwnerPresentSelection` variant alone. The only
+// constructor is `#[cfg(test)] pub(crate)`, same pattern already used by
+// `OwnerSiteRosterSnapshot::injected_for_harness` and
+// `MachineRosterCoordinator::from_validated_with_clock` in this codebase.
+// `ExpectedResponder`/`from_peer_expectation` are therefore out of scope
+// this round too — with no production constructor for `PeerExpectation`,
+// there is nothing that can reach them in production.
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerSelectionSource {
+    LocalOwnerPresentSelection,
+    // Variantes futuras (SignedConnectionIntent, AuthenticatedRendezvousOffer,
+    // ...) só entram quando D-9 tiver uma fonte medida.
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerExpectation {
+    checkpoint_hash: [u8; 32],
+    m_id: MachineId,
+    source: PeerSelectionSource,
+}
+
+impl PeerExpectation {
+    // NENHUM constructor público de produção existe ainda. A ausência É o
+    // gate de D-9 (RED-R23), não uma nota de aviso ao lado de um
+    // constructor que funciona.
+
+    #[cfg(test)]
+    pub(crate) fn injected_for_harness(
+        checkpoint_hash: [u8; 32],
+        m_id: MachineId,
+        source: PeerSelectionSource,
+    ) -> Self {
+        Self {
+            checkpoint_hash,
+            m_id,
+            source,
+        }
+    }
+
+    #[must_use]
+    pub fn checkpoint_hash(&self) -> [u8; 32] {
+        self.checkpoint_hash
+    }
+
+    #[must_use]
+    pub fn m_id(&self) -> &MachineId {
+        &self.m_id
+    }
+
+    #[must_use]
+    pub fn source(&self) -> PeerSelectionSource {
+        self.source
+    }
+}
+
+/// The redemption side of CFX-4: turning a `PeerExpectation` into an
+/// `ExpectedResponder` bound to a specific snapshot. `ExpectedResponder`
+/// itself does not exist anywhere else in this repository yet (`grep -rn
+/// ExpectedResponder admin/rust` is empty) — there is no bare-`MachineId`
+/// constructor to remove (RED-R19 is trivially true: it never existed).
+///
+/// This *is* implementable and testable now, independent of D-9/erratum1:
+/// the only way to obtain a `PeerExpectation` to pass in is
+/// `#[cfg(test)] injected_for_harness` (no production constructor exists),
+/// so `from_peer_expectation` has no production caller regardless of
+/// whether this function itself is gated — gating the function would only
+/// hide its own logic from tests. What erratum1 blocks is `PeerExpectation`
+/// acquiring a production source; it does not need this pairing check
+/// itself to also be hidden.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpectedResponder {
+    hh_id: HouseholdId,
+    m_id: MachineId,
+    cert_fingerprint: [u8; 32],
+}
+
+impl ExpectedResponder {
+    #[must_use]
+    pub fn hh_id(&self) -> &HouseholdId {
+        &self.hh_id
+    }
+
+    #[must_use]
+    pub fn m_id(&self) -> &MachineId {
+        &self.m_id
+    }
+
+    #[must_use]
+    pub fn cert_fingerprint(&self) -> [u8; 32] {
+        self.cert_fingerprint
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpectedResponderError {
+    /// `expectation` was sealed against a different snapshot revision than
+    /// `snapshot` — checked FIRST: a stale/foreign expectation must not
+    /// fall through to "not active" or "revoked" and produce a misleading
+    /// reason for what is really a pairing error (RED-R18).
+    ExpectationSnapshotMismatch,
+    MachineRevoked,
+    MachineNotActive,
+}
+
+impl ExpectedResponder {
+    /// Order matters and is pinned by test: checkpoint-hash mismatch first
+    /// (RED-R18 — a pairing error, not a membership error), then revoked,
+    /// then not-active, then success with the member's fingerprint.
+    pub fn from_peer_expectation(
+        expectation: PeerExpectation,
+        snapshot: &RosterSnapshotView,
+    ) -> Result<Self, ExpectedResponderError> {
+        if expectation.checkpoint_hash != snapshot.checkpoint_hash() {
+            return Err(ExpectedResponderError::ExpectationSnapshotMismatch);
+        }
+        if snapshot.is_revoked(&expectation.m_id) {
+            return Err(ExpectedResponderError::MachineRevoked);
+        }
+        let member = snapshot
+            .lookup_active(&expectation.m_id)
+            .ok_or(ExpectedResponderError::MachineNotActive)?;
+        Ok(Self {
+            hh_id: snapshot.hh_id().clone(),
+            m_id: expectation.m_id,
+            cert_fingerprint: member.machine_cert_fingerprint(),
+        })
+    }
+}
+
+/// D-1 (audit round 3): what `MeshSessionRegistry::register` accepts in
+/// place of a caller-supplied bare `MachineId` + a session-self-reported
+/// identity. A session handle claiming its own `peer_m_id()` is still just
+/// a claim — nothing stops a buggy or malicious `H` from lying. A
+/// `SealedBinding` instead carries exactly the fields an `ExpectedResponder`
+/// (itself only constructible by passing `ExpectedResponder::from_peer_expectation`'s
+/// revoked/active/hash-pairing checks against a real snapshot) already
+/// proved, plus the checkpoint revision that snapshot was captured at:
+/// `hh_id`, `m_id`, `machine_cert_fingerprint`, `checkpoint_hash`,
+/// `checkpoint_sequence`. The registry's `register` no longer trusts
+/// anything the handle itself reports.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SealedBinding {
+    hh_id: HouseholdId,
+    m_id: MachineId,
+    machine_cert_fingerprint: [u8; 32],
+    checkpoint_hash: [u8; 32],
+    checkpoint_sequence: u64,
+}
+
+impl SealedBinding {
+    /// `responder` proves `m_id` was active, non-revoked and paired to
+    /// `snapshot`'s exact `checkpoint_hash` at the moment
+    /// `from_peer_expectation` ran; `snapshot` additionally supplies the
+    /// `checkpoint_sequence` that `ExpectedResponder` itself does not carry
+    /// (`PeerExpectation` only seals a hash). Caller is expected to have
+    /// obtained `responder` from this same `snapshot` — nothing here
+    /// re-verifies that pairing beyond what `from_peer_expectation` already
+    /// checked, so this is a projection, not a second authorization step.
+    #[must_use]
+    pub fn from_expected_responder(
+        responder: &ExpectedResponder,
+        snapshot: &RosterSnapshotView,
+    ) -> Self {
+        Self {
+            hh_id: responder.hh_id().clone(),
+            m_id: responder.m_id().clone(),
+            machine_cert_fingerprint: responder.cert_fingerprint(),
+            checkpoint_hash: snapshot.checkpoint_hash(),
+            checkpoint_sequence: snapshot.checkpoint_sequence(),
+        }
+    }
+
+    #[must_use]
+    pub fn hh_id(&self) -> &HouseholdId {
+        &self.hh_id
+    }
+
+    #[must_use]
+    pub fn m_id(&self) -> &MachineId {
+        &self.m_id
+    }
+
+    #[must_use]
+    pub fn machine_cert_fingerprint(&self) -> [u8; 32] {
+        self.machine_cert_fingerprint
+    }
+
+    #[must_use]
+    pub fn checkpoint_hash(&self) -> [u8; 32] {
+        self.checkpoint_hash
+    }
+
+    #[must_use]
+    pub fn checkpoint_sequence(&self) -> u64 {
+        self.checkpoint_sequence
+    }
+}
+
+// ─── Responder-side peer binding (D-1 successor, @kiana E1) ────────────────
+//
+// `PeerExpectation`/`ExpectedResponder` are structurally initiator-only: the
+// initiator pre-declares WHICH `m_id` it expects to reach before any
+// connection exists (`PeerExpectation::m_id`), then `from_peer_expectation`
+// checks that pre-declaration against a real snapshot. A RESPONDER has no
+// such pre-declaration to check — it learns a peer's claimed identity only
+// once an inbound connection attempt has already been authenticated at the
+// transport layer. That authentication (proving "this inbound bytestream
+// really is machine X") is NOT household-rs's job; it belongs to the
+// not-yet-integrated B-SESSAO CORE wire/session handshake (see this module's
+// scope notes elsewhere, and `mesh_session_registry.rs`'s own doc comment).
+// What IS household-rs's job, symmetrically with the initiator side, is the
+// roster-authority half only: given an m_id the transport layer has ALREADY
+// authenticated for this specific inbound attempt, check it against a real
+// `RosterSnapshotView` the same way `from_peer_expectation` does for the
+// initiator — active, non-revoked, at this exact revision.
+//
+// `AuthenticatedPeerClaim` is a SEPARATE type from `PeerExpectation`/
+// `ExpectedResponder` — not a wrapper, not a reuse. An inbound authenticated
+// claim and a locally pre-declared expectation are different authorities
+// with different failure semantics and different origins; folding them into
+// one type would let a future caller silently satisfy an initiator-shaped
+// check with responder-shaped evidence, or vice versa. Its only constructor
+// is `#[cfg(test)] pub(crate)`, for the same reason `PeerExpectation` has
+// none in production: there is no measured, authenticated source for an
+// inbound peer's claimed `m_id` wired into household-rs yet — that source
+// is the not-yet-built B-SESSAO CORE handshake. The absence IS the gate
+// (RED-R23's own reasoning, mirrored here), not a warning next to a
+// constructor that works.
+//
+// **Open integration blocker, registered explicitly, not closed here**
+// (round D-1 successor, @kiana recheck): `pub(crate)` is a HARD crate
+// boundary regardless of build mode — it is not merely "gated pending a
+// measured source" the way a `#[cfg(test)]`-only item is. Once the
+// B-SESSAO CORE handshake exists, it will live in a DIFFERENT crate
+// (`mesh-session-core-rs`/its runtime), and a `pub(crate)` item in
+// household-rs is structurally invisible to it FOREVER, in every build
+// mode — "integrate the handshake" alone can never make this path
+// reachable from production, no matter what else changes. Production
+// wiring needs one of: (a) an opaque, capability-shaped facade this type
+// accepts as proof (the shape D-9 is expected to define — not decided or
+// built here), or (b) an explicitly-approved typed dependency from
+// `mesh-session-core-rs` onto household-rs internals. Neither exists yet.
+// This round deliberately does NOT invent either — exposing a raw,
+// forgeable, cross-crate-reachable constructor "just to compile" would
+// itself be the vulnerability E1 exists to prevent. What this round DOES
+// close, and what is safe to rely on today: the roster-authority
+// projection itself (`SealedBinding::from_responding_peer`, below) is
+// real, tested, and origin-agnostic — whatever eventually proves an
+// `AuthenticatedPeerClaim` can hand it straight to this same, already-
+// audited check. Only the "how does a responder legitimately construct
+// the claim in production" half remains open.
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthenticatedPeerClaim {
+    m_id: MachineId,
+}
+
+impl AuthenticatedPeerClaim {
+    // NENHUM constructor público de produção existe ainda — mesma
+    // disciplina de `PeerExpectation::injected_for_harness` (RED-R23).
+
+    #[cfg(test)]
+    pub(crate) fn injected_for_harness(m_id: MachineId) -> Self {
+        Self { m_id }
+    }
+
+    #[must_use]
+    pub fn m_id(&self) -> &MachineId {
+        &self.m_id
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RespondingPeerError {
+    MachineRevoked,
+    MachineNotActive,
+}
+
+impl SealedBinding {
+    /// Responder-side origin (D-1 successor, @kiana E1) — see this
+    /// section's module-level comment for why this is a distinct path from
+    /// [`from_expected_responder`](Self::from_expected_responder), not a
+    /// variant of it. Performs exactly the roster-authority half
+    /// `ExpectedResponder::from_peer_expectation` performs for the
+    /// initiator: revoked first (mirroring RED-R18's ordering), then
+    /// active — both against `snapshot` — so a responder and an initiator
+    /// produce identically-shaped refusals for identically-shaped roster
+    /// states.
+    pub fn from_responding_peer(
+        claim: &AuthenticatedPeerClaim,
+        snapshot: &RosterSnapshotView,
+    ) -> Result<Self, RespondingPeerError> {
+        if snapshot.is_revoked(claim.m_id()) {
+            return Err(RespondingPeerError::MachineRevoked);
+        }
+        let member = snapshot
+            .lookup_active(claim.m_id())
+            .ok_or(RespondingPeerError::MachineNotActive)?;
+        Ok(Self {
+            hh_id: snapshot.hh_id().clone(),
+            m_id: claim.m_id().clone(),
+            machine_cert_fingerprint: member.machine_cert_fingerprint(),
+            checkpoint_hash: snapshot.checkpoint_hash(),
+            checkpoint_sequence: snapshot.checkpoint_sequence(),
+        })
+    }
+}
+
+// ─── Runtime-facade membership projection (Lane R, @ilia) ──────────────────
+//
+// Feature-gated: only compiled when `mesh-session-runtime` is enabled.
+// `D1MembershipKey` (mesh-session-core-rs) is the ceremony's own
+// capability — constructed only by that crate's own handshake code,
+// after `verify_frame` + delegation + checkpoint all succeed (and after
+// nonce consumption), carrying 6 fields: `session_id`, `hh_id`,
+// `peer_m_id`, `peer_cert_fingerprint`, `checkpoint_hash`,
+// `checkpoint_sequence`. `session_id` is a ceremony-freshness token that
+// belongs entirely to the core/D1 admission layer (its own nonce ledger
+// already closes replay) — it is deliberately never read here and never
+// enters `SealedBinding`. The other 5 fields are compared, in full,
+// against the CURRENT roster snapshot before a `SealedBinding` is ever
+// produced — a stronger check than `from_responding_peer` above, which
+// never had `peer_cert_fingerprint` to compare against at all.
+//
+// Error is a single, opaque, fieldless type — see `MembershipKeyRejected`
+// and `validate_membership_fields`'s own doc for exactly how "no oracle"
+// is enforced structurally, not just by convention.
+
+#[cfg(feature = "mesh-session-runtime")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MembershipKeyRejected;
+
+#[cfg(feature = "mesh-session-runtime")]
+impl std::fmt::Display for MembershipKeyRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "membership key rejected")
+    }
+}
+
+#[cfg(feature = "mesh-session-runtime")]
+impl std::error::Error for MembershipKeyRejected {}
+
+#[cfg(feature = "mesh-session-runtime")]
+impl SealedBinding {
+    /// Projects a real `D1MembershipKey` into a `SealedBinding`, or
+    /// rejects it. `session_id` is read by nothing here — see the module
+    /// comment above.
+    ///
+    /// **Declared partition (2026-08-05, @ilia audit of `29dc6139`,
+    /// independently verified line-by-line, narrowed by @zain's
+    /// structural analysis — not a defect, but undeclared before this
+    /// note, which promised more than the code delivered):** `peer_m_id`
+    /// does NOT go through the same unconditional-then-combine path as
+    /// the other 4 fields. It is resolved by roster lookup FIRST, with
+    /// two early returns — revoked, then absent — both completing before
+    /// any of the 4 comparisons below ever run. `MembershipKeyRejected`
+    /// itself still leaks nothing (no variant, no field, identical
+    /// `Display`/`Debug` on every path), but the CONTROL FLOW differs,
+    /// and is timing-distinguishable, from "m_id valid but one of the
+    /// other 4 fields wrong." Accepted as-is, not closed, because calling
+    /// this function already requires holding the exact
+    /// `&RosterSnapshotView` the m_id would be looked up against — a
+    /// caller who can observe this distinction could have read the
+    /// roster directly and learned the same thing; the check reveals
+    /// only existence/revocation status the caller's own snapshot already
+    /// carries, never a secret. **This condition is load-bearing: if this
+    /// code path ever becomes reachable by a principal that does NOT
+    /// already hold the snapshot, the partition stops being acceptable**
+    /// (@zain) — re-audit this note if that ever changes.
+    ///
+    /// Two DIFFERENT reasons hold the two halves of this ordering, not
+    /// one: `lookup_active` before `fingerprint_matches` needs no test at
+    /// all — it is a DATA dependency the compiler enforces
+    /// (`fingerprint_matches` reads `member.machine_cert_fingerprint()`,
+    /// and `member` IS `lookup_active`'s return value). `is_revoked`
+    /// before the 4 comparisons has no such dependency and is
+    /// behaviorally unobservable if moved — see
+    /// `membership_key_is_revoked_check_precedes_field_comparisons`
+    /// below, which pins exactly that ONE relationship, not the whole
+    /// function's shape.
+    pub fn from_membership_key(
+        key: &mesh_session_core_rs::intent::D1MembershipKey,
+        snapshot: &RosterSnapshotView,
+    ) -> Result<Self, MembershipKeyRejected> {
+        validate_membership_fields(
+            key.hh_id(),
+            key.peer_m_id(),
+            key.peer_cert_fingerprint(),
+            key.checkpoint_hash(),
+            key.checkpoint_sequence(),
+            snapshot,
+        )
+    }
+}
+
+/// The real comparison logic, factored to primitive-typed arguments so it
+/// is directly, non-vacuously testable without a real `D1MembershipKey`
+/// — its constructor is `pub(crate)` to mesh-session-core-rs, genuinely
+/// unreachable from any other crate, including this one, even in tests
+/// (verified: the only two construction sites are inside that crate's
+/// own `run_responder_handshake`/`run_initiator_handshake`, both
+/// `pub(crate)` there too).
+///
+/// Revoked/not-active is checked FIRST, matching `from_responding_peer`'s
+/// existing ordering exactly — an unavoidable, pre-existing short-circuit
+/// (there is no member to compare fields against if the `m_id` isn't
+/// active), not something new introduced here. **This IS an observable
+/// partition, and only `is_revoked`'s position within it is a genuine,
+/// pinned choice** — see `SealedBinding::from_membership_key`'s own doc
+/// for the full declaration, including why `lookup_active` before
+/// `fingerprint_matches` needs no pin at all (compiler-enforced data
+/// dependency) while `is_revoked`'s position does (no such dependency,
+/// behaviorally unobservable if moved). Past that gate, all 4 remaining
+/// field comparisons (`hh_id`, fingerprint, `checkpoint_hash`,
+/// `checkpoint_sequence`) are evaluated UNCONDITIONALLY and combined with
+/// a single `&&`, checked once — no per-field early return among THESE
+/// four, so no observable control-flow or timing difference between
+/// fingerprint being wrong and `checkpoint_sequence` being wrong
+/// specifically.
+#[cfg(feature = "mesh-session-runtime")]
+fn validate_membership_fields(
+    hh_id: &str,
+    peer_m_id: &str,
+    peer_cert_fingerprint: &[u8],
+    checkpoint_hash: &[u8],
+    checkpoint_sequence: u64,
+    snapshot: &RosterSnapshotView,
+) -> Result<SealedBinding, MembershipKeyRejected> {
+    let m_id = MachineId(peer_m_id.to_string());
+    if snapshot.is_revoked(&m_id) {
+        return Err(MembershipKeyRejected);
+    }
+    let member = snapshot.lookup_active(&m_id).ok_or(MembershipKeyRejected)?;
+
+    let hh_id_matches = hh_id == snapshot.hh_id().0.as_str();
+    let fingerprint_matches = peer_cert_fingerprint == member.machine_cert_fingerprint().as_slice();
+    let checkpoint_hash_matches = checkpoint_hash == snapshot.checkpoint_hash().as_slice();
+    let checkpoint_sequence_matches = checkpoint_sequence == snapshot.checkpoint_sequence();
+
+    if !(hh_id_matches
+        && fingerprint_matches
+        && checkpoint_hash_matches
+        && checkpoint_sequence_matches)
+    {
+        return Err(MembershipKeyRejected);
+    }
+
+    Ok(SealedBinding {
+        hh_id: snapshot.hh_id().clone(),
+        m_id,
+        machine_cert_fingerprint: member.machine_cert_fingerprint(),
+        checkpoint_hash: snapshot.checkpoint_hash(),
+        checkpoint_sequence: snapshot.checkpoint_sequence(),
+    })
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -1730,6 +2346,283 @@ pub(crate) fn derive_machine_currency(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── Lane R (@ilia): membership-key projection REDs ─────────────────
+
+    #[cfg(feature = "mesh-session-runtime")]
+    #[allow(clippy::too_many_arguments)]
+    fn membership_test_snapshot(
+        hh_id: &str,
+        m_id: &str,
+        fingerprint: [u8; 32],
+        checkpoint_hash: [u8; 32],
+        checkpoint_sequence: u64,
+        revoked: bool,
+    ) -> RosterSnapshotView {
+        let hh_id = HouseholdId(hh_id.to_string());
+        let machine_id = MachineId(m_id.to_string());
+        let active = if revoked {
+            Vec::new()
+        } else {
+            vec![MachineRosterMemberV1 {
+                m_id: machine_id.clone(),
+                m_pub: crate::keys::P256PublicKey([0x02; 33]),
+                machine_cert: Vec::new(),
+                machine_cert_fingerprint: fingerprint,
+            }]
+        };
+        let tombstones = if revoked {
+            vec![MachineRosterRevocationV1 {
+                v: 1,
+                kind: "machine_roster_revocation_v1".to_string(),
+                hh_id: hh_id.clone(),
+                epoch: [1u8; 32],
+                sequence: 1,
+                prev_event_hash: [0u8; 32],
+                m_id: machine_id.clone(),
+                m_pub: crate::keys::P256PublicKey([0x02; 33]),
+                machine_cert_fingerprint: fingerprint,
+                revoked_at: 1,
+                reason: RevocationReason::OwnerAction,
+                cascade: RevocationCascade::MachineOnly,
+                owner_p_id: crate::machine_cert::PersonId("owner".to_string()),
+                owner_cert_fingerprint: [4u8; 32],
+                owner_person_cert: Vec::new(),
+                signature: crate::keys::P256Signature([7u8; 64]),
+            }]
+        } else {
+            Vec::new()
+        };
+        let data = AcceptedRosterData {
+            epoch: [1u8; 32],
+            checkpoint_sequence,
+            checkpoint_hash,
+            prev_checkpoint_hash: [0u8; 32],
+            event_sequence: 1,
+            event_head_hash: [3u8; 32],
+            predecessor_event_sequence: 0,
+            predecessor_event_head_hash: [0u8; 32],
+            issued_at: 1,
+            not_after: u64::MAX,
+            owner_cert_fingerprint: [4u8; 32],
+            genesis_basis: VerifiedGenesisRoster {
+                epoch: [1u8; 32],
+                members: Vec::new(),
+            },
+            active,
+            tombstones,
+        };
+        RosterSnapshotView::project(&hh_id, &data)
+    }
+
+    /// Real `D1MembershipKey`, via the `test-support`-gated escape hatch
+    /// — every field-mismatch RED below drives the REAL public
+    /// `SealedBinding::from_membership_key` wrapper, not the private
+    /// `validate_membership_fields` helper alone. A test that only
+    /// exercises a helper parallel to the caller cannot catch the caller
+    /// itself (@ilia) — if the wrapper ever mis-ordered its own field
+    /// extraction or passed the wrong accessor to the helper, these REDs
+    /// would still catch it; the earlier helper-only version could not.
+    /// `session_id` is a fixed, arbitrary fixture value — it is read by
+    /// nothing on either side of this call chain (see this section's own
+    /// module doc for why).
+    #[cfg(feature = "mesh-session-runtime")]
+    fn membership_key_for_test(
+        hh_id: &str,
+        peer_m_id: &str,
+        peer_cert_fingerprint: [u8; 32],
+        checkpoint_hash: [u8; 32],
+        checkpoint_sequence: u64,
+    ) -> mesh_session_core_rs::intent::D1MembershipKey {
+        mesh_session_core_rs::intent::D1MembershipKey::new_for_test(
+            b"fixture-session-id".to_vec(),
+            hh_id.to_string(),
+            peer_m_id.to_string(),
+            peer_cert_fingerprint.to_vec(),
+            checkpoint_hash.to_vec(),
+            checkpoint_sequence,
+        )
+    }
+
+    #[cfg(feature = "mesh-session-runtime")]
+    #[test]
+    fn membership_key_all_fields_match_produces_sealed_binding() {
+        let snapshot =
+            membership_test_snapshot("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7, false);
+        let key = membership_key_for_test("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7);
+        let bound = SealedBinding::from_membership_key(&key, &snapshot).unwrap();
+        assert_eq!(bound.hh_id().0, "hh-runtime-1");
+        assert_eq!(bound.m_id().0, "m-1");
+        assert_eq!(bound.machine_cert_fingerprint(), [0xAAu8; 32]);
+        assert_eq!(bound.checkpoint_hash(), [0xCCu8; 32]);
+        assert_eq!(bound.checkpoint_sequence(), 7);
+    }
+
+    #[cfg(feature = "mesh-session-runtime")]
+    #[test]
+    fn red_membership_key_hh_id_mismatch_rejected() {
+        let snapshot =
+            membership_test_snapshot("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7, false);
+        let key = membership_key_for_test("hh-DIFFERENT", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7);
+        let err = SealedBinding::from_membership_key(&key, &snapshot).unwrap_err();
+        assert_eq!(err, MembershipKeyRejected);
+    }
+
+    #[cfg(feature = "mesh-session-runtime")]
+    #[test]
+    fn red_membership_key_unknown_peer_m_id_rejected() {
+        let snapshot =
+            membership_test_snapshot("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7, false);
+        let key = membership_key_for_test(
+            "hh-runtime-1",
+            "m-DOES-NOT-EXIST",
+            [0xAAu8; 32],
+            [0xCCu8; 32],
+            7,
+        );
+        let err = SealedBinding::from_membership_key(&key, &snapshot).unwrap_err();
+        assert_eq!(err, MembershipKeyRejected);
+    }
+
+    #[cfg(feature = "mesh-session-runtime")]
+    #[test]
+    fn red_membership_key_fingerprint_mismatch_rejected() {
+        let snapshot =
+            membership_test_snapshot("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7, false);
+        let key = membership_key_for_test("hh-runtime-1", "m-1", [0xFFu8; 32], [0xCCu8; 32], 7);
+        let err = SealedBinding::from_membership_key(&key, &snapshot).unwrap_err();
+        assert_eq!(err, MembershipKeyRejected);
+    }
+
+    #[cfg(feature = "mesh-session-runtime")]
+    #[test]
+    fn red_membership_key_checkpoint_hash_mismatch_rejected() {
+        let snapshot =
+            membership_test_snapshot("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7, false);
+        let key = membership_key_for_test("hh-runtime-1", "m-1", [0xAAu8; 32], [0xEEu8; 32], 7);
+        let err = SealedBinding::from_membership_key(&key, &snapshot).unwrap_err();
+        assert_eq!(err, MembershipKeyRejected);
+    }
+
+    #[cfg(feature = "mesh-session-runtime")]
+    #[test]
+    fn red_membership_key_checkpoint_sequence_mismatch_rejected() {
+        let snapshot =
+            membership_test_snapshot("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7, false);
+        let key = membership_key_for_test("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 999);
+        let err = SealedBinding::from_membership_key(&key, &snapshot).unwrap_err();
+        assert_eq!(err, MembershipKeyRejected);
+    }
+
+    #[cfg(feature = "mesh-session-runtime")]
+    #[test]
+    fn red_membership_key_revoked_rejected() {
+        let snapshot =
+            membership_test_snapshot("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7, true);
+        let key = membership_key_for_test("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7);
+        let err = SealedBinding::from_membership_key(&key, &snapshot).unwrap_err();
+        assert_eq!(err, MembershipKeyRejected);
+    }
+
+    /// Key minted against an OLDER checkpoint (seq 7) is rejected once the
+    /// roster has genuinely advanced (seq 8) — even though it would have
+    /// been accepted against the exact snapshot it was minted for. Proves
+    /// temporal correctness, not just flat field equality.
+    #[cfg(feature = "mesh-session-runtime")]
+    #[test]
+    fn red_membership_key_stale_against_advanced_roster_rejected() {
+        let old_snapshot =
+            membership_test_snapshot("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7, false);
+        let key = membership_key_for_test("hh-runtime-1", "m-1", [0xAAu8; 32], [0xCCu8; 32], 7);
+        SealedBinding::from_membership_key(&key, &old_snapshot).unwrap();
+
+        let advanced_snapshot =
+            membership_test_snapshot("hh-runtime-1", "m-1", [0xAAu8; 32], [0xDDu8; 32], 8, false);
+        let err = SealedBinding::from_membership_key(&key, &advanced_snapshot).unwrap_err();
+        assert_eq!(err, MembershipKeyRejected);
+    }
+
+    /// Pins the ONE half of the declared partition (@ilia audit of
+    /// `29dc6139`, narrowed by @zain's structural analysis) that actually
+    /// needs pinning — `is_revoked`'s position relative to the 4
+    /// unconditional field comparisons.
+    ///
+    /// **The `lookup_active` → `fingerprint_matches` order is NOT pinned
+    /// here, deliberately: it needs no pin at all.** `fingerprint_matches`
+    /// reads `member.machine_cert_fingerprint()`, and `member` is exactly
+    /// `lookup_active`'s own return value — this is a DATA dependency the
+    /// compiler enforces; `lookup_active` cannot be moved after that
+    /// comparison because the value it produces would not exist yet.
+    /// Pinning something the type system already guarantees would
+    /// wrongly imply this test is what secures it.
+    ///
+    /// **`is_revoked` has no such dependency** — nothing downstream reads
+    /// its result besides the early return itself, so it could freely
+    /// move to after the 4 comparisons and the code would still compile.
+    /// Moving it is also BEHAVIORALLY UNOBSERVABLE: the error stays the
+    /// same fieldless `MembershipKeyRejected` either way, so no black-box
+    /// call sequence can distinguish the two orderings by return value —
+    /// which is exactly why a source-position pin is the only proof
+    /// available for this half, not a weaker substitute for something
+    /// free elsewhere.
+    ///
+    /// **`include_str!` limitation, stated plainly:** this reads the
+    /// current SOURCE FILE at compile time — it proves what the source
+    /// says, not what the compiled binary does. Accepted here only
+    /// because this test lives in the same crate and recompiles whenever
+    /// the source it reads changes; a copy or a stale build would not be
+    /// covered.
+    #[cfg(feature = "mesh-session-runtime")]
+    #[test]
+    fn membership_key_is_revoked_check_precedes_field_comparisons() {
+        let source = include_str!("machine_roster_authority.rs");
+        let fn_start = source
+            .find("fn validate_membership_fields(")
+            .expect("validate_membership_fields must exist");
+        let fn_body = &source[fn_start..];
+        let fn_end = fn_body
+            .find("\n}\n")
+            .expect("validate_membership_fields must have a closing brace");
+        let fn_body = &fn_body[..fn_end];
+
+        let revoked_check = fn_body
+            .find("snapshot.is_revoked(")
+            .expect("revoked check must exist in validate_membership_fields");
+
+        // @khai's cross-audit (2026-08-05): anchoring on `hh_id_matches`
+        // alone only proved `is_revoked` precedes ONE of the four
+        // comparisons, not all of them, despite the assertion's own name
+        // claiming "field comparisons" plural. A mutant that reorders the
+        // four so `hh_id_matches` sits last (with `is_revoked` moved to
+        // after the other three but still before `hh_id_matches`) left
+        // this pin green while `is_revoked` had already stopped preceding
+        // 3 of the 4. Anchoring on the MINIMUM of all four indices closes
+        // that gap — `is_revoked` must precede every one of them, not just
+        // whichever one this pin happened to name.
+        let earliest_field_comparison = [
+            "let hh_id_matches",
+            "let fingerprint_matches",
+            "let checkpoint_hash_matches",
+            "let checkpoint_sequence_matches",
+        ]
+        .into_iter()
+        .map(|needle| {
+            fn_body.find(needle).unwrap_or_else(|| {
+                panic!("{needle} comparison must exist in validate_membership_fields")
+            })
+        })
+        .min()
+        .expect("four comparisons are listed above, so a minimum always exists");
+
+        assert!(
+            revoked_check < earliest_field_comparison,
+            "is_revoked has no data dependency forcing this order — unlike lookup_active, whose \
+             result the field comparisons directly consume — so this position is not \
+             compiler-guaranteed and needs this explicit pin. It must precede ALL FOUR field \
+             comparisons, not just one of them. If this genuinely changed, update it deliberately, \
+             not by accident."
+        );
+    }
 
     // Local wrappers preserving old call signatures for tests
     fn sign_revocation(
@@ -8522,5 +9415,312 @@ mod tests {
         );
         let rev_hash = hex::decode(f["revocation"]["event_hash_hex"].as_str().unwrap()).unwrap();
         assert_eq!(refresh.event_head_hash.as_slice(), rev_hash.as_slice());
+    }
+
+    /// D-1 (B-ROSTER-ADAPTER v2 CFX-4, erratum1): `PeerExpectation` has no
+    /// production constructor — this exercises the only implementable code
+    /// this round, the `#[cfg(test)]` harness constructor, and pins that it
+    /// round-trips the fields it was given. RED-R23 (no production
+    /// constructor exists at all) is a compile-time property, not a runtime
+    /// assertion: it is proven by `from_snapshot` simply not existing
+    /// outside `#[cfg(test)]` anywhere in this file.
+    #[test]
+    fn peer_expectation_test_constructor_round_trips_its_fields() {
+        let m_id = MachineId("m-peer-expectation-test".to_string());
+        let checkpoint_hash = [9u8; 32];
+        let expectation = PeerExpectation::injected_for_harness(
+            checkpoint_hash,
+            m_id.clone(),
+            PeerSelectionSource::LocalOwnerPresentSelection,
+        );
+        assert_eq!(expectation.checkpoint_hash(), checkpoint_hash);
+        assert_eq!(expectation.m_id(), &m_id);
+        assert_eq!(
+            expectation.source(),
+            PeerSelectionSource::LocalOwnerPresentSelection
+        );
+    }
+
+    /// RED-R17/POS-R8, mutant-proof: `checkpoint_hash`, `event_head_hash`
+    /// and `prev_checkpoint_hash` are three DISTINCT byte patterns here
+    /// (0xAA / 0xBB / 0xCC), not all-zero as a fresh-genesis fixture would
+    /// naturally have them. A `project()` that wired
+    /// `checkpoint_event_head` to `checkpoint_hash` or
+    /// `prev_checkpoint_hash` by mistake would still pass a test built on
+    /// an all-zero genesis (every field reads back as the same zero value)
+    /// but fails this one, since the three fields disagree.
+    #[test]
+    fn project_wires_checkpoint_event_head_to_event_head_hash_specifically() {
+        let hh_id = HouseholdId("hh-project-field-wiring-test".to_string());
+        let data = AcceptedRosterData {
+            epoch: [1u8; 32],
+            checkpoint_sequence: 7,
+            checkpoint_hash: [0xAAu8; 32],
+            prev_checkpoint_hash: [0xCCu8; 32],
+            event_sequence: 3,
+            event_head_hash: [0xBBu8; 32],
+            predecessor_event_sequence: 2,
+            predecessor_event_head_hash: [0xDDu8; 32],
+            issued_at: 1,
+            not_after: 999,
+            owner_cert_fingerprint: [4u8; 32],
+            genesis_basis: VerifiedGenesisRoster {
+                epoch: [1u8; 32],
+                members: Vec::new(),
+            },
+            active: Vec::new(),
+            tombstones: Vec::new(),
+        };
+        let view = RosterSnapshotView::project(&hh_id, &data);
+        assert_eq!(view.checkpoint_hash(), [0xAAu8; 32]);
+        assert_eq!(view.checkpoint_event_head(), [0xBBu8; 32]);
+        assert_ne!(view.checkpoint_event_head(), view.checkpoint_hash());
+        assert_ne!(view.checkpoint_event_head(), data.prev_checkpoint_hash);
+        assert_eq!(view.checkpoint_sequence(), 7);
+        assert_eq!(view.not_after(), 999);
+    }
+
+    /// RED-R17, as a compile guard, not just runtime values (round 3, point
+    /// d): exhaustively destructures every field of `RosterSnapshotView`.
+    /// If a field is ever added without updating this pattern, this FAILS
+    /// TO COMPILE (E0027, pattern does not mention field) — caught before
+    /// any test even runs, not only if some other test happens to notice a
+    /// wrong value.
+    #[test]
+    fn roster_snapshot_view_field_set_is_exhaustively_matched_at_compile_time() {
+        let view = RosterSnapshotView::project(
+            &HouseholdId("hh-exhaustive-field-guard".to_string()),
+            &AcceptedRosterData {
+                epoch: [1u8; 32],
+                checkpoint_sequence: 1,
+                checkpoint_hash: [1u8; 32],
+                prev_checkpoint_hash: [1u8; 32],
+                event_sequence: 1,
+                event_head_hash: [1u8; 32],
+                predecessor_event_sequence: 0,
+                predecessor_event_head_hash: [0u8; 32],
+                issued_at: 1,
+                not_after: 1,
+                owner_cert_fingerprint: [1u8; 32],
+                genesis_basis: VerifiedGenesisRoster {
+                    epoch: [1u8; 32],
+                    members: Vec::new(),
+                },
+                active: Vec::new(),
+                tombstones: Vec::new(),
+            },
+        );
+        let RosterSnapshotView {
+            hh_id: _,
+            checkpoint_hash: _,
+            checkpoint_sequence: _,
+            checkpoint_event_head: _,
+            not_after: _,
+            active: _,
+            revoked_m_ids: _,
+        } = view;
+    }
+
+    fn test_snapshot_for_responder(
+        checkpoint_hash: [u8; 32],
+        active_m_id: Option<&MachineId>,
+        revoked_m_id: Option<&MachineId>,
+    ) -> RosterSnapshotView {
+        let hh_id = HouseholdId("hh-expected-responder-test".to_string());
+        let active = active_m_id
+            .map(|m_id| MachineRosterMemberV1 {
+                m_id: m_id.clone(),
+                m_pub: crate::keys::P256PublicKey([0x02; 33]),
+                machine_cert: Vec::new(),
+                machine_cert_fingerprint: [0xAAu8; 32],
+            })
+            .into_iter()
+            .collect();
+        let tombstones = revoked_m_id
+            .map(|m_id| MachineRosterRevocationV1 {
+                v: 1,
+                kind: "machine_roster_revocation_v1".to_string(),
+                hh_id: hh_id.clone(),
+                epoch: [1u8; 32],
+                sequence: 1,
+                prev_event_hash: [0u8; 32],
+                m_id: m_id.clone(),
+                m_pub: crate::keys::P256PublicKey([0x02; 33]),
+                machine_cert_fingerprint: [0xBBu8; 32],
+                revoked_at: 1,
+                reason: RevocationReason::OwnerAction,
+                cascade: RevocationCascade::MachineOnly,
+                owner_p_id: crate::machine_cert::PersonId("owner".to_string()),
+                owner_cert_fingerprint: [4u8; 32],
+                owner_person_cert: Vec::new(),
+                signature: crate::keys::P256Signature([7u8; 64]),
+            })
+            .into_iter()
+            .collect();
+        let data = AcceptedRosterData {
+            epoch: [1u8; 32],
+            checkpoint_sequence: 1,
+            checkpoint_hash,
+            prev_checkpoint_hash: [0u8; 32],
+            event_sequence: 1,
+            event_head_hash: [3u8; 32],
+            predecessor_event_sequence: 0,
+            predecessor_event_head_hash: [0u8; 32],
+            issued_at: 1,
+            not_after: u64::MAX,
+            owner_cert_fingerprint: [4u8; 32],
+            genesis_basis: VerifiedGenesisRoster {
+                epoch: [1u8; 32],
+                members: Vec::new(),
+            },
+            active,
+            tombstones,
+        };
+        RosterSnapshotView::project(&hh_id, &data)
+    }
+
+    /// RED-R18, checked first: a `PeerExpectation` sealed against one
+    /// `checkpoint_hash` redeemed against a snapshot with a different hash
+    /// is `ExpectationSnapshotMismatch` — even though, in this fixture, the
+    /// `m_id` would ALSO fail "not active" if the hash check didn't run
+    /// first. Pins the order, not just the outcome.
+    #[test]
+    fn expected_responder_rejects_snapshot_hash_mismatch_before_checking_membership() {
+        let m_id = MachineId("m-responder-hash-mismatch".to_string());
+        let expectation = PeerExpectation::injected_for_harness(
+            [1u8; 32],
+            m_id.clone(),
+            PeerSelectionSource::LocalOwnerPresentSelection,
+        );
+        // Different hash AND m_id absent from active — if "not active" were
+        // checked first this would return MachineNotActive instead.
+        let snapshot = test_snapshot_for_responder([2u8; 32], None, None);
+        let result = ExpectedResponder::from_peer_expectation(expectation, &snapshot);
+        assert_eq!(
+            result,
+            Err(ExpectedResponderError::ExpectationSnapshotMismatch)
+        );
+    }
+
+    #[test]
+    fn expected_responder_rejects_revoked_machine_on_matching_snapshot() {
+        let checkpoint_hash = [5u8; 32];
+        let m_id = MachineId("m-responder-revoked".to_string());
+        let expectation = PeerExpectation::injected_for_harness(
+            checkpoint_hash,
+            m_id.clone(),
+            PeerSelectionSource::LocalOwnerPresentSelection,
+        );
+        let snapshot = test_snapshot_for_responder(checkpoint_hash, None, Some(&m_id));
+        let result = ExpectedResponder::from_peer_expectation(expectation, &snapshot);
+        assert_eq!(result, Err(ExpectedResponderError::MachineRevoked));
+    }
+
+    #[test]
+    fn expected_responder_rejects_not_listed_machine_on_matching_snapshot() {
+        let checkpoint_hash = [6u8; 32];
+        let m_id = MachineId("m-responder-not-listed".to_string());
+        let expectation = PeerExpectation::injected_for_harness(
+            checkpoint_hash,
+            m_id.clone(),
+            PeerSelectionSource::LocalOwnerPresentSelection,
+        );
+        let snapshot = test_snapshot_for_responder(checkpoint_hash, None, None);
+        let result = ExpectedResponder::from_peer_expectation(expectation, &snapshot);
+        assert_eq!(result, Err(ExpectedResponderError::MachineNotActive));
+    }
+
+    #[test]
+    fn expected_responder_succeeds_for_active_machine_on_matching_snapshot() {
+        let checkpoint_hash = [7u8; 32];
+        let hh_id = HouseholdId("hh-expected-responder-test".to_string());
+        let m_id = MachineId("m-responder-active".to_string());
+        let expectation = PeerExpectation::injected_for_harness(
+            checkpoint_hash,
+            m_id.clone(),
+            PeerSelectionSource::LocalOwnerPresentSelection,
+        );
+        let snapshot = test_snapshot_for_responder(checkpoint_hash, Some(&m_id), None);
+        let responder = ExpectedResponder::from_peer_expectation(expectation, &snapshot)
+            .expect("active machine, matching snapshot");
+        assert_eq!(responder.hh_id(), &hh_id);
+        assert_eq!(responder.m_id(), &m_id);
+        assert_eq!(responder.cert_fingerprint(), [0xAAu8; 32]);
+    }
+
+    /// D-1 (audit round 3): `SealedBinding` carries exactly the fields
+    /// derived from a real, snapshot-validated `ExpectedResponder`, plus the
+    /// checkpoint sequence `ExpectedResponder` itself does not carry.
+    #[test]
+    fn sealed_binding_projects_expected_responder_and_snapshot_sequence() {
+        let checkpoint_hash = [8u8; 32];
+        let hh_id = HouseholdId("hh-expected-responder-test".to_string());
+        let m_id = MachineId("m-sealed-binding".to_string());
+        let expectation = PeerExpectation::injected_for_harness(
+            checkpoint_hash,
+            m_id.clone(),
+            PeerSelectionSource::LocalOwnerPresentSelection,
+        );
+        let snapshot = test_snapshot_for_responder(checkpoint_hash, Some(&m_id), None);
+        let responder = ExpectedResponder::from_peer_expectation(expectation, &snapshot)
+            .expect("active machine, matching snapshot");
+        let binding = SealedBinding::from_expected_responder(&responder, &snapshot);
+        assert_eq!(binding.hh_id(), &hh_id);
+        assert_eq!(binding.m_id(), &m_id);
+        assert_eq!(binding.machine_cert_fingerprint(), [0xAAu8; 32]);
+        assert_eq!(binding.checkpoint_hash(), checkpoint_hash);
+        assert_eq!(
+            binding.checkpoint_sequence(),
+            snapshot.checkpoint_sequence()
+        );
+    }
+
+    /// D-1 successor (@kiana E1): the responder path mirrors the
+    /// initiator path's revoked-first ordering — a revoked machine is
+    /// rejected as `MachineRevoked` even though (in a fixture with only
+    /// one of active/revoked populated) it is trivially also "not active".
+    #[test]
+    fn responding_peer_rejects_revoked_machine() {
+        let checkpoint_hash = [9u8; 32];
+        let m_id = MachineId("m-responder-inbound-revoked".to_string());
+        let claim = AuthenticatedPeerClaim::injected_for_harness(m_id.clone());
+        let snapshot = test_snapshot_for_responder(checkpoint_hash, None, Some(&m_id));
+        let result = SealedBinding::from_responding_peer(&claim, &snapshot);
+        assert_eq!(result, Err(RespondingPeerError::MachineRevoked));
+    }
+
+    #[test]
+    fn responding_peer_rejects_not_listed_machine() {
+        let checkpoint_hash = [10u8; 32];
+        let m_id = MachineId("m-responder-inbound-not-listed".to_string());
+        let claim = AuthenticatedPeerClaim::injected_for_harness(m_id);
+        let snapshot = test_snapshot_for_responder(checkpoint_hash, None, None);
+        let result = SealedBinding::from_responding_peer(&claim, &snapshot);
+        assert_eq!(result, Err(RespondingPeerError::MachineNotActive));
+    }
+
+    /// The end-to-end compile/API proof for E1: a responder — which has no
+    /// `PeerExpectation`/`ExpectedResponder` to redeem at all, only an
+    /// (already-authenticated, here harness-injected) claimed `m_id` — can
+    /// still produce a `SealedBinding` carrying exactly what the snapshot
+    /// proves for that machine, without ever constructing or naming
+    /// `PeerExpectation`/`ExpectedResponder` in this test.
+    #[test]
+    fn responding_peer_succeeds_for_active_machine_and_projects_into_sealed_binding() {
+        let checkpoint_hash = [11u8; 32];
+        let hh_id = HouseholdId("hh-expected-responder-test".to_string());
+        let m_id = MachineId("m-responder-inbound-active".to_string());
+        let claim = AuthenticatedPeerClaim::injected_for_harness(m_id.clone());
+        let snapshot = test_snapshot_for_responder(checkpoint_hash, Some(&m_id), None);
+        let binding = SealedBinding::from_responding_peer(&claim, &snapshot)
+            .expect("active machine, real snapshot");
+        assert_eq!(binding.hh_id(), &hh_id);
+        assert_eq!(binding.m_id(), &m_id);
+        assert_eq!(binding.machine_cert_fingerprint(), [0xAAu8; 32]);
+        assert_eq!(binding.checkpoint_hash(), checkpoint_hash);
+        assert_eq!(
+            binding.checkpoint_sequence(),
+            snapshot.checkpoint_sequence()
+        );
     }
 }

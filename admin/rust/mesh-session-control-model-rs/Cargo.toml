@@ -1,0 +1,76 @@
+[workspace]
+# Own workspace root — deliberately breaks out of admin/rust's [workspace].
+# This crate is standalone: it is never added to admin/rust/Cargo.toml's
+# `members`, never touches admin/rust/Cargo.lock, and has its own Cargo.lock.
+members = ["."]
+resolver = "2"
+
+[package]
+name = "mesh-session-control-model-rs"
+version = "0.1.0"
+edition = "2024"
+# Round 6: bumped 1.85 -> 1.89 for std::fs::File::lock/try_lock (stable
+# cross-platform advisory file locking, stabilized in 1.89), used for a
+# REAL cross-process CAS lock in store.rs -- the standard library's own
+# flock/LockFileEx wrapper, no external locking crate needed.
+rust-version = "1.89"
+publish = false
+
+[features]
+# Round 6, item 4: gates the fault-injection test double
+# (`FaultInjectingStore`/`FaultInjectingCell`/`cell::open_fault_injecting`)
+# and the `ControlRecordCell::seed_for_test` escape hatch out of the
+# default build entirely. Before this, they were merely DOCUMENTED as
+# "test-only" -- a comment, not a control -- and were fully `pub` in a
+# normal `cargo build`, reachable by any consumer of this crate as a
+# library, including a way to write ANY record content directly, bypassing
+# `transition::apply` and every invariant it enforces.
+test-support = []
+# Round 6, item 5: gates `RosterSyncPurpose` (and therefore any ability to
+# activate/revalidate a RosterSync record through the `PurposeMarker`
+# mechanism) out of the default build. `PurposeId::RosterSync` itself
+# stays part of the wire format (it is a real value other purposes' data
+# must coexist with on the wire), but this crate has no ratified
+# production authority model for it -- D6 owns that, and has not ratified
+# anything here yet. A doc comment saying "no production path" is not a
+# control; this is.
+roster-sync-unratified = []
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+ciborium = "0.2"
+sha2 = "0.10"
+blake3 = "1"
+thiserror = "2"
+rand = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "cas_race_helper"
+path = "src/bin/cas_race_helper.rs"
+# Test-only infrastructure (spawned as a genuinely separate OS process by
+# the multi-process CAS tests) -- calls the test-support-gated
+# `load_canonical_for_test`, so it must not even attempt to build under a
+# plain `cargo build`.
+required-features = ["test-support"]
+
+[[test]]
+name = "model_invariants"
+path = "tests/model_invariants.rs"
+# Round 6, item 4/5: deliberately NOT auto-enabled via a dev-dependency on
+# self. A `compile_fail` doctest (see `src/lib.rs`) proves the gated
+# surface is absent under a PLAIN `cargo test`/`cargo build` -- auto-
+# enabling the features for every `cargo test` invocation would make that
+# doctest unexpectedly compile and fail its own "must not compile" check.
+# The two properties are proven by two separate, explicit invocations:
+#   cargo test                                            -- closed surface
+#   cargo test --features test-support,roster-sync-unratified -- full suite
+required-features = ["test-support", "roster-sync-unratified"]
+
+[[test]]
+name = "cas_multiprocess"
+path = "tests/cas_multiprocess.rs"
+required-features = ["test-support", "roster-sync-unratified"]

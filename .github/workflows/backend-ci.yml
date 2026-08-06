@@ -29,7 +29,14 @@ jobs:
   build-and-test-linux:
     name: Build & Test (Rust / Linux)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 50, not 30: three phase3_atomic_rollback tests each wait out the full
+    # production RECOVERY_TIMEOUT (~300s) because a launched finalize POST
+    # retries against an unreachable M2 before owner_approve_handler returns —
+    # documented in 6476673a and tracked as its own follow-up. At 30 the job was
+    # cancelled mid-suite, which reads as a failure but measured nothing. Raise
+    # the ceiling rather than shorten the budget: the wait is what those tests
+    # prove. Drop this back when the retry policy becomes injectable.
+    timeout-minutes: 50
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -125,6 +132,21 @@ jobs:
         run: cd admin/rust && cargo build --workspace 2>&1
       - name: Run tests (serialised)
         run: cd admin/rust && cargo test --workspace -- --test-threads=1 2>&1
+      - name: Feature-gated compile-fail proofs (mesh-session-runtime)
+        # `cargo test --workspace` runs with DEFAULT features, so any trybuild
+        # case inside a `#[cfg(feature = "...")]` test fn is never executed --
+        # it is merely NAMED in the source. Two of them guard
+        # `SealedBinding::from_membership_key` against a raw `ProofI` and a bare
+        # `m_id`, which is the "never a raw ProofI" rule, and neither was being
+        # run anywhere.
+        #
+        # `cargo check --features` (the feature-surface step above) compiles the
+        # crate but does NOT execute trybuild, so it cannot substitute for this.
+        #
+        # Measured before adding: break `membership_key_from_raw_proof_i.rs` so
+        # it compiles, and this step exits 101 while the default `cargo test`
+        # above still exits 0. The step is the only thing that sees it.
+        run: cd admin/rust && cargo test -p household-rs --features mesh-session-runtime --test compile_fail_peer_expectation -- --test-threads=1 2>&1
       - name: APNS dispatcher opacity lint (Constitution III source-level gate)
         # Third leg of the three-layer "no household metadata reaches the
         # push provider" enforcement stack (compile-time API shape +
@@ -135,7 +157,9 @@ jobs:
   build-and-test-macos:
     name: Build & Test (Rust / macOS)
     runs-on: macos-15
-    timeout-minutes: 30
+    # Same reason as the Linux job above: the ~300s×3 RECOVERY_TIMEOUT wait in
+    # phase3_atomic_rollback is what those tests prove, not overhead to trim.
+    timeout-minutes: 50
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -199,6 +223,21 @@ jobs:
         run: cd admin/rust && cargo build --workspace 2>&1
       - name: Run tests (serialised)
         run: cd admin/rust && cargo test --workspace -- --test-threads=1 2>&1
+      - name: Feature-gated compile-fail proofs (mesh-session-runtime)
+        # `cargo test --workspace` runs with DEFAULT features, so any trybuild
+        # case inside a `#[cfg(feature = "...")]` test fn is never executed --
+        # it is merely NAMED in the source. Two of them guard
+        # `SealedBinding::from_membership_key` against a raw `ProofI` and a bare
+        # `m_id`, which is the "never a raw ProofI" rule, and neither was being
+        # run anywhere.
+        #
+        # `cargo check --features` (the feature-surface step above) compiles the
+        # crate but does NOT execute trybuild, so it cannot substitute for this.
+        #
+        # Measured before adding: break `membership_key_from_raw_proof_i.rs` so
+        # it compiles, and this step exits 101 while the default `cargo test`
+        # above still exits 0. The step is the only thing that sees it.
+        run: cd admin/rust && cargo test -p household-rs --features mesh-session-runtime --test compile_fail_peer_expectation -- --test-threads=1 2>&1
       - name: APNS dispatcher opacity lint (Constitution III source-level gate)
         # Third leg of the three-layer "no household metadata reaches the
         # push provider" enforcement stack (compile-time API shape +
@@ -302,6 +341,40 @@ jobs:
       - name: cargo test
         working-directory: admin/rust
         run: cargo test -p claw-share-bridge-rs
+
+      - name: Lane C graph gate (Product A / D4 boundary, blocking)
+        # The gate existed from 6bd1f57c with a baseline, an allowlist, and two
+        # non-vacuity probes -- and no job invoked it, in any spelling. It has
+        # failed since 6d1ce46c and nobody saw it for 63 commits, including the
+        # approval that declared "gates green". This workflow already says, of
+        # another job, "A job that cannot fail the build is not a gate"; this
+        # step is that sentence applied to the instrument that enforces the
+        # Product A / nvpn and feature-off boundaries.
+        #
+        # The `skip=0` assertion below is DEFENCE IN DEPTH, not the primary fix.
+        # It was written against a script that ended with `[ "$fail" -eq 0 ] ||
+        # exit 1`, so `pass=0 fail=0 skip=7` exited 0 -- the script's own header
+        # refused to count SKIP as PASS while its exit code did. That defect is
+        # fixed in this same commit at both exit sites (structural and full), and
+        # `fail=0 skip=7` now exits 1 on its own. The assertion is kept anyway:
+        # it fails the build on the summary CI can actually see, so a future
+        # regression in the script's exit path cannot silently restore the hole.
+        #
+        # Measured on this tree (worktree at b750f2c6 + this movement):
+        #   before the movement                 -> pass=4 fail=3 skip=0, exit 1
+        #   after                               -> pass=7 fail=0 skip=0, exit 0
+        #   synthetic normal edge to core-rs    -> FAIL (the predicate's own RED)
+        working-directory: admin/rust
+        run: |
+          set -o pipefail
+          bash scripts/graph-gate/run_gate.sh structural 2>&1 | tee /tmp/graph-gate.log
+          summary="$(grep -E '^pass=[0-9]+ fail=[0-9]+ skip=[0-9]+$' /tmp/graph-gate.log | tail -1)"
+          echo "summary: ${summary}"
+          case "${summary}" in
+            *" skip=0") ;;
+            "") echo "::error::graph gate printed no summary line -- it did not run to completion"; exit 1 ;;
+            *) echo "::error::graph gate reported SKIPs (${summary}); a skipped configuration is not a pass"; exit 1 ;;
+          esac
 
   no-bash-policy:
     name: No-Bash Policy Check

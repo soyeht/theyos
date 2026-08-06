@@ -8,13 +8,14 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::body::{Body, to_bytes};
+use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::Response;
 use axum::{Router, middleware, routing};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
+use household_rs::household_lifecycle::HouseholdLifecycleLock;
 use household_rs::keys::{IdentityKey, P256Keypair, P256PublicKey, verify_signature};
 use household_rs::machine_cert::Platform;
 use household_rs::owner_events::{
@@ -33,13 +34,15 @@ use serde::Deserialize;
 use serde_bytes::ByteBuf;
 use server_rs::handlers_owner_events::{self, OwnerEventsRouterState};
 use server_rs::handlers_pair_machine::{
-    PairMachineRouterState, PreHouseholdRouterState, founder_join_request_handler,
-    pre_household_router,
+    PairMachineRouterState, PreHouseholdRouterState, anchor_handoff_handler,
+    founder_join_request_handler, local_anchor_handler, local_finalize_handler,
+    local_seed_handler,
 };
 use server_rs::household_state::HouseholdState;
 use server_rs::tailnet_address::TailnetResolver;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
+use tokio::sync::RwLock;
 use tower::ServiceExt;
 
 pub const JOIN_REQUEST_PATH: &str = "/api/v1/household/join-request";
@@ -93,11 +96,15 @@ pub struct FounderHarness {
     /// stage `JoinRequest`s against the same in-process founder window
     /// the HTTP router writes into.
     pub pair_state: PairMachineRouterState,
+    /// Stored so call sites elsewhere can `lock_shared()` to call
+    /// `event_log.read_since`, same pattern as `server-rs`'s own
+    /// `founder.lifecycle.lock_shared()`.
+    pub lifecycle: HouseholdLifecycleLock,
 }
 
 pub struct CandidateHarness {
     pub dir: TempDir,
-    pub window: Arc<PairMachineWindow>,
+    pub window: SharedCandidateWindow,
     pub prepared: household_rs::pair_machine::PreparedCandidate,
     pub router: Router,
     server: Option<tokio::task::JoinHandle<()>>,
@@ -109,7 +116,9 @@ impl CandidateHarness {
     /// implementing the entire `candidate_harness()` body. The orphan
     /// rule prevents external test files from adding inherent impls,
     /// hence this `__new_for_test` escape hatch lives in the support
-    /// module.
+    /// module. Its router wires `local_finalize_handler` directly (no
+    /// restart-simulation), so `window` never gets swapped out from under
+    /// it -- a plain, non-restart-aware shared cell is exactly right.
     #[doc(hidden)]
     #[must_use]
     pub fn __new_for_test(
@@ -121,7 +130,7 @@ impl CandidateHarness {
     ) -> Self {
         Self {
             dir,
-            window,
+            window: SharedCandidateWindow::new(window),
             prepared,
             router,
             server: Some(server),
@@ -212,9 +221,18 @@ pub fn founder_harness_with_tailnet_resolver(
     let window =
         Arc::new(PairMachineWindow::with_persistence(dir.path().to_path_buf()).expect("m1 window"));
     let broadcaster = OwnerEventsBroadcaster::new();
-    let event_log =
-        OwnerEventLog::open_with_broadcaster(dir.path().to_path_buf(), broadcaster.clone())
-            .expect("owner event log");
+    let lifecycle = HouseholdLifecycleLock::open_verified(dir.path()).expect("open lifecycle lock");
+    let lifecycle_guard = lifecycle
+        .lock_exclusive()
+        .expect("lock lifecycle exclusive");
+    let event_log = OwnerEventLog::open_with_broadcaster_under_lifecycle(
+        &lifecycle_guard,
+        dir.path().to_path_buf(),
+        &identity.record.hh_id.to_string(),
+        broadcaster.clone(),
+    )
+    .expect("owner event log");
+    drop(lifecycle_guard);
 
     let pair_state = PairMachineRouterState {
         window: Arc::clone(&window),
@@ -264,6 +282,7 @@ pub fn founder_harness_with_tailnet_resolver(
         event_log,
         router,
         pair_state,
+        lifecycle,
     }
 }
 
@@ -275,6 +294,7 @@ pub fn rebuild_founder_router_from_disk(
             .expect("reload founder identity")
             .expect("founder identity exists"),
     );
+    let expected_hh_id = identity.record.hh_id.to_string();
     let household =
         HouseholdState::loaded_with_owner_auth(identity, Some(Arc::clone(&founder.owner.auth)));
     let window = Arc::new(
@@ -282,9 +302,19 @@ pub fn rebuild_founder_router_from_disk(
             .expect("reload pair-machine window"),
     );
     let broadcaster = OwnerEventsBroadcaster::new();
-    let event_log =
-        OwnerEventLog::open_with_broadcaster(founder.dir.path().to_path_buf(), broadcaster.clone())
-            .expect("reload owner event log");
+    let lifecycle =
+        HouseholdLifecycleLock::open_verified(founder.dir.path()).expect("open lifecycle lock");
+    let lifecycle_guard = lifecycle
+        .lock_exclusive()
+        .expect("lock lifecycle exclusive");
+    let event_log = OwnerEventLog::open_with_broadcaster_under_lifecycle(
+        &lifecycle_guard,
+        founder.dir.path().to_path_buf(),
+        &expected_hh_id,
+        broadcaster.clone(),
+    )
+    .expect("reload owner event log");
+    drop(lifecycle_guard);
     let pair_state = PairMachineRouterState {
         window: Arc::clone(&window),
         household: household.clone(),
@@ -323,11 +353,23 @@ pub fn rebuild_founder_router_from_disk(
 }
 
 pub async fn candidate_harness() -> CandidateHarness {
-    candidate_harness_with_optional_tailnet_hint(JoinTransport::Tailscale, None).await
+    candidate_harness_with_optional_tailnet_hint(JoinTransport::Tailscale, None, DEFAULT_PREPARED_TTL)
+        .await
 }
 
 pub async fn candidate_harness_with_tailnet_hint(ip: Ipv4Addr) -> CandidateHarness {
-    candidate_harness_with_optional_tailnet_hint(JoinTransport::Lan, Some(ip)).await
+    candidate_harness_with_optional_tailnet_hint(JoinTransport::Lan, Some(ip), DEFAULT_PREPARED_TTL)
+        .await
+}
+
+/// Like `candidate_harness()`, but with a custom `PairMachineWindow` TTL so a
+/// timeout test can drive an expiry without waiting out the default. Carries
+/// the same restart-simulating finalize route as every other candidate
+/// harness here -- there is exactly one candidate-router construction path
+/// in this module, so a fix to it (like the runtime_signal gap) reaches
+/// every caller instead of needing to be re-applied per test file.
+pub async fn candidate_harness_with_ttl(ttl: Duration) -> CandidateHarness {
+    candidate_harness_with_optional_tailnet_hint(JoinTransport::Tailscale, None, ttl).await
 }
 
 #[derive(Clone)]
@@ -348,9 +390,88 @@ async fn attach_candidate_tailnet_hint(
     response
 }
 
+/// The candidate's window as observed by both the router and this harness's
+/// own struct field, kept identical across a simulated restart. Real
+/// production restarts (`install_cli.rs::cold_reexec_current_process`)
+/// re-exec the whole process, so every reader -- the router included --
+/// naturally sees one fresh `PairMachineWindow` reloaded from disk. A test
+/// harness has no process boundary to force that on every reader for free,
+/// so this makes the "current window" a single shared cell instead: one
+/// `Arc<PairMachineWindow>` that gets replaced in place on restart, observed
+/// identically by `CandidateHarness.window` and the finalize route.
+#[derive(Clone)]
+pub struct SharedCandidateWindow(Arc<RwLock<Arc<PairMachineWindow>>>);
+
+impl SharedCandidateWindow {
+    fn new(window: Arc<PairMachineWindow>) -> Self {
+        Self(Arc::new(RwLock::new(window)))
+    }
+
+    async fn current(&self) -> Arc<PairMachineWindow> {
+        Arc::clone(&*self.0.read().await)
+    }
+
+    pub async fn snapshot(&self) -> household_rs::pair_machine::PairMachineWindowSnapshot {
+        self.current().await.snapshot().await
+    }
+
+    /// Reopen the durable namespace under a fresh lifecycle-exclusive guard
+    /// and swap it in -- the same "in-memory state is always re-read from
+    /// disk on boot" a real restart produces (`bootstrap_state.rs`), without
+    /// actually forking a process.
+    async fn reload_after_restart_required(&self, state_dir: &std::path::Path) {
+        let lifecycle = HouseholdLifecycleLock::open_verified(state_dir)
+            .expect("open lifecycle lock for restart simulation");
+        let guard = lifecycle
+            .lock_exclusive()
+            .expect("lock lifecycle exclusive for restart simulation");
+        let cold_window = Arc::new(
+            PairMachineWindow::with_persistence_under_lifecycle(state_dir.to_path_buf(), &guard)
+                .expect("reload pair-machine window for restart simulation"),
+        );
+        drop(guard);
+        *self.0.write().await = cold_window;
+    }
+}
+
+#[derive(Clone)]
+struct RestartingFinalizeState {
+    base: PreHouseholdRouterState,
+    shared_window: SharedCandidateWindow,
+}
+
+/// Simulates the one thing this harness cannot otherwise produce: a
+/// candidate daemon that actually restarted. A 503 from
+/// `local_finalize_handler` means the real daemon would come back up and
+/// reload durable state; here that means dropping the in-memory window and
+/// reopening it from disk under a fresh lifecycle-exclusive guard before the
+/// caller's next retry lands -- through `SharedCandidateWindow`, so
+/// `CandidateHarness.window` observes the exact same swap instead of a
+/// second, diverging copy.
+async fn restarting_finalize_handler(
+    State(state): State<RestartingFinalizeState>,
+    body: Bytes,
+) -> Response {
+    let request_state = PreHouseholdRouterState {
+        window: state.shared_window.current().await,
+        ..state.base.clone()
+    };
+    let response = local_finalize_handler(State(request_state), body).await;
+    if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+        state
+            .shared_window
+            .reload_after_restart_required(&state.base.state_dir)
+            .await;
+    }
+    response
+}
+
+const DEFAULT_PREPARED_TTL: Duration = Duration::from_secs(300);
+
 async fn candidate_harness_with_optional_tailnet_hint(
     transport: JoinTransport,
     tailnet_ip: Option<Ipv4Addr>,
+    ttl: Duration,
 ) -> CandidateHarness {
     let dir = tempfile::tempdir().expect("m2 tempdir");
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -368,18 +489,56 @@ async fn candidate_harness_with_optional_tailnet_hint(
             hostname: "studio-m2".into(),
             platform: Platform::LinuxNix,
             policy: KeyBackingPolicy::ForceSoftware,
-            ttl: Duration::from_secs(300),
+            ttl,
             now_unix: unix_now(),
         },
     )
     .await
     .expect("prepare candidate");
-    let router = pre_household_router(PreHouseholdRouterState {
+    let base_state = PreHouseholdRouterState {
         window: Arc::clone(&window),
         state_dir: dir.path().to_path_buf(),
         key_policy: KeyBackingPolicy::ForceSoftware,
         bootstrap: None,
-    });
+        runtime_signal: None,
+    };
+    // Real production candidates restart after a Ready-rotation and pick up
+    // the durable state fresh on the next request (`install_cli.rs`'s
+    // runtime_signal receiver calls cold_reexec_current_process, a genuine
+    // exec(2)). Nothing in this harness ever restarts a process, so plugging
+    // `local_finalize_handler` in directly leaves every post-restart-required
+    // retry hitting the exact same pre-restart in-memory window forever --
+    // the founder's delivery retries at FINALIZE_RESTART_RETRY_AFTER_SECS=1
+    // and burns the full RECOVERY_TIMEOUT without ever converging. Wrap the
+    // finalize route so a 503 response reloads a fresh PairMachineWindow from
+    // disk, the same way server-rs's own restarting_finalize_handler
+    // (tests/owner_events.rs) simulates it for its candidate harness -- same
+    // pattern, not the same code, since that helper lives in an
+    // integration-test target and isn't importable here.
+    let shared_window = SharedCandidateWindow::new(Arc::clone(&window));
+    let finalize_state = RestartingFinalizeState {
+        base: base_state.clone(),
+        shared_window: shared_window.clone(),
+    };
+    let router = Router::new()
+        .route(
+            "/pair-machine/anchor-handoff",
+            routing::get(anchor_handoff_handler),
+        )
+        .route("/pair-machine/local/seed", routing::get(local_seed_handler))
+        .route(
+            "/pair-machine/local/anchor",
+            routing::post(local_anchor_handler),
+        )
+        .with_state(base_state)
+        .merge(
+            Router::new()
+                .route(
+                    "/pair-machine/local/finalize",
+                    routing::post(restarting_finalize_handler),
+                )
+                .with_state(finalize_state),
+        );
     let router = if let Some(ip) = tailnet_ip {
         let value = HeaderValue::from_str(&format!("{ip}:{}", addr.port()))
             .expect("documentation-safe candidate Tailnet hint");
@@ -397,7 +556,7 @@ async fn candidate_harness_with_optional_tailnet_hint(
 
     CandidateHarness {
         dir,
-        window,
+        window: shared_window,
         prepared,
         router,
         server: Some(server),

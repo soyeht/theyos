@@ -359,16 +359,85 @@ fn r1a7_enumerates_linked_targets_and_proves_zero_production_callers() {
     // ships its tests as inline `mod tests` rather than files under `tests/`.
     // device-key-rs DOES ship files under `tests/` (device_static,
     // s1_design_guards), so members moves by one and targets moves by two.
-    assert_eq!(members.len(), 30, "workspace member inventory changed");
+    //
+    // +1 `mesh-session-runtime-rs` (D6 runtime facade). Derived, not bumped: it
+    // joins as a REAL member rather than staying standalone, because a crate
+    // outside the workspace is not built by `--workspace` and therefore has no
+    // CI at all. At the commit where it joined, it declared no
+    // `[[bin]]`/`[[test]]`/`[[example]]` and shipped no `src/main.rs`,
+    // `src/bin/`, `tests/` or `examples/`, so by `enumerate_workspace_targets`'s
+    // own rule it contributed ZERO targets at that point -- members moved by
+    // one and targets did not move for it THEN. That stopped being true at
+    // `bc8f5e55`, which gave it its first `tests/` file — see the target
+    // count's own comment below for the +1 that landed with it. Left here,
+    // unedited except for this note, because the member-count assertion two
+    // lines down is still exactly what it says: members moved by one when
+    // this crate joined, and that fact does not change just because targets
+    // later did.
+    assert_eq!(members.len(), 31, "workspace member inventory changed");
     assert!(
         members
             .iter()
             .any(|member| member == "m1-household-mesh-smoke-rs")
     );
     let targets = enumerate_workspace_targets(&rust_root, &members);
-    // Main added the two S1 integration targets (199 → 201); this merge adds
-    // the single deliberate S0 harness example (201 → 202).
-    assert_eq!(targets.len(), 202, "Cargo target inventory changed");
+    // 202 + 4, and BOTH halves of that were wrong here before. The composition
+    // adds six files under `tests/`, of which exactly four are enumerated
+    // targets:
+    //
+    //   household-rs/tests/compile_fail_pending_admission.rs     (integration)
+    //   household-rs/tests/compile_fail_fixture_coverage.rs      (orphan gate)
+    //   household-rs/tests/workspace_msrv_invariant.rs           (MSRV floor)
+    //   server-rs/tests/khai_b3_exposure_decision_guard.rs       (B-3 exposure)
+    //
+    // Two corrections, found by running the enumerator on both trees and
+    // diffing the LISTS rather than the counts:
+    //
+    //   - `compile_fail_peer_expectation.rs` was listed here and is NOT new:
+    //     it exists in `8ff3788a`, in the freeze, and in the author's leg. The
+    //     list said five; the enumerator's own diff says four, and names them.
+    //   - the base was not 201. Run against `31cc5ae8` the enumerator reports
+    //     202, so that pin was already one low against its own tree -- the
+    //     ratchet there fails with `left: 202, right: 201`. Re-measuring here
+    //     silently corrected it, which is exactly the failure mode of taking
+    //     the expected value from the instrument being pinned: it absorbs the
+    //     defect instead of reporting it. 202 + 4 = 206.
+    //
+    // The other two, `mesh-session-control-model-rs/tests/{cas_multiprocess,
+    // model_invariants}.rs`, do NOT count: that crate is in the workspace's
+    // `exclude` list, so it is not a member and `enumerate_workspace_targets`
+    // never walks it. `mesh-session-runtime-rs` joined as a member at this
+    // composition declaring no explicit targets and shipping no `tests/`, so
+    // it added zero here AT THAT POINT — see the +1 immediately below for
+    // where that stopped being true.
+    //
+    // Every arithmetic prediction of this number made during composition was
+    // wrong (206, then 207, by two different routes). The value below is what
+    // the enumerator reported; the list above is why.
+    //
+    // 206 + 1. Derived, not bumped: @daisy's `bc8f5e55` adds
+    // `mesh-session-runtime-rs/tests/compile_fail_channel_mapping.rs`, a real
+    // `[[test]]`-kind integration target (the trybuild runner for the
+    // channel-mapping exhaustiveness proof) — `mesh-session-runtime-rs`'s own
+    // entry above only claimed it "ships no `tests/`" as of the commit that
+    // added it as a member; that was true then and stopped being true here.
+    // Found by @khai bisecting a red the two verifications that ran before
+    // composition both missed for a legitimate reason each: `bc8f5e55`'s own
+    // check covered `household-rs`'s LIB tests (1160) and this crate's own
+    // suite, neither of which is this integration-test inventory; the
+    // composition's graph-gate run covers the dependency graph, not target
+    // counts. Re-measured directly against this tree, not inferred from the
+    // diff.
+    //
+    // MERGE with main (Share). Both sides bumped correctly for their OWN
+    // lineage and NEITHER value survives the merge: from the common base
+    // `aa3f4caa` (201), main went 201 → 202 (+1: the S0 harness example
+    // `server-rs/examples/relay_stream_s0_load.rs`) while this branch went
+    // 201 → … → 207 (+6). The merged tree carries both sets, so 202 and 207
+    // are each right about half of it. The value below is what the enumerator
+    // reported on the MERGED tree -- not 202 + 6, which is the arithmetic this
+    // file already records as having been wrong twice.
+    assert_eq!(targets.len(), 208, "Cargo target inventory changed");
     assert_eq!(
         targets.iter().filter(|target| target.kind == "bin").count(),
         50
@@ -378,7 +447,17 @@ fn r1a7_enumerates_linked_targets_and_proves_zero_production_callers() {
             .iter()
             .filter(|target| target.kind == "test")
             .count(),
-        151 // 146 + 2 R0a Fatia N + 1 B0a roster-currency + 2 device-key-rs S1 integration targets
+        // 152 + 4. The old arithmetic here (146 + 2 + 1 + 2 + 5) summed to the
+        // right total by two errors that cancel: the base was 152 in the tree,
+        // not the 151 those terms add to, and the composition adds 4 test
+        // targets, not 5. Decomposing by kind is what exposed both -- the
+        // total assertion fires first and hides the sub-counters, and one
+        // wrong count is visible where two that cancel are not.
+        //
+        // 156 + 1: `compile_fail_channel_mapping.rs` (see the total assert's
+        // own comment above) is a `[[test]]`-kind target, not `bin`/`example`
+        // — those two counts below are unaffected.
+        157
     );
     assert_eq!(
         targets
@@ -1008,4 +1087,395 @@ fn public_constructors_reject_invalid_shapes_without_state_or_io() {
         ),
         Err(CodecError::FrameTooLarge)
     );
+}
+
+/// True if this manifest inherits the workspace lint table, in EITHER spelling.
+///
+/// Both forms are accepted deliberately. Cargo treats
+///
+/// ```toml
+/// [lints]
+/// workspace = true
+/// ```
+///
+/// and the dotted `lints.workspace = true` as the same thing, and every member
+/// here happens to use the table form. A checker that recognised only the
+/// dotted spelling would report zero of thirty members opting in and conclude
+/// the workspace lint table was inert — which is exactly the wrong conclusion,
+/// reached exactly that way, before this guard existed. Matching one spelling
+/// is how a search fails toward "nobody is protected".
+fn declares_workspace_lint_inheritance(manifest: &str) -> bool {
+    let code = |line: &str| {
+        line.split('#')
+            .next()
+            .unwrap_or("")
+            .replace(char::is_whitespace, "")
+    };
+    if manifest.lines().any(|l| code(l) == "lints.workspace=true") {
+        return true;
+    }
+    let mut in_lints = false;
+    for line in manifest.lines() {
+        let stripped = code(&line);
+        if stripped.starts_with('[') {
+            in_lints = stripped == "[lints]";
+            continue;
+        }
+        if in_lints && stripped == "workspace=true" {
+            return true;
+        }
+    }
+    false
+}
+
+/// Every workspace member must inherit `[workspace.lints]`.
+///
+/// The line is load-bearing and its absence is SILENT. Drop it from a member and
+/// the real gate — `cargo clippy --workspace -- -D warnings` — stops applying
+/// `clippy::all` and `pedantic` to that crate entirely, while still exiting 0.
+/// The crate simply stops being linted, and no existing check notices: the only
+/// other mention of `[lints]` in test code uses the string as a delimiter for
+/// slicing a `[dependencies]` section, not as a property to enforce.
+///
+/// So the thirty members that do inherit are correct by convention, not by
+/// mechanism — a thirty-first joins unlinted and nothing fails. That is worse
+/// than the target ratchet, which at least shouts when its number moves.
+#[test]
+fn every_workspace_member_inherits_the_workspace_lint_table() {
+    let rust_root = repository_root().join("admin/rust");
+    let members = workspace_members(&rust_root);
+
+    // Positive control: a broken enumerator returning an empty list would make
+    // the emptiness check below pass while examining nothing.
+    assert!(
+        members.len() >= 25,
+        "only {} workspace members enumerated; the member parse is broken, so \
+         this guard would pass without checking anything",
+        members.len()
+    );
+
+    let missing: Vec<&String> = members
+        .iter()
+        .filter(|member| {
+            let manifest = fs::read_to_string(rust_root.join(member).join("Cargo.toml"))
+                .unwrap_or_else(|error| panic!("read {member}/Cargo.toml: {error}"));
+            !declares_workspace_lint_inheritance(&manifest)
+        })
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "workspace members that do NOT inherit `[workspace.lints]`: {missing:?}. \
+         Without it the member is silently exempt from `clippy::all` and \
+         `pedantic` under the real gate, which still exits 0 — the crate stops \
+         being linted and nothing else notices. Add `[lints]` with \
+         `workspace = true` to each."
+    );
+}
+
+/// Unit coverage for [`declares_workspace_lint_inheritance`] itself.
+///
+/// The workspace-wide test above can only exercise the shapes that happen to be
+/// in the tree — today that is thirty identical table-form declarations, so it
+/// proves the recogniser works for exactly one case. @khai's independent
+/// verification of the guard supplied two more shapes by mutating a real
+/// manifest and running the gate. That kind of check evaporates when the
+/// transcript scrolls away, so it is restated here as a standing assertion:
+/// each accepted and each rejected shape gets its own case, because a
+/// recogniser claiming to handle several forms and only ever exercised on one
+/// looks identical and has a fraction of the coverage.
+#[test]
+fn lint_inheritance_recogniser_accepts_and_rejects_the_right_shapes() {
+    // Accepted: the two spellings cargo treats as equivalent.
+    assert!(declares_workspace_lint_inheritance(
+        "[package]\nname = \"x\"\n\n[lints]\nworkspace = true\n"
+    ));
+    assert!(declares_workspace_lint_inheritance(
+        "lints.workspace = true\n[package]\nname = \"x\"\n"
+    ));
+    assert!(
+        declares_workspace_lint_inheritance("[lints]\nworkspace   =   true\n"),
+        "whitespace around the value must not change the meaning"
+    );
+
+    // Rejected: present but explicitly NOT inheriting. This is the shape a
+    // recogniser that merely looked for the `[lints]` section would wave
+    // through, and it is the one that matters -- the member opts OUT on
+    // purpose and would be silently unlinted.
+    assert!(!declares_workspace_lint_inheritance(
+        "[package]\nname = \"x\"\n\n[lints]\nworkspace = false\n"
+    ));
+
+    // Rejected: a member declaring its OWN lint table instead of inheriting.
+    // `[lints.clippy]` is a different section from `[lints]`, and the workspace
+    // table does not reach it.
+    assert!(!declares_workspace_lint_inheritance(
+        "[package]\nname = \"x\"\n\n[lints.clippy]\nall = \"warn\"\n"
+    ));
+
+    // Rejected: absent entirely, and absent-after-another-section, which is
+    // where a section-scanner that forgets to reset its state goes wrong.
+    assert!(!declares_workspace_lint_inheritance(
+        "[package]\nname = \"x\"\n"
+    ));
+    assert!(!declares_workspace_lint_inheritance(
+        "[lints]\nworkspace = true\n[dependencies]\nserde = \"1\"\n[other]\nworkspace = true\n"
+            .replace("[lints]\nworkspace = true\n", "")
+            .as_str()
+    ));
+
+    // Rejected: commented out. A guard that counts commented declarations
+    // reports protection that is not there.
+    assert!(!declares_workspace_lint_inheritance(
+        "[lints]\n# workspace = true\n"
+    ));
+}
+
+/// A silencing `allow` must keep its receipt.
+///
+/// `[workspace.lints.clippy]` carries two entries that suppress real findings —
+/// `collapsible_if` and `manual_is_multiple_of` — allowed rather than fixed
+/// because the fixes are ~180 mechanical edits across 15 crates that would
+/// collide with branches held mid-composition. That trade is defensible only
+/// while the reasoning travels with it. Delete the explanation and what remains
+/// is indistinguishable from policy: two lints nobody enforces, for reasons
+/// nobody can reconstruct.
+///
+/// Scope, stated honestly because it is narrower than it looks: this guards the
+/// RECEIPT, not the repayment. It cannot make the post-composition sweep happen,
+/// and it does not stop the suppressed count from growing — an `allow` silences
+/// the gate, so new violations land free. The stronger instrument is a count
+/// ratchet (tolerate today's N, fail at N+1), which needs a second
+/// whole-workspace clippy run to measure; that cost is exactly what gets a gate
+/// switched off, so it is a composition-time decision rather than something
+/// smuggled in here.
+#[test]
+fn msrv_lint_debt_keeps_its_justification() {
+    let manifest = fs::read_to_string(repository_root().join("admin/rust/Cargo.toml"))
+        .expect("read workspace Cargo.toml");
+
+    for lint in ["collapsible_if", "manual_is_multiple_of"] {
+        let Some(line) = manifest
+            .lines()
+            .find(|line| line.trim_start().starts_with(lint))
+        else {
+            // Absent is fine and is the intended end state: the sweep happened
+            // and the entry was removed.
+            continue;
+        };
+        assert!(
+            line.contains("allow"),
+            "`{lint}` is declared at workspace level but not as an allow; if its \
+             level changed, this guard's premise changed with it"
+        );
+        assert!(
+            line.contains('#'),
+            "the `{lint}` allow lost its inline measurement. The number of sites \
+             it suppresses is what makes the trade auditable — without it the \
+             entry is an unexplained silence."
+        );
+    }
+
+    let suppresses_anything = ["collapsible_if", "manual_is_multiple_of"]
+        .iter()
+        .any(|lint| {
+            manifest
+                .lines()
+                .any(|line| line.trim_start().starts_with(lint))
+        });
+    if !suppresses_anything {
+        return; // debt repaid; nothing left to justify
+    }
+
+    for marker in [
+        "MSRV-woken lint debt",
+        "FOLLOW-UP",
+        "DELETE these two lines",
+    ] {
+        assert!(
+            manifest.contains(marker),
+            "the MSRV lint-debt receipt lost its `{marker}` section. These allows \
+             were accepted as debt with a written reason and an explicit \
+             repayment instruction; strip either and the next reader inherits \
+             two silenced lints with no way to tell whether that was a decision \
+             or an accident."
+        );
+    }
+}
+
+// ---------------------------------------------------------------- doc-scope
+//
+// A crate doc that lists "this round's scope, exactly:" and then omits a module
+// is not a style nit: a reader concludes the module does not exist. Measured on
+// `90ff54db`, `mesh-session-runtime-rs` had shipped with `intent_nonce_ledger_bridge`
+// absent from that list while `lib.rs` declared AND exported it, and the same
+// list never named `signer_seam` (a `pub mod`).
+//
+// WHAT THIS GUARD CATCHES: a module declared in `lib.rs` and not named in that
+// crate's `//!` block.
+//
+// WHAT IT DOES NOT CATCH, and this limit is the reason it is written here and
+// not in a commit message: a doc sentence that is syntactically perfect and
+// semantically dead. The same delivery carried a stale "no concrete backend
+// exists in this workspace yet" duplicated verbatim inside `ledger_seam.rs`,
+// which no structural check can read as false. Do not treat a green here as
+// coverage of "the crate docs are accurate".
+//
+// SCOPE LIMIT: `workspace_members()` reads `members = [...]`, so the two
+// deliberately-excluded roots (`mesh-session-core-rs`,
+// `mesh-session-control-model-rs`) are unreachable by this guard even if they
+// adopt the marker. They are the nearest crates to the convention (1 missing
+// module each, measured), so this is a real gap, not a theoretical one.
+
+/// The opt-in, as ONE exact literal. Unlike Rust's three `mod` spellings --
+/// which the language gives us, so the enumerator must accept all of them --
+/// this string is chosen by us. Accepting variants of something we define would
+/// multiply controls without closing anything, and would let a near-miss read
+/// as compliance. Near-misses are therefore a hard failure, not a shrug.
+/// Split with `concat!` so this file does not contain the marker as a
+/// contiguous string. Today two independent barriers already stop the guard
+/// finding itself -- the scan domain is a path CONSTRUCTED as
+/// `<member>/src/lib.rs`, and `crate_doc_block` reads only `//!` lines, where
+/// none of these literals live. Both were measured, and an attempt to pin the
+/// first with an assertion was withdrawn: it re-derived the path instead of
+/// asking the scanner, so it stayed GREEN under the very mutation its name
+/// claimed to catch.
+///
+/// `concat!` needs neither barrier to hold. It resolves at compile time, the
+/// `&str` is identical, and it survives ANY future widening -- a new guard that
+/// walks whole files, a copied fixture, these literals moving into a doc
+/// comment. The sibling `r0a_implementation_scope_guard.rs` already uses it
+/// seven times; this file used it zero, which is why the hazard existed here
+/// and not there.
+const DOC_SCOPE_MARKER: &str = concat!(
+    "doc-",
+    "scope: every declared module is named in this crate doc."
+);
+
+/// Crates that have opted in, committed so that LEAVING the scope costs a
+/// visible diff exactly like joining it. The marker lives in a doc comment, so
+/// an ordinary doc rewrite would otherwise drop a crate silently and this guard
+/// would stay green while measuring less.
+const DOC_SCOPE_MEMBERS: &[&str] = &["mesh-session-runtime-rs"];
+
+fn crate_lib_rs(rust_root: &Path, member: &str) -> Option<String> {
+    fs::read_to_string(rust_root.join(member).join("src").join("lib.rs")).ok()
+}
+
+/// The `//!` block only. Doc comments on items (`///`) are not the crate doc.
+fn crate_doc_block(lib_rs: &str) -> String {
+    lib_rs
+        .lines()
+        .filter(|l| l.trim_start().starts_with("//!"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Every `mod x;` form Rust accepts: `mod`, `pub mod`, `pub(crate) mod`,
+/// `pub(super) mod`, ... Enumerating one spelling is how a guard silently
+/// measures a subset.
+fn declared_modules(lib_rs: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in lib_rs.lines() {
+        let code = line.split("//").next().unwrap_or("").trim();
+        let rest = match code.strip_prefix("pub") {
+            Some(after_pub) => after_pub.trim_start().trim_start_matches(|c| c != 'm'),
+            None => code,
+        };
+        if let Some(name) = rest
+            .strip_prefix("mod ")
+            .and_then(|n| n.strip_suffix(';'))
+            .map(str::trim)
+        {
+            if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                out.push(name.to_owned());
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn doc_scope_opted_in_crates_name_every_declared_module() {
+    let rust_root = repository_root().join("admin/rust");
+    for member in DOC_SCOPE_MEMBERS {
+        let lib_rs = crate_lib_rs(&rust_root, member)
+            .unwrap_or_else(|| panic!("{member} is in DOC_SCOPE_MEMBERS but has no src/lib.rs"));
+        let doc = crate_doc_block(&lib_rs);
+        let missing: Vec<_> = declared_modules(&lib_rs)
+            .into_iter()
+            .filter(|m| !doc.contains(m.as_str()))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{member} declares {missing:?} but its crate doc never names them. A \
+             scope list that omits a module tells the reader the module does not \
+             exist -- which is how a bridge got documented as absent while being \
+             exported three lines away."
+        );
+    }
+}
+
+#[test]
+fn doc_scope_membership_matches_the_marker_in_both_directions() {
+    let rust_root = repository_root().join("admin/rust");
+    for member in workspace_members(&rust_root) {
+        let Some(lib_rs) = crate_lib_rs(&rust_root, &member) else {
+            continue;
+        };
+        let has_marker = crate_doc_block(&lib_rs).contains(DOC_SCOPE_MARKER);
+        let in_snapshot = DOC_SCOPE_MEMBERS.contains(&member.as_str());
+        assert_eq!(
+            has_marker, in_snapshot,
+            "doc-scope membership disagrees for `{member}`: marker={has_marker}, \
+             snapshot={in_snapshot}. BOTH directions fail on purpose. Dropping the \
+             marker without editing DOC_SCOPE_MEMBERS would silently shrink what \
+             this guard measures; adding it without editing the snapshot would \
+             leave a crate believing it is checked when nothing checks it. A set \
+             that only fails when it shrinks tolerates growing unobserved."
+        );
+    }
+}
+
+#[test]
+fn doc_scope_marker_near_misses_are_rejected() {
+    let rust_root = repository_root().join("admin/rust");
+    // Deliberately NOT the marker: each differs from it, so a crate carrying one
+    // of these is opting in as far as its author is concerned and is invisible
+    // to the exact-match check above.
+    let near_misses = [
+        // `concat!` for the same reason as the marker above: these are the
+        // spellings the guard hunts for, so a contiguous copy here is exactly
+        // the needle a widened scan would find in its own fixture.
+        concat!(
+            "doc ",
+            "scope: every declared module is named in this crate doc."
+        ),
+        concat!(
+            "doc-",
+            "scope: every declared module is named in this crate doc"
+        ),
+        concat!(
+            "DOC-",
+            "SCOPE: every declared module is named in this crate doc."
+        ),
+    ];
+    for member in workspace_members(&rust_root) {
+        let Some(lib_rs) = crate_lib_rs(&rust_root, &member) else {
+            continue;
+        };
+        let doc = crate_doc_block(&lib_rs);
+        if doc.contains(DOC_SCOPE_MARKER) {
+            continue;
+        }
+        for near in near_misses {
+            assert!(
+                !doc.contains(near),
+                "`{member}` carries a near-miss of the doc-scope marker (`{near}`) \
+                 rather than the exact literal, so it reads as opted in to a human \
+                 and is invisible to the guard. The marker is one exact spelling \
+                 BECAUSE we define it: `{DOC_SCOPE_MARKER}`"
+            );
+        }
+    }
 }

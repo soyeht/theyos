@@ -20,9 +20,10 @@ use axum::{
 use core_rs::env::set_test_env;
 use household_rs::bootstrap_state::BootstrapState;
 use household_rs::keys::{IdentityKey, P256Keypair};
-use household_rs::machine_cert::SignOptions;
+use household_rs::machine_cert::{SignOptions, save_self_cert};
 use household_rs::pair_device::PairDeviceWindow;
 use household_rs::person_cert::SignOwnerOptions;
+use household_rs::storage::{atomic_write_cbor, household_record_path};
 use household_rs::{
     HouseholdAuthState, HouseholdRecord, LoadedIdentity, MachineCert, PersonCert, Platform,
     derive_household_id, derive_machine_id,
@@ -131,6 +132,16 @@ fn make_fixture(bs: BootstrapState) -> Fixture {
     let state_dir = tmpdir.clone();
     std::fs::create_dir_all(state_dir.join("household")).unwrap();
     auth_state.save(&state_dir).unwrap();
+    // `teardown_household_on_disk` decides household existence from disk
+    // (`household_lifecycle.rs::household_exists`), not from the in-memory
+    // identity below — sibling fixtures (phase1_identity_chain,
+    // phase3_generic_failures, phase3_support) already persist this.
+    atomic_write_cbor(&household_record_path(&state_dir), &record).unwrap();
+    // The disk-side recheck also loads the self machine cert
+    // (`verify_installed_household_for_teardown` -> `load_self_cert`), which
+    // needs both the cert file and the `self_m_id` marker `save_self_cert`
+    // writes together.
+    save_self_cert(&state_dir, &machine_cert).unwrap();
 
     let identity = Arc::new(LoadedIdentity {
         record,

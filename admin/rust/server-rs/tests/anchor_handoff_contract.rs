@@ -73,6 +73,7 @@ fn make_state(window: Arc<PairMachineWindow>) -> PreHouseholdRouterState {
         state_dir: tempfile::tempdir().unwrap().keep(),
         key_policy: household_rs::KeyBackingPolicy::ForceSoftware,
         bootstrap: None,
+        runtime_signal: None,
     }
 }
 

@@ -20,6 +20,7 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
 use household_rs::caveats::{Operation, permits};
+use household_rs::household_lifecycle::HouseholdLifecycleLock;
 use household_rs::keys::{IdentityKey, P256Keypair};
 use household_rs::machine_cert::Platform;
 use household_rs::owner_approval_v2::{OwnerApprovalContextV2, OwnerApprovalV2, OwnerOperation};
@@ -55,7 +56,7 @@ use household_rs::secure_upgrade::{
     SecureUpgradePlatform, SecureUpgradeProofEnvironment, SecureUpgradeTranscript,
 };
 use household_rs::storage::{
-    household_record_path, machine_cert_for, phase3_finalize_ack_marker_exists, staged_path_for,
+    household_record_path, machine_cert_for, read_phase3_recovery_manifest, staged_path_for,
 };
 use household_rs::{BootstrapOpts, HouseholdAuthState, KeyBackingPolicy};
 use keystore_rs::{FileKeystore, KeystoreBackend, KeystoreError};
@@ -68,7 +69,7 @@ use server_rs::handlers_owner_events::{
     self, OwnerApprovalEnforcementPolicy, OwnerEventsRouterState, OwnerOperationEnforcement,
     RecoveryCodeEnforcement, SecureUpgradeEnforcement, SecureUpgradeRuntimeConfig,
 };
-use server_rs::handlers_pair_machine::{PreHouseholdRouterState, pre_household_router};
+use server_rs::handlers_pair_machine::PreHouseholdRouterState;
 use server_rs::household_state::HouseholdState;
 use server_rs::macos_local_caller_auth::{
     MacosLocalAppProfile, MacosLocalCallerAuth, MacosLocalCallerAuthError,
@@ -78,7 +79,7 @@ use server_rs::macos_local_caller_auth::{
 use server_rs::macos_local_registration_listener::MacosLocalPeerConnectInfo;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, RwLock};
 use tower::ServiceExt;
 use webauthn_authenticator_rs::WebauthnAuthenticator;
 use webauthn_authenticator_rs::softpasskey::SoftPasskey;
@@ -690,8 +691,41 @@ fn router_from_owner_auth_with_router_state(
     let household =
         HouseholdState::loaded_with_owner_auth(Arc::clone(&identity), Some(Arc::new(owner_auth)));
     let broadcaster = OwnerEventsBroadcaster::new();
-    let event_log =
-        OwnerEventLog::open_with_broadcaster(td.path().to_path_buf(), broadcaster.clone()).unwrap();
+    // `household/` must exist before the log is opened. The B-2 hardening
+    // replaced a path-based `create_dir_all` with an fd-relative
+    // `openat(state_dir, "household", O_DIRECTORY)` + `mkdirat`, which OPENS the
+    // parent rather than creating it. The old call incidentally fabricated
+    // `household/` on demand, and this harness depended on that without anyone
+    // noticing -- fixtures that never call `bootstrap_or_load` used to work.
+    //
+    // Created here, in the single place every router fixture is built, rather
+    // than in each test: if every test has to remember, the next one that
+    // forgets fails the same way and the cause looks mysterious again.
+    //
+    // Production is unaffected and was verified so: the sole production caller
+    // opens the log only when a household is already loaded, and a loaded
+    // household implies `household/` exists because the record lives inside it.
+    std::fs::create_dir_all(td.path().join("household")).unwrap();
+    // And the record itself: opening the log verifies the household binding
+    // against `household/household_record.cbor`. Persisting the identity this
+    // fixture already claims to run with makes the on-disk state COHERENT with
+    // the router being built -- previously the fixture ran against a household
+    // record that existed only in memory.
+    household_rs::storage::atomic_write_cbor(
+        &household_rs::storage::household_record_path(td.path()),
+        &identity.record,
+    )
+    .unwrap();
+    let lifecycle = HouseholdLifecycleLock::open_verified(td.path()).unwrap();
+    let lifecycle_guard = lifecycle.lock_exclusive().unwrap();
+    let event_log = OwnerEventLog::open_with_broadcaster_under_lifecycle(
+        &lifecycle_guard,
+        td.path().to_path_buf(),
+        identity.record.hh_id.as_str(),
+        broadcaster.clone(),
+    )
+    .unwrap();
+    drop(lifecycle_guard);
     let window = Arc::new(PairMachineWindow::with_persistence(td.path().to_path_buf()).unwrap());
     let state = OwnerEventsRouterState::with_timeout(
         household,
@@ -1951,8 +1985,15 @@ async fn post_cbor_with_macos_local_peer(
     (status, headers, bytes)
 }
 
-fn append_join_event(log: &OwnerEventLog, identity: &household_rs::LoadedIdentity) -> OwnerEvent {
+fn append_join_event(
+    state_dir: &Path,
+    log: &OwnerEventLog,
+    identity: &household_rs::LoadedIdentity,
+) -> OwnerEvent {
+    let lifecycle = HouseholdLifecycleLock::open_verified(state_dir).unwrap();
+    let lifecycle_guard = lifecycle.lock_shared().unwrap();
     log.append(
+        &lifecycle_guard,
         &identity.cert.m_id.to_string(),
         identity.m_priv.as_ref(),
         OwnerEventType::JoinRequest,
@@ -1965,7 +2006,14 @@ fn append_join_event(log: &OwnerEventLog, identity: &household_rs::LoadedIdentit
     .unwrap()
 }
 
+fn read_owner_events_since(state_dir: &Path, log: &OwnerEventLog, since: u64) -> Vec<OwnerEvent> {
+    let lifecycle = HouseholdLifecycleLock::open_verified(state_dir).unwrap();
+    let lifecycle_guard = lifecycle.lock_shared().unwrap();
+    log.read_since(&lifecycle_guard, since).unwrap()
+}
+
 async fn stage_join_window(
+    state_dir: &Path,
     window: &PairMachineWindow,
     log: &OwnerEventLog,
     identity: &household_rs::LoadedIdentity,
@@ -1983,7 +2031,7 @@ async fn stage_join_window(
         )
         .await
         .unwrap();
-    let event = append_join_event(log, identity);
+    let event = append_join_event(state_dir, log, identity);
     window.enter_awaiting_owner(event.cursor).await.unwrap();
     event
 }
@@ -1995,9 +2043,33 @@ struct CandidateHarness {
     addr: String,
 }
 
+impl CandidateHarness {
+    async fn current_window_snapshot(
+        &self,
+    ) -> household_rs::pair_machine::PairMachineWindowSnapshot {
+        PairMachineWindow::with_persistence(self.td.path().to_path_buf())
+            .unwrap()
+            .snapshot()
+            .await
+    }
+
+    async fn assert_terminal_reexec_ready(&self) {
+        assert_eq!(
+            household_rs::bootstrap_state::load(self.td.path()).unwrap(),
+            household_rs::bootstrap_state::BootstrapState::Ready,
+        );
+        assert_eq!(
+            self.current_window_snapshot().await.state,
+            PairMachineState::Idle,
+            "the cold G1 process must not adopt the stale G0 pair window",
+        );
+    }
+}
+
 #[derive(Default)]
 struct BlockingFinalizeGate {
     calls: AtomicUsize,
+    released: AtomicBool,
     entered: Notify,
     release: Notify,
 }
@@ -2017,17 +2089,19 @@ impl BlockingFinalizeGate {
     }
 
     fn release_all(&self) {
+        self.released.store(true, Ordering::SeqCst);
         self.release.notify_waiters();
     }
 }
 
 #[derive(Clone)]
-struct BlockingFinalizeState {
-    inner: PreHouseholdRouterState,
-    gate: Arc<BlockingFinalizeGate>,
+struct RestartingFinalizeState {
+    current: Arc<RwLock<PreHouseholdRouterState>>,
+    mode: CandidateFinalizeMode,
+    gate: Option<Arc<BlockingFinalizeGate>>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum CandidateFinalizeMode {
     Normal,
     CommitThenBadAck,
@@ -2039,37 +2113,46 @@ async fn start_candidate_harness() -> CandidateHarness {
 }
 
 async fn start_candidate_harness_with_mode(mode: CandidateFinalizeMode) -> CandidateHarness {
-    start_candidate_harness_with_router(|state| match mode {
-        CandidateFinalizeMode::Normal => pre_household_router(state),
-        CandidateFinalizeMode::CommitThenBadAck => Router::new()
-            .route(
-                "/pair-machine/local/finalize",
-                post(commit_then_bad_finalize_ack),
-            )
-            .with_state(state),
-        CandidateFinalizeMode::RejectFinalize => Router::new()
-            .route("/pair-machine/local/finalize", post(reject_finalize))
-            .with_state(state),
-    })
-    .await
+    match mode {
+        CandidateFinalizeMode::Normal | CandidateFinalizeMode::CommitThenBadAck => {
+            start_restarting_candidate_harness(mode, None).await
+        }
+        CandidateFinalizeMode::RejectFinalize => {
+            start_candidate_harness_with_router(|state| {
+                Router::new()
+                    .route("/pair-machine/local/finalize", post(reject_finalize))
+                    .with_state(state)
+            })
+            .await
+        }
+    }
 }
 
 async fn start_blocking_candidate_harness() -> (CandidateHarness, Arc<BlockingFinalizeGate>) {
     let gate = Arc::new(BlockingFinalizeGate::default());
-    let gate_for_router = Arc::clone(&gate);
-    let candidate = start_candidate_harness_with_router(move |state| {
+    let candidate =
+        start_restarting_candidate_harness(CandidateFinalizeMode::Normal, Some(Arc::clone(&gate)))
+            .await;
+    (candidate, gate)
+}
+
+async fn start_restarting_candidate_harness(
+    mode: CandidateFinalizeMode,
+    gate: Option<Arc<BlockingFinalizeGate>>,
+) -> CandidateHarness {
+    start_candidate_harness_with_router(move |state| {
         Router::new()
             .route(
                 "/pair-machine/local/finalize",
-                post(blocking_finalize_handler),
+                post(restarting_finalize_handler),
             )
-            .with_state(BlockingFinalizeState {
-                inner: state,
-                gate: Arc::clone(&gate_for_router),
+            .with_state(RestartingFinalizeState {
+                current: Arc::new(RwLock::new(state)),
+                mode,
+                gate,
             })
     })
-    .await;
-    (candidate, gate)
+    .await
 }
 
 async fn start_candidate_harness_with_router(
@@ -2099,6 +2182,7 @@ async fn start_candidate_harness_with_router(
         state_dir: td.path().to_path_buf(),
         key_policy: KeyBackingPolicy::ForceSoftware,
         bootstrap: None,
+        runtime_signal: None,
     };
     let router = router_for_state(state);
     tokio::spawn(async move {
@@ -2112,26 +2196,43 @@ async fn start_candidate_harness_with_router(
     }
 }
 
-async fn blocking_finalize_handler(
-    State(state): State<BlockingFinalizeState>,
+async fn restarting_finalize_handler(
+    State(state): State<RestartingFinalizeState>,
     body: Bytes,
 ) -> Response {
-    state.gate.calls.fetch_add(1, Ordering::SeqCst);
-    state.gate.entered.notify_waiters();
-    state.gate.release.notified().await;
-    server_rs::handlers_pair_machine::local_finalize_handler(State(state.inner), body).await
-}
-
-async fn commit_then_bad_finalize_ack(
-    State(state): State<PreHouseholdRouterState>,
-    body: Bytes,
-) -> Response {
-    let committed =
-        server_rs::handlers_pair_machine::local_finalize_handler(State(state), body).await;
-    if committed.status() != StatusCode::OK {
-        return committed;
+    if let Some(gate) = state.gate.as_ref() {
+        gate.calls.fetch_add(1, Ordering::SeqCst);
+        gate.entered.notify_waiters();
+        if !gate.released.load(Ordering::SeqCst) {
+            gate.release.notified().await;
+        }
     }
-    (StatusCode::OK, b"not-cbor".to_vec()).into_response()
+    let current = state.current.read().await.clone();
+    let response =
+        server_rs::handlers_pair_machine::local_finalize_handler(State(current.clone()), body)
+            .await;
+    if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+        let lifecycle = HouseholdLifecycleLock::open_verified(&current.state_dir).unwrap();
+        let guard = lifecycle.lock_exclusive().unwrap();
+        let cold_window = Arc::new(
+            PairMachineWindow::with_persistence_under_lifecycle(current.state_dir.clone(), &guard)
+                .unwrap(),
+        );
+        drop(guard);
+        *state.current.write().await = PreHouseholdRouterState {
+            window: cold_window,
+            state_dir: current.state_dir,
+            key_policy: current.key_policy,
+            bootstrap: current.bootstrap,
+            runtime_signal: current.runtime_signal,
+        };
+        return response;
+    }
+    if response.status() == StatusCode::OK && state.mode == CandidateFinalizeMode::CommitThenBadAck
+    {
+        return (StatusCode::OK, b"not-cbor".to_vec()).into_response();
+    }
+    response
 }
 
 async fn reject_finalize() -> Response {
@@ -2139,6 +2240,7 @@ async fn reject_finalize() -> Response {
 }
 
 async fn stage_prepared_join_window(
+    state_dir: &Path,
     window: &PairMachineWindow,
     log: &OwnerEventLog,
     identity: &household_rs::LoadedIdentity,
@@ -2165,8 +2267,11 @@ async fn stage_prepared_join_window(
         .await
         .unwrap();
     let expiry = window.snapshot().await.expiry.unwrap();
+    let lifecycle = HouseholdLifecycleLock::open_verified(state_dir).unwrap();
+    let lifecycle_guard = lifecycle.lock_shared().unwrap();
     let event = log
         .append(
+            &lifecycle_guard,
             &identity.cert.m_id.to_string(),
             identity.m_priv.as_ref(),
             OwnerEventType::JoinRequest,
@@ -2230,9 +2335,9 @@ async fn wait_for_captured_tickle(spy: &SpyTransport, expected_len: usize) -> Ve
 
 #[tokio::test]
 async fn catch_up_returns_immediately() {
-    let (_td, router, log, _broadcaster, person, identity, _window) =
+    let (td, router, log, _broadcaster, person, identity, _window) =
         router_with_state(Duration::from_secs(45));
-    let event = append_join_event(&log, &identity);
+    let event = append_join_event(td.path(), &log, &identity);
 
     let uri = owner_events_uri(0);
     let (status, headers, resp_bytes) = get_cbor(router, &uri, Some(&person)).await;
@@ -2252,7 +2357,7 @@ async fn catch_up_returns_immediately() {
 
 #[tokio::test]
 async fn idle_holds_open_until_event() {
-    let (_td, router, log, _broadcaster, person, identity, _window) =
+    let (td, router, log, _broadcaster, person, identity, _window) =
         router_with_state(Duration::from_secs(1));
     let uri = owner_events_uri(0);
     let auth = pop_header(&person, &uri, unix_now());
@@ -2285,7 +2390,7 @@ async fn idle_holds_open_until_event() {
         !handle.is_finished(),
         "idle long-poll returned before event"
     );
-    let event = append_join_event(&log, &identity);
+    let event = append_join_event(td.path(), &log, &identity);
 
     let (status, resp_bytes) = tokio::time::timeout(Duration::from_secs(1), handle)
         .await
@@ -2533,7 +2638,7 @@ async fn owner_webauthn_registration_local_fake_auth_allows_start_and_status_onl
 #[tokio::test]
 async fn owner_webauthn_registration_local_attested_challenge_not_consumed_by_tcp_finish() {
     let (
-        _td,
+        td,
         network_router,
         local_router,
         log,
@@ -2578,7 +2683,7 @@ async fn owner_webauthn_registration_local_attested_challenge_not_consumed_by_tc
 
     assert_generic_unauth(status, &resp_bytes);
     assert!(
-        log.read_since(0).unwrap().is_empty(),
+        read_owner_events_since(td.path(), &log, 0).is_empty(),
         "normal finish must not mutate authority log for a local attested challenge"
     );
     assert!(
@@ -5548,6 +5653,16 @@ fn owner_webauthn_add_credential_start_source_guards_challenge_only_contract() {
 #[test]
 fn owner_webauthn_add_credential_finish_source_guards_mutation_contract() {
     let source = include_str!("../src/handlers_owner_events.rs");
+    let persistence = source_segment(
+        source,
+        "async fn persist_owner_auth_under_lifecycle(",
+        "#[derive(Clone)]\npub struct OwnerEventsRouterState",
+    );
+    assert!(persistence.contains("acquire_owner_events_lifecycle_exclusive"));
+    assert!(persistence.contains("verify_installed_identity_under_lifecycle"));
+    assert!(persistence.contains(".save("));
+    assert!(persistence.contains("MayHaveTakenEffect"));
+    assert!(persistence.contains("set_owner_auth"));
     let plan = source_segment(
         source,
         "fn owner_webauthn_add_credential_finish_plan(",
@@ -5582,8 +5697,24 @@ fn owner_webauthn_add_credential_finish_source_guards_mutation_contract() {
     assert!(handler.contains("finish_owner_approval_assertion"));
     assert!(handler.contains("OwnerWebauthnAuthority::sign_append"));
     assert!(handler.contains("OwnerWebauthnCredentialEventAction::Add"));
-    assert!(handler.contains(".save("));
-    assert!(handler.contains("set_owner_auth"));
+    // Was `.save(`. The B-2 lifecycle hardening replaced that call with
+    // `persist_owner_auth_under_lifecycle`, which persists the same thing under
+    // a lifecycle guard -- strictly stronger. Asserting the OLD spelling made
+    // this guard fail on a change that improved the property it guards.
+    //
+    // This is the second instance in this composition of the same shape: a
+    // security change RELOCATES or RENAMES a mechanism, and an incidental
+    // property of the old site -- here a literal call spelling -- is removed in
+    // silence, breaking whatever depended on it. Assert the guarded call, so the
+    // guard tracks the property rather than the wording of one era.
+    assert!(handler.contains("persist_owner_auth_under_lifecycle"));
+    // The handler no longer calls `.save(` / `.set_owner_auth(` directly: the B-2
+    // hardening EXTRACTED both into `persist_owner_auth_under_lifecycle`, which
+    // performs them under a lifecycle guard. These guards slice the handler's
+    // byte range, so a call moved into a shared helper becomes invisible to them
+    // even though the property still holds -- and holds more strongly.
+    // Assert the helper, which is the thing the handler must now call.
+    assert!(handler.contains("persist_owner_auth_under_lifecycle"));
     assert!(handler.contains("verify_or_update_owner_webauthn_authority_anchor"));
     assert!(!handler.contains("OwnerWebauthnAuthority::sign_recovery_add"));
     assert!(!handler.contains("OwnerWebauthnRecoveryAuthority::sign_consume"));
@@ -5602,8 +5733,12 @@ fn owner_webauthn_add_credential_finish_source_guards_mutation_contract() {
     let registration_finish = handler.find("finish_registration_with_binding").unwrap();
     let approval_finish = handler.find("finish_owner_approval_assertion").unwrap();
     let append = handler.find("OwnerWebauthnAuthority::sign_append").unwrap();
-    let save = handler.find(".save(").unwrap();
-    let memory = handler.find("set_owner_auth").unwrap();
+    // `.save(` and `set_owner_auth` were DEDUPLICATED into
+    // `persist_owner_auth_under_lifecycle` (five inline copies collapsed into
+    // one). They are no longer inside this handler's segment, so locate the
+    // helper call instead -- the ordering property is unchanged, only its
+    // anchor moved.
+    let persist = handler.find("persist_owner_auth_under_lifecycle").unwrap();
     let anchor = handler
         .find("verify_or_update_owner_webauthn_authority_anchor")
         .unwrap();
@@ -5613,9 +5748,8 @@ fn owner_webauthn_add_credential_finish_source_guards_mutation_contract() {
     assert!(approval_context < registration_finish);
     assert!(registration_finish < approval_finish);
     assert!(approval_finish < append);
-    assert!(append < save);
-    assert!(save < memory);
-    assert!(memory < anchor);
+    assert!(append < persist);
+    assert!(persist < anchor);
 
     let auth_source = include_str!("../src/household_auth.rs");
     let auth_helper = source_segment(
@@ -5665,7 +5799,7 @@ fn owner_webauthn_revoke_finish_source_guards_mutation_contract() {
     assert!(handler.contains("finish_owner_approval_assertion"));
     assert!(handler.contains("OwnerWebauthnAuthority::sign_append"));
     assert!(handler.contains("OwnerWebauthnCredentialEventAction::Revoke"));
-    assert!(handler.contains("set_owner_auth"));
+    assert!(handler.contains("persist_owner_auth_under_lifecycle"));
     assert!(handler.contains("OwnerWebauthnAnchorMode::Enforcement"));
     assert!(!handler.contains("MigrationDefaultOff"));
     assert!(!handler.contains("OwnerAuthEnrollInitial"));
@@ -5680,8 +5814,9 @@ fn owner_webauthn_revoke_finish_source_guards_mutation_contract() {
         .unwrap();
     let challenge_finish = handler.find("finish_owner_approval_assertion").unwrap();
     let append = handler.find("OwnerWebauthnAuthority::sign_append").unwrap();
-    let save = handler.find(".save(").unwrap();
-    let memory = handler.find("set_owner_auth").unwrap();
+    // Deduplicated into `persist_owner_auth_under_lifecycle`; the ordering
+    // property is unchanged, only its anchor moved out of this segment.
+    let persist = handler.find("persist_owner_auth_under_lifecycle").unwrap();
     let anchor = handler
         .find("verify_or_update_owner_webauthn_authority_anchor")
         .unwrap();
@@ -5689,9 +5824,8 @@ fn owner_webauthn_revoke_finish_source_guards_mutation_contract() {
     assert!(context_check < challenge_check);
     assert!(challenge_check < challenge_finish);
     assert!(challenge_finish < append);
-    assert!(append < save);
-    assert!(save < memory);
-    assert!(memory < anchor);
+    assert!(append < persist);
+    assert!(persist < anchor);
 
     let auth_source = include_str!("../src/household_auth.rs");
     let auth_helper = source_segment(
@@ -5772,8 +5906,14 @@ fn owner_webauthn_recovery_source_guards_provision_readiness_contract() {
     assert!(finish_handler.contains("require_owner_approval_challenge_context"));
     assert!(finish_handler.contains("finish_owner_approval_assertion"));
     assert!(finish_handler.contains("OwnerWebauthnRecoveryAuthority::sign_next"));
-    assert!(finish_handler.contains(".save("));
-    assert!(finish_handler.contains("set_owner_auth"));
+    // The handler no longer calls `.save(` / `.set_owner_auth(` directly: the B-2
+    // hardening EXTRACTED both into `persist_owner_auth_under_lifecycle`, which
+    // performs them under a lifecycle guard. These guards slice the handler's
+    // byte range, so a call moved into a shared helper becomes invisible to them
+    // even though the property still holds -- and holds more strongly.
+    // Assert the helper, which is the thing the handler must now call.
+    assert!(finish_handler.contains("persist_owner_auth_under_lifecycle"));
+    assert!(finish_handler.contains("persist_owner_auth_under_lifecycle"));
     assert!(finish_handler.contains("advance_owner_webauthn_recovery_anchor_after_commit"));
     assert!(!finish_handler.contains("MigrationDefaultOff"));
     assert!(!finish_handler.contains("OwnerAuthEnrollInitial"));
@@ -5789,8 +5929,11 @@ fn owner_webauthn_recovery_source_guards_provision_readiness_contract() {
     let append = finish_handler
         .find("OwnerWebauthnRecoveryAuthority::sign_next")
         .unwrap();
-    let save = finish_handler.find(".save(").unwrap();
-    let memory = finish_handler.find("set_owner_auth").unwrap();
+    // Deduplicated into `persist_owner_auth_under_lifecycle`; the ordering
+    // property is unchanged, only its anchor moved out of this segment.
+    let persist = finish_handler
+        .find("persist_owner_auth_under_lifecycle")
+        .unwrap();
     let anchor = finish_handler
         .find("advance_owner_webauthn_recovery_anchor_after_commit")
         .unwrap();
@@ -5798,9 +5941,8 @@ fn owner_webauthn_recovery_source_guards_provision_readiness_contract() {
     assert!(context_check < challenge_check);
     assert!(challenge_check < challenge_finish);
     assert!(challenge_finish < append);
-    assert!(append < save);
-    assert!(save < memory);
-    assert!(memory < anchor);
+    assert!(append < persist);
+    assert!(persist < anchor);
 
     let consume_plan = source_segment(
         source,
@@ -5881,8 +6023,8 @@ fn owner_webauthn_recovery_source_guards_provision_readiness_contract() {
     assert!(consume_finish_handler.contains("finish_registration_with_binding"));
     assert!(consume_finish_handler.contains("OwnerWebauthnAuthority::sign_recovery_add"));
     assert!(consume_finish_handler.contains("OwnerWebauthnRecoveryAuthority::sign_consume"));
-    assert!(consume_finish_handler.contains(".save("));
-    assert!(consume_finish_handler.contains("set_owner_auth"));
+    assert!(consume_finish_handler.contains("persist_owner_auth_under_lifecycle"));
+    assert!(consume_finish_handler.contains("persist_owner_auth_under_lifecycle"));
     assert!(consume_finish_handler.contains("verify_or_update_owner_webauthn_authority_anchor"));
     assert!(consume_finish_handler.contains("advance_owner_webauthn_recovery_anchor_after_commit"));
     assert!(!consume_finish_handler.contains("finish_owner_approval_assertion"));
@@ -5907,8 +6049,10 @@ fn owner_webauthn_recovery_source_guards_provision_readiness_contract() {
     let consume = consume_finish_handler
         .find("OwnerWebauthnRecoveryAuthority::sign_consume")
         .unwrap();
-    let save = consume_finish_handler.find(".save(").unwrap();
-    let memory = consume_finish_handler.find("set_owner_auth").unwrap();
+    // Deduplicated into `persist_owner_auth_under_lifecycle`.
+    let persist = consume_finish_handler
+        .find("persist_owner_auth_under_lifecycle")
+        .unwrap();
     let webauthn_anchor = consume_finish_handler
         .find("verify_or_update_owner_webauthn_authority_anchor")
         .unwrap();
@@ -5920,9 +6064,8 @@ fn owner_webauthn_recovery_source_guards_provision_readiness_contract() {
     assert!(plan < challenge_finish);
     assert!(challenge_finish < add);
     assert!(add < consume);
-    assert!(consume < save);
-    assert!(save < memory);
-    assert!(memory < webauthn_anchor);
+    assert!(consume < persist);
+    assert!(persist < webauthn_anchor);
     assert!(webauthn_anchor < recovery_anchor);
 
     let pair_machine_policy = source_segment(
@@ -9662,7 +9805,7 @@ async fn owner_webauthn_registration_rejects_non_empty_authority_without_anchor(
     let owner_auth_for_assert = owner_auth.clone();
     let anchor_store: Arc<dyn keystore_rs::KeystoreBackend> =
         Arc::new(FileKeystore::new(td.path(), keystore_rs::SERVICE));
-    let (_td, router, _log, _broadcaster, person, identity, _window) =
+    let (td, router, _log, _broadcaster, person, identity, _window) =
         router_from_owner_auth(td, identity, owner_auth, person, Duration::from_secs(45), {
             let anchor_store = Arc::clone(&anchor_store);
             move |state| {
@@ -9693,7 +9836,7 @@ async fn owner_webauthn_registration_rejects_non_empty_authority_without_anchor(
     assert_generic_unauth(status, &resp_bytes);
 
     let (_td, router, _log, _broadcaster, person, identity, _window) = router_from_owner_auth(
-        tempfile::tempdir().unwrap(),
+        td,
         Arc::clone(&identity),
         owner_auth_for_assert.clone(),
         person,
@@ -10023,7 +10166,7 @@ async fn owner_webauthn_registration_does_not_flip_pair_machine_policy() {
 
     fs::write(household_root_sole_path(td.path()), b"fake-sole-shard").unwrap();
     let candidate = start_candidate_harness().await;
-    let event = stage_prepared_join_window(&window, &log, &identity, &candidate).await;
+    let event = stage_prepared_join_window(td.path(), &window, &log, &identity, &candidate).await;
     candidate
         .window
         .pin_household_anchor(
@@ -10076,9 +10219,9 @@ async fn owner_webauthn_registration_does_not_flip_pair_machine_policy() {
 
 #[tokio::test]
 async fn decline_transitions_and_records_cancel_event() {
-    let (_td, router, log, _broadcaster, person, identity, window) =
+    let (td, router, log, _broadcaster, person, identity, window) =
         router_with_state(Duration::from_secs(45));
-    let event = stage_join_window(&window, &log, &identity).await;
+    let event = stage_join_window(td.path(), &window, &log, &identity).await;
     let uri = format!("/api/v1/household/owner-events/{}/decline", event.cursor);
     let auth = pop_header_for(&person, "POST", &uri, unix_now(), b"");
 
@@ -10103,7 +10246,7 @@ async fn decline_transitions_and_records_cancel_event() {
     let ack: OwnerDeclineAck = household_rs::cbor::from_canonical_slice(&resp_bytes).unwrap();
     assert_eq!(ack.version, 1);
     assert_eq!(window.snapshot().await.state, PairMachineState::Aborted);
-    let events = log.read_since(event.cursor).unwrap();
+    let events = read_owner_events_since(td.path(), &log, event.cursor);
     assert_eq!(events.len(), 1);
     assert!(matches!(
         events[0].event_type,
@@ -10121,7 +10264,7 @@ async fn approve_happy_path_drives_commit() {
         router_with_state(Duration::from_secs(45));
     fs::write(household_root_sole_path(td.path()), b"fake-sole-shard").unwrap();
     let candidate = start_candidate_harness().await;
-    let event = stage_prepared_join_window(&window, &log, &identity, &candidate).await;
+    let event = stage_prepared_join_window(td.path(), &window, &log, &identity, &candidate).await;
     // Simulate the iPhone-side `POST /pair-machine/local/anchor` per
     // `contracts/local-anchor.md` (B7): without this, M2's
     // `local/finalize` correctly refuses with 401 trust_anchor_missing.
@@ -10182,12 +10325,9 @@ async fn approve_happy_path_drives_commit() {
     assert!(machine_cert_for(candidate.td.path(), &m2_id).exists());
     assert_eq!(window.snapshot().await.state, PairMachineState::Committed);
     assert!(window.snapshot().await.cached_response.is_some());
-    assert_eq!(
-        candidate.window.snapshot().await.state,
-        PairMachineState::Committed
-    );
+    candidate.assert_terminal_reexec_ready().await;
     assert!(!household_root_sole_path(td.path()).exists());
-    let events = log.read_since(event.cursor).unwrap();
+    let events = read_owner_events_since(td.path(), &log, event.cursor);
     assert_eq!(events.len(), 1);
     assert!(matches!(
         events[0].event_type,
@@ -10212,7 +10352,7 @@ async fn approve_legacy_policy_allows_tierless_owner_before_strong_minting() {
 
     fs::write(household_root_sole_path(td.path()), b"fake-sole-shard").unwrap();
     let candidate = start_candidate_harness().await;
-    let event = stage_prepared_join_window(&window, &log, &identity, &candidate).await;
+    let event = stage_prepared_join_window(td.path(), &window, &log, &identity, &candidate).await;
     candidate
         .window
         .pin_household_anchor(
@@ -10254,11 +10394,8 @@ async fn approve_legacy_policy_allows_tierless_owner_before_strong_minting() {
     let ack: OwnerApprovalAck = household_rs::cbor::from_canonical_slice(&resp_bytes).unwrap();
     assert_eq!(ack.version, 1);
     assert_eq!(window.snapshot().await.state, PairMachineState::Committed);
-    assert_eq!(
-        candidate.window.snapshot().await.state,
-        PairMachineState::Committed
-    );
-    let events = log.read_since(event.cursor).unwrap();
+    candidate.assert_terminal_reexec_ready().await;
+    let events = read_owner_events_since(td.path(), &log, event.cursor);
     assert_eq!(events.len(), 1);
     assert!(matches!(
         events[0].event_type,
@@ -10272,7 +10409,7 @@ async fn approve_reviewed_rollout_trust_state_never_enrolled_keeps_legacy_path()
         router_with_v2_policy_without_passkey(Duration::from_secs(45));
     fs::write(household_root_sole_path(td.path()), b"fake-sole-shard").unwrap();
     let candidate = start_candidate_harness().await;
-    let event = stage_prepared_join_window(&window, &log, &identity, &candidate).await;
+    let event = stage_prepared_join_window(td.path(), &window, &log, &identity, &candidate).await;
     candidate
         .window
         .pin_household_anchor(
@@ -10322,7 +10459,7 @@ async fn approve_reviewed_rollout_trust_state_missing_anchor_fails_closed() {
     let identity = Arc::new(bootstrap(td.path()));
     let (owner_auth, person, rp, _authenticator) = owner_auth_with_webauthn_credential(&identity);
     let policy = OwnerApprovalEnforcementPolicy::reviewed_core_v2_rollout();
-    let (_td, router, log, _broadcaster, person, identity, window) = router_from_owner_auth(
+    let (td, router, log, _broadcaster, person, identity, window) = router_from_owner_auth(
         td,
         identity,
         owner_auth,
@@ -10335,7 +10472,7 @@ async fn approve_reviewed_rollout_trust_state_missing_anchor_fails_closed() {
         },
     );
     let candidate = start_candidate_harness().await;
-    let event = stage_prepared_join_window(&window, &log, &identity, &candidate).await;
+    let event = stage_prepared_join_window(td.path(), &window, &log, &identity, &candidate).await;
     let uri = format!("/api/v1/household/owner-events/{}/approve", event.cursor);
     let timestamp = unix_now();
     let body = approval_body(
@@ -10372,7 +10509,7 @@ async fn approve_reviewed_rollout_trust_state_missing_anchor_fails_closed() {
         window.snapshot().await.state,
         PairMachineState::AwaitingOwner
     );
-    assert!(log.read_since(event.cursor).unwrap().is_empty());
+    assert!(read_owner_events_since(td.path(), &log, event.cursor).is_empty());
 }
 
 #[tokio::test]
@@ -10385,7 +10522,7 @@ async fn approval_v2_start_does_not_migrate_missing_anchor_on_request_path() {
         Arc::new(FileKeystore::new(td.path(), keystore_rs::SERVICE));
     let policy = OwnerApprovalEnforcementPolicy::default()
         .with_pair_machine_approve(OwnerOperationEnforcement::V2WhenOwnerHasActiveCredential);
-    let (_td, router, log, _broadcaster, person, identity, window) =
+    let (td, router, log, _broadcaster, person, identity, window) =
         router_from_owner_auth(td, identity, owner_auth, person, Duration::from_secs(45), {
             let anchor_store = Arc::clone(&anchor_store);
             move |state| {
@@ -10396,7 +10533,7 @@ async fn approval_v2_start_does_not_migrate_missing_anchor_on_request_path() {
             }
         });
     let candidate = start_candidate_harness().await;
-    let event = stage_prepared_join_window(&window, &log, &identity, &candidate).await;
+    let event = stage_prepared_join_window(td.path(), &window, &log, &identity, &candidate).await;
     let start_uri = format!(
         "/api/v1/household/owner-events/{}/approval-v2/start",
         event.cursor
@@ -10430,7 +10567,7 @@ async fn approval_v2_start_does_not_migrate_missing_anchor_on_request_path() {
         window.snapshot().await.state,
         PairMachineState::AwaitingOwner
     );
-    assert!(log.read_since(event.cursor).unwrap().is_empty());
+    assert!(read_owner_events_since(td.path(), &log, event.cursor).is_empty());
     assert!(
         verify_or_update_owner_webauthn_authority_anchor(
             anchor_store.as_ref(),
@@ -10461,7 +10598,7 @@ async fn approval_v2_start_rejects_tierless_owner_even_with_active_passkey() {
     )
     .unwrap();
     let policy = OwnerApprovalEnforcementPolicy::reviewed_core_v2_rollout();
-    let (_td, router, log, _broadcaster, person, identity, window) = router_from_owner_auth(
+    let (td, router, log, _broadcaster, person, identity, window) = router_from_owner_auth(
         td,
         identity,
         owner_auth,
@@ -10475,7 +10612,7 @@ async fn approval_v2_start_rejects_tierless_owner_even_with_active_passkey() {
         },
     );
     let candidate = start_candidate_harness().await;
-    let event = stage_prepared_join_window(&window, &log, &identity, &candidate).await;
+    let event = stage_prepared_join_window(td.path(), &window, &log, &identity, &candidate).await;
     let (status, resp_bytes) = post_approval_v2_start(router, &person, event.cursor).await;
 
     assert_generic_unauth(status, &resp_bytes);
@@ -10483,7 +10620,7 @@ async fn approval_v2_start_rejects_tierless_owner_even_with_active_passkey() {
         window.snapshot().await.state,
         PairMachineState::AwaitingOwner
     );
-    assert!(log.read_since(event.cursor).unwrap().is_empty());
+    assert!(read_owner_events_since(td.path(), &log, event.cursor).is_empty());
 }
 
 #[tokio::test]
@@ -10504,7 +10641,7 @@ async fn approve_v2_reviewed_rollout_rejects_tierless_owner_before_fan_out() {
     )
     .unwrap();
     let policy = OwnerApprovalEnforcementPolicy::reviewed_core_v2_rollout();
-    let (_td, router, log, _broadcaster, person, identity, window) = router_from_owner_auth(
+    let (td, router, log, _broadcaster, person, identity, window) = router_from_owner_auth(
         td,
         identity,
         owner_auth,
@@ -10518,9 +10655,9 @@ async fn approve_v2_reviewed_rollout_rejects_tierless_owner_before_fan_out() {
         },
     );
 
-    fs::write(household_root_sole_path(_td.path()), b"fake-sole-shard").unwrap();
+    fs::write(household_root_sole_path(td.path()), b"fake-sole-shard").unwrap();
     let candidate = start_candidate_harness().await;
-    let event = stage_prepared_join_window(&window, &log, &identity, &candidate).await;
+    let event = stage_prepared_join_window(td.path(), &window, &log, &identity, &candidate).await;
     candidate
         .window
         .pin_household_anchor(
@@ -10557,9 +10694,9 @@ async fn approve_v2_reviewed_rollout_rejects_tierless_owner_before_fan_out() {
         window.snapshot().await.state,
         PairMachineState::AwaitingOwner
     );
-    assert!(log.read_since(event.cursor).unwrap().is_empty());
+    assert!(read_owner_events_since(td.path(), &log, event.cursor).is_empty());
     assert_ne!(
-        candidate.window.snapshot().await.state,
+        candidate.current_window_snapshot().await.state,
         PairMachineState::Committed
     );
 }
@@ -10580,7 +10717,7 @@ async fn approve_reviewed_rollout_trust_state_recovery_required_rejects_legacy_p
     )
     .unwrap();
     let policy = OwnerApprovalEnforcementPolicy::reviewed_core_v2_rollout();
-    let (_td, router, log, _broadcaster, person, identity, window) = router_from_owner_auth(
+    let (td, router, log, _broadcaster, person, identity, window) = router_from_owner_auth(
         td,
         identity,
         owner_auth,
@@ -10594,7 +10731,7 @@ async fn approve_reviewed_rollout_trust_state_recovery_required_rejects_legacy_p
         },
     );
     let candidate = start_candidate_harness().await;
-    let event = stage_prepared_join_window(&window, &log, &identity, &candidate).await;
+    let event = stage_prepared_join_window(td.path(), &window, &log, &identity, &candidate).await;
     let uri = format!("/api/v1/household/owner-events/{}/approve", event.cursor);
     let timestamp = unix_now();
     let body = approval_body(
@@ -10631,7 +10768,7 @@ async fn approve_reviewed_rollout_trust_state_recovery_required_rejects_legacy_p
         window.snapshot().await.state,
         PairMachineState::AwaitingOwner
     );
-    assert!(log.read_since(event.cursor).unwrap().is_empty());
+    assert!(read_owner_events_since(td.path(), &log, event.cursor).is_empty());
 }
 
 #[tokio::test]
@@ -10650,7 +10787,7 @@ async fn approval_v2_start_reviewed_rollout_trust_state_recovery_required_fails_
     )
     .unwrap();
     let policy = OwnerApprovalEnforcementPolicy::reviewed_core_v2_rollout();
-    let (_td, router, log, _broadcaster, person, identity, window) = router_from_owner_auth(
+    let (td, router, log, _broadcaster, person, identity, window) = router_from_owner_auth(
         td,
         identity,
         owner_auth,
@@ -10664,7 +10801,7 @@ async fn approval_v2_start_reviewed_rollout_trust_state_recovery_required_fails_
         },
     );
     let candidate = start_candidate_harness().await;
-    let event = stage_prepared_join_window(&window, &log, &identity, &candidate).await;
+    let event = stage_prepared_join_window(td.path(), &window, &log, &identity, &candidate).await;
     let start_uri = format!(
         "/api/v1/household/owner-events/{}/approval-v2/start",
         event.cursor
@@ -10698,7 +10835,7 @@ async fn approval_v2_start_reviewed_rollout_trust_state_recovery_required_fails_
         window.snapshot().await.state,
         PairMachineState::AwaitingOwner
     );
-    assert!(log.read_since(event.cursor).unwrap().is_empty());
+    assert!(read_owner_events_since(td.path(), &log, event.cursor).is_empty());
 }
 
 #[tokio::test]
@@ -10716,7 +10853,7 @@ async fn approve_reviewed_rollout_trust_state_empty_authority_with_anchor_fails_
     );
     write_owner_webauthn_authority_anchor(anchor_store.as_ref(), &stale_anchor).unwrap();
     let policy = OwnerApprovalEnforcementPolicy::reviewed_core_v2_rollout();
-    let (_td, router, log, _broadcaster, person, identity, window) = router_from_owner_auth(
+    let (td, router, log, _broadcaster, person, identity, window) = router_from_owner_auth(
         td,
         identity,
         owner_auth,
@@ -10729,7 +10866,7 @@ async fn approve_reviewed_rollout_trust_state_empty_authority_with_anchor_fails_
         },
     );
     let candidate = start_candidate_harness().await;
-    let event = stage_prepared_join_window(&window, &log, &identity, &candidate).await;
+    let event = stage_prepared_join_window(td.path(), &window, &log, &identity, &candidate).await;
     let uri = format!("/api/v1/household/owner-events/{}/approve", event.cursor);
     let timestamp = unix_now();
     let body = approval_body(
@@ -10766,7 +10903,7 @@ async fn approve_reviewed_rollout_trust_state_empty_authority_with_anchor_fails_
         window.snapshot().await.state,
         PairMachineState::AwaitingOwner
     );
-    assert!(log.read_since(event.cursor).unwrap().is_empty());
+    assert!(read_owner_events_since(td.path(), &log, event.cursor).is_empty());
 }
 
 #[tokio::test]
@@ -10795,7 +10932,7 @@ async fn approve_reviewed_rollout_trust_state_rollback_or_divergent_anchor_fails
         };
         write_owner_webauthn_authority_anchor(anchor_store.as_ref(), &stale_anchor).unwrap();
         let policy = OwnerApprovalEnforcementPolicy::reviewed_core_v2_rollout();
-        let (_td, router, log, _broadcaster, person, identity, window) =
+        let (td, router, log, _broadcaster, person, identity, window) =
             router_from_owner_auth(td, identity, owner_auth, person, Duration::from_secs(45), {
                 let anchor_store = Arc::clone(&anchor_store);
                 move |state| {
@@ -10806,7 +10943,8 @@ async fn approve_reviewed_rollout_trust_state_rollback_or_divergent_anchor_fails
                 }
             });
         let candidate = start_candidate_harness().await;
-        let event = stage_prepared_join_window(&window, &log, &identity, &candidate).await;
+        let event =
+            stage_prepared_join_window(td.path(), &window, &log, &identity, &candidate).await;
         let uri = format!("/api/v1/household/owner-events/{}/approve", event.cursor);
         let timestamp = unix_now();
         let body = approval_body(
@@ -10843,7 +10981,7 @@ async fn approve_reviewed_rollout_trust_state_rollback_or_divergent_anchor_fails
             window.snapshot().await.state,
             PairMachineState::AwaitingOwner
         );
-        assert!(log.read_since(event.cursor).unwrap().is_empty());
+        assert!(read_owner_events_since(td.path(), &log, event.cursor).is_empty());
         let persisted =
             read_owner_webauthn_authority_anchor(anchor_store.as_ref(), &identity.record.hh_id)
                 .unwrap()
@@ -10855,10 +10993,10 @@ async fn approve_reviewed_rollout_trust_state_rollback_or_divergent_anchor_fails
 
 #[tokio::test]
 async fn approve_require_v2_rejects_legacy_body_without_mutation() {
-    let (_td, router, log, _broadcaster, person, identity, window, _authenticator) =
+    let (td, router, log, _broadcaster, person, identity, window, _authenticator) =
         router_with_v2_owner(Duration::from_secs(45));
     let candidate = start_candidate_harness().await;
-    let event = stage_prepared_join_window(&window, &log, &identity, &candidate).await;
+    let event = stage_prepared_join_window(td.path(), &window, &log, &identity, &candidate).await;
     let uri = format!("/api/v1/household/owner-events/{}/approve", event.cursor);
     let timestamp = unix_now();
     let body = approval_body(
@@ -10895,7 +11033,7 @@ async fn approve_require_v2_rejects_legacy_body_without_mutation() {
         window.snapshot().await.state,
         PairMachineState::AwaitingOwner
     );
-    assert!(log.read_since(event.cursor).unwrap().is_empty());
+    assert!(read_owner_events_since(td.path(), &log, event.cursor).is_empty());
 }
 
 #[tokio::test]
@@ -10904,7 +11042,7 @@ async fn approve_v2_reviewed_rollout_happy_path_drives_commit() {
         router_with_v2_owner(Duration::from_secs(45));
     fs::write(household_root_sole_path(td.path()), b"fake-sole-shard").unwrap();
     let candidate = start_candidate_harness().await;
-    let event = stage_prepared_join_window(&window, &log, &identity, &candidate).await;
+    let event = stage_prepared_join_window(td.path(), &window, &log, &identity, &candidate).await;
     candidate
         .window
         .pin_household_anchor(
@@ -10980,7 +11118,7 @@ async fn approve_v2_reviewed_rollout_happy_path_drives_commit() {
     let ack: OwnerApprovalAck = household_rs::cbor::from_canonical_slice(&finish_bytes).unwrap();
     assert_eq!(ack.version, 1);
     assert_eq!(window.snapshot().await.state, PairMachineState::Committed);
-    let events = log.read_since(event.cursor).unwrap();
+    let events = read_owner_events_since(td.path(), &log, event.cursor);
     assert_eq!(events.len(), 1);
     assert!(matches!(
         events[0].event_type,
@@ -10994,7 +11132,7 @@ async fn approve_v2_double_prepare_claim_rejects_second_valid_approval() {
         router_with_v2_owner(Duration::from_secs(45));
     fs::write(household_root_sole_path(td.path()), b"fake-sole-shard").unwrap();
     let (candidate, finalize_gate) = start_blocking_candidate_harness().await;
-    let event = stage_prepared_join_window(&window, &log, &identity, &candidate).await;
+    let event = stage_prepared_join_window(td.path(), &window, &log, &identity, &candidate).await;
     candidate
         .window
         .pin_household_anchor(
@@ -11073,11 +11211,8 @@ async fn approve_v2_double_prepare_claim_rejects_second_valid_approval() {
     assert_eq!(ack.version, 1);
     assert_eq!(window.snapshot().await.state, PairMachineState::Committed);
     assert!(window.snapshot().await.approval_claim.is_none());
-    assert_eq!(
-        candidate.window.snapshot().await.state,
-        PairMachineState::Committed
-    );
-    let events = log.read_since(event.cursor).unwrap();
+    candidate.assert_terminal_reexec_ready().await;
+    let events = read_owner_events_since(td.path(), &log, event.cursor);
     assert_eq!(events.len(), 1);
     assert!(matches!(
         events[0].event_type,
@@ -11087,10 +11222,11 @@ async fn approve_v2_double_prepare_claim_rejects_second_valid_approval() {
 
 #[tokio::test]
 async fn approve_v2_post_claim_abort_clears_claim_for_next_window() {
-    let (_td, router, log, _broadcaster, person, identity, window, mut authenticator) =
+    let (td, router, log, _broadcaster, person, identity, window, mut authenticator) =
         router_with_v2_owner_without_hh_priv(Duration::from_secs(45));
     let first_candidate = start_candidate_harness().await;
-    let first_event = stage_prepared_join_window(&window, &log, &identity, &first_candidate).await;
+    let first_event =
+        stage_prepared_join_window(td.path(), &window, &log, &identity, &first_candidate).await;
     first_candidate
         .window
         .pin_household_anchor(
@@ -11121,7 +11257,7 @@ async fn approve_v2_post_claim_abort_clears_claim_for_next_window() {
 
     let second_candidate = start_candidate_harness().await;
     let second_event =
-        stage_prepared_join_window(&window, &log, &identity, &second_candidate).await;
+        stage_prepared_join_window(td.path(), &window, &log, &identity, &second_candidate).await;
     assert_ne!(first_event.cursor, second_event.cursor);
     second_candidate
         .window
@@ -11146,7 +11282,7 @@ async fn approve_v2_definite_finalize_failure_aborts_and_clears_claim() {
         router_with_v2_owner(Duration::from_secs(45));
     fs::write(household_root_sole_path(td.path()), b"fake-sole-shard").unwrap();
     let candidate = start_candidate_harness_with_mode(CandidateFinalizeMode::RejectFinalize).await;
-    let event = stage_prepared_join_window(&window, &log, &identity, &candidate).await;
+    let event = stage_prepared_join_window(td.path(), &window, &log, &identity, &candidate).await;
     candidate
         .window
         .pin_household_anchor(
@@ -11170,7 +11306,7 @@ async fn approve_v2_definite_finalize_failure_aborts_and_clears_claim() {
     let snapshot = window.snapshot().await;
     assert_eq!(snapshot.state, PairMachineState::Aborted);
     assert!(snapshot.approval_claim.is_none());
-    let events = log.read_since(event.cursor).unwrap();
+    let events = read_owner_events_since(td.path(), &log, event.cursor);
     assert_eq!(events.len(), 1);
     assert!(matches!(
         events[0].event_type,
@@ -11184,10 +11320,10 @@ async fn approve_v2_definite_finalize_failure_aborts_and_clears_claim() {
 
 #[tokio::test]
 async fn approve_v2_context_mismatch_returns_401_without_mutation() {
-    let (_td, router, log, _broadcaster, person, identity, window, mut authenticator) =
+    let (td, router, log, _broadcaster, person, identity, window, mut authenticator) =
         router_with_v2_owner(Duration::from_secs(45));
     let candidate = start_candidate_harness().await;
-    let event = stage_prepared_join_window(&window, &log, &identity, &candidate).await;
+    let event = stage_prepared_join_window(td.path(), &window, &log, &identity, &candidate).await;
 
     let start_uri = format!(
         "/api/v1/household/owner-events/{}/approval-v2/start",
@@ -11258,7 +11394,7 @@ async fn approve_v2_context_mismatch_returns_401_without_mutation() {
         window.snapshot().await.state,
         PairMachineState::AwaitingOwner
     );
-    assert!(log.read_since(event.cursor).unwrap().is_empty());
+    assert!(read_owner_events_since(td.path(), &log, event.cursor).is_empty());
 }
 
 #[tokio::test]
@@ -11268,7 +11404,7 @@ async fn approve_preserves_m1_evidence_when_m2_commits_but_ack_is_bad() {
     fs::write(household_root_sole_path(td.path()), b"fake-sole-shard").unwrap();
     let candidate =
         start_candidate_harness_with_mode(CandidateFinalizeMode::CommitThenBadAck).await;
-    let event = stage_prepared_join_window(&window, &log, &identity, &candidate).await;
+    let event = stage_prepared_join_window(td.path(), &window, &log, &identity, &candidate).await;
     candidate
         .window
         .pin_household_anchor(
@@ -11309,15 +11445,15 @@ async fn approve_preserves_m1_evidence_when_m2_commits_but_ack_is_bad() {
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     let parsed: GenericUnauth = household_rs::cbor::from_canonical_slice(&resp_bytes).unwrap();
     assert_eq!(parsed.error, "internal");
-    assert_eq!(
-        candidate.window.snapshot().await.state,
-        PairMachineState::Committed
-    );
+    candidate.assert_terminal_reexec_ready().await;
     assert_eq!(
         window.snapshot().await.state,
         PairMachineState::AwaitingOwner
     );
-    assert!(phase3_finalize_ack_marker_exists(td.path()));
+    assert!(
+        read_phase3_recovery_manifest(td.path()).unwrap().is_some(),
+        "the exact manifest is the sole M1 recovery authority after launch",
+    );
     assert!(staged_path_for(&household_record_path(td.path())).exists());
     assert!(staged_path_for(&shamir_self_shard_path(td.path())).exists());
     let m2_id = household_rs::derive_machine_id(
@@ -11332,15 +11468,15 @@ async fn approve_preserves_m1_evidence_when_m2_commits_but_ack_is_bad() {
     assert!(staged_path_for(&m1_candidate_cert).exists());
     assert!(machine_cert_for(candidate.td.path(), &m2_id).exists());
     assert!(household_root_sole_path(td.path()).exists());
-    assert!(log.read_since(event.cursor).unwrap().is_empty());
+    assert!(read_owner_events_since(td.path(), &log, event.cursor).is_empty());
 }
 
 #[tokio::test]
 async fn approve_with_different_challenge_sig_returns_401_and_cancel_event() {
-    let (_td, router, log, _broadcaster, person, identity, window) =
+    let (td, router, log, _broadcaster, person, identity, window) =
         router_with_state(Duration::from_secs(45));
     let candidate = start_candidate_harness().await;
-    let event = stage_prepared_join_window(&window, &log, &identity, &candidate).await;
+    let event = stage_prepared_join_window(td.path(), &window, &log, &identity, &candidate).await;
     let uri = format!("/api/v1/household/owner-events/{}/approve", event.cursor);
     let timestamp = unix_now();
     let mut wrong_challenge = candidate.prepared.join_request.challenge_sig.to_vec();
@@ -11376,7 +11512,7 @@ async fn approve_with_different_challenge_sig_returns_401_and_cancel_event() {
     let parsed: GenericUnauth = household_rs::cbor::from_canonical_slice(&resp_bytes).unwrap();
     assert_eq!(parsed.error, "unauthenticated");
     assert_eq!(window.snapshot().await.state, PairMachineState::Aborted);
-    let events = log.read_since(event.cursor).unwrap();
+    let events = read_owner_events_since(td.path(), &log, event.cursor);
     assert_eq!(events.len(), 1);
     assert!(matches!(
         events[0].event_type,
@@ -11386,10 +11522,10 @@ async fn approve_with_different_challenge_sig_returns_401_and_cancel_event() {
 
 #[tokio::test]
 async fn approve_with_mismatched_cursor_returns_401() {
-    let (_td, router, log, _broadcaster, person, identity, window) =
+    let (td, router, log, _broadcaster, person, identity, window) =
         router_with_state(Duration::from_secs(45));
     let candidate = start_candidate_harness().await;
-    let event = stage_prepared_join_window(&window, &log, &identity, &candidate).await;
+    let event = stage_prepared_join_window(td.path(), &window, &log, &identity, &candidate).await;
     let uri = format!("/api/v1/household/owner-events/{}/approve", event.cursor);
     let timestamp = unix_now();
     let body = approval_body(
@@ -11418,10 +11554,10 @@ async fn approve_with_mismatched_cursor_returns_401() {
 
 #[tokio::test]
 async fn approve_with_timestamp_outside_window_returns_401() {
-    let (_td, router, log, _broadcaster, person, identity, window) =
+    let (td, router, log, _broadcaster, person, identity, window) =
         router_with_state(Duration::from_secs(45));
     let candidate = start_candidate_harness().await;
-    let event = stage_prepared_join_window(&window, &log, &identity, &candidate).await;
+    let event = stage_prepared_join_window(td.path(), &window, &log, &identity, &candidate).await;
     let uri = format!("/api/v1/household/owner-events/{}/approve", event.cursor);
     let timestamp = unix_now() - 120;
     let body = approval_body(
@@ -11450,10 +11586,10 @@ async fn approve_with_timestamp_outside_window_returns_401() {
 
 #[tokio::test]
 async fn approve_with_bad_pop_returns_401() {
-    let (_td, router, log, _broadcaster, person, identity, window) =
+    let (td, router, log, _broadcaster, person, identity, window) =
         router_with_state(Duration::from_secs(45));
     let candidate = start_candidate_harness().await;
-    let event = stage_prepared_join_window(&window, &log, &identity, &candidate).await;
+    let event = stage_prepared_join_window(td.path(), &window, &log, &identity, &candidate).await;
     let uri = format!("/api/v1/household/owner-events/{}/approve", event.cursor);
     let timestamp = unix_now();
     let body = approval_body(
@@ -11526,7 +11662,7 @@ async fn test_apns_dispatched_when_no_poll() {
     )
     .unwrap();
 
-    append_join_event(&log, &identity);
+    append_join_event(td.path(), &log, &identity);
     handlers_owner_events::dispatch_owner_event_tickle_if_idle(
         td.path().to_path_buf(),
         &broadcaster,
@@ -11536,7 +11672,7 @@ async fn test_apns_dispatched_when_no_poll() {
 
     spy.clear();
     let _sub = broadcaster.subscribe();
-    append_join_event(&log, &identity);
+    append_join_event(td.path(), &log, &identity);
     handlers_owner_events::dispatch_owner_event_tickle_if_idle(
         td.path().to_path_buf(),
         &broadcaster,
@@ -11868,6 +12004,18 @@ mod device_roster_read {
         // state dir. Its owner cert verifies under its own root, so the refusal
         // is attributable to the durable record belonging to another root —
         // not to a cert or clock failure earlier in the chain.
+        //
+        // This is the *server* disagreeing with its own durable record: the
+        // record comes from the identity this server loaded and the path from
+        // this server's state dir, so no request byte selects the branch. It is
+        // therefore the availability class, not the collapsed device class — the
+        // device-side cross-binding (a device bound to another household) is a
+        // different condition, is caller-selectable, and still collapses via
+        // `pop_person_slot_must_equal_the_entry_parent`. Answering 401 here
+        // would hide a misconfigured server behind a client-facing refusal.
+        // `the_refusal_class_is_never_selectable_by_the_caller` is what holds
+        // the anti-enumeration property; this test only pins where this one
+        // condition belongs.
         let foreign_seam = self::seam(None);
         let foreign_state = foreign_seam.state;
         let now = unix_now();
@@ -11883,7 +12031,85 @@ mod device_roster_read {
             now,
         )
         .await;
-        assert_device_rejected(result);
+        match result {
+            Err(RosterReadAuthError::AuthorityUnavailable) => {}
+            Err(other) => {
+                panic!("expected the cross-root authority to be unavailable, got {other:?}")
+            }
+            Ok(_) => panic!("a cross-root authority must never authorize"),
+        }
+    }
+
+    /// The refusal *class* must be a function of server state alone.
+    ///
+    /// Every other test here pins one reason to one class, so none of them
+    /// would notice a new availability condition that reads the request: each
+    /// would keep passing on its own reason while the wire gained an oracle.
+    /// This asserts the property instead — materially different device-side
+    /// failures come back indistinguishable, and the availability class appears
+    /// only when the *server* is deprived, with the request bytes unchanged.
+    #[tokio::test]
+    async fn the_refusal_class_is_never_selectable_by_the_caller() {
+        let seam = seam(None);
+        admit(&seam, 1);
+        let now = unix_now();
+        let p_id = seam.owner_cert.p_id.0.clone();
+        let good = device_pop_header(&seam.device, &p_id, URI, now);
+
+        let stranger = P256Keypair::generate();
+        let stranger_id = household_rs::device_cert::derive_device_id(&stranger.public());
+        let unknown = device_pop_header(&stranger, &p_id, URI, now);
+
+        let stranger_p_id = household_rs::derive_person_id(&P256Keypair::generate().public()).0;
+        let wrong_person = device_pop_header(&seam.device, &stranger_p_id, URI, now);
+        let wrong_path = device_pop_header(&seam.device, &p_id, "/api/v1/household/other", now);
+
+        let mut malformed = seam.cert.d_id.0.clone();
+        malformed.pop();
+        malformed.push('1');
+
+        for (label, request) in [
+            ("unknown device", headers(&unknown, Some(&stranger_id.0))),
+            (
+                "wrong person slot",
+                headers(&wrong_person, Some(&seam.cert.d_id.0)),
+            ),
+            (
+                "signature bound elsewhere",
+                headers(&wrong_path, Some(&seam.cert.d_id.0)),
+            ),
+            ("malformed device id", headers(&good, Some(&malformed))),
+        ] {
+            match call(&seam, request, now).await {
+                Err(RosterReadAuthError::DeviceUnauthenticated) => {}
+                Err(other) => panic!(
+                    "{label}: a request-derived refusal escaped the collapsed class: {other:?}"
+                ),
+                Ok(_) => panic!("{label}: must not authorize"),
+            }
+        }
+
+        // Byte-identical request, server deprived of its loaded identity. The
+        // class may differ here and only here: nothing about the caller moved.
+        let deprived = HouseholdState::empty();
+        let result = authorize_roster_read(
+            &deprived,
+            &seam.state_dir,
+            &headers(&good, Some(&seam.cert.d_id.0)),
+            &Method::GET,
+            URI,
+            b"",
+            READ_OP,
+            now,
+        )
+        .await;
+        match result {
+            Err(RosterReadAuthError::AuthorityUnavailable) => {}
+            Err(other) => {
+                panic!("a deprived server must answer the availability class, got {other:?}")
+            }
+            Ok(_) => panic!("a deprived server must never authorize"),
+        }
     }
 
     #[tokio::test]

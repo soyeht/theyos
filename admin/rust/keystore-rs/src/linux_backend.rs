@@ -17,10 +17,7 @@ use crate::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 
 fn configure_backend_from_env() {
-    if std::env::var("THEYOS_KEYRING")
-        .map(|v| v.eq_ignore_ascii_case("kernel"))
-        .unwrap_or(false)
-    {
+    if std::env::var("THEYOS_KEYRING").is_ok_and(|v| v.eq_ignore_ascii_case("kernel")) {
         keyring::set_default_credential_builder(keyring::keyutils::default_credential_builder());
     }
 }

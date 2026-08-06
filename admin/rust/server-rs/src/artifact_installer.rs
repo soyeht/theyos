@@ -693,10 +693,9 @@ mod tests {
         use sha2::{Digest, Sha256};
         use std::fmt::Write as _;
 
-        for (body_claw, forbidden_rel) in [
-            ("../escaped", "escaped"),
-            ("attacker", "goldens/attacker"),
-        ] {
+        for (body_claw, forbidden_rel) in
+            [("../escaped", "escaped"), ("attacker", "goldens/attacker")]
+        {
             let tmp = tempfile::TempDir::new().unwrap();
             let assets_dir = tmp.path().join("assets");
             fs::create_dir_all(&assets_dir).unwrap();

@@ -1,0 +1,15 @@
+# Workspace-local packages `mesh-session-runtime-rs` is permitted to reach.
+# An ALLOWLIST, not a denylist: a denylist fails open for every crate nobody
+# thought to name, which is the direction a security guard must never fail.
+# Scope is workspace-local only (see --local-only); registry crates are out of
+# scope for this boundary and churn independently.
+core-rs
+household-rs
+keystore-rs
+mesh-session-core-rs
+store-rs
+# S0 neutral wire mechanics. Reached via household-rs and NOT a Product A/nvpn
+# crate: its own manifest deliberately omits household-rs so claw authority is
+# unreachable from it. Verified by reading the crate, not inferred from "tunnel"
+# in the name.
+tunnel-wire-rs

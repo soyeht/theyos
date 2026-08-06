@@ -1,0 +1,5 @@
+error[E0616]: field `gate` of struct `ActiveSessionRegistration` is private
+  --> tests/compile-fail/pending_admission/active_registration_hides_the_raw_gate.rs:15:21
+   |
+15 |     let _ = &active.gate;
+   |                     ^^^^ private field

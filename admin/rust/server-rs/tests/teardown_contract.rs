@@ -126,6 +126,12 @@ fn make_fixture_no_auth(bs: BootstrapState) -> (Fixture, Router) {
     let tmpdir = tempfile::tempdir().unwrap().keep();
     let state_dir = tmpdir.clone();
     std::fs::create_dir_all(state_dir.join("household")).unwrap();
+    household_rs::storage::atomic_write_cbor(
+        &household_rs::storage::household_record_path(&state_dir),
+        &record,
+    )
+    .unwrap();
+    household_rs::machine_cert::save_self_cert(&state_dir, &machine_cert).unwrap();
     // Intentionally no auth_state.save() — state_dir has no owner cert on disk.
 
     let identity = Arc::new(LoadedIdentity {
@@ -213,6 +219,12 @@ fn make_fixture(bs: BootstrapState) -> (Fixture, Router) {
     let tmpdir = tempfile::tempdir().unwrap().keep();
     let state_dir = tmpdir.clone();
     std::fs::create_dir_all(state_dir.join("household")).unwrap();
+    household_rs::storage::atomic_write_cbor(
+        &household_rs::storage::household_record_path(&state_dir),
+        &record,
+    )
+    .unwrap();
+    household_rs::machine_cert::save_self_cert(&state_dir, &machine_cert).unwrap();
     auth_state.save(&state_dir).unwrap();
 
     let identity = Arc::new(LoadedIdentity {

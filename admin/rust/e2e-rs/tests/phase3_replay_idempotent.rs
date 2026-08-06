@@ -2,7 +2,6 @@ mod phase3_support;
 
 use axum::http::StatusCode;
 use household_rs::owner_events::OwnerEventType;
-use household_rs::pair_machine::pair_machine_window_path;
 use household_rs::storage::machine_cert_for;
 
 #[tokio::test]
@@ -31,11 +30,17 @@ async fn test_replay_returns_cached_bytes() {
 
     let m2_id = ceremony.candidate.prepared.m_id.to_string();
     assert!(machine_cert_for(ceremony.founder.dir.path(), &m2_id).exists());
+    let founder_read = ceremony
+        .founder
+        .lifecycle
+        .lock_shared()
+        .expect("lock lifecycle shared");
     let events = ceremony
         .founder
         .event_log
-        .read_since(0)
+        .read_since(&founder_read, 0)
         .expect("read owner events after replays");
+    drop(founder_read);
     assert_eq!(events.len(), 2);
     assert_eq!(events[1].cursor, 2);
     assert_eq!(events[1].event_type, OwnerEventType::MachineJoined);
@@ -47,11 +52,17 @@ async fn test_replay_after_grace_returns_401() {
     let ceremony = phase3_support::run_remote_ceremony().await;
     let mut snap = ceremony.founder.window.snapshot().await;
     snap.expiry = Some(phase3_support::unix_now().saturating_sub(61));
-    household_rs::storage::atomic_write_cbor(
-        &pair_machine_window_path(ceremony.founder.dir.path()),
-        &snap,
-    )
-    .expect("persist expired committed window snapshot");
+    let lifecycle_guard = ceremony
+        .founder
+        .lifecycle
+        .lock_exclusive()
+        .expect("lock lifecycle exclusive");
+    ceremony
+        .founder
+        .window
+        .write_persisted_snapshot_under_lifecycle_for_test(&snap, &lifecycle_guard)
+        .expect("persist expired committed window snapshot");
+    drop(lifecycle_guard);
     let (router, _window, _event_log) =
         phase3_support::rebuild_founder_router_from_disk(&ceremony.founder);
 

@@ -35,7 +35,7 @@ failure-injection = []
 axum        = { workspace = true }
 base64      = { workspace = true }
 criterion   = { workspace = true, features = ["async_tokio"] }
-household-rs = { workspace = true }
+household-rs = { workspace = true, features = ["test-support"] }
 rusqlite    = { workspace = true }
 serde_bytes = { workspace = true }
 server-rs   = { workspace = true, features = ["failure-injection"] }

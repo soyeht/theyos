@@ -314,7 +314,13 @@ async fn main() {
     // The household listener still comes up before the main api listener
     // at the bottom of `main`, so iPhone onboarding via Bonjour stays
     // unaffected (FR-008/FR-017 timing window preserved).
-    server_rs::household_bootstrap::bootstrap_household(Some(Arc::clone(&state))).await;
+    // The household router may be started only from process startup. The token
+    // is claimable exactly once per process, so no handler can manufacture
+    // startup authority later -- a pair-machine reexec cannot reopen the router.
+    let startup_token = server_rs::household_listener::ProcessStartupToken::claim()
+        .expect("process startup token is claimed exactly once, here");
+    server_rs::household_bootstrap::bootstrap_household(&startup_token, Some(Arc::clone(&state)))
+        .await;
 
     // ── Cloudflared sync ─────────────────────────────────────────────────
     // Reconcile the on-disk cloudflared config.yml against the public_sites

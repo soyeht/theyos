@@ -1,0 +1,5 @@
+error[E0599]: no function or associated item named `injected_for_harness` found for struct `PeerExpectation` in the current scope
+ --> tests/compile-fail/peer_expectation/peer_expectation_injected_for_harness.rs:8:70
+  |
+8 |     let _ = household_rs::machine_roster_authority::PeerExpectation::injected_for_harness(
+  |                                                                      ^^^^^^^^^^^^^^^^^^^^ function or associated item not found in `PeerExpectation`

@@ -174,10 +174,19 @@ async fn linux_candidate_joins_via_tailnet_anchor_handoff() {
         PairMachineState::Committed,
         "founder window must be Committed"
     );
-    assert_eq!(
-        candidate.window.snapshot().await.state,
-        PairMachineState::Committed,
-        "candidate window must be Committed"
+    let candidate_record: household_rs::HouseholdRecord =
+        household_rs::storage::read_optional_cbor(&household_rs::storage::household_record_path(
+            candidate.dir.path(),
+        ))
+        .expect("read candidate household record")
+        .expect("candidate household record exists");
+    assert!(
+        candidate_record.shamir_n > 1,
+        "shamir_n > 1 is what distinguishes a committed Phase-3 transition from a \
+         sole-shard record that boot classifies as logically rolled back \
+         (storage.rs:798, recover_partial_phase3_commit's own post_shamir check); \
+         the ceremony window is generation-scoped and reads Idle in the \
+         post-rotation generation"
     );
 
     let m1_id = founder.identity.cert.m_id.to_string();

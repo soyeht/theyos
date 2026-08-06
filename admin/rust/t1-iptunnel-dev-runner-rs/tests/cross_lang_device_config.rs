@@ -69,7 +69,11 @@ fn generate_config(platform: &str, out: &Path) {
         status.success(),
         "gen-device-config should succeed for {platform}"
     );
-    assert!(out.is_file(), "generator should have written {}", out.display());
+    assert!(
+        out.is_file(),
+        "generator should have written {}",
+        out.display()
+    );
 }
 
 /// Invoke the Python validator via `uv run` against `config`, returning the raw
@@ -121,7 +125,10 @@ fn mangled_generated_config_is_rejected_by_python_validator() {
         "\"production_activation\": false",
         "\"production_activation\": true",
     );
-    assert_ne!(flipped, text, "expected production_activation to be flipped");
+    assert_ne!(
+        flipped, text,
+        "expected production_activation to be flipped"
+    );
     let bad_prod = tmp_path("xlang-bad-production.json");
     fs::write(&bad_prod, &flipped).expect("write mangled (production) config");
     assert_ne!(
@@ -135,7 +142,10 @@ fn mangled_generated_config_is_rejected_by_python_validator() {
         "\"claw_route_prefix_len\": 32",
         "\"claw_route_prefix_len\": 24",
     );
-    assert_ne!(widened, text, "expected claw_route_prefix_len to be widened");
+    assert_ne!(
+        widened, text,
+        "expected claw_route_prefix_len to be widened"
+    );
     let bad_route = tmp_path("xlang-bad-route.json");
     fs::write(&bad_route, &widened).expect("write mangled (route) config");
     assert_ne!(

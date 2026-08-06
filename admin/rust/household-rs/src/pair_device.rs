@@ -16,7 +16,6 @@
 //! `bonjour_publisher.rs` can flip Bonjour TXT records (`pairing=open` /
 //! `pair_nonce=…`) in real time.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -24,11 +23,16 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64};
 use rand::RngCore;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
+use serde_bytes::ByteBuf;
 use subtle::ConstantTimeEq;
 use tokio::sync::{RwLock, broadcast};
 
+use crate::household_lifecycle::{HouseholdLifecycleGenerationV1, LifecycleWriteGuard};
 use crate::keys::P256PublicKey;
 use crate::machine_cert::PersonId;
+use crate::pair_window_namespace::PairWindowNamespaceV2;
+
+const PAIR_DEVICE_SNAPSHOT_VERSION: u8 = 2;
 
 /// Hard ceiling on a single pair-window TTL. Prevents a tampered on-disk
 /// snapshot from spawning an unbounded TTL cleanup task; callers passing a
@@ -110,12 +114,16 @@ impl PairToken {
     /// Persist the token to disk so the next process (e.g. the daemon
     /// started by launchd after `theyos install` exits) can pick it up.
     #[must_use]
-    pub fn to_snapshot(&self) -> PairDeviceWindowSnapshot {
+    pub fn to_snapshot(
+        &self,
+        generation: HouseholdLifecycleGenerationV1,
+    ) -> PairDeviceWindowSnapshot {
         PairDeviceWindowSnapshot {
-            version: 1,
+            version: PAIR_DEVICE_SNAPSHOT_VERSION,
             nonce_b64: self.nonce.as_b64(),
             expires_at_unix: self.expires_at_unix,
             p_id_hint: self.p_id_hint.as_ref().map(|p| p.0.clone()),
+            lifecycle_generation: ByteBuf::from(generation.token_bytes().to_vec()),
         }
     }
 
@@ -127,7 +135,7 @@ impl PairToken {
     /// tampered snapshot with a far-future `expires_at_unix` cannot spawn an
     /// unbounded sleep task.
     pub fn from_snapshot(snap: &PairDeviceWindowSnapshot) -> Result<Option<Self>, String> {
-        if snap.version != 1 {
+        if snap.version != PAIR_DEVICE_SNAPSHOT_VERSION || snap.lifecycle_generation.len() != 32 {
             return Err(format!(
                 "unsupported pair window snapshot version: {}",
                 snap.version
@@ -293,6 +301,10 @@ pub struct PairDeviceWindowSnapshot {
     pub nonce_b64: String,
     pub expires_at_unix: u64,
     pub p_id_hint: Option<String>,
+    /// Required fixed-width lifecycle witness. Version-1 snapshots lacked it
+    /// and are deliberately never adopted.
+    #[serde(with = "serde_bytes")]
+    pub lifecycle_generation: ByteBuf,
 }
 
 /// Shared, mutable pair-receiving window.
@@ -306,11 +318,8 @@ pub struct PairDeviceWindow {
 struct PairDeviceWindowInner {
     state: RwLock<Option<PairToken>>,
     notifier: broadcast::Sender<PairDeviceWindowState>,
-    /// When `Some`, the window auto-deletes
-    /// `<state_dir>/household/pair_device_window.cbor` on consume / expiry so the
-    /// daemon (which reloads from disk on restart) cannot serve a stale
-    /// token after success.
-    state_dir: Option<PathBuf>,
+    /// Retained generation capability used by every write/delete/TTL callback.
+    namespace: Option<PairWindowNamespaceV2>,
 }
 
 impl PairDeviceWindow {
@@ -321,21 +330,38 @@ impl PairDeviceWindow {
             inner: Arc::new(PairDeviceWindowInner {
                 state: RwLock::new(None),
                 notifier: tx,
-                state_dir: None,
+                namespace: None,
             }),
         }
     }
 
-    /// Persistent variant: synchronizes window state with
-    /// `<state_dir>/household/pair_device_window.cbor`.
+    /// Persistent variant for a standalone synchronous construction site.
+    /// This may block up to the lifecycle lock deadline.
+    pub fn with_persistence(
+        state_dir: std::path::PathBuf,
+    ) -> Result<Self, crate::error::StorageError> {
+        let namespace = PairWindowNamespaceV2::current(state_dir)?;
+        Ok(Self::with_namespace(namespace))
+    }
+
+    /// Construct without reacquiring a lifecycle lock already held by caller.
+    pub fn with_persistence_under_lifecycle(
+        state_dir: std::path::PathBuf,
+        lifecycle: &LifecycleWriteGuard,
+    ) -> Result<Self, crate::error::StorageError> {
+        let namespace = PairWindowNamespaceV2::current_under_lifecycle(state_dir, lifecycle)?;
+        Ok(Self::with_namespace(namespace))
+    }
+
+    /// Construct from an explicit generation capability.
     #[must_use]
-    pub fn with_persistence(state_dir: PathBuf) -> Self {
+    pub fn with_namespace(namespace: PairWindowNamespaceV2) -> Self {
         let (tx, _) = broadcast::channel::<PairDeviceWindowState>(8);
         Self {
             inner: Arc::new(PairDeviceWindowInner {
                 state: RwLock::new(None),
                 notifier: tx,
-                state_dir: Some(state_dir),
+                namespace: Some(namespace),
             }),
         }
     }
@@ -350,9 +376,9 @@ impl PairDeviceWindow {
     /// token (caller renders the URI via [`PairToken::to_uri`]).
     ///
     /// When `state_dir` is configured (see [`Self::with_persistence`]) the
-    /// new token is also persisted to `<state_dir>/household/pair_device_window.cbor`
-    /// so a daemon restart picks up the live token instead of resurrecting
-    /// the previous one.
+    /// new token is also persisted in the current generation-scoped
+    /// [`PairWindowNamespaceV2`] so a daemon restart picks up the live token
+    /// without adopting an unscoped legacy snapshot.
     pub async fn mint_token(
         &self,
         ttl: Duration,
@@ -360,7 +386,26 @@ impl PairDeviceWindow {
     ) -> Result<PairToken, String> {
         let token = PairToken::mint(ttl, p_id_hint)?;
         let mut guard = self.inner.state.write().await;
-        let short = self.publish_locked(&mut guard, token.clone());
+        let short = self.publish_locked(&mut guard, token.clone(), None)?;
+        drop(guard);
+        let _ = self
+            .inner
+            .notifier
+            .send(PairDeviceWindowState::Open { short_nonce: short });
+        self.spawn_ttl_cleanup(ttl);
+        Ok(token)
+    }
+
+    /// Mint while reusing a lifecycle-exclusive guard held by the caller.
+    pub async fn mint_token_under_lifecycle(
+        &self,
+        ttl: Duration,
+        p_id_hint: Option<PersonId>,
+        lifecycle: &LifecycleWriteGuard,
+    ) -> Result<PairToken, String> {
+        let token = PairToken::mint(ttl, p_id_hint)?;
+        let mut guard = self.inner.state.write().await;
+        let short = self.publish_locked(&mut guard, token.clone(), Some(lifecycle))?;
         drop(guard);
         let _ = self
             .inner
@@ -389,23 +434,21 @@ impl PairDeviceWindow {
         &self,
         guard: &mut tokio::sync::RwLockWriteGuard<'_, Option<PairToken>>,
         token: PairToken,
-    ) -> String {
+        lifecycle: Option<&LifecycleWriteGuard>,
+    ) -> Result<String, String> {
         let short = token.nonce.as_short_b64();
-        if let Some(dir) = &self.inner.state_dir {
-            if let Err(e) = crate::storage::atomic_write_cbor(
-                &crate::storage::pair_device_window_path(dir),
-                &token.to_snapshot(),
-            ) {
-                tracing::warn!(
-                    stage = "pair_device_window.snapshot_write_failed",
-                    error = %e,
-                    "discarding persisted snapshot for safety"
-                );
-                let _ = crate::storage::delete_pair_device_window_snapshot(dir);
-            }
+        if let Some(namespace) = &self.inner.namespace {
+            let snapshot = token.to_snapshot(namespace.generation());
+            let result = match lifecycle {
+                Some(lifecycle) => {
+                    namespace.write_pair_device_under_lifecycle(&snapshot, lifecycle)
+                }
+                None => namespace.write_pair_device(&snapshot),
+            };
+            result.map_err(|error| format!("persist pair-device window: {error}"))?;
         }
         **guard = Some(token);
-        short
+        Ok(short)
     }
 
     /// Return the live token if one is open, otherwise mint one — atomically.
@@ -429,7 +472,29 @@ impl PairDeviceWindow {
             return Ok((live.clone(), false));
         }
         let token = PairToken::mint(ttl, p_id_hint)?;
-        let short = self.publish_locked(&mut guard, token.clone());
+        let short = self.publish_locked(&mut guard, token.clone(), None)?;
+        drop(guard);
+        let _ = self
+            .inner
+            .notifier
+            .send(PairDeviceWindowState::Open { short_nonce: short });
+        self.spawn_ttl_cleanup(ttl);
+        Ok((token, true))
+    }
+
+    /// Get or mint while reusing a lifecycle-exclusive guard.
+    pub async fn get_or_mint_under_lifecycle(
+        &self,
+        ttl: Duration,
+        p_id_hint: Option<PersonId>,
+        lifecycle: &LifecycleWriteGuard,
+    ) -> Result<(PairToken, bool), String> {
+        let mut guard = self.inner.state.write().await;
+        if let Some(live) = guard.as_ref().filter(|token| !token.is_expired()) {
+            return Ok((live.clone(), false));
+        }
+        let token = PairToken::mint(ttl, p_id_hint)?;
+        let short = self.publish_locked(&mut guard, token.clone(), Some(lifecycle))?;
         drop(guard);
         let _ = self
             .inner
@@ -449,6 +514,47 @@ impl PairDeviceWindow {
         }
     }
 
+    /// Read the snapshot belonging to this window's retained lifecycle
+    /// generation. No raw path escapes to the caller and legacy unscoped
+    /// snapshots are never considered.
+    pub fn read_persisted_snapshot(&self) -> Result<Option<PairDeviceWindowSnapshot>, String> {
+        self.read_persisted_snapshot_inner(None)
+    }
+
+    /// Read the generation-scoped snapshot without reacquiring a lifecycle
+    /// lock already held exclusively by the caller.
+    pub fn read_persisted_snapshot_under_lifecycle(
+        &self,
+        lifecycle: &LifecycleWriteGuard,
+    ) -> Result<Option<PairDeviceWindowSnapshot>, String> {
+        self.read_persisted_snapshot_inner(Some(lifecycle))
+    }
+
+    fn read_persisted_snapshot_inner(
+        &self,
+        lifecycle: Option<&LifecycleWriteGuard>,
+    ) -> Result<Option<PairDeviceWindowSnapshot>, String> {
+        let Some(namespace) = &self.inner.namespace else {
+            return Ok(None);
+        };
+        let snapshot: Option<PairDeviceWindowSnapshot> = match lifecycle {
+            Some(lifecycle) => namespace.read_pair_device_under_lifecycle(lifecycle),
+            None => namespace.read_pair_device(),
+        }
+        .map_err(|error| format!("read pair-device window: {error}"))?;
+        let Some(snapshot) = snapshot else {
+            return Ok(None);
+        };
+        if snapshot.version != PAIR_DEVICE_SNAPSHOT_VERSION
+            || snapshot.lifecycle_generation.as_ref() != namespace.generation().token_bytes()
+        {
+            return Err(
+                "pair-device snapshot does not match the retained lifecycle generation".to_string(),
+            );
+        }
+        Ok(Some(snapshot))
+    }
+
     /// Install a pre-existing token (e.g. one persisted by a sibling
     /// `theyos install` process). Replaces any existing token; spawns a TTL
     /// cleanup based on the token's remaining lifetime.
@@ -466,6 +572,27 @@ impl PairDeviceWindow {
         token: PairToken,
         snapshot: &PairDeviceWindowSnapshot,
     ) -> Result<bool, String> {
+        self.install_token_from_snapshot_inner(token, snapshot, None)
+            .await
+    }
+
+    /// Adopt while reusing a lifecycle-exclusive guard held by the watcher.
+    pub async fn install_token_from_current_snapshot_under_lifecycle(
+        &self,
+        token: PairToken,
+        snapshot: &PairDeviceWindowSnapshot,
+        lifecycle: &LifecycleWriteGuard,
+    ) -> Result<bool, String> {
+        self.install_token_from_snapshot_inner(token, snapshot, Some(lifecycle))
+            .await
+    }
+
+    async fn install_token_from_snapshot_inner(
+        &self,
+        token: PairToken,
+        snapshot: &PairDeviceWindowSnapshot,
+        lifecycle: Option<&LifecycleWriteGuard>,
+    ) -> Result<bool, String> {
         let remaining = token.expires_at.saturating_duration_since(Instant::now());
         let short = token.nonce.as_short_b64();
         let mut guard = self.inner.state.write().await;
@@ -475,10 +602,15 @@ impl PairDeviceWindow {
         {
             return Ok(false);
         }
-        if let Some(dir) = &self.inner.state_dir {
-            let latest: Option<PairDeviceWindowSnapshot> =
-                crate::storage::read_optional_cbor(&crate::storage::pair_device_window_path(dir))
-                    .map_err(|e| format!("read current pair-window snapshot: {e}"))?;
+        if let Some(namespace) = &self.inner.namespace {
+            if snapshot.lifecycle_generation.as_ref() != namespace.generation().token_bytes() {
+                return Ok(false);
+            }
+            let latest: Option<PairDeviceWindowSnapshot> = match lifecycle {
+                Some(lifecycle) => namespace.read_pair_device_under_lifecycle(lifecycle),
+                None => namespace.read_pair_device(),
+            }
+            .map_err(|e| format!("read current pair-window snapshot: {e}"))?;
             if latest.as_ref() != Some(snapshot) {
                 return Ok(false);
             }
@@ -520,17 +652,22 @@ impl PairDeviceWindow {
             None => Err(ConsumeError::NotOpen),
             Some(t) if t.is_expired() => {
                 *guard = None;
+                let delete = self.delete_persisted();
                 drop(guard);
                 let _ = self.inner.notifier.send(PairDeviceWindowState::Closed);
-                self.delete_persisted();
+                delete.map_err(ConsumeError::Storage)?;
                 Err(ConsumeError::Expired)
             }
             Some(t) if !bool::from(t.nonce.0.ct_eq(&nonce.0)) => Err(ConsumeError::WrongNonce),
             Some(_) => {
                 let token = guard.take().expect("matched Some(_) above");
+                // Authority is closed before the filesystem operation, but
+                // the memory lock remains held so a new mint cannot publish a
+                // replacement that this older consume would then delete.
+                let delete = self.delete_persisted();
                 drop(guard);
                 let _ = self.inner.notifier.send(PairDeviceWindowState::Closed);
-                self.delete_persisted();
+                delete.map_err(ConsumeError::Storage)?;
                 Ok(token)
             }
         }
@@ -547,14 +684,41 @@ impl PairDeviceWindow {
     where
         F: FnOnce(&PairToken) -> Result<T, E>,
     {
+        self.consume_token_with_inner(nonce, f, None).await
+    }
+
+    /// Consume while reusing an already-held lifecycle-exclusive guard.
+    pub async fn consume_token_with_under_lifecycle<T, E, F>(
+        &self,
+        nonce: &PairNonce,
+        f: F,
+        lifecycle: &LifecycleWriteGuard,
+    ) -> Result<T, ConsumeWithError<E>>
+    where
+        F: FnOnce(&PairToken) -> Result<T, E>,
+    {
+        self.consume_token_with_inner(nonce, f, Some(lifecycle))
+            .await
+    }
+
+    async fn consume_token_with_inner<T, E, F>(
+        &self,
+        nonce: &PairNonce,
+        f: F,
+        lifecycle: Option<&LifecycleWriteGuard>,
+    ) -> Result<T, ConsumeWithError<E>>
+    where
+        F: FnOnce(&PairToken) -> Result<T, E>,
+    {
         let mut guard = self.inner.state.write().await;
         let token = match guard.as_ref() {
             None => return Err(ConsumeWithError::Window(ConsumeError::NotOpen)),
             Some(t) if t.is_expired() => {
                 *guard = None;
+                let delete = self.delete_persisted_with(lifecycle);
                 drop(guard);
                 let _ = self.inner.notifier.send(PairDeviceWindowState::Closed);
-                self.delete_persisted();
+                delete.map_err(|error| ConsumeWithError::Window(ConsumeError::Storage(error)))?;
                 return Err(ConsumeWithError::Window(ConsumeError::Expired));
             }
             Some(t) if !bool::from(t.nonce.0.ct_eq(&nonce.0)) => {
@@ -564,23 +728,26 @@ impl PairDeviceWindow {
         };
         let output = f(token).map_err(ConsumeWithError::Callback)?;
         let _ = guard.take();
+        let delete = self.delete_persisted_with(lifecycle);
         drop(guard);
         let _ = self.inner.notifier.send(PairDeviceWindowState::Closed);
-        self.delete_persisted();
+        delete.map_err(|error| ConsumeWithError::Window(ConsumeError::Storage(error)))?;
         Ok(output)
     }
 
-    /// Best-effort delete of the persisted pair window snapshot, if any.
-    fn delete_persisted(&self) {
-        if let Some(dir) = &self.inner.state_dir {
-            if let Err(e) = crate::storage::delete_pair_device_window_snapshot(dir) {
-                tracing::warn!(
-                    stage = "pair_device_window.delete_snapshot_failed",
-                    path = %dir.display(),
-                    error = %e,
-                );
+    /// Durably delete exactly this window's generation-scoped snapshot.
+    fn delete_persisted(&self) -> Result<(), String> {
+        self.delete_persisted_with(None)
+    }
+
+    fn delete_persisted_with(&self, lifecycle: Option<&LifecycleWriteGuard>) -> Result<(), String> {
+        self.inner.namespace.as_ref().map_or(Ok(()), |namespace| {
+            match lifecycle {
+                Some(lifecycle) => namespace.delete_pair_device_under_lifecycle(lifecycle),
+                None => namespace.delete_pair_device(),
             }
-        }
+            .map_err(|error| error.to_string())
+        })
     }
 
     /// Returns true if a non-expired token is currently parked.
@@ -590,12 +757,28 @@ impl PairDeviceWindow {
     }
 
     /// Forcibly close the window (for shutdown / `--reissue-pair-qr`).
-    pub async fn close(&self) {
+    pub async fn close(&self) -> Result<(), String> {
+        self.close_inner(None).await
+    }
+
+    /// Close while reusing an already-held lifecycle-exclusive guard.
+    pub async fn close_under_lifecycle(
+        &self,
+        lifecycle: &LifecycleWriteGuard,
+    ) -> Result<(), String> {
+        self.close_inner(Some(lifecycle)).await
+    }
+
+    async fn close_inner(&self, lifecycle: Option<&LifecycleWriteGuard>) -> Result<(), String> {
         let mut guard = self.inner.state.write().await;
+        // Close authority first. A stale generation capability may make the
+        // exact-generation delete fail during teardown, but it must never
+        // leave an in-memory token usable in that fail-stop window.
         *guard = None;
+        let delete = self.delete_persisted_with(lifecycle);
         drop(guard);
         let _ = self.inner.notifier.send(PairDeviceWindowState::Closed);
-        self.delete_persisted();
+        delete
     }
 
     fn spawn_ttl_cleanup(&self, ttl: Duration) {
@@ -608,11 +791,22 @@ impl PairDeviceWindow {
             // already replaced it).
             if let Some(t) = guard.as_ref() {
                 if t.is_expired() {
+                    // Authority closes before delete. Keep the memory lock
+                    // through the exact-generation delete so a concurrent
+                    // mint cannot publish a replacement in between.
                     *guard = None;
+                    let delete = inner.namespace.as_ref().map_or(Ok(()), |namespace| {
+                        namespace
+                            .delete_pair_device()
+                            .map_err(|error| error.to_string())
+                    });
                     drop(guard);
                     let _ = inner.notifier.send(PairDeviceWindowState::Closed);
-                    if let Some(dir) = &inner.state_dir {
-                        let _ = crate::storage::delete_pair_device_window_snapshot(dir);
+                    if let Err(error) = delete {
+                        tracing::warn!(
+                            stage = "pair_device_window.ttl_delete_failed",
+                            error = %error,
+                        );
                     }
                 }
             }
@@ -634,6 +828,8 @@ pub enum ConsumeError {
     Expired,
     #[error("nonce does not match the active pair token")]
     WrongNonce,
+    #[error("pair-window persistence failed: {0}")]
+    Storage(String),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -716,15 +912,14 @@ mod tests {
     async fn get_or_mint_never_returns_a_token_memory_does_not_hold() {
         for round in 0..50 {
             let td = tempfile::tempdir().unwrap();
-            let w = PairDeviceWindow::with_persistence(td.path().to_path_buf());
+            let w = PairDeviceWindow::with_persistence(td.path().to_path_buf()).unwrap();
 
             // A snapshot on disk with nothing in memory: the state a daemon
             // restart leaves behind for the watcher to pick up.
             let stale = PairToken::mint(Duration::from_secs(60), None).unwrap();
-            let path = crate::storage::pair_device_window_path(td.path());
-            crate::storage::atomic_write_cbor(&path, &stale.to_snapshot()).unwrap();
-            let snap: PairDeviceWindowSnapshot =
-                crate::storage::read_optional_cbor(&path).unwrap().unwrap();
+            let namespace = w.inner.namespace.as_ref().unwrap();
+            let snap = stale.to_snapshot(namespace.generation());
+            namespace.write_pair_device(&snap).unwrap();
 
             let watcher = {
                 let w = w.clone();
@@ -757,12 +952,11 @@ mod tests {
     async fn mint_token_never_returns_a_token_memory_does_not_hold() {
         for round in 0..50 {
             let td = tempfile::tempdir().unwrap();
-            let w = PairDeviceWindow::with_persistence(td.path().to_path_buf());
+            let w = PairDeviceWindow::with_persistence(td.path().to_path_buf()).unwrap();
             let stale = PairToken::mint(Duration::from_secs(60), None).unwrap();
-            let path = crate::storage::pair_device_window_path(td.path());
-            crate::storage::atomic_write_cbor(&path, &stale.to_snapshot()).unwrap();
-            let snap: PairDeviceWindowSnapshot =
-                crate::storage::read_optional_cbor(&path).unwrap().unwrap();
+            let namespace = w.inner.namespace.as_ref().unwrap();
+            let snap = stale.to_snapshot(namespace.generation());
+            namespace.write_pair_device(&snap).unwrap();
 
             let watcher = {
                 let w = w.clone();
@@ -809,6 +1003,10 @@ mod tests {
 
     #[tokio::test]
     async fn every_uri_variant_carries_the_critical_machine_cert_fingerprint() {
+        // RFC 5737 documentation address — the same one `PairDeviceQR.swift`
+        // uses in its frozen examples. No real or tailnet address in fixtures.
+        const DOC_HOST: &str = "192.0.2.10:8091";
+
         let fp: [u8; 32] = [
             0x9a, 0x3f, 0x01, 0xff, 0x10, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa,
             0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
@@ -821,9 +1019,6 @@ mod tests {
         // Every entry point, not just the widest one: `to_uri` and
         // `to_uri_with_host` delegate today, but a future edit could give one
         // of them its own body and silently drop the critical field.
-        // RFC 5737 documentation address — the same one `PairDeviceQR.swift`
-        // uses in its frozen examples. No real or tailnet address in fixtures.
-        const DOC_HOST: &str = "192.0.2.10:8091";
         assert_ios_pair_device_qr_contract(&token.to_uri(&hh, &fp), &fp);
         assert_ios_pair_device_qr_contract(&token.to_uri_with_host(&hh, Some(DOC_HOST), &fp), &fp);
         assert_ios_pair_device_qr_contract(
@@ -948,11 +1143,12 @@ mod tests {
             .unwrap()
             .as_secs();
         let snap = PairDeviceWindowSnapshot {
-            version: 1,
+            version: PAIR_DEVICE_SNAPSHOT_VERSION,
             nonce_b64: PairNonce::random().as_b64(),
             // Far-future expiry — would be unbounded sleep without clamping.
             expires_at_unix: now + 10_000_000,
             p_id_hint: None,
+            lifecycle_generation: ByteBuf::from(vec![0_u8; 32]),
         };
         let token = PairToken::from_snapshot(&snap)
             .expect("decode")
@@ -963,13 +1159,13 @@ mod tests {
     #[tokio::test]
     async fn mint_persists_snapshot_when_state_dir_set() {
         let td = tempfile::tempdir().unwrap();
-        let w = PairDeviceWindow::with_persistence(td.path().to_path_buf());
+        let w = PairDeviceWindow::with_persistence(td.path().to_path_buf()).unwrap();
         let token = w.mint_token(Duration::from_secs(60), None).await.unwrap();
 
         // Persisted snapshot should carry the same nonce.
-        let path = crate::storage::pair_device_window_path(td.path());
-        let snap: PairDeviceWindowSnapshot =
-            crate::storage::read_optional_cbor(&path).unwrap().unwrap();
+        let namespace = w.inner.namespace.as_ref().unwrap();
+        let path = namespace.pair_device_snapshot_path();
+        let snap: PairDeviceWindowSnapshot = namespace.read_pair_device().unwrap().unwrap();
         assert_eq!(snap.nonce_b64, token.nonce.as_b64());
 
         // Consuming the token must wipe the persisted snapshot.
@@ -982,9 +1178,9 @@ mod tests {
     #[tokio::test]
     async fn stale_snapshot_token_is_not_reinstalled_after_consume() {
         let td = tempfile::tempdir().unwrap();
-        let w = PairDeviceWindow::with_persistence(td.path().to_path_buf());
+        let w = PairDeviceWindow::with_persistence(td.path().to_path_buf()).unwrap();
         let token = w.mint_token(Duration::from_secs(60), None).await.unwrap();
-        let snap = token.to_snapshot();
+        let snap = token.to_snapshot(w.inner.namespace.as_ref().unwrap().generation());
 
         w.consume_token(&token.nonce).await.unwrap();
 
@@ -997,5 +1193,140 @@ mod tests {
             .expect("install check");
         assert!(!installed);
         assert!(w.current_token().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_generation_ttl_cannot_delete_current_generation_window() {
+        let td = tempfile::tempdir().unwrap();
+        let lifecycle =
+            crate::household_lifecycle::HouseholdLifecycleLock::open_verified(td.path()).unwrap();
+        let guard = lifecycle.lock_exclusive().unwrap();
+        let old =
+            PairDeviceWindow::with_persistence_under_lifecycle(td.path().to_path_buf(), &guard)
+                .unwrap();
+        old.mint_token_under_lifecycle(Duration::from_millis(20), None, &guard)
+            .await
+            .unwrap();
+        guard.rotate_lifecycle_generation().unwrap();
+        let current =
+            PairDeviceWindow::with_persistence_under_lifecycle(td.path().to_path_buf(), &guard)
+                .unwrap();
+        let current_token = current
+            .mint_token_under_lifecycle(Duration::from_secs(5), None, &guard)
+            .await
+            .unwrap();
+        drop(guard);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(
+            old.current_token().await.is_none(),
+            "stale-generation TTL must close its in-memory authority even when deletion is refused"
+        );
+        assert_eq!(
+            current.current_token().await.unwrap().nonce.0,
+            current_token.nonce.0
+        );
+        assert!(
+            current
+                .inner
+                .namespace
+                .as_ref()
+                .unwrap()
+                .pair_device_snapshot_path()
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn identical_window_content_from_an_old_generation_is_not_adopted() {
+        let td = tempfile::tempdir().unwrap();
+        let lifecycle =
+            crate::household_lifecycle::HouseholdLifecycleLock::open_verified(td.path()).unwrap();
+        let guard = lifecycle.lock_exclusive().unwrap();
+        let old =
+            PairDeviceWindow::with_persistence_under_lifecycle(td.path().to_path_buf(), &guard)
+                .unwrap();
+        let token = old
+            .mint_token_under_lifecycle(Duration::from_secs(30), None, &guard)
+            .await
+            .unwrap();
+        let old_snapshot = old
+            .read_persisted_snapshot_under_lifecycle(&guard)
+            .unwrap()
+            .unwrap();
+
+        guard.rotate_lifecycle_generation().unwrap();
+        let current =
+            PairDeviceWindow::with_persistence_under_lifecycle(td.path().to_path_buf(), &guard)
+                .unwrap();
+        let mut same_content_current_generation = old_snapshot.clone();
+        same_content_current_generation.lifecycle_generation = ByteBuf::from(
+            current
+                .inner
+                .namespace
+                .as_ref()
+                .unwrap()
+                .generation()
+                .token_bytes()
+                .to_vec(),
+        );
+        current
+            .inner
+            .namespace
+            .as_ref()
+            .unwrap()
+            .write_pair_device_under_lifecycle(&same_content_current_generation, &guard)
+            .unwrap();
+        drop(guard);
+
+        assert!(
+            !current
+                .install_token_from_current_snapshot(token, &old_snapshot)
+                .await
+                .unwrap()
+        );
+        assert!(current.current_token().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_generation_consume_fails_closed_without_deleting_current_window() {
+        let td = tempfile::tempdir().unwrap();
+        let lifecycle =
+            crate::household_lifecycle::HouseholdLifecycleLock::open_verified(td.path()).unwrap();
+        let guard = lifecycle.lock_exclusive().unwrap();
+        let old =
+            PairDeviceWindow::with_persistence_under_lifecycle(td.path().to_path_buf(), &guard)
+                .unwrap();
+        let old_token = old
+            .mint_token_under_lifecycle(Duration::from_secs(30), None, &guard)
+            .await
+            .unwrap();
+        guard.rotate_lifecycle_generation().unwrap();
+        let current =
+            PairDeviceWindow::with_persistence_under_lifecycle(td.path().to_path_buf(), &guard)
+                .unwrap();
+        let current_token = current
+            .mint_token_under_lifecycle(Duration::from_secs(30), None, &guard)
+            .await
+            .unwrap();
+        drop(guard);
+
+        assert!(matches!(
+            old.consume_token(&old_token.nonce).await,
+            Err(ConsumeError::Storage(_))
+        ));
+        assert!(old.current_token().await.is_none());
+        assert_eq!(
+            current.current_token().await.unwrap().nonce.0,
+            current_token.nonce.0
+        );
+        assert!(
+            current
+                .inner
+                .namespace
+                .as_ref()
+                .unwrap()
+                .pair_device_snapshot_path()
+                .exists()
+        );
     }
 }

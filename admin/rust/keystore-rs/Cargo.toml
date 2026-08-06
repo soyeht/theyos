@@ -8,21 +8,66 @@ rust-version.workspace = true
 name = "keystore_rs"
 path = "src/lib.rs"
 
+[features]
+mesh-session = ["dep:serde", "dep:serde_bytes", "dep:ciborium", "dep:sha2", "dep:rand", "dep:mesh-session-core-rs"]
+# Declared because the co-located D4 sources reference them. They stay OFF:
+# the gated D4 surface (fault injection, seed_for_test, RosterSync) must not
+# exist in any keystore build -- see mesh-session-control-model-rs's lib.rs.
+test-support = []
+roster-sync-unratified = []
+
 [dependencies]
+serde       = { version = "1", features = ["derive"], optional = true }
+serde_bytes = { version = "0.11", optional = true }
+ciborium    = { version = "0.2", optional = true }
+sha2        = { version = "0.10", optional = true }
+rand        = { version = "0.8", optional = true }
+mesh-session-core-rs = { path = "../mesh-session-core-rs", optional = true }
 thiserror = { workspace = true }
 tracing   = { workspace = true }
 base64    = { workspace = true }
+blake3    = { workspace = true }
+zeroize   = { workspace = true }
 
-# Linux: Secret Service (gnome-keyring) or kernel keyring via the `keyring` crate.
+# P-256 for the opaque signing-slot surface (src/opaque_p256.rs). The private
+# scalar is generated, used and zeroized entirely inside that module and never
+# crosses its API — see its docs for what that does and does not buy.
+p256      = { workspace = true }
+rand_core = { workspace = true }
+
+# Linux: Secret Service (gnome-keyring) or kernel keyring via the `keyring`
+# crate, and libc for the O_NOFOLLOW/fstat-based secure reinspection used by
+# create_only's stabilization step (regular unix target, not just Linux —
+# see the crate-root `[target.'cfg(unix)'.dependencies]` below.
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { workspace = true }
+
+# unix (Linux + macOS): raw O_NOFOLLOW open + fstat for create_only's
+# reinspection step (file_backend.rs::secure_open_regular_nofollow). std
+# doesn't expose O_NOFOLLOW or geteuid(); libc is already an approved direct
+# dependency elsewhere in this workspace (server-rs's VPN backends).
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
 
 # macOS: security-framework wrapper around Keychain Services for generic-password
 # entries. The household crate's Secure-Enclave key path stays where it is
 # (household-rs::keys_se) — keystore-rs is only the generic (service, account)
-# → bytes API.
+# → bytes API. security-framework-sys/core-foundation are needed directly
+# (not just transitively) for the raw SecItemAdd call behind `create_only`:
+# the safe `security-framework::passwords` wrapper only exposes create-or-
+# update semantics, never create-only.
+#
+# core-foundation is pinned to "0.9.4" here, NOT `workspace = true` (which
+# resolves to 0.10.x elsewhere in the workspace) — security-framework 2.11.1
+# itself depends on core-foundation "0.9.4" and its public
+# `passwords_options::PasswordOptions.query: Vec<(CFString, CFType)>` uses
+# those 0.9.4 types. A workspace-aliased 0.10.x CFString is a different,
+# non-interchangeable type despite the identical name (confirmed by
+# `cargo check`: E0277, two versions of `core_foundation` in the graph).
 [target.'cfg(target_os = "macos")'.dependencies]
-security-framework = { workspace = true }
+security-framework     = { workspace = true }
+security-framework-sys = { workspace = true }
+core-foundation         = "0.9.4"
 
 [dev-dependencies]
 tempfile = { workspace = true }

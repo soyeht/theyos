@@ -72,6 +72,27 @@ impl HouseholdExposurePolicy {
                 class,
                 InterfaceClass::Loopback | InterfaceClass::Lan | InterfaceClass::Tailscale
             ),
+            // An interrupted install gets its OWN arm, and deliberately the
+            // narrowest one. `allows` is a function of the state alone -- it
+            // cannot see which state we arrived from -- so this set has to be
+            // safe from *every* legal predecessor. The transition table admits
+            // `Uninitialized | ReadyForNaming | NamedAwaitingPair` into this
+            // state, whose sets are {Loopback, Lan, Tailscale} and
+            // {Loopback, Tailscale, Mesh}. Their intersection is
+            // {Loopback, Tailscale}, and that is what this arm may grant.
+            //
+            // Sharing `Ready`'s arm was measurably wrong, not merely untidy: a
+            // household that never completed onboarding gained `Mesh` on
+            // entering this state, applied by the 60 s `sync_interface_targets`
+            // refresh without the router ever restarting. The or-pattern let a
+            // new variant inherit `Ready`'s exposure with nobody deciding it.
+            //
+            // Rule, so the next variant does not repeat this: entering
+            // `PairMachineInstallRestartRequired` must never widen the exposed
+            // class set relative to any legal predecessor.
+            BootstrapState::PairMachineInstallRestartRequired => {
+                matches!(class, InterfaceClass::Loopback | InterfaceClass::Tailscale)
+            }
             BootstrapState::NamedAwaitingPair
             | BootstrapState::Ready
             | BootstrapState::Recovering => {
@@ -880,7 +901,56 @@ async fn sync_exposure_policy(bootstrap: &Arc<RwLock<BootstrapState>>, bound: &B
 /// Spawn one `axum::serve` per bind target. Returns the set of addresses
 /// that actually bound, so the Bonjour publisher can advertise only what's
 /// reachable. Servers run in background tasks owned by tokio.
+/// Proof that the caller is process startup, not a request handler.
+///
+/// A pair-machine reexec must never reopen the household router, "not even
+/// transitively". That was previously argued by reading the reexec path and
+/// seeing no router call, and then by a test that swept source text for call
+/// sites. Both are weaker than they look: the first says nothing about a path
+/// added later, and the second was defeated in review by a second caller in an
+/// already-listed file, by a one-line `#[cfg(test)]` item, and by an import
+/// alias. A brace-counting text classifier is not a control.
+///
+/// So the restriction is a type instead. This struct has a private field, no
+/// `Clone`, no `Copy`, no `Default`, and no public constructor, so it cannot be
+/// built outside this module. [`ProcessStartupToken::claim`] is the only way to
+/// obtain one and succeeds exactly once per process. A handler cannot fabricate
+/// it and cannot claim it after `main` has, so a handler-reachable call to
+/// [`spawn_household_listeners`] does not compile — no sweep required.
+///
+/// Scope, so nobody reads more into this than it proves: this governs *starting*
+/// listeners. It does not claim bootstrap state has no effect on exposure. It
+/// does, by design — [`refresh_loop`] polls the bootstrap state on a timer and
+/// re-filters bind targets through [`HouseholdExposurePolicy`], so a reexec that
+/// commits `Ready` changes what an already-running listener exposes within one
+/// poll interval. That belongs to the exposure-policy arms, which are pinned by
+/// their own decision guard.
+pub struct ProcessStartupToken(());
+
+static STARTUP_TOKEN_CLAIMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+impl ProcessStartupToken {
+    /// Claim the process-wide startup token.
+    ///
+    /// Returns `None` if it has already been claimed, so a second claim from
+    /// anywhere — including a handler that reached this function at runtime —
+    /// cannot manufacture startup authority.
+    pub fn claim() -> Option<Self> {
+        STARTUP_TOKEN_CLAIMED
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .ok()
+            .map(|_| Self(()))
+    }
+}
+
 pub async fn spawn_household_listeners(
+    _startup: &ProcessStartupToken,
     router: Router,
     port: u16,
     bootstrap: Arc<RwLock<BootstrapState>>,
@@ -1868,6 +1938,239 @@ mod tests {
         assert!(
             spawn_body.contains("sync_interface_targets"),
             "spawn_household_listeners must route initial binds through the policy-aware sync helper"
+        );
+    }
+
+    /// The half of a source file that is not the test module.
+    ///
+    /// Anchored on `#[cfg(test)]` immediately followed by `mod tests`, never on
+    /// the first `#[cfg(test)]` alone: files with cfg-gated items scattered
+    /// through production have many of the latter, and cutting at the first one
+    /// discards the code the caller means to measure. `mesh_intent_nonce_ledger
+    /// .rs` has seven at column zero, the first on line 55, with the definition
+    /// on 588 -- the naive cut keeps 54 lines and finds nothing.
+    fn production_half(text: &str) -> &str {
+        text.split_once("\n#[cfg(test)]\nmod tests")
+            .map_or(text, |(production, _)| production)
+    }
+
+    /// Exercises [`production_half`] against input that exhibits the failure.
+    ///
+    /// `household_listener.rs` cannot: it has exactly one `#[cfg(test)]` at
+    /// column zero and that one *is* the module, so both partitions are the
+    /// same cut and mutating the anchor cannot turn the guard below red. The
+    /// guard's control would therefore be armed and never exercised, which is a
+    /// green with no red behind it.
+    ///
+    /// The fixture is synthetic rather than a real file on purpose. Pointing it
+    /// at `mesh_intent_nonce_ledger.rs` would make this test depend on that
+    /// file keeping its scattered `#[cfg(test)]` attributes: tidy them and the
+    /// input stops exhibiting the property, and the test goes green without
+    /// anyone learning why. That is the `include_str!` self-reference one level
+    /// up -- a fixture measuring another file's present instead of the property
+    /// it means to demonstrate.
+    #[test]
+    fn production_half_cuts_at_the_module_not_the_first_attribute() {
+        let fixture = "\
+use std::fs;
+
+#[cfg(test)]
+fn helper_used_only_by_tests() {}
+
+pub(crate) fn open(path: &str) {}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn t() {}
+}
+";
+        let naive = fixture
+            .split_once("\n#[cfg(test)]")
+            .map_or(fixture, |(production, _)| production);
+        assert!(
+            !naive.contains("pub(crate) fn open"),
+            "the naive cut must lose the definition -- if it does not, this \
+             fixture no longer exhibits the failure and proves nothing"
+        );
+
+        let correct = production_half(fixture);
+        assert!(
+            correct.contains("pub(crate) fn open"),
+            "the module-anchored cut must keep the definition"
+        );
+        assert!(
+            !correct.contains("fn t()"),
+            "the module-anchored cut must still exclude the test module"
+        );
+    }
+
+    /// The token closes *construction* by type; this closes *propagation*.
+    ///
+    /// `ProcessStartupToken(())` cannot be built outside this module, and
+    /// `claim` hands out at most one per process. Neither fact stops the
+    /// resulting `&ProcessStartupToken` from being stored -- parking it in a
+    /// struct field reachable from `AppState` compiles, and a handler holding
+    /// that state could call `spawn_household_listeners` a second time. That
+    /// call is not idempotent: it reconciles through
+    /// `sync_interface_targets(.., "startup")`, which opens bind targets and
+    /// not only closes them.
+    ///
+    /// Nothing in the type system keeps the token on the stack. Today it is
+    /// there because no field holds it -- a fact about the current tree, not an
+    /// invariant, until something checks it. So enumerate every occurrence in
+    /// the crate and pin the set: any new one, including a struct field, has to
+    /// be looked at rather than merely compiled.
+    #[test]
+    fn the_startup_token_is_never_stored_only_passed() {
+        // Scan the whole workspace, not just this crate. `ProcessStartupToken`
+        // is `pub` and `server-rs` is a `[lib]`, so a dependent could park it
+        // in a struct field where a crate-local scan would never look --
+        // `t1-iptunnel-dev-runner-rs` and `e2e-rs` both declare a dependency
+        // edge today. Scanning one crate in a workspace of thirty-one made the
+        // assertion message ("a struct field holding it would let a handler
+        // start the listeners again") broader than the evidence behind it.
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crate dir has a workspace parent")
+            .to_path_buf();
+        let mut found: Vec<String> = Vec::new();
+        let mut scanned_crates: Vec<String> = Vec::new();
+        let mut stack: Vec<std::path::PathBuf> = Vec::new();
+        for entry in std::fs::read_dir(&workspace).expect("read workspace dir") {
+            let member = entry.expect("workspace entry").path();
+            if !member.is_dir() || member.file_name().is_some_and(|n| n == "target") {
+                continue;
+            }
+            let member_src = member.join("src");
+            if member_src.is_dir() {
+                scanned_crates.push(
+                    member
+                        .file_name()
+                        .expect("member dir name")
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+                stack.push(member_src);
+            }
+        }
+        scanned_crates.sort();
+        // Non-vacuity by set, not by cardinality. `>= 25` in a workspace of
+        // thirty-one tolerates six members dropping out of the scan in
+        // silence, and a scan that stops seeing members is precisely the
+        // failure this guard exists to prevent -- the weak form fails only in
+        // the extreme case. Read the declared list from the manifest and
+        // require every member to have been reached: that fails on a shrunken
+        // scan AND on a new member the walk cannot reach, and adding a member
+        // needs no re-pinning here.
+        let manifest =
+            std::fs::read_to_string(workspace.join("Cargo.toml")).expect("read workspace manifest");
+        let declared: Vec<String> = manifest
+            .split_once("members = [")
+            .expect("workspace manifest declares members")
+            .1
+            .split_once(']')
+            .expect("members list terminates")
+            .0
+            .lines()
+            .filter_map(|l| l.trim().trim_end_matches(',').strip_prefix('"'))
+            .filter_map(|l| l.strip_suffix('"'))
+            .map(str::to_owned)
+            .collect();
+        // Control on the parser, not on the workspace: if this parse silently
+        // yielded few or no members the loop below would pass vacuously, so
+        // require the crate that defines the token to be among what was
+        // parsed. A parse that breaks fails here rather than downstream.
+        assert!(
+            declared.iter().any(|m| m == "server-rs"),
+            "manifest parse did not yield the defining crate -- the parser shrank, not the scan: {declared:?}"
+        );
+        for member in &declared {
+            assert!(
+                scanned_crates.contains(member),
+                "declared workspace member was never scanned: {member} (scanned: {scanned_crates:?})"
+            );
+        }
+        // The walk is deliberately WIDER than `members`. The `exclude`d roots
+        // depend on `server-rs` by path and compile, so they can park the
+        // token in a field even though `--workspace` never builds them.
+        // `read_dir` covers them; iterating `members` would not. Asserted so
+        // that narrowing this walk to the declared list -- which reads like
+        // tidying -- fails instead of quietly shedding the coverage.
+        for excluded in ["mesh-session-core-rs", "mesh-session-control-model-rs"] {
+            assert!(
+                scanned_crates.iter().any(|c| c == excluded),
+                "excluded root {excluded} must still be scanned: it compiles against \
+                 server-rs and can hold the token"
+            );
+        }
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read src dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|ext| ext != "rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).expect("read source file");
+                // Scan production only. This guard names the token in its own
+                // expected set, so an unbounded scan matches those literals and
+                // the assertion compares the guard against itself -- the same
+                // `include_str!` self-reference that made the post-ACK guard
+                // pass against an empty handler.
+                //
+                let text = production_half(&text);
+                for line in text.lines() {
+                    if !line.contains("ProcessStartupToken") {
+                        continue;
+                    }
+                    let trimmed = line.trim();
+                    if trimmed.starts_with("///") || trimmed.starts_with("//") {
+                        continue;
+                    }
+                    let name = path
+                        .strip_prefix(&workspace)
+                        .expect("path under the workspace")
+                        .to_string_lossy()
+                        .into_owned();
+                    found.push(format!("{name}: {trimmed}"));
+                }
+            }
+        }
+        found.sort();
+
+        // Control on the partition itself (@khai): a guard whose production
+        // half does not contain the definition it measures is broken whatever
+        // number it returns. In `mesh_intent_nonce_ledger.rs` both partitions
+        // happen to yield zero -- the wrong cut by discarding the definition,
+        // the right cut because there genuinely is no production call -- so the
+        // count alone cannot tell a working instrument from a broken one.
+        assert!(
+            found
+                .iter()
+                .any(|line| line.contains("pub struct ProcessStartupToken(())")),
+            "the production half must contain the definition being measured; \
+             if it does not, the partition cut in the wrong place and every \
+             count below is measuring the wrong text"
+        );
+
+        let expected = [
+            "server-rs/src/household_bootstrap.rs: startup: &household_listener::ProcessStartupToken,",
+            "server-rs/src/household_listener.rs: _startup: &ProcessStartupToken,",
+            "server-rs/src/household_listener.rs: impl ProcessStartupToken {",
+            "server-rs/src/household_listener.rs: pub struct ProcessStartupToken(());",
+            "server-rs/src/main.rs: let startup_token = server_rs::household_listener::ProcessStartupToken::claim()",
+        ];
+
+        assert_eq!(
+            found, expected,
+            "the startup token's occurrence set changed. It may be DEFINED, \
+             IMPLEMENTED, taken by reference as a function parameter, and \
+             claimed exactly once in main -- nothing else. A struct field \
+             holding it would let a handler start the listeners again, and \
+             `spawn_household_listeners` opens bind targets on every call."
         );
     }
 }

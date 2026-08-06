@@ -6,10 +6,10 @@
 //!   long-poll. Each event is signed by the issuer's `M_priv`; the
 //!   iPhone verifies the signature against the issuer's
 //!   [`crate::MachineCert`] chained to the household root.
-//! - [`OwnerEventLog`] is the long-lived handle that owns the
-//!   serialization mutex, the in-memory cursor head, and the
-//!   broadcaster wiring. Every append goes through it so concurrent
-//!   producers cannot race the cursor.
+//! - [`OwnerEventLog`] is the long-lived, lifecycle-bound handle that retains
+//!   state/household/log directory descriptors, the in-memory cursor head, and
+//!   broadcaster wiring. Every append holds the stable lifecycle reader before
+//!   the cross-process log flock and derives its cursor from the durable tail.
 //! - On-disk records are **length-prefixed**: every event is written as
 //!   `<u64 BE length><canonical CBOR>`. On boot the log is scanned and
 //!   any partial trailing record (e.g., from a torn write) is
@@ -20,11 +20,16 @@
 //! - [`OwnerDevicePushToken`] is the persisted push-token registry
 //!   entry, written by the PoP-authenticated `push-token` endpoint.
 
+use std::fs::File;
 use std::io::{Read, Write};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+use fs2::FileExt;
+use rustix::fs::{AtFlags, Mode, OFlags};
+use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use thiserror::Error;
@@ -32,6 +37,11 @@ use tokio::sync::broadcast;
 
 use crate::cbor;
 use crate::error::{HouseholdError, StorageError};
+use crate::household_lifecycle::{
+    HouseholdLifecycleGenerationV1, HouseholdLifecycleLockError, LifecycleReadGuard,
+    LifecycleWriteGuard,
+};
+use crate::household_record::HouseholdRecord;
 use crate::keys::{IdentityKey, P256Signature};
 
 pub const OWNER_EVENT_VERSION: u8 = 1;
@@ -164,54 +174,112 @@ pub enum EventError {
     ClockSkew,
     #[error("event_type / payload variant disagree")]
     PayloadTypeMismatch,
+    #[error("machine-joined event conflicts with an existing event for the same machine")]
+    MachineJoinedConflict,
+    #[error("owner-event lifecycle binding rejected: {0}")]
+    Lifecycle(#[from] HouseholdLifecycleLockError),
+    #[error("owner-event log is bound to a different household or lifecycle generation")]
+    StaleLifecycleBinding,
+    #[error("owner-event append may have taken effect at {stage:?}")]
+    MayHaveTakenEffect { stage: EventDurabilityStage },
+}
+
+/// Last durability step whose acknowledgement was lost after an append may
+/// already have changed the log. Callers must reconcile from the durable tail;
+/// they must not publish an in-memory head or broadcast from this outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventDurabilityStage {
+    Write,
+    FileSync,
+    ParentSync,
 }
 
 const LENGTH_PREFIX_BYTES: usize = 8;
 const MAX_RECORD_BYTES: u64 = 1 << 20; // 1 MiB hard cap per event
+const MAX_HOUSEHOLD_RECORD_BYTES: u64 = 1 << 20;
+const OWNER_EVENTS_SUBDIR: &str = "owner_events";
+const OWNER_EVENTS_LOG_FILENAME: &str = "log.cbor";
+const OWNER_EVENTS_LOCK_FILENAME: &str = ".append-v2.lock";
 
 /// Long-lived owner-events log handle.
 ///
-/// Owns the per-state-dir append serialization (a [`std::sync::Mutex`]
-/// held briefly across one disk write per call) and the in-memory
-/// cursor head. Optionally fans appended events out to an attached
+/// Owns the retained state-root/household/log descriptors, lifecycle binding,
+/// and in-memory cursor head. A fresh cross-process flock serializes each
+/// append. Optionally fans appended events out to an attached
 /// [`OwnerEventsBroadcaster`] so long-poll subscribers never see a
 /// disk-on-its-own state where the broadcaster forgets to publish.
 ///
-/// Construct via [`Self::open`] (no broadcaster) or
-/// [`Self::open_with_broadcaster`]. Both perform a one-shot scan-and-
-/// repair pass over `owner_events/log.cbor` so the daemon recovers from
-/// a torn-write left by an unclean shutdown.
+/// Construct via [`Self::open_under_lifecycle`] (no broadcaster) or
+/// [`Self::open_with_broadcaster_under_lifecycle`]. Both require the lifecycle
+/// writer and perform a scan-and-repair pass over `owner_events/log.cbor`.
 pub struct OwnerEventLog {
-    state_dir: PathBuf,
+    state_path: PathBuf,
+    state_dir: File,
+    household_dir: File,
+    log_dir: File,
+    expected_hh_id: String,
+    lifecycle_generation: HouseholdLifecycleGenerationV1,
     head: AtomicU64,
-    append_mu: std::sync::Mutex<()>,
     broadcaster: Option<OwnerEventsBroadcaster>,
 }
 
 impl OwnerEventLog {
-    /// Open the log without a broadcaster.
-    pub fn open(state_dir: PathBuf) -> Result<Arc<Self>, EventError> {
-        let head = scan_and_repair(&state_dir)?;
-        Ok(Arc::new(Self {
-            state_dir,
-            head: AtomicU64::new(head),
-            append_mu: std::sync::Mutex::new(()),
-            broadcaster: None,
-        }))
+    /// Open and repair the log while the caller holds the lifecycle writer.
+    ///
+    /// Construction binds the long-lived handle to the exact retained state
+    /// root, installed `household/` inode, household id, and lifecycle
+    /// generation. It never creates `household/`; a missing household is a
+    /// hard error. Only `owner_events/` and its coordination file may be
+    /// created, fd-relative, after the binding checks succeed.
+    pub fn open_under_lifecycle(
+        lifecycle: &LifecycleWriteGuard,
+        state_path: PathBuf,
+        expected_hh_id: &str,
+    ) -> Result<Arc<Self>, EventError> {
+        Self::open_inner(lifecycle, state_path, expected_hh_id, None)
     }
 
-    /// Open the log with a broadcaster pre-wired.
-    pub fn open_with_broadcaster(
-        state_dir: PathBuf,
+    /// [`Self::open_under_lifecycle`] with broadcaster wiring.
+    pub fn open_with_broadcaster_under_lifecycle(
+        lifecycle: &LifecycleWriteGuard,
+        state_path: PathBuf,
+        expected_hh_id: &str,
         broadcaster: OwnerEventsBroadcaster,
     ) -> Result<Arc<Self>, EventError> {
-        let head = scan_and_repair(&state_dir)?;
-        Ok(Arc::new(Self {
+        Self::open_inner(lifecycle, state_path, expected_hh_id, Some(broadcaster))
+    }
+
+    fn open_inner(
+        lifecycle: &LifecycleWriteGuard,
+        state_path: PathBuf,
+        expected_hh_id: &str,
+        broadcaster: Option<OwnerEventsBroadcaster>,
+    ) -> Result<Arc<Self>, EventError> {
+        lifecycle.verify_state_root(&state_path)?;
+        let lifecycle_generation = lifecycle.ensure_lifecycle_generation()?;
+        let state_dir = open_directory_path(&state_path)?;
+        let household_dir = open_household_dir(&state_dir)?;
+        verify_household_record(&household_dir, expected_hh_id)?;
+        let log_dir = open_or_create_log_dir(&household_dir)?;
+        ensure_log_lock_durable(&log_dir)?;
+
+        let log = Arc::new(Self {
+            state_path,
             state_dir,
-            head: AtomicU64::new(head),
-            append_mu: std::sync::Mutex::new(()),
-            broadcaster: Some(broadcaster),
-        }))
+            household_dir,
+            log_dir,
+            expected_hh_id: expected_hh_id.to_owned(),
+            lifecycle_generation,
+            head: AtomicU64::new(0),
+            broadcaster,
+        });
+        // Startup repair is deliberately writer-only. No request can observe
+        // the installed household while a torn tail is being truncated.
+        let _lock = log.lock_log_exclusive()?;
+        log.verify_binding_write(lifecycle)?;
+        let head = scan_and_repair_fd(&log.log_dir)?;
+        log.head.store(head, Ordering::Release);
+        Ok(log)
     }
 
     /// Highest cursor written.
@@ -227,6 +295,96 @@ impl OwnerEventLog {
     ///
     pub fn append(
         &self,
+        lifecycle: &LifecycleReadGuard,
+        issuer_m_id: &str,
+        issuer_key: &dyn IdentityKey,
+        event_type: OwnerEventType,
+        payload: OwnerEventPayload,
+    ) -> Result<OwnerEvent, EventError> {
+        self.append_with_guard(
+            OwnerEventGuard::Read(lifecycle),
+            issuer_m_id,
+            issuer_key,
+            event_type,
+            payload,
+        )
+    }
+
+    /// Append while an enclosing lifecycle writer is already held. This keeps
+    /// post-commit audit events in the same lifecycle transaction without
+    /// dropping exclusive protection merely to reacquire a reader.
+    pub fn append_under_lifecycle_write(
+        &self,
+        lifecycle: &LifecycleWriteGuard,
+        issuer_m_id: &str,
+        issuer_key: &dyn IdentityKey,
+        event_type: OwnerEventType,
+        payload: OwnerEventPayload,
+    ) -> Result<OwnerEvent, EventError> {
+        self.append_with_guard(
+            OwnerEventGuard::Write(lifecycle),
+            issuer_m_id,
+            issuer_key,
+            event_type,
+            payload,
+        )
+    }
+
+    /// Append one exact `MachineJoined` terminal side effect, or prove that
+    /// the identical event is already durable.
+    ///
+    /// The candidate machine id is the idempotency key. An existing event is
+    /// accepted only when both its issuer and full payload match exactly; a
+    /// different payload for the same machine fails closed. This method scans
+    /// and stabilizes the tail while holding the append flock, so retry after
+    /// [`EventError::MayHaveTakenEffect`] cannot append a duplicate.
+    pub fn append_machine_joined_exactly_once_under_lifecycle_write(
+        &self,
+        lifecycle: &LifecycleWriteGuard,
+        issuer_m_id: &str,
+        issuer_key: &dyn IdentityKey,
+        payload: MachineJoinedPayload,
+    ) -> Result<OwnerEvent, EventError> {
+        self.verify_binding_write(lifecycle)?;
+        let _lock = self.lock_log_exclusive()?;
+        self.verify_binding_write(lifecycle)?;
+        let head = scan_and_repair_fd(&self.log_dir)?;
+        let bytes = read_log_bytes(&self.log_dir)?;
+        let (events, valid_len) = decode_length_prefixed(&bytes);
+        if valid_len != bytes.len() {
+            return Err(EventError::MayHaveTakenEffect {
+                stage: EventDurabilityStage::Write,
+            });
+        }
+        for event in events {
+            let OwnerEventPayload::MachineJoined(existing) = &event.payload else {
+                continue;
+            };
+            if existing.m_id != payload.m_id {
+                continue;
+            }
+            if existing != &payload || event.issuer_m_id != issuer_m_id {
+                return Err(EventError::MachineJoinedConflict);
+            }
+            stabilize_log_fd(&self.log_dir)?;
+            self.head.store(head, Ordering::Release);
+            if let Some(broadcaster) = &self.broadcaster {
+                let _ = broadcaster.publish(event.clone());
+            }
+            return Ok(event);
+        }
+        self.append_new_locked(
+            head,
+            issuer_m_id,
+            issuer_key,
+            OwnerEventType::MachineJoined,
+            OwnerEventPayload::MachineJoined(payload),
+        )
+    }
+
+    fn append_with_guard(
+        &self,
+        lifecycle: OwnerEventGuard<'_>,
         issuer_m_id: &str,
         issuer_key: &dyn IdentityKey,
         event_type: OwnerEventType,
@@ -235,21 +393,26 @@ impl OwnerEventLog {
         if !payload.matches_type(&event_type) {
             return Err(EventError::PayloadTypeMismatch);
         }
-        // Serialize concurrent appenders. Critical section is short:
-        // one canonical encode + one fsync. Held with std mutex (not
-        // tokio) — caller is async but the wait is bounded.
-        //
-        // Mutex-poison recovery: a panic inside this critical section
-        // does NOT corrupt mutable state (we hold no `&mut` invariant
-        // outside the lock — the file is append-only and the cursor
-        // moves only on success). So `into_inner()` on a poisoned
-        // guard is safe and prevents a single panic from bricking the
-        // log for the rest of process lifetime.
-        let _guard = self
-            .append_mu
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let head = self.head.load(Ordering::Acquire);
+        // Lock order is normative: lifecycle first (owned by the caller), log
+        // second. The lifecycle binding is rechecked before signing and before
+        // any log pathname can be created/opened.
+        self.verify_binding(lifecycle)?;
+        let _lock = self.lock_log_exclusive()?;
+        self.verify_binding(lifecycle)?;
+        // The durable tail, not a process-local atomic, allocates cursors. This
+        // is what makes independent processes serialize correctly.
+        let head = scan_and_repair_fd(&self.log_dir)?;
+        self.append_new_locked(head, issuer_m_id, issuer_key, event_type, payload)
+    }
+
+    fn append_new_locked(
+        &self,
+        head: u64,
+        issuer_m_id: &str,
+        issuer_key: &dyn IdentityKey,
+        event_type: OwnerEventType,
+        payload: OwnerEventPayload,
+    ) -> Result<OwnerEvent, EventError> {
         let cursor = head
             .checked_add(1)
             .ok_or_else(|| EventError::Cbor("cursor overflow".into()))?;
@@ -282,7 +445,7 @@ impl OwnerEventLog {
                 event_bytes.len()
             )));
         }
-        append_length_prefixed_record(&self.state_dir, &event_bytes)?;
+        append_length_prefixed_record_fd(&self.log_dir, &event_bytes)?;
         self.head.store(cursor, Ordering::Release);
         if let Some(b) = &self.broadcaster {
             let _ = b.publish(event.clone());
@@ -293,76 +456,138 @@ impl OwnerEventLog {
     /// Read every event with `cursor > since`. Decoder is tolerant of a
     /// torn trailing record — those are repaired during [`Self::open`]
     /// and never reached here in the steady state.
-    pub fn read_since(&self, since: u64) -> Result<Vec<OwnerEvent>, EventError> {
-        let path = log_path(&self.state_dir);
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(io_to_event_err(&e, &path)),
-        };
+    pub fn read_since(
+        &self,
+        lifecycle: &LifecycleReadGuard,
+        since: u64,
+    ) -> Result<Vec<OwnerEvent>, EventError> {
+        self.verify_binding_read(lifecycle)?;
+        let _lock = self.lock_log_exclusive()?;
+        self.verify_binding_read(lifecycle)?;
+        let bytes = read_log_bytes(&self.log_dir)?;
         let (events, _) = decode_length_prefixed(&bytes);
         Ok(events.into_iter().filter(|e| e.cursor > since).collect())
     }
+
+    /// Repair a torn tail during hot reload/recovery. Only the lifecycle
+    /// writer can invoke this; normal read paths never mutate recovery state.
+    pub fn repair_under_lifecycle(
+        &self,
+        lifecycle: &LifecycleWriteGuard,
+    ) -> Result<u64, EventError> {
+        self.verify_binding_write(lifecycle)?;
+        let _lock = self.lock_log_exclusive()?;
+        self.verify_binding_write(lifecycle)?;
+        let head = scan_and_repair_fd(&self.log_dir)?;
+        self.head.store(head, Ordering::Release);
+        Ok(head)
+    }
+
+    fn verify_binding_read(&self, lifecycle: &LifecycleReadGuard) -> Result<(), EventError> {
+        lifecycle.verify_state_root(&self.state_path)?;
+        if lifecycle.lifecycle_generation()? != Some(self.lifecycle_generation) {
+            return Err(EventError::StaleLifecycleBinding);
+        }
+        self.verify_retained_binding()
+    }
+
+    fn verify_binding(&self, lifecycle: OwnerEventGuard<'_>) -> Result<(), EventError> {
+        match lifecycle {
+            OwnerEventGuard::Read(guard) => self.verify_binding_read(guard),
+            OwnerEventGuard::Write(guard) => self.verify_binding_write(guard),
+        }
+    }
+
+    fn verify_binding_write(&self, lifecycle: &LifecycleWriteGuard) -> Result<(), EventError> {
+        lifecycle.verify_state_root(&self.state_path)?;
+        if lifecycle.lifecycle_generation()? != Some(self.lifecycle_generation) {
+            return Err(EventError::StaleLifecycleBinding);
+        }
+        self.verify_retained_binding()
+    }
+
+    fn verify_retained_binding(&self) -> Result<(), EventError> {
+        let reopened = open_directory_path(&self.state_path)?;
+        if !same_file(&self.state_dir, &reopened)
+            || !named_directory_matches(&self.state_dir, "household", &self.household_dir)
+            || !named_directory_matches(&self.household_dir, OWNER_EVENTS_SUBDIR, &self.log_dir)
+        {
+            return Err(EventError::StaleLifecycleBinding);
+        }
+        verify_household_record(&self.household_dir, &self.expected_hh_id)
+    }
+
+    fn lock_log_exclusive(&self) -> Result<File, EventError> {
+        let file = open_lock_existing(&self.log_dir)?;
+        FileExt::lock_exclusive(&file)
+            .map_err(|error| io_to_event_err(&error, &log_path(&self.state_path)))?;
+        validate_regular_file(&self.log_dir, &file, Some(0))?;
+        if !named_file_matches(&self.log_dir, OWNER_EVENTS_LOCK_FILENAME, &file) {
+            return Err(EventError::StaleLifecycleBinding);
+        }
+        Ok(file)
+    }
 }
 
-fn append_length_prefixed_record(state_dir: &Path, payload: &[u8]) -> Result<(), EventError> {
-    let dir = log_dir(state_dir);
-    if !dir.exists() {
-        std::fs::create_dir_all(&dir).map_err(|e| io_to_event_err(&e, &dir))?;
-    }
-    let path = log_path(state_dir);
+#[derive(Clone, Copy)]
+enum OwnerEventGuard<'a> {
+    Read(&'a LifecycleReadGuard),
+    Write(&'a LifecycleWriteGuard),
+}
+
+fn append_length_prefixed_record_fd(log_dir: &File, payload: &[u8]) -> Result<(), EventError> {
     let mut record = Vec::with_capacity(LENGTH_PREFIX_BYTES + payload.len());
     record.extend_from_slice(&(payload.len() as u64).to_be_bytes());
     record.extend_from_slice(payload);
-
-    // Capture pre-write file length so we can truncate back to it on
-    // any partial-write failure. Without this rollback, an ENOSPC
-    // (or any I/O error) midway through `write_all` would leave a
-    // torn tail on disk that no other reader trims until the next
-    // process boot's `scan_and_repair`. Subsequent successful
-    // appends would land *after* the torn bytes, and `read_since`
-    // (which stops at the first decode failure) would silently lose
-    // every event that came after the partial write.
-    let pre_size: u64 = match std::fs::metadata(&path) {
-        Ok(m) => m.len(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(e) => return Err(io_to_event_err(&e, &path)),
-    };
-
-    let mut f = std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(&path)
-        .map_err(|e| io_to_event_err(&e, &path))?;
-    if let Err(e) = f.write_all(&record) {
-        // Roll back any partially-written bytes. Best-effort: if the
-        // truncate or fsync below also fails, we still return the
-        // original error so the caller knows the append failed.
-        if let Ok(rw) = std::fs::OpenOptions::new().write(true).open(&path) {
-            let _ = rw.set_len(pre_size);
-            let _ = rw.sync_all();
-        }
-        if let Ok(parent) = std::fs::File::open(&dir) {
-            let _ = parent.sync_all();
-        }
-        return Err(io_to_event_err(&e, &path));
+    let fd = rustix::fs::openat(
+        log_dir,
+        OWNER_EVENTS_LOG_FILENAME,
+        OFlags::WRONLY | OFlags::APPEND | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map_err(|error| errno_to_event_err(error, OWNER_EVENTS_LOG_FILENAME))?;
+    let mut file = File::from(fd);
+    validate_regular_file(log_dir, &file, None)?;
+    if let Err(_error) = file.write_all(&record) {
+        return Err(EventError::MayHaveTakenEffect {
+            stage: EventDurabilityStage::Write,
+        });
     }
-    if let Err(e) = f.sync_all() {
-        if let Ok(rw) = std::fs::OpenOptions::new().write(true).open(&path) {
-            let _ = rw.set_len(pre_size);
-            let _ = rw.sync_all();
-        }
-        if let Ok(parent) = std::fs::File::open(&dir) {
-            let _ = parent.sync_all();
-        }
-        return Err(io_to_event_err(&e, &path));
+    if file.sync_all().is_err() {
+        return Err(EventError::MayHaveTakenEffect {
+            stage: EventDurabilityStage::FileSync,
+        });
     }
-    drop(f);
-    // Parent-dir fsync so the new file size is durable.
-    if let Ok(parent) = std::fs::File::open(&dir) {
-        let _ = parent.sync_all();
+    if owner_event_fail_injection::fail_parent_sync() || log_dir.sync_all().is_err() {
+        return Err(EventError::MayHaveTakenEffect {
+            stage: EventDurabilityStage::ParentSync,
+        });
     }
     Ok(())
+}
+
+/// Re-establish the durability barriers for a complete event found during an
+/// idempotent retry. This turns a visible tail after an ambiguous append into
+/// durable authority before the outbox may be cleared.
+fn stabilize_log_fd(log_dir: &File) -> Result<(), EventError> {
+    let fd = rustix::fs::openat(
+        log_dir,
+        OWNER_EVENTS_LOG_FILENAME,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| errno_to_event_err(error, OWNER_EVENTS_LOG_FILENAME))?;
+    let file = File::from(fd);
+    validate_regular_file(log_dir, &file, None)?;
+    file.sync_all()
+        .map_err(|_| EventError::MayHaveTakenEffect {
+            stage: EventDurabilityStage::FileSync,
+        })?;
+    log_dir
+        .sync_all()
+        .map_err(|_| EventError::MayHaveTakenEffect {
+            stage: EventDurabilityStage::ParentSync,
+        })
 }
 
 fn decode_length_prefixed(bytes: &[u8]) -> (Vec<OwnerEvent>, usize) {
@@ -416,20 +641,15 @@ fn decode_length_prefixed(bytes: &[u8]) -> (Vec<OwnerEvent>, usize) {
     (out, off)
 }
 
-fn scan_and_repair(state_dir: &Path) -> Result<u64, EventError> {
-    let path = log_path(state_dir);
-    let bytes = match std::fs::read(&path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(e) => return Err(io_to_event_err(&e, &path)),
-    };
+fn scan_and_repair_fd(log_dir: &File) -> Result<u64, EventError> {
+    let bytes = read_log_bytes(log_dir)?;
     let (events, valid_len) = decode_length_prefixed(&bytes);
     let head = events.last().map_or(0, |e| e.cursor);
     if valid_len < bytes.len() {
         let truncated_bytes = bytes.len() - valid_len;
         tracing::warn!(
             stage = "owner_events.scan_and_repair.truncated_torn_tail",
-            path = %path.display(),
+            path = OWNER_EVENTS_LOG_FILENAME,
             valid_len = valid_len,
             file_len = bytes.len(),
             truncated_bytes = truncated_bytes,
@@ -437,19 +657,258 @@ fn scan_and_repair(state_dir: &Path) -> Result<u64, EventError> {
             "truncated torn trailing record(s) on owner-events log open"
         );
         // Truncate torn tail. set_len + fsync the file + parent dir.
-        let f = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .map_err(|e| io_to_event_err(&e, &path))?;
-        f.set_len(valid_len as u64)
-            .map_err(|e| io_to_event_err(&e, &path))?;
-        f.sync_all().map_err(|e| io_to_event_err(&e, &path))?;
-        drop(f);
-        if let Ok(parent) = std::fs::File::open(log_dir(state_dir)) {
-            let _ = parent.sync_all();
+        let fd = rustix::fs::openat(
+            log_dir,
+            OWNER_EVENTS_LOG_FILENAME,
+            OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| errno_to_event_err(error, OWNER_EVENTS_LOG_FILENAME))?;
+        let f = File::from(fd);
+        validate_regular_file(log_dir, &f, None)?;
+        if f.set_len(valid_len as u64).is_err() {
+            return Err(EventError::MayHaveTakenEffect {
+                stage: EventDurabilityStage::Write,
+            });
+        }
+        if f.sync_all().is_err() {
+            return Err(EventError::MayHaveTakenEffect {
+                stage: EventDurabilityStage::FileSync,
+            });
+        }
+        if log_dir.sync_all().is_err() {
+            return Err(EventError::MayHaveTakenEffect {
+                stage: EventDurabilityStage::ParentSync,
+            });
         }
     }
     Ok(head)
+}
+
+fn read_log_bytes(log_dir: &File) -> Result<Vec<u8>, EventError> {
+    let fd = match rustix::fs::openat(
+        log_dir,
+        OWNER_EVENTS_LOG_FILENAME,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Ok(Vec::new()),
+        Err(error) => return Err(errno_to_event_err(error, OWNER_EVENTS_LOG_FILENAME)),
+    };
+    let mut file = File::from(fd);
+    validate_regular_file(log_dir, &file, None)?;
+    let len = file
+        .metadata()
+        .map_err(|error| io_to_event_err(&error, Path::new(OWNER_EVENTS_LOG_FILENAME)))?
+        .len();
+    let max_log_bytes = MAX_RECORD_BYTES.saturating_mul(1_000_000);
+    if len > max_log_bytes {
+        return Err(EventError::Cbor(
+            "owner-event log exceeds safety cap".into(),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
+    file.read_to_end(&mut bytes)
+        .map_err(|error| io_to_event_err(&error, Path::new(OWNER_EVENTS_LOG_FILENAME)))?;
+    Ok(bytes)
+}
+
+fn open_directory_path(path: &Path) -> Result<File, EventError> {
+    let fd = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| errno_to_event_err(error, path))?;
+    Ok(File::from(fd))
+}
+
+fn open_household_dir(state_dir: &File) -> Result<File, EventError> {
+    let fd = rustix::fs::openat(
+        state_dir,
+        "household",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| errno_to_event_err(error, "household"))?;
+    let dir = File::from(fd);
+    validate_directory(state_dir, &dir)?;
+    Ok(dir)
+}
+
+fn open_or_create_log_dir(household_dir: &File) -> Result<File, EventError> {
+    match rustix::fs::mkdirat(household_dir, OWNER_EVENTS_SUBDIR, Mode::RWXU) {
+        Ok(()) => household_dir
+            .sync_all()
+            .map_err(|error| io_to_event_err(&error, Path::new(OWNER_EVENTS_SUBDIR)))?,
+        Err(Errno::EXIST) => {}
+        Err(error) => return Err(errno_to_event_err(error, OWNER_EVENTS_SUBDIR)),
+    }
+    let fd = rustix::fs::openat(
+        household_dir,
+        OWNER_EVENTS_SUBDIR,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| errno_to_event_err(error, OWNER_EVENTS_SUBDIR))?;
+    let dir = File::from(fd);
+    validate_directory(household_dir, &dir)?;
+    Ok(dir)
+}
+
+fn ensure_log_lock_durable(log_dir: &File) -> Result<(), EventError> {
+    let lock = match rustix::fs::openat(
+        log_dir,
+        OWNER_EVENTS_LOCK_FILENAME,
+        OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    ) {
+        Ok(fd) => File::from(fd),
+        Err(Errno::EXIST) => open_lock_existing(log_dir)?,
+        Err(error) => return Err(errno_to_event_err(error, OWNER_EVENTS_LOCK_FILENAME)),
+    };
+    validate_regular_file(log_dir, &lock, Some(0))?;
+    lock.sync_all()
+        .map_err(|error| io_to_event_err(&error, Path::new(OWNER_EVENTS_LOCK_FILENAME)))?;
+    // Unconditional. A previous creator may have made the lock visible and
+    // lost the parent acknowledgement.
+    log_dir
+        .sync_all()
+        .map_err(|error| io_to_event_err(&error, Path::new(OWNER_EVENTS_SUBDIR)))?;
+    if !named_file_matches(log_dir, OWNER_EVENTS_LOCK_FILENAME, &lock) {
+        return Err(EventError::StaleLifecycleBinding);
+    }
+    Ok(())
+}
+
+fn open_lock_existing(log_dir: &File) -> Result<File, EventError> {
+    let fd = rustix::fs::openat(
+        log_dir,
+        OWNER_EVENTS_LOCK_FILENAME,
+        OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| errno_to_event_err(error, OWNER_EVENTS_LOCK_FILENAME))?;
+    Ok(File::from(fd))
+}
+
+fn verify_household_record(household_dir: &File, expected_hh_id: &str) -> Result<(), EventError> {
+    let fd = rustix::fs::openat(
+        household_dir,
+        "household_record.cbor",
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| errno_to_event_err(error, "household_record.cbor"))?;
+    let mut file = File::from(fd);
+    validate_regular_file(household_dir, &file, None)?;
+    let len = file
+        .metadata()
+        .map_err(|error| io_to_event_err(&error, Path::new("household_record.cbor")))?
+        .len();
+    if len > MAX_HOUSEHOLD_RECORD_BYTES {
+        return Err(EventError::Cbor(
+            "household record exceeds safety cap".into(),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
+    file.read_to_end(&mut bytes)
+        .map_err(|error| io_to_event_err(&error, Path::new("household_record.cbor")))?;
+    let record: HouseholdRecord = cbor::from_canonical_slice(&bytes)
+        .map_err(|error| EventError::Cbor(format!("household record: {error}")))?;
+    record
+        .validate()
+        .map_err(|error| EventError::Cbor(format!("household record: {error}")))?;
+    if record.hh_id.to_string() != expected_hh_id {
+        return Err(EventError::StaleLifecycleBinding);
+    }
+    Ok(())
+}
+
+fn validate_directory(parent: &File, dir: &File) -> Result<(), EventError> {
+    let parent_meta = parent
+        .metadata()
+        .map_err(|error| io_to_event_err(&error, Path::new("parent")))?;
+    let meta = dir
+        .metadata()
+        .map_err(|error| io_to_event_err(&error, Path::new("directory")))?;
+    if !meta.is_dir() || meta.uid() != parent_meta.uid() || meta.permissions().mode() & 0o022 != 0 {
+        return Err(EventError::StaleLifecycleBinding);
+    }
+    Ok(())
+}
+
+fn validate_regular_file(
+    parent: &File,
+    file: &File,
+    expected_len: Option<u64>,
+) -> Result<(), EventError> {
+    let parent_meta = parent
+        .metadata()
+        .map_err(|error| io_to_event_err(&error, Path::new("parent")))?;
+    let meta = file
+        .metadata()
+        .map_err(|error| io_to_event_err(&error, Path::new("file")))?;
+    if !meta.is_file()
+        || meta.uid() != parent_meta.uid()
+        || meta.nlink() != 1
+        || meta.permissions().mode() & 0o077 != 0
+        || expected_len.is_some_and(|len| meta.len() != len)
+    {
+        return Err(EventError::StaleLifecycleBinding);
+    }
+    Ok(())
+}
+
+fn named_directory_matches(parent: &File, name: &str, dir: &File) -> bool {
+    let Ok(named) = rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) else {
+        return false;
+    };
+    let Ok(opened) = rustix::fs::fstat(dir) else {
+        return false;
+    };
+    named.st_dev == opened.st_dev && named.st_ino == opened.st_ino
+}
+
+fn named_file_matches(parent: &File, name: &str, file: &File) -> bool {
+    named_directory_matches(parent, name, file)
+}
+
+fn same_file(left: &File, right: &File) -> bool {
+    left.metadata()
+        .ok()
+        .zip(right.metadata().ok())
+        .is_some_and(|(left, right)| left.dev() == right.dev() && left.ino() == right.ino())
+}
+
+fn errno_to_event_err(error: Errno, path: impl AsRef<Path>) -> EventError {
+    let io = std::io::Error::from_raw_os_error(error.raw_os_error());
+    io_to_event_err(&io, path.as_ref())
+}
+
+#[cfg(test)]
+mod owner_event_fail_injection {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAIL_PARENT_SYNC: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn force_parent_sync_failure_once() {
+        FAIL_PARENT_SYNC.with(|value| value.set(true));
+    }
+
+    pub(super) fn fail_parent_sync() -> bool {
+        FAIL_PARENT_SYNC.with(|value| value.replace(false))
+    }
+}
+
+#[cfg(not(test))]
+mod owner_event_fail_injection {
+    pub(super) const fn fail_parent_sync() -> bool {
+        false
+    }
 }
 
 fn io_to_event_err(e: &std::io::Error, path: &Path) -> EventError {
@@ -478,129 +937,336 @@ fn unix_now() -> Result<u64, EventError> {
         .map_err(|_| EventError::ClockSkew)
 }
 
-// ---------------------------------------------------------------------------
-// Backwards-compat free functions (process-wide shared registry)
-// ---------------------------------------------------------------------------
-//
-// These wrappers exist for tests and migration. They MUST share state
-// across calls — otherwise two concurrent `append_event(state_dir,
-// ...)` invocations would each open a fresh `OwnerEventLog` with its
-// own AtomicU64 + Mutex, and the cursor TOCTOU we just fixed inside
-// the handle would re-emerge at the API boundary.
-//
-// Solution: a process-wide registry keyed by canonical `state_dir`.
-// Every free-function call resolves the same `Arc<OwnerEventLog>` and
-// thus the same lock + cursor head. Production code (T035+) should
-// inject the `Arc<OwnerEventLog>` explicitly into request handlers
-// rather than going through this registry; the registry exists so the
-// safe path is the default for tests and ad-hoc callers.
+#[cfg(test)]
+mod lifecycle_tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::process::Command;
+    use std::thread;
+    use std::time::Duration;
 
-use std::collections::HashMap;
-use std::sync::OnceLock;
+    use tempfile::TempDir;
 
-static OWNER_EVENT_LOG_REGISTRY: OnceLock<std::sync::Mutex<HashMap<PathBuf, Arc<OwnerEventLog>>>> =
-    OnceLock::new();
+    use super::*;
+    use crate::household_lifecycle::HouseholdLifecycleLock;
+    use crate::ids::{derive_household_id, derive_machine_id};
+    use crate::keys::P256Keypair;
 
-fn registry() -> &'static std::sync::Mutex<HashMap<PathBuf, Arc<OwnerEventLog>>> {
-    OWNER_EVENT_LOG_REGISTRY.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
-}
+    const CHILD_STATE_ENV: &str = "THEYOS_OWNER_EVENT_CHILD_STATE";
+    const CHILD_HH_ENV: &str = "THEYOS_OWNER_EVENT_CHILD_HH";
+    const CHILD_INDEX_ENV: &str = "THEYOS_OWNER_EVENT_CHILD_INDEX";
+    const CHILD_TEST: &str = "owner_events::lifecycle_tests::multiprocess_append_worker";
 
-fn shared_log_for(state_dir: &Path) -> Result<Arc<OwnerEventLog>, EventError> {
-    // Canonicalize so two paths that resolve to the same directory
-    // (e.g., one with a trailing slash, or via a symlink) share the
-    // same log handle. Falls back to the literal path if
-    // canonicalize fails (path may not yet exist on first use).
-    let canonical = std::fs::canonicalize(state_dir).unwrap_or_else(|_| state_dir.to_path_buf());
-    {
-        // Recover from poisoning: the only mutation is inserting into
-        // the map, so a poisoned guard is still safe to read.
-        let map = registry()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(log) = map.get(&canonical) {
-            return Ok(Arc::clone(log));
+    struct Fixture {
+        state: TempDir,
+        lifecycle: HouseholdLifecycleLock,
+        hh_id: String,
+        log: Arc<OwnerEventLog>,
+    }
+
+    fn record() -> HouseholdRecord {
+        let household = P256Keypair::generate();
+        let machine = P256Keypair::generate();
+        let hh_pub = household.public();
+        let m_pub = machine.public();
+        HouseholdRecord {
+            version: HouseholdRecord::SCHEMA_VERSION,
+            hh_id: derive_household_id(&hh_pub),
+            hh_pub,
+            name: "Owner Event Test".into(),
+            created_at: 1_714_972_800,
+            shamir_k: 1,
+            shamir_n: 1,
+            members: vec![derive_machine_id(&m_pub)],
+            is_follower: false,
         }
     }
-    // Slow path: open and insert. Re-check after acquiring the lock to
-    // race-free against another caller doing the same.
-    let mut map = registry()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(log) = map.get(&canonical) {
-        return Ok(Arc::clone(log));
+
+    fn install_record(state: &Path, record: &HouseholdRecord) {
+        let household = crate::storage::household_dir(state);
+        fs::create_dir(&household).unwrap();
+        fs::set_permissions(&household, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::storage::atomic_write_cbor(&crate::storage::household_record_path(state), record)
+            .unwrap();
     }
-    let log = OwnerEventLog::open(canonical.clone())?;
-    map.insert(canonical, Arc::clone(&log));
-    Ok(log)
-}
 
-/// Append an event via the process-shared log handle for `state_dir`.
-/// Concurrent free-function callers see the same `AtomicU64` cursor
-/// and the same append mutex.
-pub fn append_event(
-    state_dir: &Path,
-    issuer_m_id: &str,
-    issuer_key: &dyn IdentityKey,
-    event_type: OwnerEventType,
-    payload: OwnerEventPayload,
-) -> Result<OwnerEvent, EventError> {
-    let log = shared_log_for(state_dir)?;
-    log.append(issuer_m_id, issuer_key, event_type, payload)
-}
-
-/// Read every event with `cursor > since`. Routes through the shared
-/// per-state-dir handle.
-pub fn read_events_since(state_dir: &Path, since: u64) -> Result<Vec<OwnerEvent>, EventError> {
-    let log = shared_log_for(state_dir)?;
-    log.read_since(since)
-}
-
-/// Return the highest cursor (in-memory snapshot from the shared
-/// handle). The log itself is the authoritative source of truth.
-pub fn cursor_head(state_dir: &Path) -> Result<u64, EventError> {
-    let log = shared_log_for(state_dir)?;
-    Ok(log.cursor_head())
-}
-
-/// Test-only helper: drain the process-wide free-fn registry so a
-/// test that recreates `state_dir` after deleting it doesn't see a
-/// stale `OwnerEventLog` from a previous test in the same process.
-#[doc(hidden)]
-pub fn _reset_registry_for_tests() {
-    if let Some(m) = OWNER_EVENT_LOG_REGISTRY.get() {
-        let mut map = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.clear();
+    fn fixture(broadcaster: Option<OwnerEventsBroadcaster>) -> Fixture {
+        let state = TempDir::new().unwrap();
+        let record = record();
+        let hh_id = record.hh_id.to_string();
+        install_record(state.path(), &record);
+        let lifecycle = HouseholdLifecycleLock::open_verified(state.path()).unwrap();
+        let write = lifecycle.lock_exclusive().unwrap();
+        let log = match broadcaster {
+            Some(broadcaster) => OwnerEventLog::open_with_broadcaster_under_lifecycle(
+                &write,
+                state.path().to_path_buf(),
+                &hh_id,
+                broadcaster,
+            )
+            .unwrap(),
+            None => OwnerEventLog::open_under_lifecycle(&write, state.path().to_path_buf(), &hh_id)
+                .unwrap(),
+        };
+        drop(write);
+        Fixture {
+            state,
+            lifecycle,
+            hh_id,
+            log,
+        }
     }
-}
 
-/// Read the raw on-disk log bytes (test-only helper).
-#[doc(hidden)]
-pub fn read_raw_log(state_dir: &Path) -> Result<Vec<u8>, EventError> {
-    let path = log_path(state_dir);
-    match std::fs::read(&path) {
-        Ok(b) => Ok(b),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(e) => Err(io_to_event_err(&e, &path)),
+    fn payload() -> OwnerEventPayload {
+        OwnerEventPayload::JoinRequest(JoinRequestPayload {
+            join_request_cbor: ByteBuf::from(vec![0xa1, 0x01, 0x01]),
+            fingerprint: "owner-event-test".into(),
+            expiry: 1_714_972_800,
+        })
     }
-}
 
-/// Append raw bytes to the log without going through the encoder. Used
-/// by torn-write tests to simulate corruption.
-#[doc(hidden)]
-pub fn append_raw_for_test(state_dir: &Path, bytes: &[u8]) -> Result<(), EventError> {
-    let dir = log_dir(state_dir);
-    if !dir.exists() {
-        std::fs::create_dir_all(&dir).map_err(|e| io_to_event_err(&e, &dir))?;
+    #[test]
+    fn stale_generation_handle_cannot_recreate_owner_events_in_reinstalled_household() {
+        let fixture = fixture(None);
+        let stale_log = Arc::clone(&fixture.log);
+        let original: HouseholdRecord = crate::storage::read_optional_cbor(
+            &crate::storage::household_record_path(fixture.state.path()),
+        )
+        .unwrap()
+        .unwrap();
+
+        let write = fixture.lifecycle.lock_exclusive().unwrap();
+        assert!(write.rename_household_to_tearing_down().unwrap());
+        assert!(write.remove_tearing_down().unwrap());
+        // Reinstall the original canonical record bytes under a fresh
+        // lifecycle generation. Same hh_id, same public root: only the
+        // generation distinguishes the authority instance.
+        write.reserve_household_install_generation().unwrap();
+        install_record(fixture.state.path(), &original);
+        drop(write);
+
+        let read = fixture.lifecycle.lock_shared().unwrap();
+        let err = stale_log
+            .append(
+                &read,
+                "m_test_issuer",
+                &P256Keypair::generate(),
+                OwnerEventType::JoinRequest,
+                payload(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, EventError::StaleLifecycleBinding));
+        assert!(!log_dir(fixture.state.path()).exists());
     }
-    let path = log_path(state_dir);
-    let mut f = std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(&path)
-        .map_err(|e| io_to_event_err(&e, &path))?;
-    f.write_all(bytes).map_err(|e| io_to_event_err(&e, &path))?;
-    f.sync_all().map_err(|e| io_to_event_err(&e, &path))?;
-    Ok(())
+
+    #[test]
+    fn parent_sync_indeterminate_does_not_publish_head_or_broadcast() {
+        let broadcaster = OwnerEventsBroadcaster::new();
+        let mut subscriber = broadcaster.subscribe();
+        let fixture = fixture(Some(broadcaster));
+        let read = fixture.lifecycle.lock_shared().unwrap();
+        owner_event_fail_injection::force_parent_sync_failure_once();
+        let error = fixture
+            .log
+            .append(
+                &read,
+                "m_test_issuer",
+                &P256Keypair::generate(),
+                OwnerEventType::JoinRequest,
+                payload(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            EventError::MayHaveTakenEffect {
+                stage: EventDurabilityStage::ParentSync
+            }
+        ));
+        assert_eq!(fixture.log.cursor_head(), 0);
+        assert!(matches!(
+            subscriber.receiver_mut().try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn machine_joined_retry_after_ambiguous_append_stabilizes_without_duplicate() {
+        let fixture = fixture(None);
+        let issuer = P256Keypair::generate();
+        let payload = MachineJoinedPayload {
+            m_pub: ByteBuf::from(vec![2; 33]),
+            m_id: "m_exact_candidate".into(),
+            hostname: "candidate".into(),
+            joined_at: 1_714_972_801,
+        };
+        let write = fixture.lifecycle.lock_exclusive().unwrap();
+        owner_event_fail_injection::force_parent_sync_failure_once();
+        let first = fixture
+            .log
+            .append_machine_joined_exactly_once_under_lifecycle_write(
+                &write,
+                "m_test_issuer",
+                &issuer,
+                payload.clone(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            first,
+            EventError::MayHaveTakenEffect {
+                stage: EventDurabilityStage::ParentSync
+            }
+        ));
+        let recovered = fixture
+            .log
+            .append_machine_joined_exactly_once_under_lifecycle_write(
+                &write,
+                "m_test_issuer",
+                &issuer,
+                payload,
+            )
+            .expect("retry must find, stabilize, and reuse the exact tail event");
+        assert_eq!(recovered.cursor, 1);
+        drop(write);
+
+        let read = fixture.lifecycle.lock_shared().unwrap();
+        let events = fixture.log.read_since(&read, 0).unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "ambiguous retry must not duplicate the event"
+        );
+    }
+
+    #[test]
+    fn machine_joined_same_machine_with_different_payload_fails_closed() {
+        let fixture = fixture(None);
+        let issuer = P256Keypair::generate();
+        let payload = MachineJoinedPayload {
+            m_pub: ByteBuf::from(vec![2; 33]),
+            m_id: "m_exact_candidate".into(),
+            hostname: "candidate".into(),
+            joined_at: 1_714_972_801,
+        };
+        let write = fixture.lifecycle.lock_exclusive().unwrap();
+        fixture
+            .log
+            .append_machine_joined_exactly_once_under_lifecycle_write(
+                &write,
+                "m_test_issuer",
+                &issuer,
+                payload.clone(),
+            )
+            .unwrap();
+        let mut divergent = payload;
+        divergent.hostname = "replacement".into();
+        let error = fixture
+            .log
+            .append_machine_joined_exactly_once_under_lifecycle_write(
+                &write,
+                "m_test_issuer",
+                &issuer,
+                divergent,
+            )
+            .unwrap_err();
+        assert!(matches!(error, EventError::MachineJoinedConflict));
+    }
+
+    #[test]
+    fn household_id_mismatch_is_rejected_before_log_path_creation() {
+        let state = TempDir::new().unwrap();
+        let installed = record();
+        install_record(state.path(), &installed);
+        let lifecycle = HouseholdLifecycleLock::open_verified(state.path()).unwrap();
+        let write = lifecycle.lock_exclusive().unwrap();
+        let result = OwnerEventLog::open_under_lifecycle(
+            &write,
+            state.path().to_path_buf(),
+            "hh_intentionally-not-the-installed-household",
+        );
+        let Err(error) = result else {
+            panic!("mismatched household id must not open the log");
+        };
+        assert!(matches!(error, EventError::StaleLifecycleBinding));
+        assert!(!log_dir(state.path()).exists());
+    }
+
+    #[test]
+    fn multiprocess_append_worker() {
+        let Ok(state) = std::env::var(CHILD_STATE_ENV) else {
+            return;
+        };
+        let hh_id = std::env::var(CHILD_HH_ENV).unwrap();
+        let index = std::env::var(CHILD_INDEX_ENV).unwrap();
+        let state = PathBuf::from(state);
+        let lifecycle = HouseholdLifecycleLock::open_verified(&state).unwrap();
+        let write = lifecycle.lock_exclusive().unwrap();
+        let log = OwnerEventLog::open_under_lifecycle(&write, state.clone(), &hh_id).unwrap();
+        drop(write);
+        fs::write(state.join(format!("ready-{index}")), b"ready").unwrap();
+        while !state.join("go").exists() {
+            thread::sleep(Duration::from_millis(2));
+        }
+        let read = lifecycle.lock_shared().unwrap();
+        log.append(
+            &read,
+            "m_test_issuer",
+            &P256Keypair::generate(),
+            OwnerEventType::JoinRequest,
+            payload(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn multiprocess_append_allocates_unique_durable_cursors() {
+        if std::env::var_os(CHILD_STATE_ENV).is_some() {
+            return;
+        }
+        let fixture = fixture(None);
+        drop(fixture.log);
+        let executable = std::env::current_exe().unwrap();
+        let mut children = Vec::new();
+        for index in 0..6 {
+            children.push(
+                Command::new(&executable)
+                    .arg("--exact")
+                    .arg(CHILD_TEST)
+                    .arg("--nocapture")
+                    .env(CHILD_STATE_ENV, fixture.state.path())
+                    .env(CHILD_HH_ENV, &fixture.hh_id)
+                    .env(CHILD_INDEX_ENV, index.to_string())
+                    .spawn()
+                    .unwrap(),
+            );
+        }
+        while (0..6)
+            .filter(|index| fixture.state.path().join(format!("ready-{index}")).exists())
+            .count()
+            != 6
+        {
+            thread::sleep(Duration::from_millis(2));
+        }
+        fs::write(fixture.state.path().join("go"), b"go").unwrap();
+        for mut child in children {
+            assert!(child.wait().unwrap().success());
+        }
+
+        let write = fixture.lifecycle.lock_exclusive().unwrap();
+        let log = OwnerEventLog::open_under_lifecycle(
+            &write,
+            fixture.state.path().to_path_buf(),
+            &fixture.hh_id,
+        )
+        .unwrap();
+        drop(write);
+        let read = fixture.lifecycle.lock_shared().unwrap();
+        let events = log.read_since(&read, 0).unwrap();
+        assert_eq!(events.len(), 6);
+        assert_eq!(
+            events.iter().map(|event| event.cursor).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 6]
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

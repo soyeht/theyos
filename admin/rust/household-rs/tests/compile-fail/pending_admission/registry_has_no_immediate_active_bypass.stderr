@@ -1,0 +1,11 @@
+error[E0599]: no method named `register` found for reference `&MeshSessionRegistry<Session>` in the current scope
+  --> tests/compile-fail/pending_admission/registry_has_no_immediate_active_bypass.rs:18:22
+   |
+18 |     let _ = registry.register(binding, handle);
+   |                      ^^^^^^^^
+   |
+help: there is a method `unregister` with a similar name, but with different arguments
+  --> src/mesh_session_registry.rs
+   |
+   |     pub fn unregister(&self, session_id: SessionId) {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

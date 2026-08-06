@@ -28,22 +28,22 @@ pub struct RepoRootError;
 ///
 /// Returns [`RepoRootError`] if the repo root cannot be determined.
 pub fn resolve_repo_root() -> Result<PathBuf, RepoRootError> {
-    if let Ok(d) = std::env::var("THEYOS_DIR") {
-        if !d.is_empty() {
-            return Ok(PathBuf::from(d));
-        }
+    if let Ok(d) = std::env::var("THEYOS_DIR")
+        && !d.is_empty()
+    {
+        return Ok(PathBuf::from(d));
     }
     // Walk up from executable path (works when binary is inside the repo tree)
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(root) = walk_up_for_repo(exe.as_path()) {
-            return Ok(root);
-        }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(root) = walk_up_for_repo(exe.as_path())
+    {
+        return Ok(root);
     }
     // Walk up from current working directory (works for Nix-installed binaries)
-    if let Ok(cwd) = std::env::current_dir() {
-        if let Some(root) = walk_up_for_repo(&cwd) {
-            return Ok(root);
-        }
+    if let Ok(cwd) = std::env::current_dir()
+        && let Some(root) = walk_up_for_repo(&cwd)
+    {
+        return Ok(root);
     }
     // sudo-invoker fallback: on NixOS-managed installs the repo canonically
     // lives at `${real_home}/theyos`. This catches `sudo soyeht update` run

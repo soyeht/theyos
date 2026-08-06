@@ -19,6 +19,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
 use household_rs::{
     caveats::Operation,
     cbor,
+    household_lifecycle::{HouseholdLifecycleLock, LifecycleReadGuard},
     keys::P256PublicKey,
     owner_events::{DevicePairRequestPayload, OwnerEventPayload, OwnerEventType},
 };
@@ -386,18 +387,23 @@ pub async fn device_pairing_request_handler(
     let Some(now) = time_util::unix_now_secs_checked("device_pairing.request.clock") else {
         return sanitized_error(StatusCode::SERVICE_UNAVAILABLE, "clock_unavailable");
     };
+    let Ok(lifecycle_guard) = acquire_lifecycle_read(state.state_dir.clone()).await else {
+        return sanitized_error(StatusCode::SERVICE_UNAVAILABLE, "household_unavailable");
+    };
     let Some(identity) = state.household.current().await else {
         return sanitized_error(StatusCode::SERVICE_UNAVAILABLE, "household_unavailable");
     };
     let Err(code) = validate_request_version(request.version) else {
-        return device_pairing_request_inner(&state, &identity, &request, now);
+        return device_pairing_request_inner(&state, lifecycle_guard, identity, &request, now)
+            .await;
     };
     sanitized_error(StatusCode::BAD_REQUEST, code)
 }
 
-fn device_pairing_request_inner(
+async fn device_pairing_request_inner(
     state: &OwnerEventsRouterState,
-    identity: &household_rs::LoadedIdentity,
+    lifecycle_guard: LifecycleReadGuard,
+    identity: Arc<household_rs::LoadedIdentity>,
     request: &DevicePairingRequestBody,
     now: u64,
 ) -> Response {
@@ -451,12 +457,23 @@ fn device_pairing_request_inner(
             platform,
             expiry: expires_at,
         });
-        if let Err(e) = state.event_log.append(
-            &identity.cert.m_id.to_string(),
-            identity.m_priv.as_ref(),
-            OwnerEventType::DevicePairRequest,
-            payload,
-        ) {
+        let event_log = Arc::clone(&state.event_log);
+        let append_identity = Arc::clone(&identity);
+        let append_result = tokio::task::spawn_blocking(move || {
+            event_log.append(
+                &lifecycle_guard,
+                &append_identity.cert.m_id.to_string(),
+                append_identity.m_priv.as_ref(),
+                OwnerEventType::DevicePairRequest,
+                payload,
+            )
+        })
+        .await;
+        if let Err(e) = append_result.unwrap_or_else(|join_error| {
+            Err(household_rs::owner_events::EventError::Cbor(format!(
+                "append worker failed: {join_error}"
+            )))
+        }) {
             tracing::warn!(
                 stage = "device_pairing.request.rejected",
                 reason = "owner_event_append_failed",
@@ -473,6 +490,15 @@ fn device_pairing_request_inner(
         expires_at,
     })
     .into_response()
+}
+
+async fn acquire_lifecycle_read(state_dir: std::path::PathBuf) -> Result<LifecycleReadGuard, ()> {
+    tokio::task::spawn_blocking(move || {
+        let lifecycle = HouseholdLifecycleLock::open_verified(&state_dir).map_err(|_| ())?;
+        lifecycle.lock_shared().map_err(|_| ())
+    })
+    .await
+    .map_err(|_| ())?
 }
 
 pub async fn device_pairing_requests_handler(

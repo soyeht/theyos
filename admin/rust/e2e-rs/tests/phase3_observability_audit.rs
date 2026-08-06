@@ -366,7 +366,15 @@ async fn test_owner_timeout_aborts_window_and_emits_tracing() {
     // `reason="timeout"` so the iPhone long-poll observes the abort
     // semantically (this is the wake-up signal, not just an internal
     // state flip).
-    let events = founder.event_log.read_since(0).expect("read events");
+    let founder_read = founder
+        .lifecycle
+        .lock_shared()
+        .expect("lock lifecycle shared");
+    let events = founder
+        .event_log
+        .read_since(&founder_read, 0)
+        .expect("read events");
+    drop(founder_read);
     let saw_timeout = events.iter().any(|e| {
         matches!(e.event_type, OwnerEventType::JoinCancelled)
             && matches!(

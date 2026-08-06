@@ -1,14 +1,20 @@
 //! T022 + T024 coverage for the Phase 3 owner-events log + broadcaster
 //! and the owner-device push-token registry.
 
-use household_rs::keys::P256Keypair;
+use std::fs;
+use std::os::unix::fs::PermissionsExt as _;
+use std::sync::Arc;
+
+use household_rs::household_lifecycle::HouseholdLifecycleLock;
+use household_rs::keys::{IdentityKey as _, P256Keypair};
 use household_rs::owner_events::{
     EventError, JoinRequestPayload, MachineJoinedPayload, OwnerDevicePushToken, OwnerEventLog,
-    OwnerEventPayload, OwnerEventType, OwnerEventsBroadcaster, PushTokenError, append_event,
-    cursor_head, get_owner_push_token, put_owner_push_token, read_events_since,
+    OwnerEventPayload, OwnerEventType, OwnerEventsBroadcaster, PushTokenError,
+    get_owner_push_token, put_owner_push_token,
 };
+use household_rs::{HouseholdRecord, derive_household_id, derive_machine_id};
 use serde_bytes::ByteBuf;
-use tempfile::tempdir;
+use tempfile::{TempDir, tempdir};
 
 fn issuer_kp() -> P256Keypair {
     P256Keypair::generate()
@@ -22,22 +28,75 @@ fn join_request_payload() -> OwnerEventPayload {
     })
 }
 
-#[test]
-fn append_then_read_round_trip() {
+struct TestLog {
+    td: TempDir,
+    lifecycle: HouseholdLifecycleLock,
+    log: Arc<OwnerEventLog>,
+}
+
+fn test_log(broadcaster: Option<OwnerEventsBroadcaster>) -> TestLog {
     let td = tempdir().unwrap();
-    std::fs::create_dir_all(household_rs::storage::household_dir(td.path())).unwrap();
-    let kp = issuer_kp();
-    let evt = append_event(
-        td.path(),
-        "m_test_issuer",
-        &kp,
-        OwnerEventType::JoinRequest,
-        join_request_payload(),
+    let household_key = P256Keypair::generate();
+    let machine_key = P256Keypair::generate();
+    let hh_pub = household_key.public();
+    let record = HouseholdRecord {
+        version: HouseholdRecord::SCHEMA_VERSION,
+        hh_id: derive_household_id(&hh_pub),
+        hh_pub,
+        name: "Owner Events Integration Test".into(),
+        created_at: 1_714_972_800,
+        shamir_k: 1,
+        shamir_n: 1,
+        members: vec![derive_machine_id(&machine_key.public())],
+        is_follower: false,
+    };
+    let household = household_rs::storage::household_dir(td.path());
+    fs::create_dir(&household).unwrap();
+    fs::set_permissions(&household, fs::Permissions::from_mode(0o700)).unwrap();
+    household_rs::storage::atomic_write_cbor(
+        &household_rs::storage::household_record_path(td.path()),
+        &record,
     )
     .unwrap();
+    let lifecycle = HouseholdLifecycleLock::open_verified(td.path()).unwrap();
+    let write = lifecycle.lock_exclusive().unwrap();
+    let log = match broadcaster {
+        Some(broadcaster) => OwnerEventLog::open_with_broadcaster_under_lifecycle(
+            &write,
+            td.path().to_path_buf(),
+            &record.hh_id.to_string(),
+            broadcaster,
+        )
+        .unwrap(),
+        None => OwnerEventLog::open_under_lifecycle(
+            &write,
+            td.path().to_path_buf(),
+            &record.hh_id.to_string(),
+        )
+        .unwrap(),
+    };
+    drop(write);
+    TestLog { td, lifecycle, log }
+}
+
+#[test]
+fn append_then_read_round_trip() {
+    let fixture = test_log(None);
+    let read = fixture.lifecycle.lock_shared().unwrap();
+    let kp = issuer_kp();
+    let evt = fixture
+        .log
+        .append(
+            &read,
+            "m_test_issuer",
+            &kp,
+            OwnerEventType::JoinRequest,
+            join_request_payload(),
+        )
+        .unwrap();
     assert_eq!(evt.cursor, 1);
-    assert_eq!(cursor_head(td.path()).unwrap(), 1);
-    let read_back = read_events_since(td.path(), 0).unwrap();
+    assert_eq!(fixture.log.cursor_head(), 1);
+    let read_back = fixture.log.read_since(&read, 0).unwrap();
     assert_eq!(read_back.len(), 1);
     assert_eq!(read_back[0].cursor, evt.cursor);
     assert_eq!(read_back[0].payload, evt.payload);
@@ -45,26 +104,28 @@ fn append_then_read_round_trip() {
 
 #[test]
 fn cursor_increases_strictly_across_appends() {
-    let td = tempdir().unwrap();
-    std::fs::create_dir_all(household_rs::storage::household_dir(td.path())).unwrap();
+    let fixture = test_log(None);
+    let read = fixture.lifecycle.lock_shared().unwrap();
     let kp = issuer_kp();
     let mut last = 0u64;
     for _ in 0..5 {
-        let evt = append_event(
-            td.path(),
-            "m_test_issuer",
-            &kp,
-            OwnerEventType::JoinRequest,
-            join_request_payload(),
-        )
-        .unwrap();
+        let evt = fixture
+            .log
+            .append(
+                &read,
+                "m_test_issuer",
+                &kp,
+                OwnerEventType::JoinRequest,
+                join_request_payload(),
+            )
+            .unwrap();
         assert!(evt.cursor > last);
         last = evt.cursor;
     }
-    assert_eq!(cursor_head(td.path()).unwrap(), 5);
-    let all = read_events_since(td.path(), 0).unwrap();
+    assert_eq!(fixture.log.cursor_head(), 5);
+    let all = fixture.log.read_since(&read, 0).unwrap();
     assert_eq!(all.len(), 5);
-    let from_3 = read_events_since(td.path(), 3).unwrap();
+    let from_3 = fixture.log.read_since(&read, 3).unwrap();
     assert_eq!(
         from_3.iter().map(|e| e.cursor).collect::<Vec<_>>(),
         vec![4, 5]
@@ -77,16 +138,18 @@ async fn broadcaster_wakes_subscriber_within_one_ms() {
     let mut sub = bc.subscribe();
     let bc2 = bc.clone();
     let kp = issuer_kp();
-    let td = tempdir().unwrap();
-    std::fs::create_dir_all(household_rs::storage::household_dir(td.path())).unwrap();
-    let evt = append_event(
-        td.path(),
-        "m_test_issuer",
-        &kp,
-        OwnerEventType::JoinRequest,
-        join_request_payload(),
-    )
-    .unwrap();
+    let fixture = test_log(None);
+    let read = fixture.lifecycle.lock_shared().unwrap();
+    let evt = fixture
+        .log
+        .append(
+            &read,
+            "m_test_issuer",
+            &kp,
+            OwnerEventType::JoinRequest,
+            join_request_payload(),
+        )
+        .unwrap();
     let h = tokio::spawn(async move {
         let _ = bc2.publish(evt);
     });
@@ -120,12 +183,13 @@ fn active_subscribers_decrements_synchronously_on_drop() {
 fn append_publishes_to_attached_broadcaster() {
     let bc = OwnerEventsBroadcaster::new();
     let mut sub = bc.subscribe();
-    let td = tempdir().unwrap();
-    std::fs::create_dir_all(household_rs::storage::household_dir(td.path())).unwrap();
-    let log = OwnerEventLog::open_with_broadcaster(td.path().to_path_buf(), bc.clone()).unwrap();
+    let fixture = test_log(Some(bc.clone()));
+    let read = fixture.lifecycle.lock_shared().unwrap();
     let kp = issuer_kp();
-    let evt = log
+    let evt = fixture
+        .log
         .append(
+            &read,
             "m_test_issuer",
             &kp,
             OwnerEventType::JoinRequest,
@@ -138,14 +202,15 @@ fn append_publishes_to_attached_broadcaster() {
 
 #[test]
 fn payload_event_type_mismatch_rejected() {
-    let td = tempdir().unwrap();
-    std::fs::create_dir_all(household_rs::storage::household_dir(td.path())).unwrap();
-    let log = OwnerEventLog::open(td.path().to_path_buf()).unwrap();
+    let fixture = test_log(None);
+    let read = fixture.lifecycle.lock_shared().unwrap();
     let kp = issuer_kp();
     // event_type=MachineJoined but payload=JoinRequest — must be
     // rejected by append rather than encoded into the log.
-    let err = log
+    let err = fixture
+        .log
         .append(
+            &read,
             "m_test_issuer",
             &kp,
             OwnerEventType::MachineJoined,
@@ -160,10 +225,9 @@ fn concurrent_appends_serialize_cleanly() {
     // Multiple threads hammer the same log. With per-state-dir
     // serialization, every event must land with a unique cursor and
     // the log must round-trip on read_since.
-    use std::sync::Arc;
-    let td = tempdir().unwrap();
-    std::fs::create_dir_all(household_rs::storage::household_dir(td.path())).unwrap();
-    let log = OwnerEventLog::open(td.path().to_path_buf()).unwrap();
+    let fixture = test_log(None);
+    let log = Arc::clone(&fixture.log);
+    let lifecycle = fixture.lifecycle.clone();
     let kp = Arc::new(issuer_kp());
 
     let mut handles = Vec::new();
@@ -171,10 +235,13 @@ fn concurrent_appends_serialize_cleanly() {
     let n_threads = 4usize;
     for _ in 0..n_threads {
         let log = Arc::clone(&log);
+        let lifecycle = lifecycle.clone();
         let kp = Arc::clone(&kp);
         handles.push(std::thread::spawn(move || {
+            let read = lifecycle.lock_shared().unwrap();
             for _ in 0..total_per_thread {
                 log.append(
+                    &read,
                     "m_test_issuer",
                     kp.as_ref(),
                     OwnerEventType::JoinRequest,
@@ -193,7 +260,8 @@ fn concurrent_appends_serialize_cleanly() {
     }
     let total = total_per_thread * n_threads;
     assert_eq!(log.cursor_head(), total as u64);
-    let all = log.read_since(0).unwrap();
+    let read = fixture.lifecycle.lock_shared().unwrap();
+    let all = log.read_since(&read, 0).unwrap();
     assert_eq!(all.len(), total);
     let mut cursors: Vec<u64> = all.iter().map(|e| e.cursor).collect();
     cursors.sort_unstable();
@@ -204,29 +272,40 @@ fn concurrent_appends_serialize_cleanly() {
 }
 
 #[test]
-fn concurrent_free_fn_appends_share_state() {
-    // Regression for pr-backend-4 #1: append_event used to open a
-    // transient OwnerEventLog per call, so each invocation got its
-    // own AtomicU64 + Mutex and concurrent free-fn callers raced the
-    // cursor. The shared registry routes them through the same
-    // handle. This test would have produced duplicate cursors under
-    // the old implementation.
-    use std::sync::Arc;
-    let td = tempdir().unwrap();
-    std::fs::create_dir_all(household_rs::storage::household_dir(td.path())).unwrap();
+fn independent_handles_share_the_cross_process_cursor_lock() {
+    let fixture = test_log(None);
+    let write = fixture.lifecycle.lock_exclusive().unwrap();
+    let second = OwnerEventLog::open_under_lifecycle(
+        &write,
+        fixture.td.path().to_path_buf(),
+        &household_rs::storage::read_optional_cbor::<HouseholdRecord>(
+            &household_rs::storage::household_record_path(fixture.td.path()),
+        )
+        .unwrap()
+        .unwrap()
+        .hh_id
+        .to_string(),
+    )
+    .unwrap();
+    drop(write);
     let kp = Arc::new(issuer_kp());
-    let state = Arc::new(td.path().to_path_buf());
 
     let total_per_thread = 25usize;
     let n_threads = 4usize;
     let mut handles = Vec::new();
-    for _ in 0..n_threads {
+    for thread_index in 0..n_threads {
         let kp = Arc::clone(&kp);
-        let state = Arc::clone(&state);
+        let lifecycle = fixture.lifecycle.clone();
+        let log = if thread_index % 2 == 0 {
+            Arc::clone(&fixture.log)
+        } else {
+            Arc::clone(&second)
+        };
         handles.push(std::thread::spawn(move || {
+            let read = lifecycle.lock_shared().unwrap();
             for _ in 0..total_per_thread {
-                append_event(
-                    state.as_path(),
+                log.append(
+                    &read,
                     "m_test_issuer",
                     kp.as_ref(),
                     OwnerEventType::JoinRequest,
@@ -244,8 +323,8 @@ fn concurrent_free_fn_appends_share_state() {
         h.join().unwrap();
     }
     let total = total_per_thread * n_threads;
-    assert_eq!(cursor_head(td.path()).unwrap(), total as u64);
-    let all = read_events_since(td.path(), 0).unwrap();
+    let read = fixture.lifecycle.lock_shared().unwrap();
+    let all = fixture.log.read_since(&read, 0).unwrap();
     assert_eq!(all.len(), total);
     let mut cursors: Vec<u64> = all.iter().map(|e| e.cursor).collect();
     cursors.sort_unstable();
@@ -255,37 +334,62 @@ fn concurrent_free_fn_appends_share_state() {
 
 #[test]
 fn torn_trailing_record_is_truncated_on_open() {
-    let td = tempdir().unwrap();
-    std::fs::create_dir_all(household_rs::storage::household_dir(td.path())).unwrap();
-    let log = OwnerEventLog::open(td.path().to_path_buf()).unwrap();
+    use std::io::Write as _;
+
+    let fixture = test_log(None);
+    let read = fixture.lifecycle.lock_shared().unwrap();
     let kp = issuer_kp();
-    log.append(
-        "m_test_issuer",
-        &kp,
-        OwnerEventType::JoinRequest,
-        join_request_payload(),
-    )
-    .unwrap();
-    drop(log);
+    fixture
+        .log
+        .append(
+            &read,
+            "m_test_issuer",
+            &kp,
+            OwnerEventType::JoinRequest,
+            join_request_payload(),
+        )
+        .unwrap();
+    drop(read);
+    drop(fixture.log);
 
     // Append a valid length prefix declaring 1024 bytes but only write
     // 8 bytes of payload — simulates a torn write of the trailing
     // record after an unclean shutdown.
     let bogus_prefix = (1024u64).to_be_bytes();
     let bogus_partial = vec![0xCDu8; 8];
-    household_rs::owner_events::append_raw_for_test(td.path(), &bogus_prefix).unwrap();
-    household_rs::owner_events::append_raw_for_test(td.path(), &bogus_partial).unwrap();
+    let mut raw = fs::OpenOptions::new()
+        .append(true)
+        .open(household_rs::owner_events::log_path(fixture.td.path()))
+        .unwrap();
+    raw.write_all(&bogus_prefix).unwrap();
+    raw.write_all(&bogus_partial).unwrap();
+    raw.sync_all().unwrap();
+    drop(raw);
 
     // Re-open: scan_and_repair must truncate the partial trailer and
     // leave only the original good record.
-    let log2 = OwnerEventLog::open(td.path().to_path_buf()).unwrap();
+    let record = household_rs::storage::read_optional_cbor::<HouseholdRecord>(
+        &household_rs::storage::household_record_path(fixture.td.path()),
+    )
+    .unwrap()
+    .unwrap();
+    let write = fixture.lifecycle.lock_exclusive().unwrap();
+    let log2 = OwnerEventLog::open_under_lifecycle(
+        &write,
+        fixture.td.path().to_path_buf(),
+        &record.hh_id.to_string(),
+    )
+    .unwrap();
+    drop(write);
     assert_eq!(log2.cursor_head(), 1);
-    let events = log2.read_since(0).unwrap();
+    let read = fixture.lifecycle.lock_shared().unwrap();
+    let events = log2.read_since(&read, 0).unwrap();
     assert_eq!(events.len(), 1);
 
     // After repair, a new append must succeed and land at cursor=2.
     let next = log2
         .append(
+            &read,
             "m_test_issuer",
             &kp,
             OwnerEventType::MachineJoined,
