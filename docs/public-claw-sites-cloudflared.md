@@ -150,16 +150,6 @@ reloads cloudflared. The public URL returns 404 from cloudflared after that.
 
 ---
 
-## What's not in this MVP
-
-- **Auto-CNAME** via Cloudflare API: today the operator creates each CNAME
-  manually in the dashboard. Could be automated with a Cloudflare API token
-  scoped to `Zone:DNS:Edit`, called from the backend on every site add.
-- **Per-claw self-service**: today the agent inside the VM tells the operator
-  "publish me at port 3000" via chat. The operator clicks. A future endpoint
-  could let the agent register itself directly. See the
-  `/etc/theyos/how-to-publish.md` file inside every VM for the agent-facing
-  guidance.
-- **Multi-tunnel support**: one tunnel per host today. If you want to
-  segregate domains across tunnels for multi-tenant isolation, that's a
-  schema change.
+<!-- A "What's not in this MVP" backlog stood here until 2026-08-06 (auto-CNAME
+     via the Cloudflare API, and others). Removed with the rest of the planning
+     corpus: this document describes the tunnel as it works today. -->

@@ -11,8 +11,12 @@ per-claw binaries layered on top of that base image at provisioning time.
 This is a different path from the Linux artifact registry (golden rootfs +
 `latest.json` + sha256, HTTPS-only). The Linux installer plan
 (`admin/rust/vmrunner-rs/src/installer_plan.rs`) already version-pins/resolves
-and uses hardened curl; the macOS guest-binary path is being brought in line in
-stages.
+and uses hardened curl; the macOS guest-binary path does not.
+
+That difference is stated as a fact, not as a stage in a migration. The sentence
+here used to say the macOS path was "being brought in line in stages", which
+described an intent from a plan that no longer exists — and an unowned intent in
+a posture document reads to the next reader as work already scheduled.
 
 ## Current status
 

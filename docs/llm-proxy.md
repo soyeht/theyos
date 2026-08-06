@@ -541,29 +541,11 @@ curl -sS -X PUT http://127.0.0.1:18900/admin/llm/active/openclaw \
 # curl -sS -X DELETE http://127.0.0.1:18900/admin/llm/active/openclaw
 ```
 
-## What's NOT in this v1
-
-These are tracked but defer to follow-up slices:
-
-- **OpenAI Codex OAuth** (`openai-codex` ChatGPT subscription) — requires
-  OAuth client + token refresh infra. The `cli-oauth` pattern is in
-  place; the OAuth dance and Codex transport need their own subgroup.
-- **Gemini CLI** — straightforward subprocess but the `gemini` CLI's
-  exact argv pattern wasn't verified live in the Slice 6 window.
-- **GitHub Copilot** — OpenAI-compat against `api.githubcopilot.com`
-  with a `gh auth token` credential source. Just a catalog entry +
-  small credential-fetch helper.
-- **Live reload** of profiles via admin API (Slice 5 part 2). Today the
-  proxy reloads on process restart only.
-- **Prometheus `/metrics`** — audit log covers per-request accounting;
-  a Prometheus exporter on top would help fleet-level dashboards.
-- **Frontend wiring to `/admin/catalog`** — the Models page
-  (`admin/frontend/src/pages/ModelsPage.tsx`) still uses an in-file
-  constant. Switching it to a `fetch('/api/v1/llm/catalog')` plus a
-  Vite proxy entry is mechanical work.
-- **server-rs admin endpoints** — the proxy's `/admin/*` endpoints are
-  meant to be consumed by `server-rs` (the admin host) on behalf of the
-  frontend. The pass-through in server-rs is unimplemented today.
+<!-- A "What's NOT in this v1" backlog stood here until 2026-08-06. It listed
+     Codex OAuth, Gemini CLI, Copilot, live reload, Prometheus and frontend
+     wiring as deferred slices. The product is being replanned, so a deferred
+     list from the old plan reads as a commitment nobody made. This document
+     now describes only what the proxy does today. -->
 
 ## Pointers
 

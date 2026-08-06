@@ -80,7 +80,10 @@ enrolled only until `PLAN_ENROLLMENT_DEADLINE`, then fails. Enrol the new plan a
 `REQUIRED_ANCHORED`, replace this section — and do not move the date. Still live,
 and not plans: `share-foundation-boundary-map.md`, `household-protocol.md` (cited
 by nine Rust sources), and the contracts under `owner-mesh-rendezvous/`,
-`owner-site-a2-dataplane/` and `contracts/`.
+`owner-site-a2-dataplane/` and `contracts/`. They survive only because live code
+cites them; that is the test, not seniority. **When the new plan ships, sweep
+again and delete whatever it did not use** — standing owner instruction, recorded
+in `~/.soyeht-ops/authorizations.md`.
 
 **The macOS and iOS applications are not in this repository.** Zero `.swift` and
 zero `.xcodeproj` files are tracked here `MEASURED 2026-08-06 origin/main@e60bad85`.
@@ -127,21 +130,15 @@ Four mistakes have each cost real time here.
   workspace members. Check `exclude`, check each crate's `[features] default`,
   and check whether the engine references the module, *before* quoting a
   readiness number.
-- **Confusing "CI compiles it" with "CI runs it".** Both excluded crates'
-  *libraries* do compile in CI — `keystore-rs`'s `mesh-session` feature and
-  `mesh-session-runtime-rs`'s `mesh-session-runtime` feature path-depend on
-  `mesh-session-core-rs`, and the backend-ci feature-surface loop compiles every
-  non-default feature. Their *tests* never execute: `cargo test --workspace`
-  only reaches members. `mesh-session-control-model-rs` has no dependent at all,
-  so nothing in CI compiles it.
-  `MEASURED 2026-08-06 origin/main@e60bad85`
-- **Assuming a feature-gated test ran.**
-  `admin/rust/mesh-session-control-model-rs/tests/model_invariants.rs` declares
-  `required-features = ["test-support", "roster-sync-unratified"]` — **two
-  features at once**. The CI loop passes exactly one feature per invocation
-  (`cargo check -p "${pkg}" --features "${feat}"`), so that target is never even
-  compiled there, let alone run. A test target can be named in CI's universe and
-  still be unreachable by CI's invocation shape.
+- **Confusing "CI compiles it" with "CI runs it".** The excluded crates'
+  *libraries* compile in CI via feature path-deps and the feature-surface loop;
+  their *tests* never execute, because `cargo test --workspace` reaches only
+  members. The same gap hid a red end-to-end test behind `dev_t1_datapath` for
+  weeks — clippy compiled it every push, nothing ran it, until backend-ci gained
+  a step that does. **Ask which invocation reaches a target, not whether the
+  target exists.** A target can be named in CI's universe and still be
+  unreachable by CI's invocation shape: `model_invariants.rs` needs *two*
+  features at once and the loop passes exactly one.
   `MEASURED 2026-08-06 origin/main@e60bad85`
 
 ## 6. The dating rule — the one rule behind all four failures
