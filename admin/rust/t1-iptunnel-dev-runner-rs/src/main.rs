@@ -22,7 +22,6 @@ use household_rs::claw_share_data_tunnel::{
 use household_rs::claw_share_relay_stream_contract::{
     RelayStreamAudience, RelayStreamExpectedPath, RelayStreamOfferContract, RelayStreamResource,
 };
-use household_rs::claw_vpn::{CLAW_VPN_MIN_INTERFACE_MTU, CLAW_VPN_V1_INNER_MTU};
 use household_rs::claw_share_relay_stream_endpoint::parse_relay_endpoint;
 use household_rs::claw_share_relay_stream_noise::{
     RelayStreamNoiseAsyncStream, RelayStreamNoiseFramed,
@@ -31,6 +30,7 @@ use household_rs::claw_share_rendezvous_hello::{RendezvousHello, RendezvousRole}
 #[cfg(feature = "dev_t1_datapath")]
 use household_rs::claw_vpn::ClawVpnIpv4Pool;
 use household_rs::claw_vpn::ClawVpnSessionAddrs;
+use household_rs::claw_vpn::{CLAW_VPN_MIN_INTERFACE_MTU, CLAW_VPN_V1_INNER_MTU};
 use household_rs::keys::{IdentityKey, P256Keypair, P256PublicKey};
 use rand::RngCore;
 use serde_json::{Map, Value};
@@ -781,7 +781,7 @@ mod dev_datapath {
 
     use anyhow::{Result, anyhow, bail};
     use household_rs::claw_share_data_tunnel::{
-        TargetSession, TunnelFrame, recv_frame, send_frame,
+        DataTunnelError, TargetSession, TunnelFrame, recv_frame, send_frame,
     };
     use household_rs::claw_share_relay_stream_contract::RelayStreamAudience;
     use household_rs::claw_vpn::{
@@ -1104,96 +1104,148 @@ mod dev_datapath {
     {
         let (mut tunnel_r, mut tunnel_w) = tokio::io::split(stream);
         let mut buf = vec![0u8; PIPE_CHUNK];
-        loop {
-            tokio::select! {
-                read = target_session.reader.read(&mut buf) => {
-                    match read {
-                        Ok(0) | Err(_) => {
-                            let _ = send_frame(&mut tunnel_w, &TunnelFrame::Close).await;
-                            return Ok(());
+        // CANCEL SAFETY (load-bearing; do not inline this back into the
+        // `select!`). This is the same defect `claw_share_data_tunnel.rs` fixed
+        // at its own pump, and the fix was applied there and not here.
+        //
+        // `recv_frame` is a sequence of awaits -- the 4-byte length prefix,
+        // then the body -- so it is NOT cancel-safe. Built inline
+        // as a `select!` arm it is reconstructed every turn, so every win by the
+        // sibling `read` arm DROPS it. Parked between the two reads, the prefix
+        // bytes are already off the socket and go with the future; the next read
+        // consumes body bytes as a length, the stream desynchronises, and the
+        // peer sees `connection closed during frame`.
+        //
+        // That is not a hypothesis. The two-ended datapath test failed with
+        // exactly that string the first time it ever ran on a GitHub Linux
+        // runner: the window needs the sibling to win BETWEEN the two reads, and
+        // a shared, slow runner opens it where a developer machine never had.
+        // Accepting that string as a normal end-of-exchange close -- which was
+        // the tempting way to make CI green -- would have masked this.
+        //
+        // So the future is built ONCE per inbound frame and pinned across the
+        // inner loop. A sibling win merely stops polling it; the partially-read
+        // state lives in the future, which is still alive, so the next turn
+        // RESUMES the same read. It is rebuilt only after it has produced a
+        // value.
+        'inbound: loop {
+            let mut inbound = std::pin::pin!(recv_frame(&mut tunnel_r));
+            loop {
+                tokio::select! {
+                    read = target_session.reader.read(&mut buf) => {
+                        match read {
+                            Ok(0) | Err(_) => {
+                                let _ = send_frame(&mut tunnel_w, &TunnelFrame::Close).await;
+                                return Ok(());
+                            }
+                            Ok(n) => send_frame(&mut tunnel_w, &TunnelFrame::Data(buf[..n].to_vec())).await
+                                .map_err(|error| anyhow!("dev datapath tunnel write failed: {error}"))?,
                         }
-                        Ok(n) => send_frame(&mut tunnel_w, &TunnelFrame::Data(buf[..n].to_vec())).await
-                            .map_err(|error| anyhow!("dev datapath tunnel write failed: {error}"))?,
                     }
-                }
-                frame = recv_frame(&mut tunnel_r) => {
-                    match frame.map_err(|error| anyhow!("dev datapath tunnel read failed: {error}"))? {
-                        TunnelFrame::Data(packet) => {
-                            target_session.writer.write_all(&packet).await
-                                .map_err(|_| anyhow!("dev datapath target write failed"))?;
-                            target_session.writer.flush().await
-                                .map_err(|_| anyhow!("dev datapath target flush failed"))?;
-                        }
-                        TunnelFrame::Window(_) | TunnelFrame::Resize { .. } => {}
-                        TunnelFrame::Close => {
+                    frame = &mut inbound => {
+                        // END OF EXCHANGE, not a failure. The peer closing between
+                        // frames is how this pump is meant to finish, and it is
+                        // the SAME event as the `Close` frame two arms below --
+                        // the peer just dropped the connection instead of naming
+                        // it. Which of the two happens is a teardown race with
+                        // the sibling `read` arm, so a run where the tunnel side
+                        // wins must end exactly like a run where the target side
+                        // does.
+                        //
+                        // This is narrower than it looks, and deliberately not
+                        // the string match that was the tempting way to green:
+                        // only an EOF with NOTHING of the next frame consumed
+                        // lands here. A frame cut in half is still
+                        // `Closed("frame")` and still fatal, which is the whole
+                        // reason the wire layer now separates them.
+                        if let Err(DataTunnelError::ClosedAtFrameBoundary(_)) = &frame {
                             let _ = target_session.writer.shutdown().await;
                             return Ok(());
                         }
-                        TunnelFrame::Error(_) => bail!("dev datapath peer returned target error"),
-                        TunnelFrame::Exit(_) => return Ok(()),
-                        // `OpenPersistent` joins `Open` rather than getting an arm of
-                        // its own: both are client-to-server control frames, and this
-                        // dev runner is the client. Receiving either means the peer
-                        // sent something it never should, so it stays fail-closed.
-                        TunnelFrame::Health(_)
-                        | TunnelFrame::Open
-                        | TunnelFrame::OpenPersistent => {
-                            bail!("dev datapath peer sent unexpected control frame");
-                        }
-                        TunnelFrame::NetworkSettings(sealed) => {
-                            // IpTunnel path: the server delivers the guest's VPN
-                            // interface here (once, right after the Open-ack). This
-                            // dev runner installs no real interface, but it MUST
-                            // consume the frame (never a silent noop) and enforce the
-                            // client-side route-scope invariant, mirroring the iOS
-                            // client: a default route (prefix 0) is rejected fail-closed.
-                            //
-                            // S0: the body is sealed, so it is read through the one
-                            // strict door. Route scope is now checked with the neutral
-                            // rule that travels with the type rather than by an
-                            // open-coded `prefix_len == 0`, so this consumer also
-                            // rejects a peer outside the prefix and a peer equal to
-                            // addr — strictly more than it caught before.
-                            let settings =
-                                household_rs::claw_share_data_tunnel::decode_network_settings_body(
-                                    &sealed,
-                                )
-                                .map_err(|_| anyhow!("dev datapath received a malformed NetworkSettings body"))?;
-                            if let Some(violation) = settings.mesh_ipv4.route_scope_violation() {
-                                bail!(
-                                    "dev datapath received NetworkSettings violating route scope: {violation}"
+                        match frame.map_err(|error| anyhow!("dev datapath tunnel read failed: {error}"))? {
+                            TunnelFrame::Data(packet) => {
+                                target_session.writer.write_all(&packet).await
+                                    .map_err(|_| anyhow!("dev datapath target write failed"))?;
+                                target_session.writer.flush().await
+                                    .map_err(|_| anyhow!("dev datapath target flush failed"))?;
+                            }
+                            TunnelFrame::Window(_) | TunnelFrame::Resize { .. } => {}
+                            TunnelFrame::Close => {
+                                let _ = target_session.writer.shutdown().await;
+                                return Ok(());
+                            }
+                            TunnelFrame::Error(_) => bail!("dev datapath peer returned target error"),
+                            TunnelFrame::Exit(_) => return Ok(()),
+                            // `OpenPersistent` joins `Open` rather than getting an arm of
+                            // its own: both are client-to-server control frames, and this
+                            // dev runner is the client. Receiving either means the peer
+                            // sent something it never should, so it stays fail-closed.
+                            TunnelFrame::Health(_)
+                            | TunnelFrame::Open
+                            | TunnelFrame::OpenPersistent => {
+                                bail!("dev datapath peer sent unexpected control frame");
+                            }
+                            TunnelFrame::NetworkSettings(sealed) => {
+                                // IpTunnel path: the server delivers the guest's VPN
+                                // interface here (once, right after the Open-ack). This
+                                // dev runner installs no real interface, but it MUST
+                                // consume the frame (never a silent noop) and enforce the
+                                // client-side route-scope invariant, mirroring the iOS
+                                // client: a default route (prefix 0) is rejected fail-closed.
+                                //
+                                // S0: the body is sealed, so it is read through the one
+                                // strict door. Route scope is now checked with the neutral
+                                // rule that travels with the type rather than by an
+                                // open-coded `prefix_len == 0`, so this consumer also
+                                // rejects a peer outside the prefix and a peer equal to
+                                // addr — strictly more than it caught before.
+                                let settings =
+                                    household_rs::claw_share_data_tunnel::decode_network_settings_body(
+                                        &sealed,
+                                    )
+                                    .map_err(|_| anyhow!("dev datapath received a malformed NetworkSettings body"))?;
+                                if let Some(violation) = settings.mesh_ipv4.route_scope_violation() {
+                                    bail!(
+                                        "dev datapath received NetworkSettings violating route scope: {violation}"
+                                    );
+                                }
+                                // D3: the SERVER's allocation must be the one this
+                                // client is running on. Route scope above says the
+                                // frame is well-shaped; it says nothing about whether
+                                // it describes THIS session. Without this, a datapath
+                                // that came up on a locally computed address and one
+                                // that honoured the server are indistinguishable from
+                                // the outside, and a green T1/T2 attests only that two
+                                // independently configured allocators agreed.
+                                //
+                                // Fail closed rather than reconfigure: this runner has
+                                // already opened its interface and installed routes by
+                                // the time the frame arrives, so a mismatch is a
+                                // session that must not continue, not one to fix up.
+                                // The real client reconfigures instead — it applies
+                                // settings before returning the session — and that
+                                // asymmetry is why the invariant is stated as "the
+                                // client honours the server's allocation" and not "the
+                                // client checks it".
+                                served_allocation_matches_configured(
+                                    &settings.mesh_ipv4,
+                                    configured,
+                                )?;
+                                // Follow the module's address-redaction discipline: log
+                                // only the non-sensitive prefix length.
+                                eprintln!(
+                                    "dev datapath: VPN NetworkSettings received and matches the \
+                                     configured session (prefix_len={})",
+                                    settings.mesh_ipv4.prefix_len
                                 );
                             }
-                            // D3: the SERVER's allocation must be the one this
-                            // client is running on. Route scope above says the
-                            // frame is well-shaped; it says nothing about whether
-                            // it describes THIS session. Without this, a datapath
-                            // that came up on a locally computed address and one
-                            // that honoured the server are indistinguishable from
-                            // the outside, and a green T1/T2 attests only that two
-                            // independently configured allocators agreed.
-                            //
-                            // Fail closed rather than reconfigure: this runner has
-                            // already opened its interface and installed routes by
-                            // the time the frame arrives, so a mismatch is a
-                            // session that must not continue, not one to fix up.
-                            // The real client reconfigures instead — it applies
-                            // settings before returning the session — and that
-                            // asymmetry is why the invariant is stated as "the
-                            // client honours the server's allocation" and not "the
-                            // client checks it".
-                            served_allocation_matches_configured(
-                                &settings.mesh_ipv4,
-                                configured,
-                            )?;
-                            // Follow the module's address-redaction discipline: log
-                            // only the non-sensitive prefix length.
-                            eprintln!(
-                                "dev datapath: VPN NetworkSettings received and matches the \
-                                 configured session (prefix_len={})",
-                                settings.mesh_ipv4.prefix_len
-                            );
                         }
+                        // The pinned future has produced a value, so it is spent.
+                        // Leave the inner loop to build a fresh one; staying here
+                        // would poll a completed future. Every other exit from this
+                        // arm is a `return`/`bail!`, so this is the only path that
+                        // needs another frame.
+                        continue 'inbound;
                     }
                 }
             }
@@ -1249,8 +1301,7 @@ mod dev_datapath {
             session_ack.session_id_present(),
             session_ack.mesh_ipv6_present()
         );
-        let pipe_result =
-            pipe_target_session_to_tunnel(stream, target_session, config.addrs).await;
+        let pipe_result = pipe_target_session_to_tunnel(stream, target_session, config.addrs).await;
         let runtime_report = runtime_handle
             .await
             .map_err(|_| anyhow!("dev datapath runtime join failed"))??;
@@ -2759,15 +2810,14 @@ mod tests {
             let _ = root;
             let policy = RelayStreamTrustContextRefreshPolicy::new(Duration::from_secs(3_600), 3)
                 .expect("trust refresh policy");
-            let runtime =
-                RelayStreamTrustContextRuntime::load(
-                    &household,
-                    &MeshLogStore::new(),
-                    session_now(),
-                    policy,
-                )
-                .await
-                .expect("load trust runtime");
+            let runtime = RelayStreamTrustContextRuntime::load(
+                &household,
+                &MeshLogStore::new(),
+                session_now(),
+                policy,
+            )
+            .await
+            .expect("load trust runtime");
             RelayStreamAdmission::new(Arc::new(runtime))
         }
 
@@ -2901,9 +2951,111 @@ mod tests {
             }
         }
 
+        /// A no-op binary standing in for the platform's interface and routing
+        /// tools, resolved on the host rather than hardcoded.
+        ///
+        /// Do not name those tools literally here. `source_keeps_session_open_
+        /// boundary_bounded` scans this file for them to prove the dev session
+        /// opener never crosses into TUN/route/app control, and it splits its own
+        /// needles with `concat!` so it cannot match itself. An earlier draft of
+        /// this very comment spelled one out and turned that guard red — the
+        /// guard was right, the comment was careless.
+        ///
+        /// This used to be `/usr/bin/true` outright. `try_new` validates only
+        /// the SHAPE of a path, never its existence, so a host without that file
+        /// builds a perfectly valid `ClawVpnInterfaceRouteToolPaths` and then
+        /// fails at exec time as `ClawVpnPollableRuntimeError::RouteSetup` — an
+        /// error that reads like the route layer is broken when the truth is
+        /// that the test's own stand-in is missing. Measured on NixOS, where
+        /// `/usr/bin` contains exactly one entry (`env`): the whole two-ended
+        /// datapath test failed there for that reason alone, on a tree whose
+        /// route handling was fine.
+        ///
+        /// So resolve it, and **panic with the list of places tried** if nothing
+        /// is found. A test that cannot build its own stand-in must say so in
+        /// those words; silently substituting something else would turn a
+        /// missing fixture into a green run.
+        const NOOP_CANDIDATES: &[&str] = &["/usr/bin/true", "/bin/true", "/usr/local/bin/true"];
+
+        /// The resolution itself, with both inputs injected.
+        ///
+        /// Split out from `true_tool_paths` so BOTH outcomes are provable without
+        /// touching the host: the found case, and the not-found case that must
+        /// stay `None` so the caller can panic. Testing this through the
+        /// environment instead would mean emptying `PATH`, which takes the shell's
+        /// own tools with it — the first attempt at that lost `grep`.
+        fn resolve_noop_binary(
+            candidates: &[&str],
+            path_var: Option<&std::ffi::OsStr>,
+            exists: &dyn Fn(&Path) -> bool,
+        ) -> Option<PathBuf> {
+            candidates
+                .iter()
+                .map(PathBuf::from)
+                .find(|p| exists(p))
+                .or_else(|| {
+                    // NixOS and friends put coreutils only on PATH.
+                    path_var.and_then(|paths| {
+                        std::env::split_paths(paths)
+                            .map(|dir| dir.join("true"))
+                            .find(|p| exists(p))
+                    })
+                })
+        }
+
         fn true_tool_paths() -> ClawVpnInterfaceRouteToolPaths {
-            let path = PathBuf::from("/usr/bin/true");
-            ClawVpnInterfaceRouteToolPaths::try_new(&path, &path, &path).expect("true tool paths")
+            let path = resolve_noop_binary(
+                NOOP_CANDIDATES,
+                std::env::var_os("PATH").as_deref(),
+                &|p: &Path| p.is_file(),
+            )
+            .unwrap_or_else(|| {
+                panic!(
+                    "no no-op binary found for the route-tool stand-in; tried \
+                     {NOOP_CANDIDATES:?} and every PATH entry. This is the TEST's fixture, \
+                     not the route layer: without it the run fails as RouteSetup and points \
+                     at the wrong code."
+                )
+            });
+
+            ClawVpnInterfaceRouteToolPaths::try_new(&path, &path, &path)
+                .expect("no-op tool paths are absolute and well-formed")
+        }
+
+        #[cfg(feature = "dev_t1_datapath")]
+        #[test]
+        fn noop_binary_resolution_finds_a_candidate_and_refuses_to_invent_one() {
+            use std::ffi::OsString;
+
+            // Found via the fixed candidate list.
+            let only_bin_true = |p: &Path| p == Path::new("/bin/true");
+            assert_eq!(
+                Some(PathBuf::from("/bin/true")),
+                resolve_noop_binary(NOOP_CANDIDATES, None, &only_bin_true),
+            );
+
+            // Found via PATH when no candidate exists -- the NixOS case.
+            let only_on_path = |p: &Path| p == Path::new("/nix/store/xyz/bin/true");
+            assert_eq!(
+                Some(PathBuf::from("/nix/store/xyz/bin/true")),
+                resolve_noop_binary(
+                    NOOP_CANDIDATES,
+                    Some(&OsString::from("/nowhere:/nix/store/xyz/bin")),
+                    &only_on_path,
+                ),
+            );
+
+            // Nothing anywhere -> None, so the caller panics with its own message.
+            // Without this arm the panic branch is unreachable in any test and the
+            // fixture could go missing while the suite still reported green.
+            assert_eq!(
+                None,
+                resolve_noop_binary(
+                    NOOP_CANDIDATES,
+                    Some(&OsString::from("/nowhere:/also-nowhere")),
+                    &|_: &Path| false,
+                ),
+            );
         }
 
         fn ipv4_packet(src: Ipv4Addr, dst: Ipv4Addr) -> Vec<u8> {
@@ -3011,7 +3163,10 @@ mod tests {
         .expect_err("unparseable addr must be refused")
         .to_string();
         assert!(err.contains("unparseable addresses"), "{err}");
-        assert!(!err.contains("not-an-address"), "refusal echoed the value: {err}");
+        assert!(
+            !err.contains("not-an-address"),
+            "refusal echoed the value: {err}"
+        );
     }
 
     #[cfg(feature = "dev_t1_datapath")]

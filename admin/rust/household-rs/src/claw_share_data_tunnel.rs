@@ -85,6 +85,15 @@ pub enum DataTunnelError {
     FrameTooLarge(usize),
     #[error("connection closed during {0}")]
     Closed(&'static str),
+    /// The peer closed BETWEEN frames, with nothing of the next one consumed.
+    /// Split out of `Closed` because the two are the same event to a reader that
+    /// only has `read_exact`: it reports `UnexpectedEof` without saying how many
+    /// bytes it took, so an orderly end of exchange and a stream cut mid-frame
+    /// arrived indistinguishable. A caller that must not accept a truncated
+    /// frame can now say so; one that treats any close as the end keeps matching
+    /// both.
+    #[error("connection closed at a {0} boundary")]
+    ClosedAtFrameBoundary(&'static str),
     #[error("auth timeout")]
     AuthTimeout,
     #[error("cbor: {0}")]
@@ -323,7 +332,21 @@ async fn read_frame<R: AsyncRead + Unpin>(
     what: &'static str,
 ) -> Result<Vec<u8>, DataTunnelError> {
     let mut len_buf = [0u8; 4];
-    r.read_exact(&mut len_buf)
+    // The first byte is taken alone, and not because the prefix wants reading in
+    // pieces. `read_exact` reports a shortfall as `UnexpectedEof` without saying
+    // how much it consumed, so a peer that closed cleanly between frames and one
+    // that cut a frame in half both landed on `Closed(what)` and read the same.
+    // `Ok(0)` on a single-byte read is EOF with nothing consumed -- a frame
+    // boundary, and the only case that earns the softer variant. A partial
+    // prefix, or an EOF inside the body below, stays `Closed` and stays fatal.
+    if r.read(&mut len_buf[..1])
+        .await
+        .map_err(|_| DataTunnelError::Closed(what))?
+        == 0
+    {
+        return Err(DataTunnelError::ClosedAtFrameBoundary(what));
+    }
+    r.read_exact(&mut len_buf[1..])
         .await
         .map_err(|_| DataTunnelError::Closed(what))?;
     let n = u32::from_be_bytes(len_buf) as usize;
@@ -979,7 +1002,11 @@ where
                         "expected health or open before stream".into(),
                     ));
                 }
-                Err(DataTunnelError::Closed(_)) => return Ok(()),
+                // Both closes end the connection here: a client that goes away
+                // before opening a stream has nothing to hand over either way.
+                Err(DataTunnelError::Closed(_) | DataTunnelError::ClosedAtFrameBoundary(_)) => {
+                    return Ok(());
+                }
                 Err(other) => return Err(other),
             }
         };
@@ -1074,8 +1101,8 @@ where
         revoke_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         'target: loop {
             // CANCEL SAFETY (load-bearing; do not inline this back into the
-            // `select!`). `recv_frame` is two sequential `read_exact` awaits — the
-            // 4-byte length prefix, then the body — so it is NOT cancel-safe. When
+            // `select!`). `recv_frame` is a sequence of awaits — the 4-byte length
+            // prefix, then the body — so it is NOT cancel-safe. When
             // it was built inline as a `select!` arm it was reconstructed every
             // turn, which means every sibling win DROPPED it; if it was parked
             // between the two reads, the prefix bytes were already off the socket
@@ -1191,7 +1218,11 @@ where
                     let _ = resize(cols, rows);
                 }
                 Ok(TunnelFrame::Window(_)) => {} // credit ack; await-based backpressure governs
-                Ok(TunnelFrame::Close) | Err(DataTunnelError::Closed(_)) => {
+                // Both closes end the stream here, as they did when they were one
+                // variant: the client is gone, and the target gets its shutdown
+                // whether the last frame arrived whole or not.
+                Ok(TunnelFrame::Close)
+                | Err(DataTunnelError::Closed(_) | DataTunnelError::ClosedAtFrameBoundary(_)) => {
                     let _ = writer.shutdown().await;
                     if persistent {
                         send_frame(&mut tunnel_w, &TunnelFrame::Close).await?;
@@ -2883,6 +2914,59 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// `read_frame` must report an orderly close and a frame cut in half as
+    /// DIFFERENT errors. They used to be one variant, so a reader could not tell
+    /// the end of an exchange from a stream that lost bytes: `read_exact`
+    /// reports a shortfall without saying how much it consumed, and both arrived
+    /// as `Closed("frame")` with identical text.
+    ///
+    /// All three outcomes are pinned in one test on purpose. Asserting only the
+    /// boundary case would not show the split has teeth — a change that returned
+    /// `ClosedAtFrameBoundary` for every shortfall would satisfy that half while
+    /// making truncation silently acceptable at every caller that treats the
+    /// softer variant as a clean end.
+    #[tokio::test]
+    async fn a_close_between_frames_is_reported_apart_from_a_frame_cut_in_half() {
+        // A `Data` frame, not the 1-byte-body `Close`: case 3 has to cut a body
+        // in half, which needs a body with a half.
+        let mut whole = Vec::new();
+        send_frame(&mut whole, &TunnelFrame::Data(b"payload".to_vec()))
+            .await
+            .unwrap();
+        assert!(
+            whole.len() > 5,
+            "the fixture needs a body of at least 2 bytes for case 3 to cut one, got {} byte(s)",
+            whole.len(),
+        );
+
+        // 1. EOF with nothing of the next frame consumed — a frame boundary.
+        let mut at_boundary = whole.as_slice();
+        recv_frame(&mut at_boundary)
+            .await
+            .expect("the whole frame reads back");
+        assert_eq!(
+            recv_frame(&mut at_boundary).await.unwrap_err(),
+            DataTunnelError::ClosedAtFrameBoundary("frame"),
+            "a peer that stops between frames ended the exchange; it did not cut it",
+        );
+
+        // 2. EOF inside the 4-byte length prefix — NOT a boundary.
+        let mut partial_prefix = &whole[..2];
+        assert_eq!(
+            recv_frame(&mut partial_prefix).await.unwrap_err(),
+            DataTunnelError::Closed("frame"),
+            "a length prefix that arrived in pieces is a cut stream, not an orderly close",
+        );
+
+        // 3. EOF inside the body, prefix complete — NOT a boundary.
+        let mut partial_body = &whole[..whole.len() - 1];
+        assert_eq!(
+            recv_frame(&mut partial_body).await.unwrap_err(),
+            DataTunnelError::Closed("frame"),
+            "a body cut short is a cut stream, not an orderly close",
+        );
     }
 
     /// A sibling `select!` arm winning while the inbound reader sits BETWEEN the

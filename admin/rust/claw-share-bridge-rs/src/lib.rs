@@ -263,6 +263,11 @@ fn dt_error_label(e: &dt::DataTunnelError) -> &'static str {
         dt::DataTunnelError::Io(_) => "io",
         dt::DataTunnelError::FrameTooLarge(_) => "frame_too_large",
         dt::DataTunnelError::Closed(_) => "closed",
+        // A distinct label, not a fold into "closed": the split exists so a
+        // reader can tell an orderly end of exchange from a cut stream, and a
+        // diag channel that erases it back to one word cannot answer the
+        // question the variant was added for.
+        dt::DataTunnelError::ClosedAtFrameBoundary(_) => "closed_at_frame_boundary",
         dt::DataTunnelError::AuthTimeout => "auth_timeout",
         dt::DataTunnelError::Cbor(_) => "cbor",
         dt::DataTunnelError::Rejected(_) => "rejected",

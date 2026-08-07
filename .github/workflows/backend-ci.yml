@@ -130,6 +130,32 @@ jobs:
           exit $rc
       - name: Build workspace
         run: cd admin/rust && cargo build --workspace 2>&1
+      - name: Populate the registry for the WHOLE resolve graph
+        # `household-rs/tests/workspace_msrv_invariant.rs` runs
+        # `cargo metadata --offline`, deliberately: it makes "this test touches
+        # no network" a cargo-enforced fact instead of an assumption about the
+        # runner, and it refuses to fall back to a guess because an empty graph
+        # would compare against an empty set and pass while checking nothing.
+        #
+        # `cargo metadata` resolves EVERY platform, so it needs crates that
+        # nothing here ever builds -- `android_system_properties`, `winapi`.
+        # `cargo build --workspace` never downloads those, and no step did, so
+        # the test passed only when Swatinem/rust-cache happened to restore a
+        # cache that already held them. That is an undeclared dependency on
+        # cache contents, and it shows up in the history as alternating
+        # green/red with no code change between:
+        #
+        #   e60bad85 failure   d128ac25 success   5b04e135 failure
+        #   aa3f4caa failure   05a51603 success
+        #
+        # `cargo fetch` downloads the full lockfile, so the precondition the
+        # test already requires is now guaranteed rather than hoped for. The
+        # test keeps `--offline` and keeps its teeth.
+        #
+        # Measured: on a NixOS host the same test failed on `winapi` with this
+        # exact message; `cargo fetch --locked` then made it pass, with no
+        # change to the test.
+        run: cd admin/rust && cargo fetch --locked 2>&1
       - name: Run tests (serialised)
         run: cd admin/rust && cargo test --workspace -- --test-threads=1 2>&1
       - name: Feature-gated compile-fail proofs (mesh-session-runtime)
@@ -147,6 +173,17 @@ jobs:
         # it compiles, and this step exits 101 while the default `cargo test`
         # above still exits 0. The step is the only thing that sees it.
         run: cd admin/rust && cargo test -p household-rs --features mesh-session-runtime --test compile_fail_peer_expectation -- --test-threads=1 2>&1
+      - name: Install uv (the datapath suite shells out to it)
+        # `t1-iptunnel-dev-runner-rs/tests/cross_lang_device_config.rs` invokes
+        # `uv run` to check the generated session config against the Python
+        # validator -- cross-language agreement is the whole point of that
+        # target, so it cannot be done in Rust. It carries
+        # `required-features = ["dev_t1_datapath"]`, so it runs ONLY in the step
+        # below and never appeared in `cargo test --workspace`; that is why no
+        # job here ever needed uv, and why the first run of that step failed on
+        # macOS with "uv must be installed (repo convention: run Python via
+        # `uv run`)". The test's own message named the fix.
+        uses: astral-sh/setup-uv@v5
       - name: Feature-gated datapath tests (dev_t1_datapath)
         # The clippy step above COMPILES everything behind `dev_t1_datapath`;
         # it does not RUN any of it. `cargo test --workspace` uses default
@@ -243,6 +280,32 @@ jobs:
           exit $rc
       - name: Build workspace
         run: cd admin/rust && cargo build --workspace 2>&1
+      - name: Populate the registry for the WHOLE resolve graph
+        # `household-rs/tests/workspace_msrv_invariant.rs` runs
+        # `cargo metadata --offline`, deliberately: it makes "this test touches
+        # no network" a cargo-enforced fact instead of an assumption about the
+        # runner, and it refuses to fall back to a guess because an empty graph
+        # would compare against an empty set and pass while checking nothing.
+        #
+        # `cargo metadata` resolves EVERY platform, so it needs crates that
+        # nothing here ever builds -- `android_system_properties`, `winapi`.
+        # `cargo build --workspace` never downloads those, and no step did, so
+        # the test passed only when Swatinem/rust-cache happened to restore a
+        # cache that already held them. That is an undeclared dependency on
+        # cache contents, and it shows up in the history as alternating
+        # green/red with no code change between:
+        #
+        #   e60bad85 failure   d128ac25 success   5b04e135 failure
+        #   aa3f4caa failure   05a51603 success
+        #
+        # `cargo fetch` downloads the full lockfile, so the precondition the
+        # test already requires is now guaranteed rather than hoped for. The
+        # test keeps `--offline` and keeps its teeth.
+        #
+        # Measured: on a NixOS host the same test failed on `winapi` with this
+        # exact message; `cargo fetch --locked` then made it pass, with no
+        # change to the test.
+        run: cd admin/rust && cargo fetch --locked 2>&1
       - name: Run tests (serialised)
         run: cd admin/rust && cargo test --workspace -- --test-threads=1 2>&1
       - name: Feature-gated compile-fail proofs (mesh-session-runtime)
@@ -260,6 +323,17 @@ jobs:
         # it compiles, and this step exits 101 while the default `cargo test`
         # above still exits 0. The step is the only thing that sees it.
         run: cd admin/rust && cargo test -p household-rs --features mesh-session-runtime --test compile_fail_peer_expectation -- --test-threads=1 2>&1
+      - name: Install uv (the datapath suite shells out to it)
+        # `t1-iptunnel-dev-runner-rs/tests/cross_lang_device_config.rs` invokes
+        # `uv run` to check the generated session config against the Python
+        # validator -- cross-language agreement is the whole point of that
+        # target, so it cannot be done in Rust. It carries
+        # `required-features = ["dev_t1_datapath"]`, so it runs ONLY in the step
+        # below and never appeared in `cargo test --workspace`; that is why no
+        # job here ever needed uv, and why the first run of that step failed on
+        # macOS with "uv must be installed (repo convention: run Python via
+        # `uv run`)". The test's own message named the fix.
+        uses: astral-sh/setup-uv@v5
       - name: Feature-gated datapath tests (dev_t1_datapath)
         # The clippy step above COMPILES everything behind `dev_t1_datapath`;
         # it does not RUN any of it. `cargo test --workspace` uses default
