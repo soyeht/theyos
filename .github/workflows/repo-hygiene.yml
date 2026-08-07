@@ -85,7 +85,12 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: uv run scripts/check-branch-hygiene.py
+        # Actions checks out the PULL REQUEST merge ref, detached, so the gate's
+        # HEAD-based fail scope has nothing to hold and it exits 2 ("cannot
+        # decide the fail scope"). Name the branch instead: the PR head on a
+        # pull_request, the pushed branch everywhere else. resolve_ref maps the
+        # bare name onto the fetched remote ref, so no local branch is needed.
+        run: uv run scripts/check-branch-hygiene.py --branch "${{ github.head_ref || github.ref_name }}"
 
       - name: Gate — agent operations index
         id: index

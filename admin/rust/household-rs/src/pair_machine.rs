@@ -3961,6 +3961,23 @@ mod tests {
         received[header_end..header_end + content_length].to_vec()
     }
 
+    /// A write failure that means "the client already left". Several tests
+    /// drive EXACTLY that: the client gives up — a timeout below the server's
+    /// delayed reply, which is the behaviour under test — and closes the
+    /// socket while this thread still owes it bytes. The reset or broken pipe
+    /// that then kills these writes is the expected end of that exchange;
+    /// panicking on it turns the product being RIGHT (giving up fast) into a
+    /// test failure, so the more correct the client, the more the old unwrap
+    /// flaked. Any OTHER write error still fails the test.
+    fn client_gone(error: &std::io::Error) -> bool {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionAborted
+        )
+    }
+
     fn spawn_finalize_server(
         replies: Vec<TestFinalizeReply>,
     ) -> (String, std::thread::JoinHandle<Vec<Vec<u8>>>) {
@@ -3980,14 +3997,22 @@ mod tests {
                         body_prefix,
                         declared_length,
                     } => {
-                        write!(
-                            stream,
+                        let head = format!(
                             "HTTP/1.1 {status} OK\r\nContent-Type: application/cbor\r\nContent-Length: {declared_length}\r\nConnection: close\r\n\r\n"
-                        )
-                        .unwrap();
-                        stream.write_all(&body_prefix).unwrap();
-                        stream.flush().unwrap();
-                        stream.shutdown(Shutdown::Both).unwrap();
+                        );
+                        let delivered = stream
+                            .write_all(head.as_bytes())
+                            .and_then(|_| stream.write_all(&body_prefix))
+                            .and_then(|_| stream.flush());
+                        match delivered {
+                            Ok(()) => stream.shutdown(Shutdown::Both).unwrap(),
+                            Err(error) => {
+                                assert!(
+                                    client_gone(&error),
+                                    "fake finalize server write failed: {error}"
+                                );
+                            }
+                        }
                     }
                     TestFinalizeReply::Response {
                         status,
@@ -4007,14 +4032,20 @@ mod tests {
                         } else {
                             ""
                         };
-                        write!(
-                            stream,
+                        let head = format!(
                             "HTTP/1.1 {status} {reason}\r\nContent-Type: application/cbor\r\nContent-Length: {}\r\n{retry_header}Connection: close\r\n\r\n",
                             body.len()
-                        )
-                        .unwrap();
-                        stream.write_all(&body).unwrap();
-                        stream.flush().unwrap();
+                        );
+                        let delivered = stream
+                            .write_all(head.as_bytes())
+                            .and_then(|_| stream.write_all(&body))
+                            .and_then(|_| stream.flush());
+                        if let Err(error) = delivered {
+                            assert!(
+                                client_gone(&error),
+                                "fake finalize server write failed: {error}"
+                            );
+                        }
                     }
                 }
             }
