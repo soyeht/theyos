@@ -1,7 +1,23 @@
 name: Backend CI
 
 on:
+  # Branch pushes are deliberately NOT built here. A PR branch fires `push` and
+  # `pull_request` on the same SHA, and with identical `paths` below that built
+  # every commit twice: ~86 wasted runner-minutes per PR, and — worse — two
+  # independent rolls of every flaky test, so a correct PR had double the chance
+  # of being failed by noise. Measured on #432 and #433.
+  #
+  # `main` stays: the post-merge run on this branch is what caught 5b04e135, a
+  # direct push that broke compilation on both OS and left main red for ~20h.
+  #
+  # Proved on a throwaway repo with this repo's protection geometry before
+  # landing (5/5): PR with backend paths still publishes all four required
+  # contexts on the head; docs-only PRs are still covered by the shim; a PR
+  # branch created *before* this change still gets its contexts, because
+  # `pull_request` evaluates the workflow from the merge commit.
   push:
+    branches:
+      - main
     paths:
       - "admin/rust/**"
       - "admin/contracts/mobile-claw-vpn/v1/**"
