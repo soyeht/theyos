@@ -12,7 +12,7 @@
 //! consume the 2 admission slots, or touch `/Applications/Soyeht.app`.
 //!
 //! The real VM-boot / admission-limit / disk-gate validation is a SEPARATE,
-//! AUTHORIZED, manual procedure documented in `docs/live-vz-validation.md`.
+//! AUTHORIZED, manual procedure.
 //! DO NOT run it without explicit authorization and confirmed isolation.
 //!
 //! ```bash
@@ -51,7 +51,7 @@ fn opted_in() -> bool {
 /// real location.
 fn require_scratch_dir(var: &str) -> PathBuf {
     let value = std::env::var(var).unwrap_or_else(|_| {
-        panic!("{var} must be set to an isolated scratch dir for live VZ (see docs/live-vz-validation.md)")
+        panic!("{var} must be set to an isolated scratch dir for live VZ")
     });
     assert!(
         Path::new(&value).is_absolute(),
@@ -88,10 +88,10 @@ fn live_harness_is_default_skip_without_optin() {
 /// state. Double-gated: `#[ignore]` (skipped by default) AND requires
 /// `THEYOS_LIVE_VZ=1`. The real VM-boot validation is authorized-manual.
 #[test]
-#[ignore = "LIVE VZ opt-in: set THEYOS_LIVE_VZ=1 + isolated THEYOS_* scratch dirs, run with --ignored. Isolation precheck only; VM-boot validation is authorized-manual (docs/live-vz-validation.md)."]
+#[ignore = "LIVE VZ opt-in: set THEYOS_LIVE_VZ=1 + isolated THEYOS_* scratch dirs, run with --ignored. Isolation precheck only; VM-boot validation is authorized-manual."]
 fn live_isolation_precheck() {
     if !opted_in() {
-        eprintln!("skipped: THEYOS_LIVE_VZ != 1 (see docs/live-vz-validation.md)");
+        eprintln!("skipped: THEYOS_LIVE_VZ != 1");
         return;
     }
 
@@ -111,8 +111,7 @@ fn live_isolation_precheck() {
 
     eprintln!(
         "isolation precheck OK: {} scratch dirs verified. VM-boot / admission-limit / \
-         disk-gate validation is authorized-manual and BLOCKED here — see \
-         docs/live-vz-validation.md.",
+         disk-gate validation is authorized-manual and BLOCKED here.",
         dirs.len()
     );
 }

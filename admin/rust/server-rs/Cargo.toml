@@ -190,8 +190,7 @@ dev_t1_datapath = ["dev_claw_share_mint"]
 # macOS-only FFI bindings to Apple's dns_sd.h system header. Used by
 # `bonjour_impl_dns_sd.rs` to publish/browse via `mDNSResponder` (the
 # system mDNS daemon) instead of racing it on UDP 5353 with the
-# pure-Rust `mdns-sd` crate. See
-# `docs/followup-mdns-sd-macos-publisher.md` for context.
+# pure-Rust `mdns-sd` crate.
 [target.'cfg(target_os = "macos")'.build-dependencies]
 bindgen = { workspace = true }
 

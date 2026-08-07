@@ -964,8 +964,7 @@ pub enum PublicCurrencyOutcome {
 
 impl PublicCurrencyOutcome {
     /// Wire literal for the `outcome` field of
-    /// `GET /api/v1/household/roster/currency/{m_id}` — see
-    /// `docs/household-protocol.md` §Machine Roster Currency.
+    /// `GET /api/v1/household/roster/currency/{m_id}`.
     ///
     /// The mapping lives beside the enum on purpose: it is the single
     /// canonical source of the currency vocabulary, so no transport or

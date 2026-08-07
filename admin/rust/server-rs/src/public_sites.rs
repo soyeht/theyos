@@ -779,8 +779,8 @@ fn validate_public_domain(domain: &str) -> Result<(), ApiError> {
 /// config's ingress block?
 ///
 /// Returns an empty vec when the config file can't be read (operator may not
-/// be using Cloudflare Tunnel — DNS-only / proxied DNS are valid alternatives,
-/// see docs/public-claw-sites.md). Never errors; the warning is informational.
+/// be using Cloudflare Tunnel — DNS-only / proxied DNS are valid alternatives).
+/// Never errors; the warning is informational.
 fn missing_cloudflared_ingress(domains: &[String]) -> Vec<String> {
     let path = crate::cloudflared_sync::cloudflared_config_path();
     let Ok(content) = std::fs::read_to_string(&path) else {

@@ -41,7 +41,7 @@ const SOYEHT_SETUP_SERVICE: &str = "_soyeht-setup._tcp.local.";
 const LOCAL_SEED_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One observed Bonjour announcement from a candidate machine M2 advertising
-/// itself as `pair_role=joiner` per `docs/household-protocol.md` §13.
+/// itself as `pair_role=joiner`.
 ///
 /// `hh_id` is `Option`al because the candidate has not yet joined any
 /// household — the protocol mandates that the joiner publishes WITHOUT

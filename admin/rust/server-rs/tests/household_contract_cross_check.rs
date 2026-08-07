@@ -1,7 +1,7 @@
-//! Cross-check between the executable Claw Store contract and the household docs mirror.
+//! Cross-check between the executable Claw Store contract and its household projection.
 //!
 //! `admin/contracts/claw-store/v1/contract.json` is the source of truth. The
-//! household-only docs JSON must stay a projection of its `surface == "household"`
+//! household-only JSON beside it must stay a projection of its `surface == "household"`
 //! routes, keyed by the same route ids.
 
 use std::collections::BTreeMap;
@@ -9,7 +9,8 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 
 const V1_CONTRACT: &str = include_str!("../../../contracts/claw-store/v1/contract.json");
-const HOUSEHOLD_V1: &str = include_str!("../../../../docs/contracts/claw-store-household-v1.json");
+const HOUSEHOLD_V1: &str =
+    include_str!("../../../contracts/claw-store/v1/claw-store-household-v1.json");
 
 #[derive(Debug, Deserialize)]
 struct ExecutableContract {
@@ -119,7 +120,7 @@ fn household_routes_from_docs_contract() -> BTreeMap<String, ComparableRoute> {
                 auth_kind,
                 peer_guard: route.peer_guard,
             },
-            "docs/contracts/claw-store-household-v1.json",
+            "admin/contracts/claw-store/v1/claw-store-household-v1.json",
         );
     }
 
@@ -158,7 +159,7 @@ fn household_docs_contract_tracks_executable_household_subset_by_id() {
 
     assert!(
         missing_ids.is_empty() && extra_ids.is_empty() && divergent.is_empty(),
-        "docs/contracts/claw-store-household-v1.json must be a projection of \
+        "admin/contracts/claw-store/v1/claw-store-household-v1.json must be a projection of \
          admin/contracts/claw-store/v1/contract.json household routes.\n\
          missing ids: {missing_ids:?}\n\
          extra ids: {extra_ids:?}\n\

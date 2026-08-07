@@ -452,40 +452,8 @@ mod tests {
         assert_eq!(back, FailureScope::Unknown);
     }
 
-    // Runbook doc-sync guard: every code/scope wire string must be documented in
-    // docs/macos-runner-recovery-runbook.md so operators have a recovery action.
-
-    /// Read the operator runbook at test time, so the crate build itself does
-    /// not depend on a repo-root doc - only `cargo test` does.
-    fn read_runbook() -> String {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../../docs/macos-runner-recovery-runbook.md"
-        );
-        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read runbook {path}: {e}"))
-    }
-
-    const ALL_FAILURE_CODES: &[GuestImageFailureCode] = &[
-        GuestImageFailureCode::HostVmLimitReached,
-        GuestImageFailureCode::HelperMissing,
-        GuestImageFailureCode::InsufficientDisk,
-        GuestImageFailureCode::EntitlementMissing,
-        GuestImageFailureCode::IpswDownloadFailed,
-        GuestImageFailureCode::IpswIncompatible,
-        GuestImageFailureCode::VirtualizationUnavailable,
-        GuestImageFailureCode::Unknown,
-    ];
-
-    const ALL_FAILURE_SCOPES: &[FailureScope] = &[
-        FailureScope::CurrentBoot,
-        FailureScope::Persistent,
-        FailureScope::Retryable,
-        FailureScope::Unknown,
-    ];
-
     // Compile-time exhaustiveness: adding a variant breaks these matches, a
-    // reminder to extend ALL_FAILURE_* above and document the new value in the
-    // runbook.
+    // reminder to handle the new value everywhere the wire string appears.
     #[allow(dead_code)]
     fn codes_exhaustive(c: GuestImageFailureCode) {
         match c {
@@ -506,30 +474,6 @@ mod tests {
             | FailureScope::Persistent
             | FailureScope::Retryable
             | FailureScope::Unknown => {}
-        }
-    }
-
-    #[test]
-    fn runbook_documents_every_failure_code() {
-        let runbook = read_runbook();
-        for code in ALL_FAILURE_CODES {
-            assert!(
-                runbook.contains(code.as_str()),
-                "macos-runner-recovery-runbook.md must document failure code `{}`",
-                code.as_str()
-            );
-        }
-    }
-
-    #[test]
-    fn runbook_documents_every_failure_scope() {
-        let runbook = read_runbook();
-        for scope in ALL_FAILURE_SCOPES {
-            assert!(
-                runbook.contains(scope.as_str()),
-                "macos-runner-recovery-runbook.md must document failure scope `{}`",
-                scope.as_str()
-            );
         }
     }
 }

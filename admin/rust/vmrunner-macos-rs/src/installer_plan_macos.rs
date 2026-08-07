@@ -79,7 +79,7 @@ fn pinned_git_commit(claw: &str) -> Result<&'static str, VZError> {
 /// read their version from the manifest; hermes-agent pins its git tag
 /// (`git clone --branch`) rather than a release asset - a partial pin, since its
 /// pip/npm build deps still float and there is no checksum (it builds from
-/// source). See `docs/macos-runner-artifact-posture.md`.
+/// source).
 fn macos_install_command(claw_type: &str) -> Result<String, VZError> {
     let cmd = match claw_type {
         "picoclaw" => {
@@ -324,7 +324,6 @@ mod tests {
     /// `git clone --branch`). A new claw added with an unpinned fetch
     /// (`releases/latest/download`, a HEAD `git clone` without `--branch`, or an
     /// unversioned pip/npm install) must be added here consciously, or pinned.
-    /// See `docs/macos-runner-artifact-posture.md`.
     const UNPINNED_EXCEPTIONS: &[&str] = &[];
 
     /// Reliable markers that a command fetches an unpinned upstream artifact.

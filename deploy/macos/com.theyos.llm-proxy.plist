@@ -12,7 +12,7 @@
   substitution.
 
   Not enabled by default in Slice 1 — operators opt in once they have a
-  profile configured. See docs/llm-proxy.md (Slice 8).
+  profile configured.
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

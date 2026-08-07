@@ -169,8 +169,7 @@ impl PairToken {
         }))
     }
 
-    /// Render the canonical `soyeht://household/pair-device?…` URI per
-    /// `docs/household-protocol.md` §11.
+    /// Render the canonical `soyeht://household/pair-device?…` URI.
     ///
     /// The install-time variant carries `hh_pub` (the household's 33-byte
     /// SEC1 public key, base64url-encoded) so the scanning device can verify

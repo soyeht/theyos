@@ -23,7 +23,7 @@ struct Route {
 
 fn contract() -> Contract {
     serde_json::from_str(include_str!(
-        "../../../../docs/contracts/claw-store-household-v1.json"
+        "../../../contracts/claw-store/v1/claw-store-household-v1.json"
     ))
     .expect("contract fixture must be valid JSON")
 }

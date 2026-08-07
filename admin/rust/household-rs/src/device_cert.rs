@@ -1,6 +1,6 @@
 //! R0a Fatia D2a — typed `DeviceCert` v1 with byte-exact wire parity.
 //!
-//! The wire shape is fixed by `docs/household-protocol.md` §8 and is the same
+//! The wire shape is fixed and is the same
 //! canonical CBOR the iOS owner-device produces. Wire field names are pinned at
 //! the serde layer (`v`, `type`, …) because the signature covers the canonical
 //! bytes: renaming a field here would silently break cross-language

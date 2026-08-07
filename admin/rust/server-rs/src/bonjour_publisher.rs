@@ -1,7 +1,7 @@
 //! Bonjour publisher for `_soyeht-household._tcp` (FR-017).
 //!
 //! Publishes one announcement per non-loopback bind target (LAN +
-//! Tailscale). TXT records, per `docs/household-protocol.md` §13:
+//! Tailscale). TXT records:
 //!
 //! - Always present (base):
 //!   - `hh_id`   — household identifier (omitted when the publisher is a
@@ -484,8 +484,8 @@ pub async fn publish_household_bonjour(
 /// Publish `_soyeht-household._tcp` for a candidate machine M2 that has
 /// not yet joined any household.
 ///
-/// Used by `theyos install --pair-machine` (B8). Per
-/// `docs/household-protocol.md` §13 the candidate joiner publishes:
+/// Used by `theyos install --pair-machine` (B8). The candidate joiner
+/// publishes:
 /// - `pairing=machine`, `pair_role=joiner`
 /// - `pair_nonce=<short>`, `m_pub_b32=<short hash>`
 /// - **NO** `hh_id` (the candidate has not joined any household yet)

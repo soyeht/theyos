@@ -2686,8 +2686,8 @@ impl Drop for CeremonyTxn {
 /// self-signed cert would only move the trust problem somewhere else.
 /// Confidentiality is provided by the network underlay — production
 /// traffic flows over Tailscale's `WireGuard` overlay (encrypted
-/// end-to-end at the network layer) or a trusted LAN segment per
-/// `docs/household-protocol.md` §11. Authenticity is provided by the
+/// end-to-end at the network layer) or a trusted LAN segment.
+/// Authenticity is provided by the
 /// `JoinResponse.response_sig` (signed under M1's `m_priv` and verified
 /// against the founder cert pinned by the trust-anchor delivery, see B7
 /// in `contracts/local-anchor.md`); confidentiality of the shard is

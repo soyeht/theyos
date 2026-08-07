@@ -11,7 +11,7 @@ use crate::keys::P256PublicKey;
 /// Wire / on-disk schema for the household root record.
 ///
 /// Wire field name is `"v"` (not `"version"`) for parity with the `MachineCert`
-/// schema (`docs/household-protocol.md` §5).
+/// schema.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct HouseholdRecord {

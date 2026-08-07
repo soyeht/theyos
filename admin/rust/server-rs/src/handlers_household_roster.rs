@@ -1,6 +1,6 @@
 //! `GET /api/v1/household/roster/currency/{m_id}` — machine roster currency.
 //!
-//! Contract: `docs/household-protocol.md` §Machine Roster Currency. This is the
+//! Contract: Machine Roster Currency. This is the
 //! B0a slice: a projection of the durable roster authority already in
 //! [`household_rs::machine_roster_store`]. It admits no checkpoint and signs no
 //! roster fact, but a successful query does durably advance the monotonic clock

@@ -23,8 +23,9 @@
     "is being migrated. An expired exemption is a failure. There is no permanent",
     "exemption on purpose.",
     "",
-    "Any markdown file under docs/ that carries an anchor block is checked whether",
-    "or not it is listed here, so opting in costs one edit."
+    "Any markdown file under the scan root (default: docs/) that carries an",
+    "anchor block is checked whether or not it is listed here; a missing scan",
+    "root scans as empty. Opting in costs one edit."
   ],
   "documents": []
 }

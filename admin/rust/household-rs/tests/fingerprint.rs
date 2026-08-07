@@ -162,8 +162,7 @@ fn vectors_json_path() -> std::path::PathBuf {
     // sandbox (Nix, devcontainer, etc.). Used to live under
     // `specs/003-machine-join/tests/` when the spec-kit flow was active;
     // moved into the crate alongside the other fixture data after the
-    // spec-kit retire (see `docs/followup-llm-proxy-protecthome.md`-era
-    // cleanup commits).
+    // spec-kit retire.
     let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
     crate_root
         .join("tests")

@@ -136,8 +136,8 @@ pub enum Caveat {}
 
 /// On-disk machine certificate.
 ///
-/// Wire field name is `"v"` (not `"version"`) per `docs/household-protocol.md`
-/// §5. Renaming changes the canonical CBOR bytes that the signature covers,
+/// Wire field name is `"v"` (not `"version"`).
+/// Renaming changes the canonical CBOR bytes that the signature covers,
 /// so this is fixed at the wire layer rather than the struct field name.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
 #[serde(deny_unknown_fields)]

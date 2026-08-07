@@ -1,13 +1,13 @@
 name: Repo Hygiene
 
-# Four gates against one failure mode: a number nobody re-evaluates, which stays
+# Three gates against one failure mode: a number nobody re-evaluates, which stays
 # green while it rots. Each was written after that failure had already cost real
 # time, and each was proved able to go RED by breaking its own guard and watching
-# the test fail.
+# the test fail. A fourth gate (the agent operations index) left with the docs/
+# corpus it measured.
 #
 # DELIBERATELY NOT A REQUIRED CHECK, and this is a design decision, not an
-# oversight. Three of these four gates are RED against `main` today — that is the
-# point of building them, and making them required on day one would either block
+# oversight. Making these required on day one would either block
 # every PR or, far more likely, get them switched off within a week. They report
 # first. Promotion to required happens per gate, once its findings are at zero,
 # and each promotion is its own reviewed change.
@@ -92,11 +92,6 @@ jobs:
         # bare name onto the fetched remote ref, so no local branch is needed.
         run: uv run scripts/check-branch-hygiene.py --branch "${{ github.head_ref || github.ref_name }}"
 
-      - name: Gate — agent operations index
-        id: index
-        continue-on-error: true
-        run: uv run scripts/check-agent-operations-index.py
-
       - name: Gate self-tests
         continue-on-error: true
         run: |
@@ -104,8 +99,7 @@ jobs:
           rc=0
           for t in scripts/test_check_cross_repo_pin_freshness.py \
                    scripts/test_check_plan_doc_freshness.py \
-                   scripts/test_check_branch_hygiene.py \
-                   scripts/test_check_agent_operations_index.py; do
+                   scripts/test_check_branch_hygiene.py; do
             echo "::group::${t}"
             uv run "${t}" || rc=1
             echo "::endgroup::"
@@ -123,7 +117,6 @@ jobs:
             echo "| cross-repo pin freshness | ${{ steps.pin.outcome }} |"
             echo "| plan document freshness | ${{ steps.docs.outcome }} |"
             echo "| branch hygiene | ${{ steps.branches.outcome }} |"
-            echo "| agent operations index | ${{ steps.index.outcome }} |"
             echo ""
             echo "This job is NOT a required check, so a red here does not block a merge."
           } >> "$GITHUB_STEP_SUMMARY"
@@ -135,7 +128,7 @@ jobs:
       # gate.
       #
       # The per-step `continue-on-error` above stays — it is there so one red gate
-      # does not hide the other three, which is a different problem. This step
+      # does not hide the other two, which is a different problem. This step
       # restores the signal: the job goes red when any gate did, while the check
       # remains non-required so a red never blocks a merge. Removing this step to
       # "get CI green" removes the entire point of the workflow.
@@ -146,9 +139,8 @@ jobs:
           [ "${{ steps.pin.outcome }}" = "failure" ] && failed="${failed} cross-repo-pin-freshness"
           [ "${{ steps.docs.outcome }}" = "failure" ] && failed="${failed} plan-doc-freshness"
           [ "${{ steps.branches.outcome }}" = "failure" ] && failed="${failed} branch-hygiene"
-          [ "${{ steps.index.outcome }}" = "failure" ] && failed="${failed} agent-operations-index"
           if [ -n "${failed}" ]; then
             echo "::error::red gates:${failed} — see the step logs above. This check is not required; it reports."
             exit 1
           fi
-          echo "all four gates green"
+          echo "all three gates green"

@@ -50,7 +50,7 @@ impl ProxyClient {
     ///
     /// Why so strict: every admin LLM mutation — including provider
     /// adds, credential storage, active-profile swaps — passes through
-    /// this client. The threat model in `docs/llm-proxy.md` rests on
+    /// this client. The threat model rests on
     /// "credentials never leave the host". An operator typo
     /// (`http://0.0.0.0:18900`), a stale DNS entry, or a malicious env
     /// dump that swaps the URL would silently leak API keys to a remote

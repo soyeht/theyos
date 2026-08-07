@@ -53,7 +53,10 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-DEFAULT_ENROLLMENT = "docs/doc-freshness-enrollment.json"
+DEFAULT_ENROLLMENT = "scripts/doc-freshness-enrollment.json"
+# Where anchored plan documents are looked up. The docs/ corpus was deleted on
+# 2026-08-07; a missing directory scans as empty, and a new plan that lives
+# elsewhere can be pointed at with --scan-root.
 DEFAULT_SCAN_ROOT = "docs"
 
 ENROLLMENT_SCHEMA = "doc_freshness_enrollment_v1"
@@ -109,7 +112,7 @@ def report_replan_interregnum(today: date) -> int:
             f"on 2026-08-06 and the replacement is not written yet. This gate "
             f"fails on {PLAN_ENROLLMENT_DEADLINE.isoformat()} ({remaining} day(s) "
             "away). Clear it by enrolling the new plan as 'anchored' in "
-            "docs/doc-freshness-enrollment.json and naming it in "
+            "scripts/doc-freshness-enrollment.json and naming it in "
             "REQUIRED_ANCHORED -- not by moving the date."
         )
         return 0
@@ -117,7 +120,7 @@ def report_replan_interregnum(today: date) -> int:
         f"ERROR: no plan document has been enrolled and the grace period ended on "
         f"{PLAN_ENROLLMENT_DEADLINE.isoformat()}; the planning corpus was retired "
         "on 2026-08-06 and nothing replaced it. Enrol the new plan as 'anchored' "
-        "in docs/doc-freshness-enrollment.json and name it in REQUIRED_ANCHORED.",
+        "in scripts/doc-freshness-enrollment.json and name it in REQUIRED_ANCHORED.",
         file=sys.stderr,
     )
     return 1
@@ -487,16 +490,25 @@ def load_enrollment(path: Path) -> tuple[dict[str, Entry], list[str]]:
 
 
 def discover_anchored_documents(
-    repo_root: Path, scan_root: Path, already_enrolled: frozenset[str]
+    repo_root: Path,
+    scan_root: Path,
+    already_enrolled: frozenset[str],
+    require_existing: bool = True,
 ) -> tuple[list[str], list[tuple[str, str]], str | None]:
     """Find markdown files that carry an anchor, so opting in never needs a second edit.
 
     Returns (discovered, findings, fatal).  A file that cannot be read is a
     finding, not a skip: "we could not tell whether it is anchored" must never
     resolve to "it is fine".
+
+    require_existing is False only for the DEFAULT scan root: the docs/ corpus
+    was deleted, so a missing default directory scans as empty. An explicit
+    --scan-root still fails when it does not exist, so a typo cannot pass.
     """
     if not scan_root.is_dir():
-        return [], [], f"scan root {relative(repo_root, scan_root)} is not a directory"
+        if require_existing:
+            return [], [], f"scan root {relative(repo_root, scan_root)} is not a directory"
+        return [], [], None
     found: list[str] = []
     findings: list[tuple[str, str]] = []
     for candidate in sorted(scan_root.rglob("*.md")):
@@ -688,7 +700,7 @@ def main(argv: list[str] | None = None) -> int:
             findings.append((required, f"required document must be enrolled as {STATUS_ANCHORED!r}, not {entry.status!r}"))
 
     discovered, scan_findings, scan_fatal = discover_anchored_documents(
-        repo_root, scan_root, frozenset(entries)
+        repo_root, scan_root, frozenset(entries), require_existing=args.scan_root is not None
     )
     if scan_fatal is not None:
         print(f"ERROR: {scan_fatal}", file=sys.stderr)

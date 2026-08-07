@@ -1223,7 +1223,7 @@ mod tests {
         // ssh_reverse_forward MUST return a spec mapping guest:18900 →
         // host:18900. If either drifts, claws stop reaching the
         // host-side multiplexer and "production PTY path" validation
-        // (docs/llm-proxy.md) silently breaks.
+        // silently breaks.
         let _guard = ENV_LOCK.lock().expect("env lock");
         let provider_prev = std::env::var("THEYOS_LLM_PROVIDER").ok();
         let model_prev = std::env::var("THEYOS_LLM_MODEL").ok();

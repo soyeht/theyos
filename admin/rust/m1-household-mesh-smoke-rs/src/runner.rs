@@ -35,8 +35,8 @@ The /machines query is access-controlled, but its reachability bool is not an
 authenticated identity or presence claim. The echo is unauthenticated. Neither
 result is membership, authority, DeviceCert presence, or VerifiedMesh evidence.
 
-See docs/m1-household-mesh-smoke-runbook.md for the manual iPhone/Face ID and
-pair-machine ceremony. Bare invocation stops here.
+The manual iPhone/Face ID and pair-machine ceremony is driven by the operator;
+bare invocation stops here.
 ";
 
 const EXIT_BLOCKED: u8 = 20;

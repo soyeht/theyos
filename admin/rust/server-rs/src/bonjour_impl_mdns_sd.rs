@@ -3,8 +3,7 @@
 //! This module is the I/O layer the `bonjour_publisher` and `bonjour_browser`
 //! facades call into. It exists so a parallel `bonjour_impl_dns_sd.rs` can
 //! provide a macOS-native backend (Apple's `dns_sd.h` system bridge) without
-//! the facades knowing which is wired in. See
-//! `docs/followup-mdns-sd-macos-publisher.md` for context.
+//! the facades knowing which is wired in.
 //!
 //! On `mdns-sd` 0.10 the publisher does not propagate to macOS's
 //! `mDNSResponder` daemon when `mDNSResponder` already binds 5353 — the

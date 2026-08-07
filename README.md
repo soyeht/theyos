@@ -102,7 +102,9 @@ If the `soyeht` binary is missing or damaged, use the recovery endpoint:
 curl -fsSL https://soyeht.com/uninstall | sh
 ```
 
-See [docs/uninstall.md](docs/uninstall.md) for details.
+Options: `soyeht uninstall --keep-data` preserves customer/VM data,
+`--dry-run` shows the action without removing anything, and `--yes` skips
+the confirmation prompt for automation.
 
 ## Accessing the Admin Panel
 

@@ -28,6 +28,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -121,7 +122,7 @@ class TempRepo:
 
     def write_enrollment(self, documents: list[dict[str, object]], schema: str = gate.ENROLLMENT_SCHEMA) -> None:
         self.write(
-            "docs/doc-freshness-enrollment.json",
+            "scripts/doc-freshness-enrollment.json",
             json.dumps({"schema": schema, "documents": documents}, indent=2) + "\n",
         )
 
@@ -475,7 +476,7 @@ class EnrollmentTests(DocFreshnessTestCase):
                 self.assertIn(expected, err)
 
     def test_broken_enrollment_files_cannot_pass(self) -> None:
-        enrollment = self.repo.root / "docs/doc-freshness-enrollment.json"
+        enrollment = self.repo.root / "scripts/doc-freshness-enrollment.json"
         cases = (
             ("not json at all", "not valid JSON"),
             ('["a"]', "must be a JSON object"),
@@ -511,7 +512,7 @@ class EnrollmentTests(DocFreshnessTestCase):
                 self.assertIn(expected, err)
 
     def test_deleted_enrollment_file_cannot_pass(self) -> None:
-        (self.repo.root / "docs/doc-freshness-enrollment.json").unlink()
+        (self.repo.root / "scripts/doc-freshness-enrollment.json").unlink()
         code, out, err = self.run_gate()
         self.assertEqual(2, code)
         self.assertNotIn("OK:", out)
@@ -522,6 +523,20 @@ class EnrollmentTests(DocFreshnessTestCase):
         self.assertEqual(2, code)
         self.assertNotIn("OK:", out)
         self.assertIn("is not a directory", err)
+
+    def test_absent_default_scan_root_scans_empty(self) -> None:
+        # The docs/ corpus left the repository on 2026-08-07. The default scan
+        # root must then scan as empty instead of failing -- freshness is still
+        # measured from git -- while an explicit --scan-root keeps its teeth
+        # (the test above). The enrolled plan itself must live outside docs/,
+        # since an enrolled document that vanished IS a finding.
+        self.repo.write("plans/vpn-plan.md", plan_document(self.anchor_sha))
+        self.repo.write_enrollment(
+            [{"path": "plans/vpn-plan.md", "status": "anchored"}]
+        )
+        self.repo.commit("re-enroll the plan outside docs/")
+        shutil.rmtree(self.repo.root / "docs")
+        self.assert_green()
 
     def test_unresolvable_ref_cannot_pass(self) -> None:
         code, out, err = self.run_gate("--ref", "refs/heads/does-not-exist")
@@ -656,7 +671,7 @@ class CommandLineTests(DocFreshnessTestCase):
         self.assertEqual("", stale.stdout)
         self.assertIn("doc-freshness finding", stale.stderr)
 
-        (self.repo.root / "docs/doc-freshness-enrollment.json").write_text("{", encoding="utf-8")
+        (self.repo.root / "scripts/doc-freshness-enrollment.json").write_text("{", encoding="utf-8")
         broken = self.run_cli()
         self.assertEqual(2, broken.returncode)
         self.assertEqual("", broken.stdout)

@@ -3952,7 +3952,7 @@ mod tests {
     #[test]
     fn dev_keypair_from_hex_matches_cross_language_fixture() {
         // Scalar [0x55;32] → the member_pub, and [0x33;32] → the device_pub,
-        // pinned in docs/product-a-group-op-fixtures.md. Proves the server parse
+        // pinned as the cross-language fixture. Proves the server parse
         // == friend-cli's member_key_from_hex == the cross-language fixture, so
         // the same --member-secret/--device-secret yield identical keys on both.
         let m = dev_keypair_from_hex(&"55".repeat(32)).expect("valid member scalar");

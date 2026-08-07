@@ -11,20 +11,12 @@ fn crate_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
 }
 
-fn repo_dir() -> PathBuf {
-    crate_dir().join("../../..")
-}
-
 fn src_dir() -> PathBuf {
     crate_dir().join("src")
 }
 
 fn read_src(file: &str) -> String {
     fs::read_to_string(src_dir().join(file)).unwrap_or_else(|e| panic!("read src/{file}: {e}"))
-}
-
-fn read_repo(file: &str) -> String {
-    fs::read_to_string(repo_dir().join(file)).unwrap_or_else(|e| panic!("read {file}: {e}"))
 }
 
 fn slice_between<'a>(source: &'a str, start_marker: &str, end_marker: &str) -> &'a str {
@@ -263,34 +255,7 @@ fn mesh_exposure_requires_typed_configuration_verified_ownership_and_prebind_tra
 }
 
 #[test]
-fn ready_posture_doc_matches_plain_http_listener_contract() {
-    let doc = read_repo("docs/household-bind-posture.md");
-    for term in [
-        "HTTP plaintext",
-        "no TLS/rustls",
-        "Ready invariant is loopback + Tailnet + verified Mesh",
-        "`THEYOS_MESH_SUBNET` is only a validated input",
-        "verified Mesh-interface ownership fact",
-        "must not advertise Mesh addresses through LAN mDNS",
-        "literal `ready`",
-        "before PoP, minting, or token consumption",
-        "LAN is only",
-        "for onboarding and pre-household discovery",
-        "Wildcard binds remain prohibited",
-        "operator-network boundary",
-        "`GET /bootstrap/status`, `GET /health`, `GET /healthz`",
-        "`POST /api/v1/household/reachability/echo`",
-        "proves byte reachability only",
-        "No auth by contract",
-        "Soyeht-PoP plus the declared `Operation::Claws*` caveat",
-        "single-use header token",
-    ] {
-        assert!(
-            doc.contains(term),
-            "household bind posture doc must describe `{term}`"
-        );
-    }
-
+fn plain_http_listener_contract_is_pinned_in_code() {
     let listener = read_src("household_listener.rs");
     let spawn_body = slice_between(
         &listener,
@@ -301,7 +266,7 @@ fn ready_posture_doc_matches_plain_http_listener_contract() {
         spawn_body.contains("TcpListener")
             && spawn_body.contains("phase0_axum_serve!")
             && spawn_body.contains("connect_info = SocketAddr"),
-        "household listener must keep plaintext TCP behind the Phase 0 HTTP serve choke-point, or update docs/tests with the transport migration"
+        "household listener must keep plaintext TCP behind the Phase 0 HTTP serve choke-point, or update the tests with the transport migration"
     );
 
     let bootstrap = read_src("handlers_bootstrap.rs");

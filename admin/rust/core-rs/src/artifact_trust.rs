@@ -152,8 +152,7 @@ impl ArtifactSignatureKeyring {
 }
 
 /// The pinned production artifact-signing key identifier, baked into the client
-/// so it can verify manifests signed by the release key. See
-/// `docs/artifact-signing-runbook.md`.
+/// so it can verify manifests signed by the release key.
 pub const PRODUCTION_ARTIFACT_KEY_ID: &str = "artifact-prod-p256-2026q2";
 
 /// SEC1-compressed P-256 public key (33 bytes) for [`PRODUCTION_ARTIFACT_KEY_ID`].

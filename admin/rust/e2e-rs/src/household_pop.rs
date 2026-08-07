@@ -1225,10 +1225,6 @@ impl GateReport {
         let _ = writeln!(out, "**Date**: {}", self.started_date);
         let _ = writeln!(out, "**Target Alias**: {}", self.target_alias);
         let _ = writeln!(out, "**Git Commit**: {}", self.git_commit);
-        let _ = writeln!(
-            out,
-            "**Plan Reference**: QA/domains/household-pop-claw-store.md"
-        );
         let _ = writeln!(out, "**Result**: {}", self.overall_result());
         let _ = writeln!(out);
         let _ = writeln!(
@@ -1487,7 +1483,7 @@ fn report_directory(report_dir: Option<&Path>, date: &str) -> Result<(PathBuf, S
         return Ok((report_dir.to_path_buf(), "custom-report-dir".to_string()));
     }
     let repo_root = core_rs::path::resolve_repo_root().map_err(|_| ())?;
-    let rel_dir = format!("QA/runs/{date}-household-pop-claw-store");
+    let rel_dir = format!("artifacts/qa/runs/{date}-household-pop-claw-store");
     Ok((repo_root.join(&rel_dir), rel_dir))
 }
 

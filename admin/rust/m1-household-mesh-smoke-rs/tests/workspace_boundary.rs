@@ -128,11 +128,9 @@ fn package_is_a_binary_only_non_publishable_leaf() {
 }
 
 #[test]
-fn crate_and_runbook_remain_neutral_and_non_operational() {
+fn crate_remains_neutral_and_non_operational() {
     let mut sources = Vec::new();
     rust_sources(&package_dir(), &mut sources);
-    let runbook = repository_root().join("docs/m1-household-mesh-smoke-runbook.md");
-    sources.push(runbook);
 
     let forbidden = [
         ["Product ", "A"].concat(),
@@ -172,11 +170,9 @@ fn signer_contract_is_local_versioned_and_shell_free() {
     let production_adapters = adapters
         .split_once("#[cfg(test)]")
         .map_or(adapters.as_str(), |(production, _)| production);
-    let runbook = read(repository_root().join("docs/m1-household-mesh-smoke-runbook.md"));
 
     assert!(source.contains("THEYOS_HH_POP_SIGNER_ARGV_JSON_V1"));
     assert_only_versioned_signer_name(&source);
-    assert_only_versioned_signer_name(&runbook);
     assert!(source.contains("THEYOS_HH_POP_SIGNER_CMD"));
     assert!(!source.contains("shlex"));
     assert!(!source.contains("Command::new(\"bash\")"));

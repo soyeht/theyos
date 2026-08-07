@@ -85,7 +85,7 @@ CLAUDE.md
 # Test artifacts
 test-reports/
 .pytest_cache/
-QA/runs/**/screenshots/*.png
+artifacts/qa/runs/**/screenshots/*.png
 artifacts/qa/screenshots/
 
 # Streamlit

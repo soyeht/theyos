@@ -3,8 +3,7 @@
 //! The pure-Rust `mdns-sd` crate binds UDP 5353 alongside macOS's
 //! `mDNSResponder` daemon via `SO_REUSEPORT`; the resulting publisher
 //! announces never propagate to the system mDNS cache (T046 hardware
-//! walkthrough on 2026-05-08, see
-//! `docs/followup-mdns-sd-macos-publisher.md`). This module routes
+//! walkthrough on 2026-05-08). This module routes
 //! through `mDNSResponder` instead, sharing its socket the way Apple's
 //! `NSNetService` and `NWBrowser` do.
 //!
@@ -237,8 +236,7 @@ impl PublisherHandle {
         // The pump exits when its shutdown pipe is signalled; the spawning
         // side then joins and only afterwards deallocates the ref. That
         // ordering avoids a libdispatch teardown race that would otherwise
-        // crash inside `DNSServiceProcessResult` on shutdown — see
-        // `docs/followup-dns-sd-test-teardown-signal.md`.
+        // crash inside `DNSServiceProcessResult` on shutdown.
         let sd_handle = SdRefHandle::new(sd_ref);
         let shutdown_pipe = ShutdownPipe::new().inspect_err(|_| {
             // SAFETY: ref was just successfully created and no other
@@ -557,8 +555,7 @@ impl BrowserHandle {
         // the pump's shutdown pipe (so it exits select(2) without
         // entering another DNSServiceProcessResult call), join the
         // pump, then deallocate the ref. Doing it the other way around
-        // reintroduces the libdispatch teardown race fixed in
-        // `docs/followup-dns-sd-test-teardown-signal.md`.
+        // reintroduces the libdispatch teardown race.
         //
         // Loop until the registry is stable: a resolve callback can run
         // *after* the resolve pump exits but before we observe the empty
@@ -717,8 +714,7 @@ struct RegisterContext {
 /// pipe FIRST so the pump exits its `select` and stops calling
 /// `DNSServiceProcessResult`, then join, and only afterwards deallocate
 /// the ref. Doing it any other way reintroduces the libdispatch
-/// teardown race documented in
-/// `docs/followup-dns-sd-test-teardown-signal.md`.
+/// teardown race.
 ///
 /// Must run on a worker thread (it joins a thread); avoid calling from
 /// async contexts unless wrapped in `spawn_blocking`.
@@ -797,7 +793,7 @@ extern "C" fn register_reply(
 /// a different thread is inside `DNSServiceProcessResult`, but in
 /// practice that path occasionally crashes inside
 /// `dispatch_channel_cancel` (libdispatch teardown) when the deallocate
-/// races a callback dispatch — see `docs/followup-dns-sd-test-teardown-signal.md`.
+/// races a callback dispatch.
 ///
 /// The fix: have the pump only enter `DNSServiceProcessResult` when the
 /// underlying socket is readable, exit cleanly when the self-pipe gets
@@ -941,7 +937,7 @@ fn select_pump_ready(sd_fd: c_int, shutdown_fd: c_int) -> Result<bool, c_int> {
 /// `DNSServiceRef`. Exits when the shutdown pipe is signalled. The
 /// caller is expected to deallocate the ref AFTER joining the pump
 /// thread — that ordering is what avoids the libdispatch teardown
-/// race documented in `docs/followup-dns-sd-test-teardown-signal.md`.
+/// race.
 fn pump_events(sd_ref: ffi::DNSServiceRef, shutdown_fd: c_int) {
     // SAFETY: `DNSServiceRefSockFD` returns a stable fd for the
     // lifetime of the ref (per dns_sd.h).
@@ -1086,8 +1082,7 @@ struct GetAddrInfoContext {
 /// FIRST so the pump exits its `select(2)` and stops calling
 /// `DNSServiceProcessResult`, then join, then deallocate the browse
 /// ref. Doing it any other way (e.g. deallocate-then-join) reintroduces
-/// the libdispatch teardown race documented in
-/// `docs/followup-dns-sd-test-teardown-signal.md`.
+/// the libdispatch teardown race.
 ///
 /// The `BrowseContext` is intentionally leaked for the daemon's
 /// lifetime — like `RegisterContext`, mDNSResponder may still hold the

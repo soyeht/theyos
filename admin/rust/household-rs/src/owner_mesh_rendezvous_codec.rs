@@ -1,6 +1,7 @@
 //! Pure, inert codec for owner-mesh rendezvous frames.
 //!
-//! The wire format is pinned by `docs/owner-mesh-rendezvous/wire-encoding-v1.md`.
+//! The wire format is pinned by the frozen owner-mesh rendezvous corpus in
+//! `admin/contracts/mobile-claw-vpn/v1/`.
 //! This module deliberately contains no transport, authority, replay, minting,
 //! persistence, or signature-verification behavior. In particular,
 //! `signed_offer` is an opaque, bounded byte string.
