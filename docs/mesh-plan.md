@@ -3,7 +3,10 @@
 **v5 — executável.** Substitui a v4 congelada (`soyeht-plano.md`), que pressupunha
 um datapath WireGuard que não existe e não vai ser construído.
 
-**Hardware:** `linux` (sempre ligado, host das VMs) · `macstudio` · `macbook` · `iphone`
+**Bancada:** `host-alpha` (Linux, sempre ligado, host das VMs) · `desktop-alpha` ·
+`laptop-alpha` · `device-alpha` (telefone). Aliases neutros de propósito: nome de
+máquina, hostname de SSH e nome de device são identificadores de infraestrutura
+pessoal e não entram em documento versionado.
 
 ---
 
@@ -65,16 +68,22 @@ começo do caminho crítico.
 
 O caminho crítico deixou de ser a sequência numérica.
 
+Arestas reais, não agrupamento visual:
+
 ```
-Lane A (independência)   M1a conformance Noise ─┐
-                         M1b wire/auth RS↔Swift ─┤
-                                                 ├─→ M2 TUN↔utun ─→ M3 relay ─→ M4 mobile
-Lane B (sem datapath)    M6 · M8 · M9 · M10-core ┘                    │
-                                                                      ├─→ M5 control plane
-                                                                      ├─→ M7 VM como node
-                                                                      ├─→ M11 compartilhar
-                                                                      └─→ M12a direct ─→ M12b mobilidade
+M1a + M1b            → M2
+M2                   → M3
+M3                   → M4
+M3 + M8              → M5
+M3 + M5 + M6         → M7
+M5 + M6 + M7 + M8    → M11
+M3 + M4 + M5         → M12a → M12b-0 (congela o SLO) → M12b
+M7                   → fechamento E2E do M10
 ```
+
+**Lane B — M6, M8, M9 e o core do M10 — roda em paralelo e NÃO converge toda em
+M2.** M6 e M8 alimentam M5/M7/M11 mais tarde; M9 e o core do M10 não são
+pré-requisito de marco de datapath nenhum.
 
 - **M6, M8, M9 e o core do M10 não implementam datapath** e podem começar já,
   em paralelo com a Lane A.
@@ -120,11 +129,11 @@ ambos são observação momentânea. `mapping_consistent` é `Option<bool>` —
 
 | vantagem | estado |
 |---|---|
-| macstudio / ethernet | ✅ |
-| iphone / wifi | ✅ |
-| iphone / 5G | ❌ aparelho sem dado celular (linha/plano) |
-| linux / ethernet | ❌ host `devs` inalcançável |
-| macbook / wifi casa · wifi café | ❌ precisa de acesso físico |
+| `desktop-alpha` / ethernet | ✅ |
+| `device-alpha` / wifi | ✅ |
+| `device-alpha` / rede móvel | ❌ aparelho sem dado celular (linha/plano) |
+| `host-alpha` / ethernet | ❌ host de laboratório temporariamente inalcançável |
+| `laptop-alpha` / wifi doméstico · wifi público | ❌ precisa de acesso físico |
 
 Duas lições que ficaram no código:
 
@@ -138,23 +147,75 @@ Duas lições que ficaram no código:
 
 ---
 
+## M0b — Smoke de provisioning iOS
+
+**Objetivo:** descobrir o inferno de provisioning agora, não no M4. Ortogonal ao
+datapath — não depende de nada nesta lista e não bloqueia nada.
+
+Não implemente VPN nenhuma. Suba uma extensão mínima que carrega e lê um valor.
+
+**Construir e validar:** entitlement de Network Extension
+(`packet-tunnel-provider`) · App Group compartilhado entre app e extensão ·
+Keychain Access Group compartilhado · XCFramework Rust carregando **dentro da
+extensão**, não só no app.
+
+**Teste, no aparelho físico e não no simulador:**
+1. o app grava um canary no Keychain (access group compartilhado);
+2. a extensão sobe, lê o canary e loga;
+3. a extensão chama uma função Rust trivial do XCFramework;
+4. bloquear o aparelho e repetir 2 e 3.
+
+**Pronto quando:** os quatro passos funcionam no aparelho real.
+
+> Bloqueio conhecido: o primeiro save de uma `NETunnelProviderManager` nova pede
+> o passcode físico do aparelho. É gate humano, não bug — não dá para automatizar
+> em torno dele.
+
 ## M1a — Conformance Noise independente
 
-**Construir:** exportador de vetores congelados do handshake e dos primeiros
-records; verificador numa segunda implementação Noise, em outra linguagem, sem
-compartilhar crypto/estado com o `snow`.
+Duas metades, porque exigir "byte-a-byte" de um handshake com chaves frescas é
+impossível por construção — e a resposta certa **não** é enfraquecer o core.
 
-**Pronto quando:** a segunda implementação reproduz transcript hash e records
-byte-a-byte, e as negativas (bit flip, replay, reorder, prologue trocado) falham.
+**a) Vetores determinísticos, em harness isolado.** Chaves static/ephemeral fixas
+de teste, num harness que nunca toca o build de produção.
+**Proibido** adicionar `fixed_ephemeral_key_for_testing_only` — ou qualquer seam
+de chave fixa — à superfície ou ao fluxo de produção. Hoje o core gera keypair
+fresco por conexão e não expõe esse seam; isso é propriedade, não acidente.
+
+**b) Interop ao vivo, com o código de produção.** O endpoint Rust real completa um
+handshake contra a segunda implementação, cada lado com chave própria que o outro
+nunca viu.
+
+**Construir:** exportador dos vetores (prologue, os 3 flights XX, transcript hash,
+primeiros records); verificador numa segunda implementação Noise, em outra
+linguagem, sem compartilhar crypto nem estado com o `snow`.
+
+**Pronto quando:** (a) a segunda implementação reproduz os vetores byte-a-byte;
+(b) o handshake ao vivo completa e **os dois lados derivam o mesmo handshake
+hash**; e as negativas (bit flip, replay, reorder, prologue trocado) falham nos
+dois modos.
+
+> Estado: o interop ao vivo (b) já foi provado fora do repo — `snow` ↔ uma
+> implementação Python independente, com o prologue e o framing reais, derivaram
+> hash idêntico e trocaram transporte nos dois sentidos. Falta portar como teste
+> versionado e escrever (a).
 
 ## M1b — Wire e autorização cross-language
 
 **Construir:** vetores Rust↔Swift de length framing, CBOR canônico, intent/auth
 frames, DATA/CLOSE/REKEY.
 
-**Pronto quando:** os dois lados concordam byte-a-byte nos positivos **e** recusam
-cada negativa (length excessivo, CBOR não canônico, assinatura/nonce/epoch/
-`previous_hash` alterados).
+**Pronto quando:**
+1. CBOR, preimage, digest e frame são **byte-idênticos** nos dois lados;
+2. uma assinatura pública fixa verifica nos dois lados;
+3. assinatura gerada por cada lado verifica no outro;
+4. cada negativa falha (length excessivo, CBOR não canônico,
+   assinatura/nonce/epoch/`previous_hash` alterados).
+
+> **Não** exigir que duas assinaturas ECDSA geradas tenham os mesmos bytes. ECDSA
+> é randomizado; exigir bytes iguais entre plataformas transformaria um teste de
+> conformidade numa exigência impossível. O que precisa ser byte-idêntico é o que
+> se assina, não a assinatura.
 
 ---
 
@@ -167,6 +228,11 @@ pela interface virtual, e confidencialidade verificada no underlay.
 **Muda:** o transporte é sessão B-SESSAO autenticada + `TunnelFrame::Data`/pump; o
 endereço vem do `NetworkSettings`/autoridade, não de um ULA hard-coded (o v1 hoje
 é IPv4 escopado).
+
+> **Formato de endereço fica deliberadamente em aberto** — não fixar ULA nem
+> família antes da autoridade de endereços fechar. Os invariantes verificáveis já
+> valem sem escolher formato: `NetworkSettings` canônico e versionado, rota
+> **não-default**, peer distinto do local, e route-scope validado na entrega.
 
 **Pronto quando:**
 1. dois nodes estabelecem sessão Noise autenticada na LAN, instalam **somente** a
@@ -191,8 +257,12 @@ endpoints.
 1. o fetch entre redes distintas funciona só pelo relay;
 2. o dump **depois** de qualquer envelope TLS/WSS e **antes** da cifra E2E não
    contém o marcador;
-3. o relay só observa metadado inevitável (tamanho, timing, routing token) — não
-   decodifica `TunnelFrame::Data` nem constrói sessão ativa;
+3. o relay não consegue decodificar `TunnelFrame::Data` nem construir sessão
+   ativa — e isso é **evidência mecânica**, não afirmação: black-box com relay
+   malicioso que tenta decodificar, mais prova de que o processo/artefato do
+   relay não recebe segredo de endpoint nem tem API que devolva `TransportState`
+   ou plaintext. Se relay e endpoint compartilham binário, a prova é um gate de
+   alcançabilidade/dependência ou compile-out, **não** um grep por nome;
 4. relay que altera, reordena ou reproduz records causa rejeição; relay que troca
    endpoint/prologue/cert também falha;
 5. limites de frame, fila e backpressure exercitados com peer lento, memória limitada.
@@ -244,8 +314,11 @@ qualquer coisa. Root dentro da VM não pode mudar o resultado.
 
 **Morreu:** a exceção nominal `wg0` e qualquer regra que identifique o overlay por
 WireGuard — substituir por interface dedicada / mark / VRF do datapath Noise.
-Continua proibido liberar `fc00::/7` ou prefixo amplo: a regra é **por interface**,
-não por prefixo, senão um `drop` global mata a própria VPN.
+
+**A regra casa por interface/mark, nunca por prefixo — nos dois sentidos.** Não
+liberar globalmente um prefixo amplo (`fc00::/7`) *e* não bloqueá-lo globalmente:
+o allow amplo fura o isolamento, e o drop amplo mata a própria VPN. O mesmo
+endereço tem que passar pela interface de overlay e falhar pela interface normal.
 
 **Construir:** netns + TAP + nftables família **`inet`** (cobre v4 e v6 numa regra
 só — um firewall só-v4 passa no teste e vaza por v6); deny de LAN, metadata,
@@ -285,9 +358,17 @@ Objetivo inalterado: **login não é autorização de rede.** Trust doc, grants,
 membership e recovery formam uma cadeia assinada e anti-rollback.
 
 **Morreu:** exatamente uma linha — "WireGuard device key X25519 no Keychain".
-Substituída por: owner signer P-256 para atos interativos; cert de device para
-admissão e reconnect; X25519 de sessão Noise fresca, nunca persistida como
-identidade.
+Substituída por três papéis distintos, e a metade secreta importa:
+
+| papel | material | onde |
+|---|---|---|
+| atos interativos do dono | owner signer P-256 | Secure Enclave, com gesto |
+| admissão e reconnect do device | **keypair de admissão do device** — privada no keystore da plataforma — e o cert correspondente | keystore, sem gesto |
+| sessão | X25519 Noise fresca por conexão | memória, nunca persistida |
+
+> "Cert de device" sozinho não autentica nada: o cert é público. O que autentica é
+> a posse da chave privada correspondente. Reconnect em background usa esse
+> keypair, nunca o owner signer.
 
 **Sobrevive integralmente:** WebAuthn, um signer P-256 **por device** (chave do
 Secure Enclave é não-extraível por definição — não existe "copiar a House key"),
@@ -320,9 +401,15 @@ host**. Nunca confiar num `resource_instance` que veio no JSON. Operações nome
 só; valida modelo, tokens, budget, tamanho, ferramentas e rate limit. Orçamento por
 instância, não por usuário.
 
-**Pronto quando:** `grep -rn "sk-"` e `env` vazios dentro da VM; operação declarada
-funciona; não declarada dá 403; `resource_instance` forjado é ignorado em favor do
-CID; budget corta e audita; e reinício/clonagem não herda orçamento indevido.
+**Pronto quando:** um canary sintético conhecido (não uma credencial real) não
+aparece em FS, env nem argv dentro da VM, e `env | grep -iE "api|key|token|secret"`
+volta vazio; operação declarada funciona; não declarada dá 403;
+`resource_instance` forjado é ignorado em favor do CID; budget corta e audita; e
+reinício/clonagem não herda orçamento indevido.
+
+> O teste prova **ausência de credencial**, não ausência de ambiente — `env` sempre
+> terá `PATH`. Exigir env vazio seria um critério impossível que ninguém cumpre e
+> todo mundo acaba ignorando.
 
 ## M10 — Agente de memorização · CORE SOBREVIVE
 
@@ -332,13 +419,17 @@ Exercita a stack inteira sem risco.
 **Morreu:** nada de WireGuard. Só o endereço ULA fixo vira endpoint/rota escopada
 entregue pelo datapath.
 
-**Pronto quando:** upload de um arquivo de teste **sem dados pessoais**; perguntas
-e agendamento persistem por 3 dias e sobrevivem a restart; dentro da VM,
-internet e LAN falham e o broker funciona; nenhum segredo em FS ou env; revogar
-acesso impede tráfego novo à UI sem apagar os dados do agente.
+Dois estados de pronto, separados de propósito — o core não pode ficar refém do
+datapath, e o E2E não pode ser declarado sem ele:
 
-> Core, broker e isolamento fecham sem datapath. Só o "device remoto acessa a UI"
-> espera M7 — então não chame o M10 inteiro de pronto antes desse E2E.
+**M10-core pronto quando:** upload de um arquivo de teste **sem dados pessoais**;
+perguntas e agendamento persistem por 3 dias e sobrevivem a restart; dentro da VM
+internet e LAN falham e o broker permitido funciona; nenhum segredo em FS ou env.
+Nada disso precisa de datapath.
+
+**M10-E2E pronto quando:** um device autorizado alcança a UI pela rota escopada, e
+revogar o acesso corta o tráfego novo **sem apagar os dados do agente**. Isso
+espera M7.
 
 ## M11 — Compartilhar VM (host Linux) · INVARIANTES SOBREVIVEM
 
@@ -350,10 +441,15 @@ SessionGate por operação; ACL exata device↔VM.
 encadeado. Firewall stateful: convidado→VM abre conexão; VM→convidado só
 `ESTABLISHED`/`RELATED`. Continua **Linux-only** enquanto o macOS não tiver
 filtragem host-side equivalente (as VMs macOS usam NAT do Virtualization
-Framework); MacBook e Mac Studio entram como devices pessoais normalmente.
+Framework); hosts macOS entram como devices pessoais normalmente.
 
 > "Zero linha de datapath nova" só vale **depois** que M2–M7 promoverem um datapath
 > existente. O M11 não pode virar atalho para abrir o gate.
+
+**O convidado de teste tem trust root / Household DISTINTO.** Um "convidado" que é
+outro device da mesma casa não prova fronteira externa nenhuma — prova só a ACL
+interna. Pode ser fixture ou simulador neutro; não precisa de pessoa real nem de
+dado de pessoa real.
 
 **Pronto quando** o convidado autorizado recebe rota só da VM **e** falham, no
 sentido seguro: alcançar o host, outros devices ou outra VM; a VM iniciar conexão
@@ -371,6 +467,21 @@ confiável novo** (LAN e IPv6 primeiro), com **cerimônia Noise completa nova**.
 relay continua sendo outro carrier. Não migrar `TransportState` entre sockets e não
 introduzir datagrama/QUIC implicitamente. Hole punching por UDP vira marco futuro
 separado, se os dados do M0a mostrarem necessidade.
+
+**Escopo, e a fronteira com o M12b:** o M12a escolhe o carrier **ao abrir uma
+sessão nova**. Perder o caminho e trocar de rede **no meio de uma sessão viva** é
+M12b. Sem essa linha, "cada troca de caminho" abrange os dois e nenhum dos dois
+fica testável.
+
+**Construir:**
+- fonte de candidatos LAN/IPv6 publicada pelo control plane, com TTL;
+- `PathProvider`/connector abstrato que entrega um stream ordenado, seja relay ou
+  direct — o pump não sabe qual;
+- probe autenticado do candidato (candidato não autenticado nunca vira caminho);
+- seleção direct-first com fallback para relay;
+- cerimônia Noise completa nova a cada carrier, revalidando cert/intent/grant/expiry
+  antes de trocar o pump;
+- métricas de latência, CPU e `bytes_relayed`.
 
 **Pronto quando:** em LAN/IPv6 alcançável o caminho é direto e `bytes_relayed`
 fica em zero durante tráfego real; bloquear o direct cai para relay de forma
@@ -395,12 +506,17 @@ handshake e auth novos, e reconecta o pump. Fila transitória estritamente
 limitada — no overflow, **dropar** (o TCP interno retransmite), nunca crescer sem
 limite.
 
+**M12b-0 — congelar o SLO, antes de implementar.** Medir a baseline de pausa e de
+memória em cenários definidos, aprovar e congelar o número. Inventar um SLO sem
+baseline seria pior que não ter: vira um número que ninguém consegue defender e
+que o primeiro teste vermelho renegocia.
+
 **Pronto quando:** um download iniciado no wifi termina byte-idêntico depois de
 cortar o wifi, sem gesto do usuário; vale nos dois sentidos (direct↔relay); a
-pausa máxima e a memória em reconnect storm ficam dentro de um SLO definido
-**antes** de marcar pronto; revogar durante a janela de troca impede a sessão
-nova; replay de records da sessão velha falha; e sem carrier o estado fica
-degradado, sem instalar default route nem vazar pela rede física.
+pausa máxima e a memória em reconnect storm ficam **dentro do SLO congelado no
+M12b-0**; revogar durante a janela de troca impede a sessão nova; replay de
+records da sessão velha falha; e sem carrier o estado fica degradado, sem instalar
+default route nem vazar pela rede física.
 
 ---
 
