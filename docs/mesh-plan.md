@@ -229,10 +229,12 @@ independentes em 2026-08-08:
 
 1. `admin/rust/Cargo.toml` traz `exclude = ["mesh-session-control-model-rs",
    "mesh-session-core-rs"]`, então `cargo test --workspace` nunca os alcança;
-2. nenhum workflow em `.github/workflows/` e nenhum script em `scripts/` nomeia
-   qualquer um dos dois;
-3. o graph-gate **entra** no crate standalone, mas roda só `cargo check
-   --all-targets` — compila os testes e não executa nenhum;
+2. nenhum workflow e nenhum script **invoca `cargo test`** em qualquer um dos
+   dois;
+3. eles **não** são desreferenciados: `admin/rust/scripts/graph-gate/run_gate.sh`
+   nomeia os dois e entra nos workspaces standalone — mas a fase 4 dele roda
+   `cargo check --offline --all-targets`, que **compila** os testes e não executa
+   nenhum;
 4. dependente com feature ligada compila o crate, mas cargo não roda teste de
    dependência.
 
