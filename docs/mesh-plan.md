@@ -288,8 +288,8 @@ uma armadilha nos dois sentidos:
 1. alguém lê `0 tests` como defeito e "conserta" ligando as features no primeiro
    comando — reintroduzindo as 5 falhas de `compile_fail`. **Falha ruidosamente**,
    então este caso já se defende sozinho;
-2. alguém acha o primeiro comando redundante e o apaga. Os 137 do segundo seguem
-   verdes, ninguém nota, e a prova de superfície fechada some. **Silencioso.**
+2. alguém acha o primeiro comando redundante e o apaga. A suíte gated do segundo
+   segue verde, ninguém nota, e a prova de superfície fechada some. **Silencioso.**
 
 **Contar targets/`required-features` no manifesto não fecha o caso 2** — o
 manifesto continua perfeito enquanto o YAML perde o comando. O checker precisa
@@ -297,16 +297,18 @@ cruzar os dois lados:
 
 - por job (Linux e macOS), parsear o step e exigir, **em ordem**: (1) core
   default; (2) control default **sem** `--features`; (3) control gated com as
-  duas features, seleção explícita de target e **sem** doctests;
+  duas features, seleção explícita dos dois targets nomeados e **sem** doctests;
 - no manifesto, exigir que `model_invariants` e `cas_multiprocess` mantenham as
   duas `required-features`.
 
 Exigir os targets **nomeados** e as features exatas, nunca um `N` exato: um
 terceiro integration target legítimo não deve quebrar o contrato.
 
-Vai em PR próprio, com matriz de mutação do próprio checker (apagar o comando
-default; mover as features para ele; remover o target gated; tirar uma
-`required-feature`), no mecanismo de testes de governança que já existe — sem
+Vai em PR próprio, com matriz de mutação do próprio checker: em **cada job
+separadamente**, apagar o comando default e trocar a ordem; mover as features
+para o comando default; remover um dos dois targets gated; tirar uma
+`required-feature`. Assim o teste também prova que não inspeciona só o primeiro
+job que encontra. Vive no mecanismo de testes de governança que já existe — sem
 acoplar a biblioteca de protocolo ao `.github/`. Não é bloqueador do gate atual;
 é hardening contra regressão futura. Especificação de @saira.
 
