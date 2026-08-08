@@ -71,6 +71,7 @@ O caminho crítico deixou de ser a sequência numérica.
 Arestas reais, não agrupamento visual:
 
 ```
+M1c                  → M1a + M1b        (sem CI, nada acima é evidência)
 M1a + M1b            → M2
 M2                   → M3
 M3                   → M4
@@ -102,6 +103,8 @@ relay runtime, route installation, storage, or flags"*.
 **Isso permanece fechado.** Sair do gate é um marco com aprovação acordada, nunca
 efeito colateral de outra entrega. Exige, em revisão separada:
 
+- **M1c verde** — cobertura que não executa em automação não é evidência de
+  promoção, por mais madura que seja;
 - conformance independente (M1a/M1b) passando;
 - TUN/utun real + relay E2E;
 - tamper / replay / revoke / route-scope todos fail-closed;
@@ -212,12 +215,46 @@ frames, DATA/CLOSE/REKEY.
 4. cada negativa falha (length excessivo, CBOR não canônico,
    assinatura/nonce/epoch/`previous_hash` alterados).
 
-> **Não** exigir que duas assinaturas ECDSA geradas tenham os mesmos bytes. ECDSA
-> é randomizado; exigir bytes iguais entre plataformas transformaria um teste de
-> conformidade numa exigência impossível. O que precisa ser byte-idêntico é o que
-> se assina, não a assinatura.
+> **Não** exigir que duas assinaturas ECDSA geradas tenham os mesmos bytes.
+> Assinaturas ECDSA não são garantidamente byte-idênticas entre implementações —
+> nonce e encoding podem variar (algumas stacks usam nonce determinístico, outras
+> não). O que precisa ser byte-idêntico é **o que se assina**, não a assinatura.
 
 ---
+
+## M1c — CI do core · BLOQUEADOR
+
+**O núcleo do protocolo não roda em CI nenhum.** Verificado por dois caminhos
+independentes em 2026-08-08:
+
+1. `admin/rust/Cargo.toml` traz `exclude = ["mesh-session-control-model-rs",
+   "mesh-session-core-rs"]`, então `cargo test --workspace` nunca os alcança;
+2. nenhum workflow em `.github/workflows/` e nenhum script em `scripts/` nomeia
+   qualquer um dos dois;
+3. o graph-gate **entra** no crate standalone, mas roda só `cargo check
+   --all-targets` — compila os testes e não executa nenhum;
+4. dependente com feature ligada compila o crate, mas cargo não roda teste de
+   dependência.
+
+Resultado: ~206 testes do protocolo Noise e a CAS multiprocesso do modelo de
+controle passam localmente e **nunca** em automação.
+
+Isso não é dívida de cobertura, é dívida de *evidência*: a decisão de manter o
+stack Noise foi tomada porque ele tem essa cobertura. Cobertura que não executa
+não sustenta a decisão que ela justificou.
+
+**Construir:** job explícito rodando `cargo test --locked` (com doctests) dentro
+de cada workspace standalone, em Linux **e** macOS — a CAS do modelo de controle
+é construída sobre `std::fs::File::lock`, cujo comportamento é específico de
+plataforma. Os testes versionados do M1a/M1b entram no mesmo gate.
+
+**Pronto quando:** os dois crates excluídos rodam em CI nos dois runners, e uma
+falha injetada em cada um reprova o gate (não-vacuidade).
+
+> Muda `.github/`, então vai em PR e revisão próprios — não entra de carona num
+> branch de feature.
+
+**A promoção do `dev_t1_datapath` passa a exigir M1c verde.**
 
 ## M2 — TUN Linux ↔ utun macOS na LAN · MUDA DE FORMA
 
@@ -276,7 +313,9 @@ endpoints.
 **Sobrevive:** XCFramework Rust dentro da extensão, `NEPacketTunnelProvider`, rota
 estreita, sem default route e sem DNS, funcionamento com tela bloqueada, <20 MB.
 **Muda:** cada conexão faz uma session-static X25519 nova; a identidade durável é
-o cert de device admitido pelo Household. A accessibility do Keychain é definida
+o **keypair de admissão do device — privada no keystore da plataforma — mais o
+cert correspondente** (mesma formulação do M8; o cert sozinho é público e não
+autentica). A accessibility do Keychain é definida
 pela credencial que a reconexão em background realmente precisa — não copiada da
 regra da chave WG. Owner signer com biometria **não** pode ser exigido a cada
 reconexão.
@@ -402,8 +441,10 @@ só; valida modelo, tokens, budget, tamanho, ferramentas e rate limit. Orçament
 instância, não por usuário.
 
 **Pronto quando:** um canary sintético conhecido (não uma credencial real) não
-aparece em FS, env nem argv dentro da VM, e `env | grep -iE "api|key|token|secret"`
-volta vazio; operação declarada funciona; não declarada dá 403;
+aparece em FS, env nem argv dentro da VM — essa é a prova forte —, complementado
+por uma **denylist de nomes/prefixos de credencial conhecidos**, não por substring
+genérica: `grep -i key` casa com variável legítima e ensina a equipe a ignorar o
+resultado. Operação declarada funciona; não declarada dá 403;
 `resource_instance` forjado é ignorado em favor do CID; budget corta e audita; e
 reinício/clonagem não herda orçamento indevido.
 
@@ -486,8 +527,10 @@ fica testável.
 **Pronto quando:** em LAN/IPv6 alcançável o caminho é direto e `bytes_relayed`
 fica em zero durante tráfego real; bloquear o direct cai para relay de forma
 transparente; candidato falso ou peer errado falha sem causar downgrade para uma
-sessão menos autorizada; direct e relay entregam a **mesma** rota e audience; cada
-troca mostra handshake novo e recusa records antigos.
+sessão menos autorizada; direct e relay entregam a **mesma** rota e audience; e
+**cada sessão aberta num carrier diferente** mostra handshake novo e recusa
+records antigos — redação deliberada, para não reintroduzir migração ao vivo, que
+é M12b.
 
 > Se o produto exigir direct através de NAT IPv4 em rede móvel, isso **não** cabe
 > silenciosamente aqui: é decisão explícita de carrier datagrama e conformance nova.
