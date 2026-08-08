@@ -559,4 +559,169 @@ mod tests {
         assert!(!read_debug.contains(&read_device.file.as_raw_fd().to_string()));
         assert!(!write_debug.contains(&write_device.file.as_raw_fd().to_string()));
     }
+
+    // ─── Real kernel interface ──────────────────────────────────────────────
+    //
+    // Everything above substitutes `/dev/null` or a `tempfile` for the device,
+    // so it proves the framing and the struct layouts and nothing about the
+    // kernel. A wrong `CTLIOCGINFO` number, a wrong control name, or a wrong
+    // `sockaddr_ctl` would pass every one of them.
+    //
+    // The test below opens a real utun, lets the KERNEL route a real ICMP echo
+    // request into it, reads that packet through the production pollable
+    // interface, writes a synthesised reply back, and requires `ping` to accept
+    // the reply as a genuine answer. Measured 2026-08-08: opening a utun needs
+    // root — `connect()` on the control socket is EPERM otherwise — so this
+    // cannot run in an ordinary unprivileged CI job.
+
+    /// One's-complement sum used by both the IPv4 and ICMP checksums (RFC 1071).
+    fn ones_complement_checksum(bytes: &[u8]) -> u16 {
+        let mut sum: u32 = 0;
+        let mut chunks = bytes.chunks_exact(2);
+        for chunk in &mut chunks {
+            sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
+        }
+        if let Some(&last) = chunks.remainder().first() {
+            sum += u32::from(u16::from_be_bytes([last, 0]));
+        }
+        while (sum >> 16) != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        !u16::try_from(sum & 0xFFFF).expect("masked to 16 bits")
+    }
+
+    /// Turn a received ICMP echo request into the reply the sender expects.
+    ///
+    /// Returns `None` for anything that is not an echo request, so unrelated
+    /// traffic on the interface cannot be mistaken for the packet under test.
+    fn echo_reply_for(request: &[u8]) -> Option<Vec<u8>> {
+        const IPV4_MIN_HEADER: usize = 20;
+        const PROTO_ICMP: u8 = 1;
+        const ICMP_ECHO_REQUEST: u8 = 8;
+        const ICMP_ECHO_REPLY: u8 = 0;
+
+        if request.len() < IPV4_MIN_HEADER {
+            return None;
+        }
+        let header_len = usize::from(request[0] & 0x0F) * 4;
+        if request[9] != PROTO_ICMP
+            || request.len() < header_len + 8
+            || request[header_len] != ICMP_ECHO_REQUEST
+        {
+            return None;
+        }
+
+        let mut reply = request.to_vec();
+        let source = reply[12..16].to_vec();
+        let destination = reply[16..20].to_vec();
+        reply[12..16].copy_from_slice(&destination);
+        reply[16..20].copy_from_slice(&source);
+
+        reply[10] = 0;
+        reply[11] = 0;
+        let header_checksum = ones_complement_checksum(&reply[..header_len]);
+        reply[10..12].copy_from_slice(&header_checksum.to_be_bytes());
+
+        reply[header_len] = ICMP_ECHO_REPLY;
+        reply[header_len + 2] = 0;
+        reply[header_len + 3] = 0;
+        let icmp_checksum = ones_complement_checksum(&reply[header_len..]);
+        reply[header_len + 2..header_len + 4].copy_from_slice(&icmp_checksum.to_be_bytes());
+        Some(reply)
+    }
+
+    #[allow(unsafe_code)]
+    fn running_as_root() -> bool {
+        // SAFETY: `geteuid` reads the calling process's effective uid and cannot fail.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    #[test]
+    fn macos_utun_carries_a_real_kernel_packet_in_both_directions() {
+        const LOCAL: &str = "10.99.0.1";
+        const PEER: &str = "10.99.0.2";
+
+        if !running_as_root() {
+            // A skip must be loud and must be refusable. Without the escape
+            // hatch a privileged job that silently lost its privileges would
+            // report the same green as one that never had any.
+            assert!(
+                std::env::var_os("THEYOS_REQUIRE_REAL_UTUN").is_none(),
+                "THEYOS_REQUIRE_REAL_UTUN is set but this process is not root, \
+                 so the real-interface proof cannot run"
+            );
+            eprintln!(
+                "SKIP macos_utun_carries_a_real_kernel_packet_in_both_directions: \
+                 needs root (utun connect() is EPERM unprivileged). \
+                 Run `sudo -E cargo test -p server-rs --lib -- --test-threads=1 \
+                 macos_utun_carries_a_real_kernel_packet` to execute it, or set \
+                 THEYOS_REQUIRE_REAL_UTUN=1 to make this skip a failure."
+            );
+            return;
+        }
+
+        let mut device = ClawVpnMacosUtunDevice::open().expect("root can open a utun");
+        let interface = device.name().as_str().to_owned();
+
+        let configured = std::process::Command::new("/sbin/ifconfig")
+            .args([&interface, LOCAL, PEER, "up"])
+            .output()
+            .expect("ifconfig is executable");
+        assert!(
+            configured.status.success(),
+            "ifconfig {interface} failed: {}",
+            String::from_utf8_lossy(&configured.stderr)
+        );
+
+        device
+            .set_nonblocking()
+            .expect("utun fd accepts O_NONBLOCK");
+
+        // `ping` gives the kernel — not this test — the job of deciding that a
+        // packet belongs on this interface. That routing decision is the part a
+        // fake interface can never exercise.
+        let mut ping = std::process::Command::new("/sbin/ping")
+            .args(["-c", "1", "-W", "3000", PEER])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("ping is executable");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut request_len = None;
+        let mut replied = false;
+        let mut buffer = [0u8; 2048];
+
+        while std::time::Instant::now() < deadline && !replied {
+            match ClawVpnPollablePacketInterface::read_packet_nonblocking(&mut device, &mut buffer) {
+                Ok(Some(len)) => {
+                    if let Some(reply) = echo_reply_for(&buffer[..len]) {
+                        request_len = Some(len);
+                        let flushed = ClawVpnPollablePacketInterface::write_packet_nonblocking(
+                            &mut device,
+                            &reply,
+                        )
+                        .expect("utun accepts the echo reply");
+                        assert!(flushed, "the reply must not be left unwritten");
+                        replied = true;
+                    }
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                Err(error) => panic!("reading the real utun failed: {error}"),
+            }
+        }
+
+        let ping_status = ping.wait().expect("ping terminates");
+
+        assert!(
+            request_len.is_some(),
+            "the kernel never routed an ICMP echo request into {interface}"
+        );
+        assert!(replied, "the test never wrote a reply back to the kernel");
+        assert!(
+            ping_status.success(),
+            "ping did not accept the reply written through the production \
+             interface, so the datapath did not complete a round trip"
+        );
+    }
 }
