@@ -395,11 +395,11 @@ fn r0a_n_ratchet_names_new_targets() {
         assert!(r1a7.contains(needle), "R1a.7 is missing `{needle}`");
     }
 
-    let tsv = repository_root()
-        .join("admin/contracts/mobile-claw-vpn/v1/owner_present_phase0_artifact_boundary_v1.tsv");
+    let roots = repository_root()
+        .join(".github/owner-present-phase0-closed-input-roots-v1.txt");
     assert!(
-        tsv.is_file(),
-        "TSV path must exist and stay byte-intact in Fatia N"
+        roots.is_file(),
+        "closed-input roots path must exist in Fatia N"
     );
 }
 

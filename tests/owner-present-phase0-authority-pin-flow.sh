@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regression coverage for ordinary Phase 0 boundary updates.
+# Regression coverage for ordinary Phase 0 closed-input changes.
 #
 # This script is deliberately outside the base-owned authority root. It calls
 # the protected checkers as a consumer and must never become their authority.
@@ -9,7 +9,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INTEGRITY_MATRIX_REL=".github/scripts/test-mobile-claw-vpn-owner-present-phase0-integrity.sh"
 STRUCTURAL_CHECKER_REL=".github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh"
 POLICY_REL=".github/owner-present-phase0-protected-objects-v1.tsv"
-BOUNDARY_REL="admin/contracts/mobile-claw-vpn/v1/owner_present_phase0_artifact_boundary_v1.tsv"
+CLOSED_INPUT_ROOTS_REL=".github/owner-present-phase0-closed-input-roots-v1.txt"
 THIS_TEST_REL="tests/owner-present-phase0-authority-pin-flow.sh"
 THIS_WORKFLOW_REL=".github/workflows/claw-store-contract-ci.yml"
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/theyos-phase0-authority-pin-flow.XXXXXX")"
@@ -58,21 +58,6 @@ prepare_empty_authority_inputs() {
   chmod -R u+w "${SHARED_TARGET}" 2>/dev/null || true
   rm -rf "${SHARED_TARGET}"
   mkdir -p "${SHARED_TARGET}"
-}
-
-refresh_boundary_tree_entry() {
-  local root="$1" path="$2"
-  local manifest="${root}/${BOUNDARY_REL}" root_tree oid tmp="${root}/${BOUNDARY_REL}.tmp"
-
-  git -C "${root}" add -A
-  root_tree="$(git -C "${root}" write-tree)"
-  oid="$(git -C "${root}" rev-parse "${root_tree}:${path}")"
-  awk -F '\t' -v OFS='\t' -v path="${path}" -v oid="${oid}" '
-    $4 == path { $3 = oid; found = 1 }
-    { print }
-    END { if (!found) exit 2 }
-  ' "${manifest}" > "${tmp}"
-  mv "${tmp}" "${manifest}"
 }
 
 run_structural_checker() {
@@ -136,37 +121,20 @@ done
 echo "PASS stale_policy_pin_refused"
 echo "PASS checker_tamper_refused"
 
-# A normal admin/rust change with a fresh tree OID must pass the actual
-# structural checker. This is the legitimate PR path that #348 lacked.
-normal_reseal="${TMP_ROOT}/normal-reseal"
-clone_head "${normal_reseal}"
+# A normal admin/rust change needs no ceremonial tree-OID reseal. The actual
+# structural checker still rebuilds from the closed snapshot and validates the
+# executable depfiles against the base-owned path list.
+normal_change="${TMP_ROOT}/normal-change"
+clone_head "${normal_change}"
 printf '\n// external authority-pin regression mutation\n' >> \
-  "${normal_reseal}/admin/rust/server-rs/src/handlers_misc.rs"
-refresh_boundary_tree_entry "${normal_reseal}" "admin/rust"
-git -C "${normal_reseal}" add -A
-git -C "${normal_reseal}" commit --quiet -m normal-admin-rust-reseal
-expect_structural_success normal_admin_rust_reseal "${normal_reseal}"
+  "${normal_change}/admin/rust/server-rs/src/handlers_misc.rs"
+git -C "${normal_change}" add -A
+git -C "${normal_change}" commit --quiet -m normal-admin-rust-change
+expect_structural_success normal_admin_rust_without_oid_reseal "${normal_change}"
 
-# The same change without re-sealing must fail before it can become a release
-# input. The expected error binds the rejection to the stale boundary root.
-stale_boundary="${TMP_ROOT}/stale-boundary"
-clone_head "${stale_boundary}"
-printf '\n// external stale boundary regression mutation\n' >> \
-  "${stale_boundary}/admin/rust/server-rs/src/handlers_misc.rs"
-git -C "${stale_boundary}" add -A
-git -C "${stale_boundary}" commit --quiet -m stale-boundary-tsv
-if [[ "${structural_available}" == "1" ]]; then
-  expect_structural_failure stale_boundary_tsv_requires_reseal \
-    "file=admin/rust::signed Phase 0 boundary object differs from ${BOUNDARY_REL}" \
-    "${stale_boundary}"
-else
-  stale_boundary_oid="$(awk -F '\t' '$4 == "admin/rust" { print $3 }' \
-    "${stale_boundary}/${BOUNDARY_REL}")"
-  stale_tree_oid="$(git -C "${stale_boundary}" rev-parse "HEAD:admin/rust")"
-  [[ "${stale_boundary_oid}" =~ ^[0-9a-f]{40}$ \
-    && "${stale_boundary_oid}" != "${stale_tree_oid}" ]] \
-    || { echo "error: stale boundary mutation was not material" >&2; exit 1; }
-  echo "SKIP stale_boundary_tsv_requires_reseal_closed_toolchain_unavailable_locally"
-fi
+[[ ! -e "${ROOT}/admin/contracts/mobile-claw-vpn/v1/owner_present_phase0_artifact_boundary_v1.tsv" ]] \
+  || { echo "error: retired Phase 0 boundary TSV still exists" >&2; exit 1; }
+grep -Fqx "admin/rust" "${ROOT}/${CLOSED_INPUT_ROOTS_REL}" \
+  || { echo "error: closed-input roots omit admin/rust" >&2; exit 1; }
 
 echo "Phase 0 external authority-pin regression passed."

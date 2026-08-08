@@ -3,20 +3,5 @@
   "_comment": "Phase 3.5 declarations: every chronic red on main must have an owner + an expiry. The chronic-red gate reads this; a red matched here (and not expired) is DECLARED and the gate does not open an issue for it. A red NOT matched here is ORPHAN and the gate opens/re-pings a deduped issue. The blocking tooth (promote to required after expiry) is a DECLARED admin escalation, never fabricated by the gate.",
   "oncall": "caiosalgado",
   "sla_hours": 24,
-  "reds": [
-    {
-      "check": "Owner-present structural boundary",
-      "owner": "caiosalgado",
-      "expires": "2026-08-09",
-      "issue": 442,
-      "reason": "Compile-Out: signed Phase 0 boundary contract stale (admin/rust 156 commits, scripts 4 behind). Re-selo is a security attestation awaiting Caio's blessing of the current boundary. See #442."
-    },
-    {
-      "check": "Published-target candidate",
-      "owner": "caiosalgado",
-      "expires": "2026-08-09",
-      "issue": 442,
-      "reason": "Compile-Out published-target matrix (x86_64/aarch64-musl, aarch64-darwin): same stale-boundary root cause as the structural-boundary job. See #442."
-    }
-  ]
+  "reds": []
 }

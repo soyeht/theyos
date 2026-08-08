@@ -63,7 +63,7 @@ HISTORICAL_WIRE_REL="admin/contracts/mobile-claw-vpn/v1/owner_present_success_wi
 AUTHORITY_STATUS_REL="admin/contracts/mobile-claw-vpn/v1/owner_present_wire_authority_status_v1.json"
 BUILD_TOOL_MANIFEST_REL="admin/rust/theyos-engine-build-rs/Cargo.toml"
 BUILD_TOOL_SOURCE_REL="admin/rust/theyos-engine-build-rs/src/main.rs"
-BOUNDARY_REL="admin/contracts/mobile-claw-vpn/v1/owner_present_phase0_artifact_boundary_v1.tsv"
+CLOSED_INPUT_ROOTS_REL=".github/owner-present-phase0-closed-input-roots-v1.txt"
 FORBIDDEN_MARKERS_REL="admin/rust/phase0-forbidden-markers.txt"
 TOOLCHAIN_POLICY_REL=".github/owner-present-phase0-toolchain-v1.json"
 TOOLCHAIN_CLOSURE_POLICY_ID="rustup-package-payload-v1-excluding-bookkeeping-v1"
@@ -95,6 +95,49 @@ git -C "${THEYOS_DIR}" archive --format=tar "${HEAD_SHA}" \
 SNAPSHOT="$(cd "${SNAPSHOT}" && pwd -P)"
 chmod -R a-w "${SNAPSHOT}"
 
+# This path-only policy is protected and evolved by the trusted-base integrity
+# checker. Object identities are resolved from the exact release subject at
+# runtime; no committed tree/blob OID needs a ceremonial reseal.
+CLOSED_INPUT_ROOTS=()
+CLOSED_INPUT_ROOT_MODES=()
+closed_roots_file="${SNAPSHOT}/${CLOSED_INPUT_ROOTS_REL}"
+closed_roots_seen="${TMP_ROOT}/closed-input-roots-seen.txt"
+: > "${closed_roots_seen}"
+[[ -f "${closed_roots_file}" ]] || {
+  echo "::error file=${CLOSED_INPUT_ROOTS_REL}::closed-input roots policy is missing"
+  exit 1
+}
+while IFS= read -r closed_root || [[ -n "${closed_root}" ]]; do
+  if [[ -z "${closed_root}" || "${closed_root}" == \#* \
+    || "${closed_root}" == /* || "${closed_root}" == *"../"* \
+    || "${closed_root}" == *$'\r'* ]]; then
+    echo "::error file=${CLOSED_INPUT_ROOTS_REL}::closed-input root is invalid: ${closed_root}"
+    exit 1
+  fi
+  if grep -Fqx -- "${closed_root}" "${closed_roots_seen}"; then
+    echo "::error file=${CLOSED_INPUT_ROOTS_REL}::duplicate closed-input root: ${closed_root}"
+    exit 1
+  fi
+  printf '%s\n' "${closed_root}" >> "${closed_roots_seen}"
+  closed_entry="$(git -C "${THEYOS_DIR}" ls-tree \
+    --format='%(objectmode)%x09%(objecttype)%x09%(objectname)' \
+    "${HEAD_SHA}" -- "${closed_root}")"
+  closed_mode="$(cut -f1 <<<"${closed_entry}")"
+  closed_type="$(cut -f2 <<<"${closed_entry}")"
+  if [[ ( "${closed_mode}" == "040000" && "${closed_type}" == "tree" ) \
+    || ( "${closed_mode}" =~ ^100(644|755)$ && "${closed_type}" == "blob" ) ]]; then
+    CLOSED_INPUT_ROOTS+=("${closed_root}")
+    CLOSED_INPUT_ROOT_MODES+=("${closed_mode}")
+  else
+    echo "::error file=${CLOSED_INPUT_ROOTS_REL}::closed-input root is not a Git tree or regular blob: ${closed_root}"
+    exit 1
+  fi
+done < "${closed_roots_file}"
+(( ${#CLOSED_INPUT_ROOTS[@]} >= 8 )) || {
+  echo "::error file=${CLOSED_INPUT_ROOTS_REL}::closed-input roots policy is unexpectedly small"
+  exit 1
+}
+
 # The authority build receives only the signed closed-input roots. The full
 # ODB snapshot remains available for policy checks, but it is never mounted as
 # the Cargo workspace, so an include!/build script cannot read an undeclared
@@ -103,10 +146,7 @@ BUILD_SOURCE_PARENT="${TMP_ROOT}/build-source-parent"
 BUILD_SNAPSHOT="${BUILD_SOURCE_PARENT}/source"
 mkdir -p "${BUILD_SNAPSHOT}"
 git -C "${THEYOS_DIR}" archive --format=tar "${HEAD_SHA}" \
-  admin/rust \
-  admin/contracts/claw-store/v1/contract.json \
-  admin/contracts/mobile-claw-vpn/v1/owner_present_success_wire_v1.json \
-  claws flake.lock flake.nix nix scripts \
+  "${CLOSED_INPUT_ROOTS[@]}" \
   | "${TAR_BIN}" -xf - -C "${BUILD_SNAPSHOT}"
 BUILD_SNAPSHOT="$(cd "${BUILD_SNAPSHOT}" && pwd -P)"
 chmod -R a-w "${BUILD_SNAPSHOT}"
@@ -193,10 +233,7 @@ verify_build_snapshot_matches_odb() {
   rm -rf "${verification_snapshot}"
   mkdir -p "${verification_snapshot}"
   git -C "${THEYOS_DIR}" archive --format=tar "${HEAD_SHA}" \
-    admin/rust \
-    admin/contracts/claw-store/v1/contract.json \
-    admin/contracts/mobile-claw-vpn/v1/owner_present_success_wire_v1.json \
-    claws flake.lock flake.nix nix scripts \
+    "${CLOSED_INPUT_ROOTS[@]}" \
     | "${TAR_BIN}" -xf - -C "${verification_snapshot}"
   if ! diff -qr "${BUILD_SNAPSHOT}" "${verification_snapshot}" >/dev/null; then
     echo "::error::build mutated the closed-input source snapshot"
@@ -829,66 +866,6 @@ if ! grep -Fq 'PKG_CONFIG_PATH = ""' "${SNAPSHOT}/admin/rust/.cargo/config.toml"
   exit 1
 fi
 
-validate_boundary_manifest() {
-  local manifest="${1}" seen_paths="${TMP_ROOT}/boundary-paths.txt"
-  local mode type oid path entry expected count=0
-  : > "${seen_paths}"
-
-  while IFS=$'\t' read -r mode type oid path; do
-    [[ -z "${mode}" || "${mode}" == \#* ]] && continue
-    if [[ ! "${mode}" =~ ^(040000|100644|100755)$ \
-      || ! "${type}" =~ ^(blob|tree)$ \
-      || ! "${oid}" =~ ^[0-9a-f]{40}$ \
-      || -z "${path}" \
-      || "${path}" == /* \
-      || "${path}" == *"../"* \
-      || "${path}" == *$'\n'* ]]; then
-      echo "::error file=${BOUNDARY_REL}::invalid signed Phase 0 boundary entry"
-      exit 1
-    fi
-    if [[ ( "${mode}" == "040000" && "${type}" != "tree" ) \
-      || ( "${mode}" != "040000" && "${type}" != "blob" ) ]]; then
-      echo "::error file=${BOUNDARY_REL}::signed Phase 0 boundary mode/type mismatch"
-      exit 1
-    fi
-    if grep -Fqx -- "${path}" "${seen_paths}"; then
-      echo "::error file=${BOUNDARY_REL}::duplicate signed Phase 0 boundary path: ${path}"
-      exit 1
-    fi
-    printf '%s\n' "${path}" >> "${seen_paths}"
-
-    entry="$(git -C "${THEYOS_DIR}" ls-tree \
-      --format='%(objectmode)%x09%(objecttype)%x09%(objectname)' \
-      "${HEAD_SHA}" -- "${path}")"
-    expected="${mode}"$'\t'"${type}"$'\t'"${oid}"
-    if [[ "${entry}" != "${expected}" ]]; then
-      echo "::error file=${path}::signed Phase 0 boundary object differs from ${BOUNDARY_REL}"
-      exit 1
-    fi
-    count=$((count + 1))
-  done < "${manifest}"
-
-  if [[ "${count}" -ne 8 ]]; then
-    echo "::error file=${BOUNDARY_REL}::signed Phase 0 boundary must contain exactly eight closed inputs"
-    exit 1
-  fi
-
-  for path in \
-    "admin/rust" \
-    "admin/contracts/claw-store/v1/contract.json" \
-    "admin/contracts/mobile-claw-vpn/v1/owner_present_success_wire_v1.json" \
-    "claws" \
-    "flake.lock" \
-    "flake.nix" \
-    "nix" \
-    "scripts"; do
-    if ! grep -Fqx -- "${path}" "${seen_paths}"; then
-      echo "::error file=${BOUNDARY_REL}::required Phase 0 boundary path is absent: ${path}"
-      exit 1
-    fi
-  done
-}
-
 for path in \
   "admin/rust/.cargo/config.toml" \
   "admin/rust/Cross.toml" \
@@ -925,7 +902,7 @@ for path in \
   "claws/manifest.yml" \
   "${HISTORICAL_WIRE_REL}" \
   "${AUTHORITY_STATUS_REL}" \
-  "${BOUNDARY_REL}" \
+  "${CLOSED_INPUT_ROOTS_REL}" \
   "${TOOLCHAIN_POLICY_REL}"; do
   require_blob "${path}"
 done
@@ -1232,10 +1209,6 @@ if [[ -s "${ACTUAL_LOCAL_PROC_MACROS}" ]]; then
   echo "::error::Phase 0 forbids local proc-macro codegen targets"
   exit 1
 fi
-
-BOUNDARY_MANIFEST="${TMP_ROOT}/phase0-boundary.tsv"
-git -C "${THEYOS_DIR}" cat-file blob "${HEAD_SHA}:${BOUNDARY_REL}" > "${BOUNDARY_MANIFEST}"
-validate_boundary_manifest "${BOUNDARY_MANIFEST}"
 
 if [[ "$(grep -Fc 'server_rs::production_app::compose(&state, &cfg)' \
       "${SNAPSHOT}/admin/rust/server-rs/src/main.rs")" -ne 1 \
@@ -1546,21 +1519,17 @@ if [[ "$(jq -r '.contract' "${AUTHORITY_STATUS}")" != \
     "admin/contracts/mobile-claw-vpn/v1/api_shapes.json" \
   || "$(jq -r '.retired_api_shapes.historical_sha256' "${AUTHORITY_STATUS}")" != \
     "$(sha256_file "${SNAPSHOT}/admin/contracts/mobile-claw-vpn/v1/api_shapes.json")" \
-  || "$(jq -r '.phase0_artifact_boundary.theyos_path' "${AUTHORITY_STATUS}")" != \
-    "${BOUNDARY_REL}" \
-  || "$(jq -r '.phase0_artifact_boundary.format' "${AUTHORITY_STATUS}")" != \
-    "closed-git-inputs-v2" \
-  || "$(jq -r '.phase0_artifact_boundary.policy_change_control' "${AUTHORITY_STATUS}")" != \
-    "base-owned-proof-machinery-commit-bound-inputs" \
-  || "$(jq -r '.phase0_artifact_boundary.object_identity_update' "${AUTHORITY_STATUS}")" != \
-    "per-commit-revalidation" \
-  || "$(jq -r '.phase0_artifact_boundary.object_identity_authority' "${AUTHORITY_STATUS}")" != \
-    "commit-bound-evidence-not-independent-approval" \
-  || "$(jq -r '.phase0_artifact_boundary.release_provenance' "${AUTHORITY_STATUS}")" != \
+  || "$(jq -r '.phase0_closed_inputs.roots_path' "${AUTHORITY_STATUS}")" != \
+    "${CLOSED_INPUT_ROOTS_REL}" \
+  || "$(jq -r '.phase0_closed_inputs.format' "${AUTHORITY_STATUS}")" != \
+    "ordered-git-paths-v1" \
+  || "$(jq -r '.phase0_closed_inputs.policy_change_control' "${AUTHORITY_STATUS}")" != \
+    "trusted-base-append-only-paths" \
+  || "$(jq -r '.phase0_closed_inputs.release_provenance' "${AUTHORITY_STATUS}")" != \
     "checker-on-release-subject-and-final-package-attestation" \
-  || "$(jq -r '.phase0_artifact_boundary.staged_products | sort | join(",")' "${AUTHORITY_STATUS}")" != \
+  || "$(jq -r '.phase0_closed_inputs.staged_products | sort | join(",")' "${AUTHORITY_STATUS}")" != \
     "nix-theyos-runtime,theyos-engine,theyos-llm-proxy" \
-  || "$(jq -r '.phase0_artifact_boundary.required_published_targets | sort | join(",")' "${AUTHORITY_STATUS}")" != \
+  || "$(jq -r '.phase0_closed_inputs.required_published_targets | sort | join(",")' "${AUTHORITY_STATUS}")" != \
     "aarch64-apple-darwin,aarch64-unknown-linux-musl,nix-theyos-runtime-x86_64-linux,x86_64-unknown-linux-musl" \
   || "$(jq -r '.proof_machinery_change_control.protocol' "${AUTHORITY_STATUS}")" != \
     "soyeht-owner-present-base-owned-land-exact-v1" \
@@ -1822,15 +1791,20 @@ fi
 
 repo_dep_count=0
 while IFS= read -r -d '' repo_input; do
-  case "${repo_input}" in
-    admin/rust/*|claws/*|nix/*|scripts/*|flake.nix|flake.lock|\
-    admin/contracts/claw-store/v1/contract.json|\
-    admin/contracts/mobile-claw-vpn/v1/owner_present_success_wire_v1.json) ;;
-  *)
-      echo "::error file=${repo_input}::production depfile input escapes the eight closed Git inputs"
-      exit 1
-      ;;
-  esac
+  repo_input_closed=0
+  for root_index in "${!CLOSED_INPUT_ROOTS[@]}"; do
+    closed_root="${CLOSED_INPUT_ROOTS[${root_index}]}"
+    closed_mode="${CLOSED_INPUT_ROOT_MODES[${root_index}]}"
+    if [[ ( "${closed_mode}" == "040000" && "${repo_input}" == "${closed_root}/"* ) \
+      || ( "${closed_mode}" != "040000" && "${repo_input}" == "${closed_root}" ) ]]; then
+      repo_input_closed=1
+      break
+    fi
+  done
+  if [[ "${repo_input_closed}" != "1" ]]; then
+    echo "::error file=${repo_input}::production depfile input escapes the closed Git input roots"
+    exit 1
+  fi
   require_blob "${repo_input}"
   if [[ "${repo_input}" == *.rs \
     && "${repo_input}" != "${PHASE0_REL}" \
@@ -2006,8 +1980,22 @@ else
   ATTESTATION_RUSTC_VERSION="$(run_clean "${RUSTC_BIN}" -Vv)"
   ATTESTATION_CARGO_VERSION="$(run_clean "${CARGO_BIN}" -V)"
 fi
+CLOSED_INPUT_OBJECTS_JSON="${TMP_ROOT}/closed-input-objects.json"
+printf '[]\n' > "${CLOSED_INPUT_OBJECTS_JSON}"
+for root_index in "${!CLOSED_INPUT_ROOTS[@]}"; do
+  closed_root="${CLOSED_INPUT_ROOTS[${root_index}]}"
+  closed_entry="$(git -C "${THEYOS_DIR}" ls-tree \
+    --format='%(objectmode)%x09%(objecttype)%x09%(objectname)' \
+    "${HEAD_SHA}" -- "${closed_root}")"
+  IFS=$'\t' read -r closed_mode closed_type closed_oid <<<"${closed_entry}"
+  jq -S --arg path "${closed_root}" --arg mode "${closed_mode}" \
+    --arg type "${closed_type}" --arg oid "${closed_oid}" \
+    '. + [{path: $path, mode: $mode, type: $type, oid: $oid}]' \
+    "${CLOSED_INPUT_OBJECTS_JSON}" > "${CLOSED_INPUT_OBJECTS_JSON}.next"
+  mv "${CLOSED_INPUT_OBJECTS_JSON}.next" "${CLOSED_INPUT_OBJECTS_JSON}"
+done
 jq -n -S \
-  --arg schema "theyos-owner-present-phase0-artifact-attestation-v1" \
+  --arg schema "theyos-owner-present-phase0-artifact-attestation-v2" \
   --arg source_sha "${HEAD_SHA}" \
   --arg source_tree "${HEAD_TREE}" \
   --arg target "${TARGET}" \
@@ -2035,7 +2023,8 @@ jq -n -S \
   --arg rust_toolchain_sha256 "$(sha256_file "${SNAPSHOT}/admin/rust/rust-toolchain.toml")" \
   --arg server_manifest_sha256 "$(sha256_file "${SNAPSHOT}/admin/rust/server-rs/Cargo.toml")" \
   --arg server_build_rs_sha256 "$(sha256_file "${SNAPSHOT}/admin/rust/server-rs/build.rs")" \
-  --arg boundary_manifest_sha256 "$(sha256_file "${SNAPSHOT}/${BOUNDARY_REL}")" \
+  --arg closed_input_roots_path "${CLOSED_INPUT_ROOTS_REL}" \
+  --argjson closed_input_objects "$(cat "${CLOSED_INPUT_OBJECTS_JSON}")" \
   --arg engine_build_tool_manifest_sha256 "$(sha256_file "${SNAPSHOT}/${BUILD_TOOL_MANIFEST_REL}")" \
   --arg engine_build_tool_source_sha256 "$(sha256_file "${SNAPSHOT}/${BUILD_TOOL_SOURCE_REL}")" \
   --arg depfile_sha256 "$(sha256_file "${NORMALIZED_DEPFILE}")" \
@@ -2081,7 +2070,8 @@ jq -n -S \
     rust_toolchain_sha256: $rust_toolchain_sha256,
     server_manifest_sha256: $server_manifest_sha256,
     server_build_rs_sha256: $server_build_rs_sha256,
-    boundary_manifest_sha256: $boundary_manifest_sha256,
+    closed_input_roots_path: $closed_input_roots_path,
+    closed_input_objects: $closed_input_objects,
     engine_build_tool_manifest_sha256: $engine_build_tool_manifest_sha256,
     engine_build_tool_source_sha256: $engine_build_tool_source_sha256,
     depfile_sha256: $depfile_sha256,

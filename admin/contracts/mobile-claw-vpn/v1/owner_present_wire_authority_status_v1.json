@@ -31,12 +31,10 @@
       "V1 authorize_rendezvous request"
     ]
   },
-  "phase0_artifact_boundary": {
-    "theyos_path": "admin/contracts/mobile-claw-vpn/v1/owner_present_phase0_artifact_boundary_v1.tsv",
-    "format": "closed-git-inputs-v2",
-    "policy_change_control": "base-owned-proof-machinery-commit-bound-inputs",
-    "object_identity_update": "per-commit-revalidation",
-    "object_identity_authority": "commit-bound-evidence-not-independent-approval",
+  "phase0_closed_inputs": {
+    "roots_path": ".github/owner-present-phase0-closed-input-roots-v1.txt",
+    "format": "ordered-git-paths-v1",
+    "policy_change_control": "trusted-base-append-only-paths",
     "release_provenance": "checker-on-release-subject-and-final-package-attestation",
     "staged_products": [
       "nix-theyos-runtime",
@@ -73,7 +71,8 @@
     ]
   },
   "notes": [
-    "The base-owned policy freezes immutable roots and requires exact head-object resealing for evolvable proof machinery; declarative Cargo inputs and the boundary descriptor are commit-bound evidence, not independent approval.",
+    "The base-owned policy freezes immutable roots, requires exact head-object resealing for evolvable proof machinery, and permits only append-only evolution of the closed-input path list.",
+    "Closed-input object identities are resolved from the exact release subject and recorded in the generated attestation; no committed OID manifest requires ceremonial resealing.",
     "The trusted-base checker validates every protected head object without executing pull-request code. The repository has one maintainer identity shared by its agents, so change control records exact objects and never pretends that self-review is an independent security boundary.",
     "The V1 success fixture remains only as immutable cross-language regression evidence.",
     "The V1 api_shapes dependency is historical regression evidence and is not a source of truth for Phase 1.",

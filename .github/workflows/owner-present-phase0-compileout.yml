@@ -120,7 +120,8 @@ jobs:
           env -u CARGO_HOME -u RUSTUP_HOME -u PHASE0_RUSTUP_HOME \
             bash .github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh
           jq -e --arg target "${PHASE0_TARGET}" '
-            .published_target == true
+            .schema == "theyos-owner-present-phase0-artifact-attestation-v2"
+            and .published_target == true
             and .target == $target
             and .server_equals_theyos_engine == true
             and .owner_present_authority == "none"
@@ -128,6 +129,23 @@ jobs:
             and .cargo_source_policy == "local-admin-rust-or-canonical-crates-io-v1"
             and .cargo_fetch_network == true
             and .post_fetch_build_offline == true
+            and .closed_input_roots_path == ".github/owner-present-phase0-closed-input-roots-v1.txt"
+            and (has("boundary_manifest_sha256") | not)
+            and (.closed_input_objects | length >= 8)
+            and (.closed_input_objects | map(.path) as $paths
+              | ($paths | length) == ($paths | unique | length)
+                and ([
+                  "admin/rust",
+                  "admin/contracts/claw-store/v1/contract.json",
+                  "admin/contracts/mobile-claw-vpn/v1/owner_present_success_wire_v1.json",
+                  "claws", "flake.lock", "flake.nix", "nix", "scripts"
+                ] - $paths | length == 0))
+            and all(.closed_input_objects[];
+              (.path as $path
+                | ($path | test("^[^/].*")) and ($path | contains("../") | not))
+              and (.oid | test("^[0-9a-f]{40}$"))
+              and ((.mode == "040000" and .type == "tree")
+                or ((.mode == "100644" or .mode == "100755") and .type == "blob")))
             and (.rustc_toolchain_sha256 | test("^[0-9a-f]{64}$"))
             and (.cargo_toolchain_sha256 | test("^[0-9a-f]{64}$"))
             and (.toolchain_closure_sha256 | test("^[0-9a-f]{64}$"))

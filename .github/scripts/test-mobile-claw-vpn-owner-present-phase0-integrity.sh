@@ -7,6 +7,7 @@ CHECKER_REL=".github/scripts/check-mobile-claw-vpn-owner-present-phase0-integrit
 TEST_REL=".github/scripts/test-mobile-claw-vpn-owner-present-phase0-integrity.sh"
 WORKFLOW_REL=".github/workflows/owner-present-phase0-integrity.yml"
 POLICY_REL=".github/owner-present-phase0-protected-objects-v1.tsv"
+CLOSED_INPUT_ROOTS_REL=".github/owner-present-phase0-closed-input-roots-v1.txt"
 TRANSITION_REL=".github/owner-present-phase0-transition-v1.json"
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/phase0-land-exact-test.XXXXXX")"
 trap 'chmod -R u+w "${TMP_ROOT}" 2>/dev/null || true; rm -rf "${TMP_ROOT}"' EXIT
@@ -22,6 +23,16 @@ git -C "${BASE_REPO}" config user.email phase0-land-exact@example.invalid
 cp "${ROOT}/${CHECKER_REL}" "${BASE_REPO}/${CHECKER_REL}"
 cp "${ROOT}/${TEST_REL}" "${BASE_REPO}/${TEST_REL}"
 cp "${ROOT}/${WORKFLOW_REL}" "${BASE_REPO}/${WORKFLOW_REL}"
+cat >"${BASE_REPO}/${CLOSED_INPUT_ROOTS_REL}" <<'ROOTS'
+.github/scripts
+.github/workflows
+protected/frozen.txt
+protected/land-1.txt
+protected/land-2.txt
+protected/land-3.txt
+protected/land-4.txt
+protected/land-5.txt
+ROOTS
 printf '%s\n' frozen-v1 >"${BASE_REPO}/protected/frozen.txt"
 for index in 1 2 3 4 5 6 7; do
   printf 'land-%s-v1\n' "${index}" >"${BASE_REPO}/protected/land-${index}.txt"
@@ -39,6 +50,8 @@ blob_oid() {
     "$(blob_oid "${BASE_REPO}" "${TEST_REL}")" "${TEST_REL}"
   printf '100644\tblob\t%s\tland-exact\t%s\n' \
     "$(blob_oid "${BASE_REPO}" "${WORKFLOW_REL}")" "${WORKFLOW_REL}"
+  printf '100644\tblob\t%s\tland-exact\t%s\n' \
+    "$(blob_oid "${BASE_REPO}" "${CLOSED_INPUT_ROOTS_REL}")" "${CLOSED_INPUT_ROOTS_REL}"
   printf '100644\tblob\t%s\tfrozen\tprotected/frozen.txt\n' \
     "$(blob_oid "${BASE_REPO}" protected/frozen.txt)"
   for index in 1 2 3 4 5 6 7; do
@@ -163,6 +176,31 @@ printf '100644\tblob\t%s\tland-exact\tprotected/appended.txt\n' \
   "$(blob_oid "${repo}" protected/appended.txt)" >>"${repo}/${POLICY_REL}"
 head_sha="$(commit_case "${repo}" append-root)"
 expect_success append_only_root "${repo}" "${head_sha}"
+
+repo="$(clone_case closed-roots-removal)"
+sed -i.bak '/protected\/land-5.txt/d' "${repo}/${CLOSED_INPUT_ROOTS_REL}"
+rm -f "${repo}/${CLOSED_INPUT_ROOTS_REL}.bak"
+reseal "${repo}" "${CLOSED_INPUT_ROOTS_REL}"
+head_sha="$(commit_case "${repo}" closed-roots-removal)"
+expect_failure closed_roots_removal \
+  "closed-input roots may only be appended relative to the trusted base" \
+  "${repo}" "${head_sha}"
+
+repo="$(clone_case closed-roots-reorder)"
+awk 'NR == 1 { first = $0; next } NR == 2 { print; print first; next } { print }' \
+  "${repo}/${CLOSED_INPUT_ROOTS_REL}" >"${repo}/${CLOSED_INPUT_ROOTS_REL}.tmp"
+mv "${repo}/${CLOSED_INPUT_ROOTS_REL}.tmp" "${repo}/${CLOSED_INPUT_ROOTS_REL}"
+reseal "${repo}" "${CLOSED_INPUT_ROOTS_REL}"
+head_sha="$(commit_case "${repo}" closed-roots-reorder)"
+expect_failure closed_roots_reorder \
+  "closed-input roots may only be appended relative to the trusted base" \
+  "${repo}" "${head_sha}"
+
+repo="$(clone_case closed-roots-append)"
+printf '%s\n' protected/land-6.txt >>"${repo}/${CLOSED_INPUT_ROOTS_REL}"
+reseal "${repo}" "${CLOSED_INPUT_ROOTS_REL}"
+head_sha="$(commit_case "${repo}" closed-roots-append)"
+expect_success closed_roots_append "${repo}" "${head_sha}"
 
 repo="$(clone_case transition-replay)"
 printf '%s\n' '{}' >"${repo}/${TRANSITION_REL}"

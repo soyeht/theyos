@@ -1,15 +1,15 @@
 # mode	type	oid	transition	path
 100644	blob	00b38e713ac387de9bf0353febb5c0b6e2185403	frozen	.github/owner-present-phase0-toolchain-v1.json
-100755	blob	f94943387ab2ea07c6a01d73f7d8992023771015	land-exact	.github/scripts/check-mobile-claw-vpn-owner-present-contracts.sh
-100755	blob	60bb67d1a7ebe51929b5363e9482774a25349c5d	land-exact	.github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh
-100755	blob	036c4e2621e73222236794294fdb3def9fe22bf0	land-exact	.github/scripts/test-mobile-claw-vpn-owner-present-contracts.sh
-100755	blob	5ac877b876f35277dc31bfa80c5dd6763b4ab02f	land-exact	.github/scripts/test-mobile-claw-vpn-owner-present-phase0-compileout.sh
-100644	blob	d0b9229e4fe5744cb2c072ce690b29039bafc450	land-exact	.github/workflows/contracts-cross-repo-sync.yml
-100644	blob	7e5ff189b8b840e82f8ca02342a7473c75d11769	land-exact	.github/workflows/owner-present-phase0-compileout.yml
+100755	blob	5d293891459d30336c1d6534ba0af2cced4c3d8b	land-exact	.github/scripts/check-mobile-claw-vpn-owner-present-contracts.sh
+100755	blob	9ea4f59b039ebf6ac67a580a1e2f0a0395094084	land-exact	.github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh
+100755	blob	772e8ff5929f9759fd593e751805eb7271258fae	land-exact	.github/scripts/test-mobile-claw-vpn-owner-present-contracts.sh
+100755	blob	1beda5c80e088658468a3f6576f2865182cb000a	land-exact	.github/scripts/test-mobile-claw-vpn-owner-present-phase0-compileout.sh
+100644	blob	2ae88b0480a3ef15e141f24627bc23e93920de16	land-exact	.github/workflows/contracts-cross-repo-sync.yml
+100644	blob	8277c9d82f9d1aba6b82ffffb07f10a691458c0b	land-exact	.github/workflows/owner-present-phase0-compileout.yml
 100644	blob	8ae5db96e0e72d21e829c8a582b2b74520c2ee2c	land-exact	.github/workflows/owner-present-phase0-nix-runtime.yml
 100644	blob	fa02bad762d03c386fbb27f8a61e6896264a544b	land-exact	.github/workflows/release-linux.yml
 100644	blob	c8aae2072f9e34179ef5ae5a23b28c5c1eafa159	land-exact	.github/workflows/release-macos.yml
-100644	blob	edb8674b83db39afaee7f8b2d4dcc55bf029b82f	land-exact	admin/contracts/mobile-claw-vpn/v1/owner_present_wire_authority_status_v1.json
+100644	blob	6eb4417040aa8993af530c328efda883c3806520	land-exact	admin/contracts/mobile-claw-vpn/v1/owner_present_wire_authority_status_v1.json
 100644	blob	42fa6a42c33535a3fded0a0e4210a80e3791b660	land-exact	admin/rust/.cargo/config.toml
 100644	blob	4cff2a1b3f165bbaa928e3d58d6c3d505be4c147	land-exact	admin/rust/Cross.toml
 100644	blob	a03ce9608c6081a596dbf51b7134b78ed68d3cd6	land-exact	admin/rust/clippy.toml
@@ -27,6 +27,7 @@
 100644	blob	739d57b9a25ebed3d41500bb0f0dc530e6299e88	land-exact	nix/packages/rust-workspace.nix
 100755	blob	964153c255ef7d554ff6d2c431bf10e415ebf75d	land-exact	scripts/make.sh
 100644	blob	f47d954fdd6a61451ca24583f58e44a884fb51e5	land-exact	flake.lock
-100755	blob	6391a5d192af8f8b1b09cbe76c969d885c7c870c	land-exact	.github/scripts/check-mobile-claw-vpn-owner-present-phase0-integrity.sh
-100755	blob	960c2bd1170b30e5d53d8ff46a82db49533d47e0	land-exact	.github/scripts/test-mobile-claw-vpn-owner-present-phase0-integrity.sh
+100755	blob	8372a54c72b8d4290b7a397d7e1255a0aa341c21	land-exact	.github/scripts/check-mobile-claw-vpn-owner-present-phase0-integrity.sh
+100755	blob	eed4041e09ad32616562adb4b6b0dd94c576f665	land-exact	.github/scripts/test-mobile-claw-vpn-owner-present-phase0-integrity.sh
 100644	blob	7d4d33a1e8d660250fa3e3ff631af6185f77d5a6	land-exact	.github/workflows/owner-present-phase0-integrity.yml
+100644	blob	115d06e4aacc594d9545ee7f16209ef6b557222d	land-exact	.github/owner-present-phase0-closed-input-roots-v1.txt

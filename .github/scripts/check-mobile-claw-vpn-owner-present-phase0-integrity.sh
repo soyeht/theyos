@@ -13,8 +13,10 @@ BASE_SHA="${2:?usage: $0 REPO BASE_SHA HEAD_SHA PR_NUMBER}"
 HEAD_SHA="${3:?usage: $0 REPO BASE_SHA HEAD_SHA PR_NUMBER}"
 PR_NUMBER="${4:-0}"
 POLICY_REL=".github/owner-present-phase0-protected-objects-v1.tsv"
+CLOSED_INPUT_ROOTS_REL=".github/owner-present-phase0-closed-input-roots-v1.txt"
 RETIRED_TRANSITION_REL=".github/owner-present-phase0-transition-v1.json"
 REQUIRED_SELF_PATHS=(
+  "${CLOSED_INPUT_ROOTS_REL}"
   ".github/scripts/check-mobile-claw-vpn-owner-present-phase0-integrity.sh"
   ".github/scripts/test-mobile-claw-vpn-owner-present-phase0-integrity.sh"
   ".github/workflows/owner-present-phase0-integrity.yml"
@@ -169,5 +171,46 @@ for required_path in "${REQUIRED_SELF_PATHS[@]}"; do
   grep -Fqx -- "${required_path}" "${seen_paths}" \
     || die "base-owned integrity root is absent from the head policy: ${required_path}"
 done
+
+# The build/depfile closure has one base-owned source of truth. Existing roots
+# are immutable in position and spelling; a PR may only append a valid Git
+# tree/blob path. The exact object identities remain runtime evidence and are
+# deliberately not committed to this policy.
+base_roots="${tmp_root}/base-roots.txt"
+head_roots="${tmp_root}/head-roots.txt"
+git -C "${REPO}" cat-file blob "${BASE_SHA}:${CLOSED_INPUT_ROOTS_REL}" >"${base_roots}" \
+  || die "trusted base closed-input roots policy is missing"
+git -C "${REPO}" cat-file blob "${HEAD_SHA}:${CLOSED_INPUT_ROOTS_REL}" >"${head_roots}" \
+  || die "head closed-input roots policy is missing"
+
+validate_closed_roots() {
+  local commit="$1" roots_file="$2" label="$3"
+  local root entry mode type count=0 roots_seen="${tmp_root}/${label}-roots-seen.txt"
+  : >"${roots_seen}"
+  while IFS= read -r root || [[ -n "${root}" ]]; do
+    [[ -n "${root}" && "${root}" != \#* && "${root}" != *$'\r'* ]] \
+      || die "${label} closed-input root is invalid"
+    path_is_safe "${root}" || die "${label} closed-input root is unsafe"
+    ! grep -Fqx -- "${root}" "${roots_seen}" \
+      || die "${label} closed-input roots contain a duplicate path"
+    printf '%s\n' "${root}" >>"${roots_seen}"
+    entry="$(tree_entry "${commit}" "${root}")"
+    mode="$(cut -f1 <<<"${entry}")"
+    type="$(cut -f2 <<<"${entry}")"
+    [[ ( "${mode}" == "040000" && "${type}" == "tree" ) \
+      || ( "${mode}" =~ ^100(644|755)$ && "${type}" == "blob" ) ]] \
+      || die "${label} closed-input root is not a Git tree or regular blob: ${root}"
+    count=$((count + 1))
+  done <"${roots_file}"
+  (( count >= 8 )) || die "${label} closed-input roots policy is unexpectedly small"
+}
+
+validate_closed_roots "${BASE_SHA}" "${base_roots}" "trusted-base"
+base_root_count="$(wc -l <"${base_roots}" | tr -d ' ')"
+head_root_prefix="${tmp_root}/head-roots-prefix.txt"
+head -n "${base_root_count}" "${head_roots}" >"${head_root_prefix}"
+cmp -s "${base_roots}" "${head_root_prefix}" \
+  || die "closed-input roots may only be appended relative to the trusted base"
+validate_closed_roots "${HEAD_SHA}" "${head_roots}" "head"
 
 echo "Phase 0 authority matches the trusted base-owned land-exact policy (${head_count} roots)."

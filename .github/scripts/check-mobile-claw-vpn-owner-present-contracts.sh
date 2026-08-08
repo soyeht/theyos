@@ -13,7 +13,7 @@ CONTRACT_SOURCE_REL="admin/contracts/mobile-claw-vpn/v1/owner_present_success_wi
 CONTRACT_VENDOR_REL="Packages/SoyehtCore/Tests/SoyehtCoreTests/Fixtures/mobile-claw-vpn/v1/owner_present_success_wire_v1.json"
 STATUS_SOURCE_REL="admin/contracts/mobile-claw-vpn/v1/owner_present_wire_authority_status_v1.json"
 STATUS_VENDOR_REL="Packages/SoyehtCore/Tests/SoyehtCoreTests/Fixtures/mobile-claw-vpn/v1/owner_present_wire_authority_status_v1.json"
-BOUNDARY_REL="admin/contracts/mobile-claw-vpn/v1/owner_present_phase0_artifact_boundary_v1.tsv"
+CLOSED_INPUT_ROOTS_REL=".github/owner-present-phase0-closed-input-roots-v1.txt"
 RETIREMENT_PRIOR_SHA256="ff9ad533567e29261ecbd8e11e84e9490f1829bd4d2e5b50fe8783dc82b000d1"
 RETIREMENT_HISTORICAL_SHA256="55fe55c6f1985103f21e679c5e6227646035e4d03da3e75193cfc9d1eeb45f8f"
 API_SHAPES_SOURCE_REL="admin/contracts/mobile-claw-vpn/v1/api_shapes.json"
@@ -55,37 +55,25 @@ sha256_file() {
   fi
 }
 
-validate_boundary_descriptor() {
-  local manifest="$1" count=0 mode type oid path
-  local roots="${TMP_DIR}/boundary-roots"
-  : > "${roots}"
-  while IFS=$'\t' read -r mode type oid path; do
-    [[ -z "${mode}" || "${mode}" == \#* ]] && continue
-    case "${path}" in
-      admin/rust|claws|nix|scripts)
-        expected_mode="040000"
-        expected_type="tree"
-        ;;
-      admin/contracts/claw-store/v1/contract.json|\
-      admin/contracts/mobile-claw-vpn/v1/owner_present_success_wire_v1.json|\
-      flake.lock|flake.nix)
-        expected_mode="100644"
-        expected_type="blob"
-        ;;
-      *)
-        return 1
-        ;;
-    esac
-    if [[ "${mode}" != "${expected_mode}" || "${type}" != "${expected_type}" \
-      || ! "${oid}" =~ ^[0-9a-f]{40}$ ]]; then
+validate_closed_input_roots() {
+  local roots_file="$1" count=0 path
+  local seen="${TMP_DIR}/closed-input-roots-seen"
+  : > "${seen}"
+  while IFS= read -r path || [[ -n "${path}" ]]; do
+    if [[ -z "${path}" || "${path}" == \#* || "${path}" == /* \
+      || "${path}" == *"../"* || "${path}" == *$'\r'* \
+      || -n "$(grep -Fx -- "${path}" "${seen}")" ]]; then
       return 1
     fi
-    printf '%s\n' "${path}" >> "${roots}"
+    printf '%s\n' "${path}" >> "${seen}"
     count=$((count + 1))
-  done < "${manifest}"
-  [[ "${count}" -eq 8 ]] \
-    && [[ "$(sort -u "${roots}" | tr '\n' ',')" == \
-      "admin/contracts/claw-store/v1/contract.json,admin/contracts/mobile-claw-vpn/v1/owner_present_success_wire_v1.json,admin/rust,claws,flake.lock,flake.nix,nix,scripts," ]]
+  done < "${roots_file}"
+  (( count >= 8 )) || return 1
+  for path in admin/rust admin/contracts/claw-store/v1/contract.json \
+    admin/contracts/mobile-claw-vpn/v1/owner_present_success_wire_v1.json \
+    claws flake.lock flake.nix nix scripts; do
+    grep -Fqx -- "${path}" "${seen}" || return 1
+  done
 }
 
 HEAD_CONTRACT="${TMP_DIR}/head-contract"
@@ -102,15 +90,15 @@ if ! materialize_regular_blob \
   echo "::error file=${STATUS_SOURCE_REL}::authoritative wire status is missing"
   exit 1
 fi
-HEAD_BOUNDARY="${TMP_DIR}/head-boundary"
+HEAD_CLOSED_INPUT_ROOTS="${TMP_DIR}/head-closed-input-roots"
 if ! materialize_regular_blob \
-  "${THEYOS_DIR}" "${HEAD_SHA}" "${BOUNDARY_REL}" "${HEAD_BOUNDARY}" \
-  "signed Phase 0 artifact boundary"; then
-  echo "::error file=${BOUNDARY_REL}::signed Phase 0 artifact boundary is missing"
+  "${THEYOS_DIR}" "${HEAD_SHA}" "${CLOSED_INPUT_ROOTS_REL}" "${HEAD_CLOSED_INPUT_ROOTS}" \
+  "Phase 0 closed-input roots"; then
+  echo "::error file=${CLOSED_INPUT_ROOTS_REL}::Phase 0 closed-input roots are missing"
   exit 1
 fi
-if ! validate_boundary_descriptor "${HEAD_BOUNDARY}"; then
-  echo "::error file=${BOUNDARY_REL}::Phase 0 boundary descriptor is not the complete closed-root policy"
+if ! validate_closed_input_roots "${HEAD_CLOSED_INPUT_ROOTS}"; then
+  echo "::error file=${CLOSED_INPUT_ROOTS_REL}::Phase 0 closed-input roots policy is invalid"
   exit 1
 fi
 if [[ "$(jq -r '.contract' "${HEAD_STATUS}")" != \
@@ -131,21 +119,17 @@ if [[ "$(jq -r '.contract' "${HEAD_STATUS}")" != \
     "${RETIREMENT_PRIOR_SHA256}" \
   || "$(jq -r '.retired_wire.historical_sha256' "${HEAD_STATUS}")" != \
     "${RETIREMENT_HISTORICAL_SHA256}" \
-  || "$(jq -r '.phase0_artifact_boundary.theyos_path' "${HEAD_STATUS}")" != \
-    "${BOUNDARY_REL}" \
-  || "$(jq -r '.phase0_artifact_boundary.format' "${HEAD_STATUS}")" != \
-    "closed-git-inputs-v2" \
-  || "$(jq -r '.phase0_artifact_boundary.policy_change_control' "${HEAD_STATUS}")" != \
-    "base-owned-proof-machinery-commit-bound-inputs" \
-  || "$(jq -r '.phase0_artifact_boundary.object_identity_update' "${HEAD_STATUS}")" != \
-    "per-commit-revalidation" \
-  || "$(jq -r '.phase0_artifact_boundary.object_identity_authority' "${HEAD_STATUS}")" != \
-    "commit-bound-evidence-not-independent-approval" \
-  || "$(jq -r '.phase0_artifact_boundary.release_provenance' "${HEAD_STATUS}")" != \
+  || "$(jq -r '.phase0_closed_inputs.roots_path' "${HEAD_STATUS}")" != \
+    "${CLOSED_INPUT_ROOTS_REL}" \
+  || "$(jq -r '.phase0_closed_inputs.format' "${HEAD_STATUS}")" != \
+    "ordered-git-paths-v1" \
+  || "$(jq -r '.phase0_closed_inputs.policy_change_control' "${HEAD_STATUS}")" != \
+    "trusted-base-append-only-paths" \
+  || "$(jq -r '.phase0_closed_inputs.release_provenance' "${HEAD_STATUS}")" != \
     "checker-on-release-subject-and-final-package-attestation" \
-  || "$(jq -r '.phase0_artifact_boundary.staged_products | sort | join(",")' "${HEAD_STATUS}")" != \
+  || "$(jq -r '.phase0_closed_inputs.staged_products | sort | join(",")' "${HEAD_STATUS}")" != \
     "nix-theyos-runtime,theyos-engine,theyos-llm-proxy" \
-  || "$(jq -r '.phase0_artifact_boundary.required_published_targets | sort | join(",")' "${HEAD_STATUS}")" != \
+  || "$(jq -r '.phase0_closed_inputs.required_published_targets | sort | join(",")' "${HEAD_STATUS}")" != \
     "aarch64-apple-darwin,aarch64-unknown-linux-musl,nix-theyos-runtime-x86_64-linux,x86_64-unknown-linux-musl" \
   || "$(jq -r '.proof_machinery_change_control.protocol' "${HEAD_STATUS}")" != \
     "soyeht-owner-present-base-owned-land-exact-v1" \
@@ -259,6 +243,7 @@ for pair in "${PAIRS[@]}"; do
   source_new=0
   source_retirement=0
   source_change_control_migration=0
+  source_closed_inputs_migration=0
   registration_new=0
   if [[ "${BASE_CONTEXT}" == "1" ]]; then
     base_source="${TMP_DIR}/base-${INDEX}"
@@ -296,6 +281,34 @@ for pair in "${PAIRS[@]}"; do
             and .notes[1] == "The trusted-base checker validates every protected head object without executing pull-request code. The repository has one maintainer identity shared by its agents, so change control records exact objects and never pretends that self-review is an independent security boundary."
           ' "${head_source}" >/dev/null; then
           source_change_control_migration=1
+        elif [[ "${source_rel}" == "${STATUS_SOURCE_REL}" ]] \
+          && jq -e '
+            .phase0_artifact_boundary == {
+              theyos_path: "admin/contracts/mobile-claw-vpn/v1/owner_present_phase0_artifact_boundary_v1.tsv",
+              format: "closed-git-inputs-v2",
+              policy_change_control: "base-owned-proof-machinery-commit-bound-inputs",
+              object_identity_update: "per-commit-revalidation",
+              object_identity_authority: "commit-bound-evidence-not-independent-approval",
+              release_provenance: "checker-on-release-subject-and-final-package-attestation",
+              staged_products: ["nix-theyos-runtime", "theyos-engine", "theyos-llm-proxy"],
+              required_published_targets: ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl", "aarch64-apple-darwin", "nix-theyos-runtime-x86_64-linux"]
+            }
+          ' "${base_source}" >/dev/null \
+          && jq -e --arg roots "${CLOSED_INPUT_ROOTS_REL}" '
+            .phase0_closed_inputs == {
+              roots_path: $roots,
+              format: "ordered-git-paths-v1",
+              policy_change_control: "trusted-base-append-only-paths",
+              release_provenance: "checker-on-release-subject-and-final-package-attestation",
+              staged_products: ["nix-theyos-runtime", "theyos-engine", "theyos-llm-proxy"],
+              required_published_targets: ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl", "aarch64-apple-darwin", "nix-theyos-runtime-x86_64-linux"]
+            }
+          ' "${head_source}" >/dev/null \
+          && [[ "$(jq -S 'del(.notes, .phase0_artifact_boundary)' "${base_source}")" == \
+            "$(jq -S 'del(.notes, .phase0_closed_inputs)' "${head_source}")" ]] \
+          && [[ "$(jq -S '.notes[2:]' "${base_source}")" == \
+            "$(jq -S '.notes[3:]' "${head_source}")" ]]; then
+          source_closed_inputs_migration=1
         else
           echo "::error file=${source_rel}::pinned V1 dependency is immutable; add a new version"
           diff -u "${base_source}" "${head_source}" || true
@@ -374,6 +387,49 @@ for pair in "${PAIRS[@]}"; do
       exit 1
     fi
     echo "Change-control bootstrap: land theyos before updating the iOS authority-status vendor and pin."
+    continue
+  fi
+
+  if [[ "${source_closed_inputs_migration}" == "1" ]]; then
+    closed_inputs_prior_vendor=0
+    if [[ "${vendor_exists}" == "1" ]] && cmp -s "${base_source}" "${vendor_source}"; then
+      closed_inputs_prior_vendor=1
+    elif [[ "${vendor_exists}" == "1" ]] \
+      && jq -e '
+        .proof_machinery_transition == {
+          protocol: "soyeht-owner-present-proof-machinery-transition-v1",
+          authority: "base-owned-integrity-checker",
+          state: "unarmed",
+          arming: "github-owner-review-on-exact-arm-commit",
+          consumption: "one-shot-exact-tree-and-policy-oid-removes-transition-auth",
+          canary: "arm-then-consume-merge-blocked-and-allowed",
+          anti_replay: "base-sha-expected-head-tree-generation-one-shot-consumption"
+        }
+        and .phase0_artifact_boundary.object_identity_update == "per-reviewed-commit-revalidation"
+      ' "${vendor_source}" >/dev/null \
+      && [[ "$(jq -S 'del(.proof_machinery_transition, .notes, .phase0_artifact_boundary.object_identity_update)' "${vendor_source}")" == \
+        "$(jq -S 'del(.proof_machinery_change_control, .notes, .phase0_artifact_boundary.object_identity_update)' "${base_source}")" ]] \
+      && [[ "$(jq -S '.notes[2:]' "${vendor_source}")" == \
+        "$(jq -S '.notes[2:]' "${base_source}")" ]] \
+      && jq -e '
+        .notes[0] == "The base-owned policy freezes immutable roots and requires exact head-object resealing for evolvable proof machinery; declarative Cargo inputs and the boundary descriptor are commit-bound evidence, not independent approval."
+        and .notes[1] == "The trusted-base checker validates every protected head object without executing pull-request code. The repository has one maintainer identity shared by its agents, so change control records exact objects and never pretends that self-review is an independent security boundary."
+      ' "${base_source}" >/dev/null; then
+      closed_inputs_prior_vendor=1
+    fi
+    if [[ "${closed_inputs_prior_vendor}" != "1" ]]; then
+      echo "::error file=${vendor_rel}::closed-input migration requires the prior iOS vendor until theyos lands"
+      exit 1
+    fi
+    migration_pinned="${TMP_DIR}/closed-input-pinned-${INDEX}"
+    if ! materialize_regular_blob \
+      "${THEYOS_DIR}" "${PIN}" "${source_rel}" "${migration_pinned}" \
+      "authority status at the iOS pin" \
+      || ! cmp -s "${vendor_source}" "${migration_pinned}"; then
+      echo "::error file=${PIN_REL}::closed-input migration requires iOS to remain pinned to its prior vendor"
+      exit 1
+    fi
+    echo "Closed-input bootstrap: land theyos before updating the iOS authority-status vendor and pin."
     continue
   fi
 

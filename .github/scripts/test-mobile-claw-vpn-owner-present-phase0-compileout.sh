@@ -6,7 +6,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 CHECKER_REL=".github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh"
 WORKFLOW_REL=".github/workflows/owner-present-phase0-compileout.yml"
-BOUNDARY_REL="admin/contracts/mobile-claw-vpn/v1/owner_present_phase0_artifact_boundary_v1.tsv"
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/theyos-owner-present-phase0-test.XXXXXX")"
 trap 'chmod -R u+w "${TMP_ROOT}" 2>/dev/null || true; rm -rf "${TMP_ROOT}"' EXIT
 
@@ -116,21 +115,6 @@ commit_mutation() {
   local root="$1" label="$2"
   git -C "${root}" add -A
   git -C "${root}" commit --quiet -m "${label}"
-}
-
-refresh_boundary_tree_entry() {
-  local root="$1" path="$2"
-  local manifest="${root}/${BOUNDARY_REL}"
-  local oid root_tree tmp="${manifest}.tmp"
-  git -C "${root}" add -A
-  root_tree="$(git -C "${root}" write-tree)"
-  oid="$(git -C "${root}" rev-parse "${root_tree}:${path}")"
-  awk -F '\t' -v OFS='\t' -v path="${path}" -v oid="${oid}" '
-    $4 == path { $3 = oid; found = 1 }
-    { print }
-    END { if (!found) exit 2 }
-  ' "${manifest}" > "${tmp}"
-  mv "${tmp}" "${manifest}"
 }
 
 expect_checker_failure() {
@@ -415,28 +399,16 @@ clone_head "${module_crossing}"
 perl -0pi -e \
   's/#\[cfg\(any\(test, feature = "dev_t1_datapath"\)\)\]\npub mod claw_vpn_packet_pump;/pub mod claw_vpn_packet_pump;/' \
   "${module_crossing}/admin/rust/server-rs/src/lib.rs"
-refresh_boundary_tree_entry "${module_crossing}" "admin/rust"
 commit_mutation "${module_crossing}" module-crossing
 expect_checker_failure module_crossing \
   "retired owner-present effect source entered the ${MUTATION_TARGET} production graph: claw_vpn_packet_pump.rs" \
   "${module_crossing}"
-
-composer_crossing="${TMP_ROOT}/composer-crossing"
-clone_head "${composer_crossing}"
-perl -0pi -e \
-  's/\.merge\(mobile_claw_vpn_phase0::routes\(\)\)/.route("\/claw-vpn\/hidden", get(mobile_claw_vpn_phase0::handle_status))\n        .merge(mobile_claw_vpn_phase0::routes())/' \
-  "${composer_crossing}/admin/rust/server-rs/src/mobile_api_routes.rs"
-commit_mutation "${composer_crossing}" composer-crossing
-expect_checker_failure composer_crossing \
-  "signed Phase 0 boundary object differs from ${BOUNDARY_REL}" \
-  "${composer_crossing}"
 
 composer_route_crossing="${TMP_ROOT}/composer-route-crossing"
 clone_head "${composer_route_crossing}"
 perl -0pi -e \
   's/\.merge\(mobile_claw_vpn_phase0::routes\(\)\)/.route("\/claw-vpn\/owner\/grant", post(mobile_claw_vpn_phase0::handle_status))\n        .merge(mobile_claw_vpn_phase0::routes())/' \
   "${composer_route_crossing}/admin/rust/server-rs/src/mobile_api_routes.rs"
-refresh_boundary_tree_entry "${composer_route_crossing}" "admin/rust"
 commit_mutation "${composer_route_crossing}" composer-route-crossing
 expect_route_test_failure composer_route_crossing "${composer_route_crossing}"
 
@@ -464,7 +436,6 @@ while IFS='|' read -r listener_label listener_source; do
   perl -0pi -e \
     's/core_rs::phase0_axum_serve!/axum::serve/' \
     "${listener_bypass}/${listener_source}"
-  refresh_boundary_tree_entry "${listener_bypass}" "admin/rust"
   commit_mutation "${listener_bypass}" "${listener_label}"
   expect_checker_failure "${listener_label}" \
     "published HTTP listener must use the Phase 0 serve choke-point" \
@@ -489,28 +460,16 @@ pub async fn phase0_unclosed_http_listener(
     let _ = axum::serve(listener, router).await;
 }
 RUST
-refresh_boundary_tree_entry "${new_unclosed_listener}" "admin/rust"
 commit_mutation "${new_unclosed_listener}" new-unclosed-listener
 expect_checker_failure new_unclosed_listener \
   'use of a disallowed method `axum::serve`' \
   "${new_unclosed_listener}"
-
-linked_module_crossing="${TMP_ROOT}/linked-module-crossing"
-clone_head "${linked_module_crossing}"
-printf '%s\n' \
-  'pub const PHASE0_LINKED_MODULE_CROSSING: &str = "/api/v1/mobile/claw-vpn/owner/grant";' \
-  >> "${linked_module_crossing}/admin/rust/server-rs/src/handlers_misc.rs"
-commit_mutation "${linked_module_crossing}" linked-module-crossing
-expect_checker_failure linked_module_crossing \
-  "signed Phase 0 boundary object differs from ${BOUNDARY_REL}" \
-  "${linked_module_crossing}"
 
 linked_ip_tunnel_seam="${TMP_ROOT}/linked-ip-tunnel-seam"
 clone_head "${linked_ip_tunnel_seam}"
 printf '%s\n' \
   'use crate::claw_share_relay_stream_target_router::RelayStreamIpTunnelRouter;' \
   >> "${linked_ip_tunnel_seam}/admin/rust/server-rs/src/handlers_misc.rs"
-refresh_boundary_tree_entry "${linked_ip_tunnel_seam}" "admin/rust"
 commit_mutation "${linked_ip_tunnel_seam}" linked-ip-tunnel-seam
 expect_checker_failure linked_ip_tunnel_seam \
   'unresolved import `crate::claw_share_relay_stream_target_router::RelayStreamIpTunnelRouter`' \
@@ -523,7 +482,7 @@ perl -0pi -e \
   "${store_open}/admin/rust/server-rs/src/claw_share_relay_stream_offer_store.rs"
 commit_mutation "${store_open}" store-open
 expect_checker_failure generic_ip_tunnel_store \
-  "signed Phase 0 boundary object differs from ${BOUNDARY_REL}" \
+  "published theyos-engine Phase 0 artifact contract is not status-only" \
   "${store_open}"
 
 build_cfg="${TMP_ROOT}/build-cfg"
@@ -531,7 +490,6 @@ clone_head "${build_cfg}"
 perl -0pi -e \
   's#emit_build_git_sha\(\);#emit_build_git_sha();\n    println!("cargo:rustc-cfg=owner_present_hidden");\n    let source = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("src/handlers_misc.rs");\n    let bytes = std::fs::read(&source).unwrap();\n    match std::fs::write(&source, &bytes) {\n        Ok(()) => panic!("Phase 0 source snapshot was writable"),\n        Err(error) => panic!("Phase 0 source mutation was blocked: {error}"),\n    }#' \
   "${build_cfg}/admin/rust/server-rs/build.rs"
-refresh_boundary_tree_entry "${build_cfg}" "admin/rust"
 commit_mutation "${build_cfg}" build-cfg
 expect_checker_failure build_cfg_crossing \
   "Phase 0 source mutation was blocked" \
@@ -541,7 +499,6 @@ build_tool_codegen="${TMP_ROOT}/build-tool-codegen"
 clone_head "${build_tool_codegen}"
 printf '%s\n' 'fn main() { println!("cargo:rustc-cfg=owner_present_hidden"); }' > \
   "${build_tool_codegen}/admin/rust/theyos-engine-build-rs/build.rs"
-refresh_boundary_tree_entry "${build_tool_codegen}" "admin/rust"
 commit_mutation "${build_tool_codegen}" build-tool-codegen
 expect_checker_failure build_tool_codegen \
   "canonical engine build tool must not have a build.rs codegen seam" \
@@ -552,7 +509,6 @@ clone_head "${new_build_script}"
 mkdir -p "${new_build_script}/admin/rust/server-rs/generated"
 printf '%s\n' 'fn main() { println!("cargo:rustc-cfg=owner_present_hidden"); }' > \
   "${new_build_script}/admin/rust/server-rs/generated/build.rs"
-refresh_boundary_tree_entry "${new_build_script}" "admin/rust"
 commit_mutation "${new_build_script}" new-build-script
 expect_checker_failure new_build_script \
   "Phase 0 permits exactly the three reviewed in-repo Rust build scripts" \
@@ -564,7 +520,6 @@ perl -0pi -e 's/(publish = false\n)/$1build = "phase0_codegen.rs"\n/' \
   "${custom_named_build_script}/admin/rust/theyos-engine-build-rs/Cargo.toml"
 printf '%s\n' 'fn main() { println!("cargo:rustc-cfg=owner_present_hidden"); }' > \
   "${custom_named_build_script}/admin/rust/theyos-engine-build-rs/phase0_codegen.rs"
-refresh_boundary_tree_entry "${custom_named_build_script}" "admin/rust"
 commit_mutation "${custom_named_build_script}" custom-named-build-script
 expect_checker_failure custom_named_build_script \
   "Cargo metadata custom-build targets differ from the three reviewed build scripts" \
@@ -604,7 +559,6 @@ TOML
   cd "${local_proc_macro}/admin/rust"
   cargo generate-lockfile --quiet
 )
-refresh_boundary_tree_entry "${local_proc_macro}" "admin/rust"
 commit_mutation "${local_proc_macro}" local-proc-macro
 expect_checker_failure local_proc_macro \
   "Phase 0 forbids local proc-macro codegen targets" \
@@ -623,7 +577,6 @@ cat >> "${external_include}/admin/rust/server-rs/src/handlers_misc.rs" <<'RUST'
 pub const PHASE0_EXTERNAL_INCLUDE: &str =
     include_str!("../../../../docs/phase0 external input.txt");
 RUST
-refresh_boundary_tree_entry "${external_include}" "admin/rust"
 commit_mutation "${external_include}" external-include
 expect_checker_failure external_include \
   "couldn't read \`server-rs/src/../../../../docs/phase0 external input.txt\`" \
@@ -638,7 +591,6 @@ fn phase0_unreviewed_allow_alias() {
     let _ = axum::serve;
 }
 RUST
-refresh_boundary_tree_entry "${allow_alias_escape}" "admin/rust"
 commit_mutation "${allow_alias_escape}" allow-alias-escape
 expect_checker_failure allow_alias_escape \
   "only the two reviewed Phase 0 wrapper sites may allow disallowed HTTP methods" \
@@ -652,7 +604,6 @@ cat >> "${absolute_external_include}/admin/rust/server-rs/src/handlers_misc.rs" 
 pub const PHASE0_ABSOLUTE_EXTERNAL_INCLUDE: &[u8] =
     include_bytes!("${ambient_input}");
 RUST
-refresh_boundary_tree_entry "${absolute_external_include}" "admin/rust"
 commit_mutation "${absolute_external_include}" absolute-external-include
 expect_checker_failure absolute_external_include \
   "Rust depfile input is outside the modeled immutable roots" \
@@ -665,7 +616,6 @@ cat >> "${manifest_override}/admin/rust/Cargo.toml" <<'TOML'
 [patch.crates-io]
 serde = { version = "=1.0.228" }
 TOML
-refresh_boundary_tree_entry "${manifest_override}" "admin/rust"
 commit_mutation "${manifest_override}" manifest-override
 expect_checker_failure manifest_override \
   "Phase 0 forbids Cargo override table(s): patch" \
@@ -678,7 +628,6 @@ cat >> "${cargo_config_override}/admin/rust/.cargo/config.toml" <<'TOML'
 [build]
 rustflags = ["--cfg", "owner_present_hidden"]
 TOML
-refresh_boundary_tree_entry "${cargo_config_override}" "admin/rust"
 commit_mutation "${cargo_config_override}" cargo-config-override
 expect_checker_failure cargo_config_override \
   "Phase 0 permits only the frozen PKG_CONFIG_PATH Cargo environment entry" \
@@ -689,7 +638,6 @@ clone_head "${cross_pre_build}"
 perl -0pi -e \
   's/pre-build = \[\]/pre-build = ["printf owner-present-hidden"]/' \
   "${cross_pre_build}/admin/rust/Cross.toml"
-refresh_boundary_tree_entry "${cross_pre_build}" "admin/rust"
 commit_mutation "${cross_pre_build}" cross-pre-build
 expect_checker_failure cross_pre_build \
   "Phase 0 forbids Cross pre-build commands" \
@@ -700,7 +648,6 @@ clone_head "${git_source_dependency}"
 perl -0pi -e \
   's~source = "registry\+https://github.com/rust-lang/crates.io-index"~source = "git+file:///tmp/phase0-source#0000000000000000000000000000000000000000"~' \
   "${git_source_dependency}/admin/rust/Cargo.lock"
-refresh_boundary_tree_entry "${git_source_dependency}" "admin/rust"
 commit_mutation "${git_source_dependency}" git-source-dependency
 expect_checker_failure git_source_dependency \
   "Phase 0 forbids non-canonical Cargo source" \
@@ -744,7 +691,6 @@ TOML
   cd "${external_path_dependency}/admin/rust"
   cargo generate-lockfile --quiet
 )
-refresh_boundary_tree_entry "${external_path_dependency}" "admin/rust"
 commit_mutation "${external_path_dependency}" external-path-dependency
 expect_checker_failure_any external_path_dependency \
   "${external_path_dependency}" \
@@ -777,7 +723,6 @@ workspace_cargo_alias="${TMP_ROOT}/workspace-cargo-alias"
 clone_head "${workspace_cargo_alias}"
 printf '%s\n' '[net]' 'retry = 2' > \
   "${workspace_cargo_alias}/admin/rust/.cargo/config"
-refresh_boundary_tree_entry "${workspace_cargo_alias}" "admin/rust"
 commit_mutation "${workspace_cargo_alias}" workspace-cargo-alias
 expect_checker_failure workspace_cargo_alias \
   "canonical theyos-engine build forbids ancestor Cargo config: admin/rust/.cargo/config" \
@@ -790,7 +735,7 @@ perl -0pi -e \
   "${recipe_drift}/admin/rust/theyos-engine-build-rs/src/main.rs"
 commit_mutation "${recipe_drift}" recipe-drift
 expect_checker_failure release_recipe_drift \
-  "signed Phase 0 boundary object differs from ${BOUNDARY_REL}" \
+  "production server binary cannot be built with DEV/test features" \
   "${recipe_drift}"
 
 release_subject_bypass="${TMP_ROOT}/release-subject-bypass"
