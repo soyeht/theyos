@@ -52,6 +52,18 @@ struct Cli {
     append: Option<PathBuf>,
 }
 
+fn describe_port(port: Option<u16>) -> String {
+    port.map_or_else(|| "none (no socket)".to_owned(), |port| port.to_string())
+}
+
+fn describe_consistency(consistent: Option<bool>) -> &'static str {
+    match consistent {
+        Some(true) => "true (good sign for hole punching, not a guarantee)",
+        Some(false) => "false (direct is harder, not impossible)",
+        None => "unknown (a server did not answer)",
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -96,25 +108,34 @@ fn main() -> anyhow::Result<()> {
         match outcome {
             ServerOutcome::Observed {
                 server,
+                family,
                 mapped,
                 rtt_ms,
-            } => eprintln!("  {server}: mapped {mapped} in {rtt_ms:.1} ms"),
-            ServerOutcome::Failed { server, reason } => eprintln!("  {server}: {reason}"),
+            } => eprintln!("  [{family:?}] {server}: mapped {mapped} in {rtt_ms:.1} ms"),
+            ServerOutcome::Failed {
+                server,
+                family,
+                reason,
+            } => eprintln!("  [{family:?}] {server}: {reason}"),
         }
     }
     eprintln!(
-        "  local port {} · ipv6 {} · mapping_consistent {}",
-        observation.local_port,
+        "  ipv6 address {}",
         if observation.ipv6_available {
-            "available"
+            "present"
         } else {
             "absent"
-        },
-        match observation.mapping_consistent {
-            Some(true) => "true (good sign for hole punching, not a guarantee)",
-            Some(false) => "false (direct is harder, not impossible)",
-            None => "unknown (a server did not answer)",
         }
+    );
+    eprintln!(
+        "  IPv4 port {} · mapping_consistent {}",
+        describe_port(observation.local_port),
+        describe_consistency(observation.mapping_consistent)
+    );
+    eprintln!(
+        "  IPv6 port {} · mapping_consistent {}",
+        describe_port(observation.local_port_v6),
+        describe_consistency(observation.mapping_consistent_v6)
     );
 
     Ok(())
