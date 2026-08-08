@@ -245,13 +245,39 @@ Isso não é dívida de cobertura, é dívida de *evidência*: a decisão de man
 stack Noise foi tomada porque ele tem essa cobertura. Cobertura que não executa
 não sustenta a decisão que ela justificou.
 
-**Construir:** job explícito rodando `cargo test --locked` (com doctests) dentro
-de cada workspace standalone, em Linux **e** macOS — a CAS do modelo de controle
+**Construir:** job explícito em Linux **e** macOS — a CAS do modelo de controle
 é construída sobre `std::fs::File::lock`, cujo comportamento é específico de
 plataforma. Os testes versionados do M1a/M1b entram no mesmo gate.
 
-**Pronto quando:** os dois crates excluídos rodam em CI nos dois runners, e uma
-falha injetada em cada um reprova o gate (não-vacuidade).
+**O modelo de controle exige DUAS invocações, e a primeira sozinha é vácua.** Os
+dois integration targets declaram
+`required-features = ["test-support", "roster-sync-unratified"]`, então um
+`cargo test` simples ali roda 0 unit tests e 0 integration tests — só os 13
+doctests:
+
+```
+cargo test --locked                                    # superfície fechada (doctests)
+cargo test --locked --features test-support,roster-sync-unratified \
+  --lib --test model_invariants --test cas_multiprocess   # a suíte de verdade
+```
+
+A primeira **não** é redundante e não pode ser substituída pela segunda: o
+`src/lib.rs` tem doctests `compile_fail` provando que a superfície gated está
+ausente por padrão. Com as features ligadas esses trechos compilam e o doctest
+reprova o próprio "não pode compilar" — medido, 5 falhas. Por isso a segunda
+seleciona targets explicitamente e não roda doctest.
+
+**Pronto quando:** os dois crates rodam em CI nos dois runners **e** a
+não-vacuidade está medida por comando, não afirmada:
+
+| mutação | comando simples | comando com features |
+|---|---|---|
+| `replace_exact` → sempre `KnownNoEffect` (CAS que nunca escreve) | rc 0 — **não pega** | rc 101, 4/4 `cas_multiprocess` falham |
+| `PROTOCOL_VERSION_BYTE` `0x01`→`0x02` | rc 101 no core, teste de prologue falha | — |
+
+A linha de cima é a razão do marco existir: um CAS que nunca escreve passa no
+comando simples. Mutação aplicada e revertida pelo editor, com restauração
+provada por blob e a checagem rodando por último — nunca versionada.
 
 > Muda `.github/`, então vai em PR e revisão próprios — não entra de carona num
 > branch de feature.
