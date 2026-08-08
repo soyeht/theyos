@@ -208,6 +208,11 @@ pub struct NatObservation {
     /// Whether this host holds a global-unicast IPv6 address.
     #[serde(rename = "ipv6_disponivel")]
     pub ipv6_available: bool,
+    /// Tunnel-like interfaces that were up during the run. Non-empty means a
+    /// VPN was active and this row may not describe the network the operator
+    /// intended to measure — see [`tunnel_interface_names`].
+    #[serde(default)]
+    pub tunnel_interfaces: Vec<String>,
 
     /// Local port the IPv4 requests were sent from.
     #[serde(rename = "porta_local")]
@@ -288,6 +293,7 @@ pub fn observe(settings: &ProbeSettings, labels: &ProbeLabels) -> io::Result<Nat
         network_type: labels.network_type.clone(),
         rtt_ms: servers.iter().find_map(ServerOutcome::rtt_ms),
         ipv6_available: has_global_unicast_ipv6(),
+        tunnel_interfaces: tunnel_interface_names(),
 
         local_port: v4.local_port,
         mapped_ip_1: v4.mapped(0).map(|addr| addr.ip()),
@@ -460,6 +466,37 @@ pub fn has_global_unicast_ipv6() -> bool {
     })
 }
 
+/// Names of active tunnel-like interfaces (`utun`, `tun`, `ipsec`, `ppp`, `wg`).
+///
+/// Recorded because a row taken while a VPN is up may not be measuring the
+/// network the operator thinks it is. A capture session lost two samples to
+/// exactly this: a production tunnel was connected the whole time and nobody
+/// checked, so every reading had to be re-argued afterwards instead of being
+/// self-describing. The field does not decide whether a row is valid — it makes
+/// the question answerable from the row alone.
+#[must_use]
+pub fn tunnel_interface_names() -> Vec<String> {
+    let Ok(interfaces) = if_addrs::get_if_addrs() else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = interfaces
+        .iter()
+        .map(|interface| interface.name.clone())
+        .filter(|name| is_tunnel_interface_name(name))
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+fn is_tunnel_interface_name(name: &str) -> bool {
+    const PREFIXES: [&str; 5] = ["utun", "tun", "ipsec", "ppp", "wg"];
+    let lowered = name.to_ascii_lowercase();
+    PREFIXES
+        .iter()
+        .any(|prefix| lowered.starts_with(prefix) && lowered != "tunl0")
+}
+
 fn is_global_unicast_ipv6(addr: Ipv6Addr) -> bool {
     let octets = addr.octets();
     let link_local = (u16::from_be_bytes([octets[0], octets[1]]) & 0xFFC0) == 0xFE80;
@@ -625,6 +662,7 @@ mod tests {
             network_type: Some("wifi".to_owned()),
             rtt_ms: Some(12.5),
             ipv6_available: true,
+            tunnel_interfaces: Vec::new(),
             local_port: Some(51_820),
             mapped_ip_1: Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))),
             mapped_port_1: Some(4242),
@@ -664,6 +702,7 @@ mod tests {
             network_type: Some("5g".to_owned()),
             rtt_ms: Some(30.0),
             ipv6_available: true,
+            tunnel_interfaces: Vec::new(),
             local_port: Some(57_364),
             mapped_ip_1: None,
             mapped_port_1: None,
@@ -686,6 +725,53 @@ mod tests {
         assert!(
             json["mapped_ip_1"].is_null() && !json["mapped_ip6_1"].is_null(),
             "an empty v4 half must stay visibly empty rather than borrowing v6's answer"
+        );
+    }
+
+    #[test]
+    fn tunnel_interface_names_recognises_vpn_interfaces_and_not_ordinary_ones() {
+        for name in ["utun0", "utun4", "tun0", "ipsec1", "ppp0", "wg0", "UTUN9"] {
+            assert!(is_tunnel_interface_name(name), "{name} is a tunnel");
+        }
+        for name in ["en0", "eth0", "lo0", "lo", "bridge100", "awdl0", "anpi0"] {
+            assert!(!is_tunnel_interface_name(name), "{name} is not a tunnel");
+        }
+    }
+
+    #[test]
+    fn a_row_taken_under_a_vpn_says_so_in_the_row() {
+        // The confound this field exists for: two field samples were taken with
+        // a production tunnel connected and nobody noticed until afterwards.
+        // Validity is still a judgement call — the row only has to make the
+        // question answerable without re-interviewing whoever ran it.
+        let observation = NatObservation {
+            observed_at: 1_775_000_000,
+            country: None,
+            asn: None,
+            network_type: Some("5g".to_owned()),
+            rtt_ms: None,
+            ipv6_available: true,
+            tunnel_interfaces: vec!["utun4".to_owned()],
+            local_port: Some(57_364),
+            mapped_ip_1: None,
+            mapped_port_1: None,
+            mapped_ip_2: None,
+            mapped_port_2: None,
+            mapping_consistent: None,
+            local_port_v6: Some(57_365),
+            mapped_ip6_1: None,
+            mapped_port6_1: None,
+            mapped_ip6_2: None,
+            mapped_port6_2: None,
+            mapping_consistent_v6: None,
+            servers: Vec::new(),
+        };
+
+        let json = serde_json::to_value(&observation).unwrap();
+        assert_eq!(json["tunnel_interfaces"][0], "utun4");
+        assert!(
+            observation.mapping_consistent.is_none() && observation.mapping_consistent_v6.is_none(),
+            "a row where nothing answered must claim nothing about either family"
         );
     }
 

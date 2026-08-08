@@ -127,6 +127,16 @@ fn main() -> anyhow::Result<()> {
             "absent"
         }
     );
+    if observation.tunnel_interfaces.is_empty() {
+        eprintln!("  no tunnel interface up");
+    } else {
+        eprintln!(
+            "  WARNING: tunnel interface up ({}) — a VPN may be carrying or \
+             blocking this traffic, so this row may not describe the network \
+             you meant to measure",
+            observation.tunnel_interfaces.join(", ")
+        );
+    }
     eprintln!(
         "  IPv4 port {} · mapping_consistent {}",
         describe_port(observation.local_port),
