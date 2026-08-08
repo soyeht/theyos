@@ -3432,6 +3432,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "nat-probe-rs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "if-addrs 0.10.2",
+ "rand_core 0.6.4",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "nix"
 version = "0.31.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
