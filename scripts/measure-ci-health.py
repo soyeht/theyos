@@ -74,8 +74,9 @@ SHIM_WORKFLOW_PATH = ".github/workflows/backend-ci-docs-shim.yml"
 # Injection and probe branches stay out of every rate (trava de contaminação).
 EXCLUDED_BRANCH_PREFIXES = ("zz-inj-", "zz-probe-")
 
-# Assertion ladder (rule of three, 95%): with n attempts and zero classified
-# flakes the upper bound is ~3/n. Below the first rung nothing is certifiable —
+# Assertion ladder (rule of three, 95%): a rung is certifiable only when n
+# reaches it AND the CI upper — (failures+3)/n, ~3/n at zero observed events —
+# stays below the rung's bound. Below the first rung nothing is certifiable —
 # report the observed rate and the bound, and say so.
 CI_LADDER = ((300, 0.01), (150, 0.02), (60, 0.05))
 
@@ -177,10 +178,20 @@ def ci_upper_bound(n: int, failures: int) -> float | None:
     return (failures + 3) / n
 
 
-def ladder_rung(n: int) -> tuple[int, float] | None:
-    """The strongest claim n attempts can certify. None = observed rate only."""
+def ladder_rung(n: int, failures: int = 0) -> tuple[int, float] | None:
+    """The strongest claim the evidence can certify: the LARGEST rung that n
+    reaches AND whose bound the 95% CI upper does not exceed. The plan's
+    ladder was written for zero observed flakes (upper ~3/n, with the rung
+    minimums exactly where 3/n meets the bound, so equality certifies); with
+    observed failures the bound must absorb them ((failures+3)/n) or the rung
+    overclaims the data — n alone gates eligibility, the CI clears the claim.
+    Found on the first real operation of this instrument: 8 flakes in n=731
+    reported a <1% rung while the CI upper sat at 1.5%."""
+    upper = ci_upper_bound(n, failures)
+    if upper is None:
+        return None
     for threshold, bound in CI_LADDER:
-        if n >= threshold:
+        if n >= threshold and upper <= bound:
             return threshold, bound
     return None
 
@@ -382,7 +393,7 @@ def measure(repo: str, run_ids: list[int], classifications: dict[str, str], time
     n_attempts = len(rate_attempts)
     n_flake = buckets.get("flake", 0)
     observed_rate = (n_flake / n_attempts) if n_attempts else None
-    rung = ladder_rung(n_attempts)
+    rung = ladder_rung(n_attempts, n_flake)
     # A rate computed while failures sit unclassified is a lie by omission:
     # "0% flake" with 28 unbucked failures is not a measurement, it is an
     # empty bucket. No rung is certifiable until every failure has a bucket.

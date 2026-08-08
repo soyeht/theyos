@@ -54,6 +54,27 @@ class LadderTests(unittest.TestCase):
         self.assertEqual((300, 0.01), gate.ladder_rung(300))
         self.assertEqual((300, 0.01), gate.ladder_rung(10_000))
 
+    def test_observed_failures_gate_the_rung_too(self):
+        # Found on the first real operation: 8 flakes in n=731 reported a <1%
+        # rung while the CI upper sat at 1.5% — n alone overclaims. The rung
+        # must be the largest one BOTH n reaches AND the CI upper clears.
+        self.assertEqual((150, 0.02), gate.ladder_rung(731, failures=8))
+
+    def test_zero_failures_at_300_still_certifies_one_percent(self):
+        self.assertEqual((300, 0.01), gate.ladder_rung(300, failures=0))
+
+    def test_failures_push_the_claim_down_a_rung(self):
+        # upper = (8+3)/300 ~ 3.7% clears only the 5% rung.
+        self.assertEqual((60, 0.05), gate.ladder_rung(300, failures=8))
+
+    def test_too_many_failures_certify_nothing(self):
+        # upper = 13/100 = 13% clears no rung even though n>=60.
+        self.assertIsNone(gate.ladder_rung(100, failures=10))
+
+    def test_borderline_failure_count_clears_nothing(self):
+        # upper = 5/60 ~ 8.3% does not clear the 5% rung.
+        self.assertIsNone(gate.ladder_rung(60, failures=2))
+
 
 class CountingTests(unittest.TestCase):
     def test_same_name_different_id_is_two_jobs(self):
