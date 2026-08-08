@@ -11,6 +11,17 @@ on:
       - ".github/workflows/frontend-ci.yml"
   workflow_dispatch:
 
+# One run per workflow per ref. A new commit supersedes the old run instead of
+# leaving it to burn a full build on code that no longer exists.
+#
+# `main` is deliberately exempt: the post-merge run on this branch is what
+# caught 5b04e135, a direct push that broke compilation on both platforms.
+# Cancelling it because someone pushed a branch would throw away the only
+# signal that covers what landed.
+concurrency:
+  group: frontend-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   test-and-build:
     runs-on: ubuntu-latest
