@@ -1882,6 +1882,85 @@ impl FinalizeRetryPolicy {
         request_timeout: FINALIZE_HTTP_TIMEOUT,
         maximum_sleep: Duration::from_secs(FINALIZE_RESTART_RETRY_AFTER_SECS),
     };
+
+    /// The production policy, with the retry budget read from the test-only
+    /// [`RECOVERY_TIMEOUT_ENV`] env var (clamped, defaulting to
+    /// [`RECOVERY_TIMEOUT`]). Non-`const` on purpose: a `const` cannot read the
+    /// process environment, and making the budget injectable is the whole point.
+    /// Every other field is the production value; only `budget` is affected.
+    ///
+    /// Safety of the knob: a launched finalize POST is `MayHaveTakenEffect`, so
+    /// an elapsed budget fails closed (`FinalizeOutcomeIndeterminate`, all
+    /// recovery evidence retained) and can never authorize a rollback to N=1.
+    /// The ceiling IS the production value, so even if the env reaches a
+    /// production process it can only shorten the wait — never extend it past
+    /// what production allows. The floor keeps the budget large enough that at
+    /// least one probe happens: a budget nobody can spend probing is not a
+    /// timeout, it is a skipped question.
+    ///
+    /// The env path is test-only in fact — production never sets
+    /// [`RECOVERY_TIMEOUT_ENV`]; it exists to drop the ~300s finalize retry the
+    /// three `phase3_atomic_rollback` tests each wait out against an unreachable
+    /// M2 (before the handler returns 500) to ~1-2s, which is what those tests
+    /// actually prove.
+    ///
+    /// Discovered property (negative control, falsifies "only shortens"): on the
+    /// `recovers_to_commit` path, a budget exhausted WITHOUT a finalize-POST
+    /// attempt classifies differently from an attempt that was made and rejected,
+    /// and the handler takes a different branch — so shortening the budget can
+    /// change the outcome there, not just its latency. That test is therefore
+    /// run at the production budget (it is fast there); only the three slow
+    /// "unreachable M2" tests run with the injected budget, where the verdict is
+    /// the same fail-closed either way. If the production budget ever changes,
+    /// that test is the alarm for this sensitivity.
+    ///
+    /// Floor caveat: at the 1s floor, a pathologically slow runner could spend
+    /// the whole budget before any probe happens (zero attempts). That is
+    /// acceptable for the test-only path this knob serves; it must never apply
+    /// to production, where the budget is [`RECOVERY_TIMEOUT`] (300s) regardless.
+    #[must_use]
+    fn production() -> Self {
+        Self {
+            budget: recovery_timeout_from_env(),
+            ..Self::PRODUCTION
+        }
+    }
+}
+
+/// Env var carrying the Phase-3 finalize-retry budget, in seconds. Test-only:
+/// absent means [`RECOVERY_TIMEOUT`], byte for byte the behaviour that shipped
+/// before this knob existed.
+const RECOVERY_TIMEOUT_ENV: &str = "THEYOS_PHASE3_RECOVERY_TIMEOUT_SECS";
+
+/// Floor for the injected budget (seconds). See [`FinalizeRetryPolicy::production`].
+const RECOVERY_TIMEOUT_MIN_SECS: u64 = 1;
+
+/// Ceiling for the injected budget: the production value. The knob can only
+/// shorten the wait, never extend it.
+const RECOVERY_TIMEOUT_MAX_SECS: u64 = RECOVERY_TIMEOUT.as_secs();
+
+/// Clamp a parsed Phase-3 finalize-retry budget: in-range passes through;
+/// `None` or out-of-range falls back to [`RECOVERY_TIMEOUT`]. Split from the
+/// env read so the parse/clamp/default policy is unit-testable without mutating
+/// process env.
+#[must_use]
+fn clamp_recovery_timeout(parsed: Option<u64>) -> Duration {
+    parsed
+        .filter(|secs| (RECOVERY_TIMEOUT_MIN_SECS..=RECOVERY_TIMEOUT_MAX_SECS).contains(secs))
+        .map_or(RECOVERY_TIMEOUT, Duration::from_secs)
+}
+
+/// Read the Phase-3 finalize-retry budget from [`RECOVERY_TIMEOUT_ENV`],
+/// clamped to [`RECOVERY_TIMEOUT_MIN_SECS`]..=[`RECOVERY_TIMEOUT_MAX_SECS`] and
+/// defaulting to [`RECOVERY_TIMEOUT`]. Single owner for that read — do not
+/// re-implement the parse/clamp/default at call sites.
+#[must_use]
+fn recovery_timeout_from_env() -> Duration {
+    clamp_recovery_timeout(
+        std::env::var(RECOVERY_TIMEOUT_ENV)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok()),
+    )
 }
 
 pub fn machine_cert_hash(cert: &MachineCert) -> Result<[u8; 32], HouseholdError> {
@@ -2407,7 +2486,7 @@ impl CeremonyTxn {
             &url,
             manifest.exact_join_response(),
             &self.candidate_cert,
-            FinalizeRetryPolicy::PRODUCTION,
+            FinalizeRetryPolicy::production(),
         )?;
         let returned_ack_bytes = verified
             .ack
@@ -2440,7 +2519,7 @@ impl CeremonyTxn {
             &url,
             &join_response_bytes,
             &self.candidate_cert,
-            FinalizeRetryPolicy::PRODUCTION,
+            FinalizeRetryPolicy::production(),
         )?;
         Ok(FinalizeWithM2Outcome {
             ack: verified.ack,
@@ -4063,6 +4142,30 @@ mod tests {
             request_timeout: Duration::from_millis(200),
             maximum_sleep: Duration::from_millis(5),
         }
+    }
+
+    #[test]
+    fn clamp_recovery_timeout_defaults_when_absent_or_out_of_range() {
+        // Absent is the production path, and it must be the production value.
+        assert_eq!(clamp_recovery_timeout(None), RECOVERY_TIMEOUT);
+        // Zero is the dangerous input this clamp exists for: a budget nobody can
+        // spend probing is not a timeout, it is a skipped question.
+        assert_eq!(clamp_recovery_timeout(Some(0)), RECOVERY_TIMEOUT);
+        // Above the ceiling falls back to production.
+        assert_eq!(
+            clamp_recovery_timeout(Some(RECOVERY_TIMEOUT_MAX_SECS + 1)),
+            RECOVERY_TIMEOUT
+        );
+        // In range passes through — the whole point of the knob.
+        assert_eq!(
+            clamp_recovery_timeout(Some(RECOVERY_TIMEOUT_MIN_SECS)),
+            Duration::from_secs(1)
+        );
+        // The ceiling IS production: the knob can only shorten, never extend.
+        assert_eq!(
+            Duration::from_secs(RECOVERY_TIMEOUT_MAX_SECS),
+            RECOVERY_TIMEOUT
+        );
     }
 
     #[test]
