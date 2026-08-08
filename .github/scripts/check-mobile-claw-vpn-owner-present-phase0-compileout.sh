@@ -1479,7 +1479,9 @@ ACTUAL_WORKFLOWS="${TMP_ROOT}/actual-workflows.txt"
 printf '%s\n' \
   backend-ci-docs-shim.yml \
   backend-ci.yml \
+  chronic-reds.yml \
   claw-store-contract-ci.yml \
+  consumption-coverage.yml \
   contracts-cross-repo-sync.yml \
   frontend-ci.yml \
   homebrew-smoke-docs-shim.yml \
@@ -1489,6 +1491,7 @@ printf '%s\n' \
   owner-present-phase0-nix-runtime.yml \
   release-linux.yml \
   release-macos.yml \
+  repo-hygiene.yml \
   | LC_ALL=C sort > "${KNOWN_WORKFLOWS}"
 find "${SNAPSHOT}/.github/workflows" -maxdepth 1 -type f \
   \( -name '*.yml' -o -name '*.yaml' \) -exec basename {} \; \
@@ -1550,7 +1553,7 @@ if [[ "$(jq -r '.contract' "${AUTHORITY_STATUS}")" != \
   || "$(jq -r '.phase0_artifact_boundary.policy_change_control' "${AUTHORITY_STATUS}")" != \
     "base-owned-proof-machinery-commit-bound-inputs" \
   || "$(jq -r '.phase0_artifact_boundary.object_identity_update' "${AUTHORITY_STATUS}")" != \
-    "per-reviewed-commit-revalidation" \
+    "per-commit-revalidation" \
   || "$(jq -r '.phase0_artifact_boundary.object_identity_authority' "${AUTHORITY_STATUS}")" != \
     "commit-bound-evidence-not-independent-approval" \
   || "$(jq -r '.phase0_artifact_boundary.release_provenance' "${AUTHORITY_STATUS}")" != \
@@ -1559,19 +1562,21 @@ if [[ "$(jq -r '.contract' "${AUTHORITY_STATUS}")" != \
     "nix-theyos-runtime,theyos-engine,theyos-llm-proxy" \
   || "$(jq -r '.phase0_artifact_boundary.required_published_targets | sort | join(",")' "${AUTHORITY_STATUS}")" != \
     "aarch64-apple-darwin,aarch64-unknown-linux-musl,nix-theyos-runtime-x86_64-linux,x86_64-unknown-linux-musl" \
-  || "$(jq -r '.proof_machinery_transition.protocol' "${AUTHORITY_STATUS}")" != \
-    "soyeht-owner-present-proof-machinery-transition-v1" \
-  || "$(jq -r '.proof_machinery_transition.authority' "${AUTHORITY_STATUS}")" != \
-    "base-owned-integrity-checker" \
-  || "$(jq -r '.proof_machinery_transition.state' "${AUTHORITY_STATUS}")" != "unarmed" \
-  || "$(jq -r '.proof_machinery_transition.arming' "${AUTHORITY_STATUS}")" != \
-    "github-owner-review-on-exact-arm-commit" \
-  || "$(jq -r '.proof_machinery_transition.consumption' "${AUTHORITY_STATUS}")" != \
-    "one-shot-exact-tree-and-policy-oid-removes-transition-auth" \
-  || "$(jq -r '.proof_machinery_transition.canary' "${AUTHORITY_STATUS}")" != \
-    "arm-then-consume-merge-blocked-and-allowed" \
-  || "$(jq -r '.proof_machinery_transition.anti_replay' "${AUTHORITY_STATUS}")" != \
-    "base-sha-expected-head-tree-generation-one-shot-consumption" \
+  || "$(jq -r '.proof_machinery_change_control.protocol' "${AUTHORITY_STATUS}")" != \
+    "soyeht-owner-present-base-owned-land-exact-v1" \
+  || "$(jq -r '.proof_machinery_change_control.authority' "${AUTHORITY_STATUS}")" != \
+    "trusted-base-integrity-checker" \
+  || "$(jq -r '.proof_machinery_change_control.state' "${AUTHORITY_STATUS}")" != "active" \
+  || "$(jq -r '.proof_machinery_change_control.maintainer_model' "${AUTHORITY_STATUS}")" != \
+    "single-maintainer-agents-share-maintainer-identity" \
+  || "$(jq -r '.proof_machinery_change_control.protected_change' "${AUTHORITY_STATUS}")" != \
+    "base-policy-shape-plus-exact-head-oid-reseal" \
+  || "$(jq -r '.proof_machinery_change_control.frozen_change' "${AUTHORITY_STATUS}")" != \
+    "rejected" \
+  || "$(jq -r '.proof_machinery_change_control.self_weakening' "${AUTHORITY_STATUS}")" != \
+    "trusted-base-checker-validates-head-before-merge" \
+  || "$(jq -r '.proof_machinery_change_control.anti_replay' "${AUTHORITY_STATUS}")" != \
+    "base-policy-and-exact-head-object-binding" \
   || "$(jq -r '.phase1_blocker.minimum_wire_version' "${AUTHORITY_STATUS}")" != "2" \
   || "$(jq -r '.phase1_blocker.required_shape' "${AUTHORITY_STATUS}")" != \
     "server-held-finish-consume-mint" ]]; then

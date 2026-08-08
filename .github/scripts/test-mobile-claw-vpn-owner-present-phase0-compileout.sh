@@ -612,6 +612,10 @@ expect_checker_failure local_proc_macro \
 
 external_include="${TMP_ROOT}/external-include"
 clone_head "${external_include}"
+# The repository intentionally has no tracked docs/ tree. Recreate the
+# out-of-boundary directory inside the mutation clone so this negative tests
+# the checker rather than failing while arranging its fixture.
+mkdir -p "${external_include}/docs"
 printf '%s\n' 'external compile input' > \
   "${external_include}/docs/phase0 external input.txt"
 cat >> "${external_include}/admin/rust/server-rs/src/handlers_misc.rs" <<'RUST'

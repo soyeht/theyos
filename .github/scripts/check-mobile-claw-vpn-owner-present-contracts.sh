@@ -138,7 +138,7 @@ if [[ "$(jq -r '.contract' "${HEAD_STATUS}")" != \
   || "$(jq -r '.phase0_artifact_boundary.policy_change_control' "${HEAD_STATUS}")" != \
     "base-owned-proof-machinery-commit-bound-inputs" \
   || "$(jq -r '.phase0_artifact_boundary.object_identity_update' "${HEAD_STATUS}")" != \
-    "per-reviewed-commit-revalidation" \
+    "per-commit-revalidation" \
   || "$(jq -r '.phase0_artifact_boundary.object_identity_authority' "${HEAD_STATUS}")" != \
     "commit-bound-evidence-not-independent-approval" \
   || "$(jq -r '.phase0_artifact_boundary.release_provenance' "${HEAD_STATUS}")" != \
@@ -147,19 +147,21 @@ if [[ "$(jq -r '.contract' "${HEAD_STATUS}")" != \
     "nix-theyos-runtime,theyos-engine,theyos-llm-proxy" \
   || "$(jq -r '.phase0_artifact_boundary.required_published_targets | sort | join(",")' "${HEAD_STATUS}")" != \
     "aarch64-apple-darwin,aarch64-unknown-linux-musl,nix-theyos-runtime-x86_64-linux,x86_64-unknown-linux-musl" \
-  || "$(jq -r '.proof_machinery_transition.protocol' "${HEAD_STATUS}")" != \
-    "soyeht-owner-present-proof-machinery-transition-v1" \
-  || "$(jq -r '.proof_machinery_transition.authority' "${HEAD_STATUS}")" != \
-    "base-owned-integrity-checker" \
-  || "$(jq -r '.proof_machinery_transition.state' "${HEAD_STATUS}")" != "unarmed" \
-  || "$(jq -r '.proof_machinery_transition.arming' "${HEAD_STATUS}")" != \
-    "github-owner-review-on-exact-arm-commit" \
-  || "$(jq -r '.proof_machinery_transition.consumption' "${HEAD_STATUS}")" != \
-    "one-shot-exact-tree-and-policy-oid-removes-transition-auth" \
-  || "$(jq -r '.proof_machinery_transition.canary' "${HEAD_STATUS}")" != \
-    "arm-then-consume-merge-blocked-and-allowed" \
-  || "$(jq -r '.proof_machinery_transition.anti_replay' "${HEAD_STATUS}")" != \
-    "base-sha-expected-head-tree-generation-one-shot-consumption" \
+  || "$(jq -r '.proof_machinery_change_control.protocol' "${HEAD_STATUS}")" != \
+    "soyeht-owner-present-base-owned-land-exact-v1" \
+  || "$(jq -r '.proof_machinery_change_control.authority' "${HEAD_STATUS}")" != \
+    "trusted-base-integrity-checker" \
+  || "$(jq -r '.proof_machinery_change_control.state' "${HEAD_STATUS}")" != "active" \
+  || "$(jq -r '.proof_machinery_change_control.maintainer_model' "${HEAD_STATUS}")" != \
+    "single-maintainer-agents-share-maintainer-identity" \
+  || "$(jq -r '.proof_machinery_change_control.protected_change' "${HEAD_STATUS}")" != \
+    "base-policy-shape-plus-exact-head-oid-reseal" \
+  || "$(jq -r '.proof_machinery_change_control.frozen_change' "${HEAD_STATUS}")" != \
+    "rejected" \
+  || "$(jq -r '.proof_machinery_change_control.self_weakening' "${HEAD_STATUS}")" != \
+    "trusted-base-checker-validates-head-before-merge" \
+  || "$(jq -r '.proof_machinery_change_control.anti_replay' "${HEAD_STATUS}")" != \
+    "base-policy-and-exact-head-object-binding" \
   || "$(jq -r '.phase1_blocker.minimum_wire_version' "${HEAD_STATUS}")" != "2" \
   || "$(jq -r '.phase1_blocker.required_shape' "${HEAD_STATUS}")" != \
     "server-held-finish-consume-mint" \
@@ -256,6 +258,7 @@ for pair in "${PAIRS[@]}"; do
 
   source_new=0
   source_retirement=0
+  source_change_control_migration=0
   registration_new=0
   if [[ "${BASE_CONTEXT}" == "1" ]]; then
     base_source="${TMP_DIR}/base-${INDEX}"
@@ -271,6 +274,28 @@ for pair in "${PAIRS[@]}"; do
           && "$(sha256_file "${base_source}")" == "${API_SHAPES_PRIOR_SHA256}" \
           && "$(sha256_file "${head_source}")" == "${API_SHAPES_HISTORICAL_SHA256}" ]]; then
           source_retirement=1
+        elif [[ "${source_rel}" == "${STATUS_SOURCE_REL}" ]] \
+          && jq -e '
+            .proof_machinery_transition == {
+              protocol: "soyeht-owner-present-proof-machinery-transition-v1",
+              authority: "base-owned-integrity-checker",
+              state: "unarmed",
+              arming: "github-owner-review-on-exact-arm-commit",
+              consumption: "one-shot-exact-tree-and-policy-oid-removes-transition-auth",
+              canary: "arm-then-consume-merge-blocked-and-allowed",
+              anti_replay: "base-sha-expected-head-tree-generation-one-shot-consumption"
+            }
+            and .phase0_artifact_boundary.object_identity_update == "per-reviewed-commit-revalidation"
+          ' "${base_source}" >/dev/null \
+          && [[ "$(jq -S 'del(.proof_machinery_transition, .notes, .phase0_artifact_boundary.object_identity_update)' "${base_source}")" == \
+            "$(jq -S 'del(.proof_machinery_change_control, .notes, .phase0_artifact_boundary.object_identity_update)' "${head_source}")" ]] \
+          && [[ "$(jq -S '.notes[2:]' "${base_source}")" == \
+            "$(jq -S '.notes[2:]' "${head_source}")" ]] \
+          && jq -e '
+            .notes[0] == "The base-owned policy freezes immutable roots and requires exact head-object resealing for evolvable proof machinery; declarative Cargo inputs and the boundary descriptor are commit-bound evidence, not independent approval."
+            and .notes[1] == "The trusted-base checker validates every protected head object without executing pull-request code. The repository has one maintainer identity shared by its agents, so change control records exact objects and never pretends that self-review is an independent security boundary."
+          ' "${head_source}" >/dev/null; then
+          source_change_control_migration=1
         else
           echo "::error file=${source_rel}::pinned V1 dependency is immutable; add a new version"
           diff -u "${base_source}" "${head_source}" || true
@@ -332,6 +357,23 @@ for pair in "${PAIRS[@]}"; do
       exit 1
     fi
     echo "Retirement bootstrap: historical V1 authority must land in theyos before the iOS repin."
+    continue
+  fi
+
+  if [[ "${source_change_control_migration}" == "1" ]]; then
+    if [[ "${vendor_exists}" != "1" ]] || ! cmp -s "${base_source}" "${vendor_source}"; then
+      echo "::error file=${vendor_rel}::change-control migration requires the prior iOS vendor until theyos lands"
+      exit 1
+    fi
+    migration_pinned="${TMP_DIR}/change-control-pinned-${INDEX}"
+    if ! materialize_regular_blob \
+      "${THEYOS_DIR}" "${PIN}" "${source_rel}" "${migration_pinned}" \
+      "authority status at the iOS pin" \
+      || ! cmp -s "${vendor_source}" "${migration_pinned}"; then
+      echo "::error file=${PIN_REL}::change-control migration requires iOS to remain pinned to its prior vendor"
+      exit 1
+    fi
+    echo "Change-control bootstrap: land theyos before updating the iOS authority-status vendor and pin."
     continue
   fi
 

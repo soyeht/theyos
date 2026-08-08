@@ -101,7 +101,7 @@ TSV
     "theyos_path": "${BOUNDARY_REL}",
     "format": "closed-git-inputs-v2",
     "policy_change_control": "base-owned-proof-machinery-commit-bound-inputs",
-    "object_identity_update": "per-reviewed-commit-revalidation",
+    "object_identity_update": "per-commit-revalidation",
     "object_identity_authority": "commit-bound-evidence-not-independent-approval",
     "release_provenance": "checker-on-release-subject-and-final-package-attestation",
     "staged_products": [
@@ -116,14 +116,15 @@ TSV
       "nix-theyos-runtime-x86_64-linux"
     ]
   },
-  "proof_machinery_transition": {
-    "protocol": "soyeht-owner-present-proof-machinery-transition-v1",
-    "authority": "base-owned-integrity-checker",
-    "state": "unarmed",
-    "arming": "github-owner-review-on-exact-arm-commit",
-    "consumption": "one-shot-exact-tree-and-policy-oid-removes-transition-auth",
-    "canary": "arm-then-consume-merge-blocked-and-allowed",
-    "anti_replay": "base-sha-expected-head-tree-generation-one-shot-consumption"
+  "proof_machinery_change_control": {
+    "protocol": "soyeht-owner-present-base-owned-land-exact-v1",
+    "authority": "trusted-base-integrity-checker",
+    "state": "active",
+    "maintainer_model": "single-maintainer-agents-share-maintainer-identity",
+    "protected_change": "base-policy-shape-plus-exact-head-oid-reseal",
+    "frozen_change": "rejected",
+    "self_weakening": "trusted-base-checker-validates-head-before-merge",
+    "anti_replay": "base-policy-and-exact-head-object-binding"
   },
   "phase1_blocker": {
     "minimum_wire_version": 2,
