@@ -176,6 +176,147 @@ mod tests {
         CeremonyDeadline::for_test(Instant::now(), Duration::from_secs(3600))
     }
 
+    // ─── Conformance against an implementation that is not ours ────────────
+    //
+    // The plan's M1 carried an interop test against the kernel's WireGuard. We
+    // do not implement WireGuard, so that test does not apply — but its REASON
+    // does, and the plan states it better than anything else in it: *two of
+    // your own programs agreeing prove nothing.* A real TUN round trip does not
+    // satisfy it either; both ends there are ours.
+    //
+    // This drives the REAL `run_xx_handshake` against a pure-Python responder
+    // that shares no code, no state and no cryptography with `snow`. Agreement
+    // on the handshake hash is then evidence about the protocol rather than
+    // about our own wiring.
+
+    /// Repo-relative path to the independent peer.
+    fn peer_script() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../scripts/noise-conformance-peer.py")
+    }
+
+    /// A port nobody is using, released immediately so the peer can take it.
+    fn free_port() -> u16 {
+        let probe = TcpListener::bind(("127.0.0.1", 0)).expect("bind an ephemeral port");
+        probe.local_addr().expect("probe has an address").port()
+    }
+
+    #[test]
+    fn handshake_agrees_with_an_independent_noise_implementation() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::process::{Command, Stdio};
+
+        let port = free_port();
+        let spawned = Command::new("uv")
+            .args(["run", "--quiet", "--with", "noiseprotocol", "python"])
+            .arg(peer_script())
+            .arg(port.to_string())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn();
+
+        let Ok(mut peer) = spawned else {
+            // No `uv` on this machine. A skip must be loud and refusable:
+            // without the escape hatch, a CI job that lost its Python would
+            // report the same green as one that proved interoperability.
+            assert!(
+                std::env::var_os("THEYOS_REQUIRE_NOISE_INTEROP").is_none(),
+                "THEYOS_REQUIRE_NOISE_INTEROP is set but `uv` could not be spawned, \
+                 so the independent-implementation proof cannot run"
+            );
+            eprintln!(
+                "SKIP handshake_agrees_with_an_independent_noise_implementation: `uv` \
+                 not available. Set THEYOS_REQUIRE_NOISE_INTEROP=1 to make this skip \
+                 a failure."
+            );
+            return;
+        };
+
+        let mut lines = BufReader::new(peer.stdout.take().expect("peer stdout is piped")).lines();
+
+        let ready = lines
+            .next()
+            .and_then(Result::ok)
+            .unwrap_or_else(|| "PEER_UNAVAILABLE peer produced no output".to_string());
+        if ready.starts_with("PEER_UNAVAILABLE") {
+            let _ = peer.wait();
+            assert!(
+                std::env::var_os("THEYOS_REQUIRE_NOISE_INTEROP").is_none(),
+                "THEYOS_REQUIRE_NOISE_INTEROP is set but the peer is unavailable: {ready}"
+            );
+            eprintln!("SKIP handshake_agrees_with_an_independent_noise_implementation: {ready}");
+            return;
+        }
+        assert!(
+            ready.starts_with("LISTENING"),
+            "peer must announce readiness before we connect, got {ready:?}"
+        );
+
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the peer");
+
+        // The production entry point, not a re-implementation of it. This is
+        // the whole point: a scratch harness that redoes the same sequence with
+        // `snow` would prove the parameters and leave this function untested.
+        let outcome = run_xx_handshake(&mut stream, Role::Initiator, &far_future_deadline())
+            .expect("XX handshake completes against the independent peer");
+        let ours = outcome
+            .handshake_hash
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+
+        let reported = lines
+            .next()
+            .and_then(Result::ok)
+            .expect("peer reports its handshake hash");
+        let theirs = reported
+            .strip_prefix("HANDSHAKE_HASH ")
+            .unwrap_or_else(|| panic!("expected HANDSHAKE_HASH, got {reported:?}"));
+
+        assert_eq!(
+            ours, theirs,
+            "two independent implementations must derive the same handshake hash"
+        );
+
+        // A handshake that agrees but cannot carry a record would be agreement
+        // about nothing, so the transport is exercised in both directions.
+        let mut transport = outcome.transport;
+        let mut buf = vec![0u8; MAX_NOISE_HANDSHAKE_MESSAGE_LEN as usize];
+        let len = transport
+            .write_message(b"ping-from-production-endpoint", &mut buf)
+            .expect("encrypt a transport record");
+        let framed_len = u32::try_from(len).expect("record length fits in u32");
+        stream
+            .write_all(&framed_len.to_be_bytes())
+            .expect("write the length prefix");
+        stream.write_all(&buf[..len]).expect("write the record");
+
+        let echoed = lines
+            .next()
+            .and_then(Result::ok)
+            .expect("peer reports what it decrypted");
+        assert_eq!(
+            echoed, "DECRYPTED ping-from-production-endpoint",
+            "the independent peer must recover our plaintext exactly"
+        );
+
+        let mut header = [0u8; 4];
+        std::io::Read::read_exact(&mut stream, &mut header).expect("read the reply length");
+        let reply_len = u32::from_be_bytes(header) as usize;
+        let mut reply = vec![0u8; reply_len];
+        std::io::Read::read_exact(&mut stream, &mut reply).expect("read the reply record");
+        let plain_len = transport
+            .read_message(&reply, &mut buf)
+            .expect("decrypt the peer's record");
+        assert_eq!(
+            &buf[..plain_len],
+            b"pong-from-independent-implementation",
+            "we must recover the independent peer's plaintext exactly"
+        );
+
+        let _ = peer.wait();
+    }
+
     #[test]
     fn nonempty_handshake_payload_is_rejected() {
         use std::io::Cursor;
