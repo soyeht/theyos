@@ -273,10 +273,27 @@ jobs:
         # is different: an ordinary GitHub runner CAN satisfy it once uv is
         # installed above, so leaving it permissive here is a CI defect rather
         # than an accommodation.
+        #
+        # `--nocapture` on the core crate is EVIDENCE, not debugging noise, and
+        # removing it silently blinds this step. libtest captures the stdout of
+        # a PASSING test, so a skip that returns early prints its reason into a
+        # buffer that is then discarded. Measured, with the peer unavailable:
+        #
+        #   test noise::tests::handshake_agrees_with_an_independent… ... ok
+        #   test result: ok. 1 passed; 0 failed; …
+        #
+        # — byte-identical to a run where the handshake actually happened, and
+        # the string "SKIP" appears nowhere. So "no SKIP in the log" cannot tell
+        # the two apart; it is exactly what a silent skip looks like.
+        #
+        # With `--nocapture` the log carries the discriminator directly: the
+        # success path prints `interop peer: noiseprotocol=0.3.1`, naming the
+        # independent implementation the claim was made against, and the skip
+        # path prints its reason where a reader can see it.
         env:
           THEYOS_REQUIRE_NOISE_INTEROP: "1"
         run: |
-          cd admin/rust/mesh-session-core-rs && cargo test --locked -- --test-threads=1 2>&1
+          cd admin/rust/mesh-session-core-rs && cargo test --locked -- --test-threads=1 --nocapture 2>&1
           cd ../mesh-session-control-model-rs && cargo test --locked -- --test-threads=1 2>&1
           cargo test --locked --features test-support,roster-sync-unratified \
             --lib --test model_invariants --test cas_multiprocess -- --test-threads=1 2>&1
@@ -516,10 +533,27 @@ jobs:
         # is different: an ordinary GitHub runner CAN satisfy it once uv is
         # installed above, so leaving it permissive here is a CI defect rather
         # than an accommodation.
+        #
+        # `--nocapture` on the core crate is EVIDENCE, not debugging noise, and
+        # removing it silently blinds this step. libtest captures the stdout of
+        # a PASSING test, so a skip that returns early prints its reason into a
+        # buffer that is then discarded. Measured, with the peer unavailable:
+        #
+        #   test noise::tests::handshake_agrees_with_an_independent… ... ok
+        #   test result: ok. 1 passed; 0 failed; …
+        #
+        # — byte-identical to a run where the handshake actually happened, and
+        # the string "SKIP" appears nowhere. So "no SKIP in the log" cannot tell
+        # the two apart; it is exactly what a silent skip looks like.
+        #
+        # With `--nocapture` the log carries the discriminator directly: the
+        # success path prints `interop peer: noiseprotocol=0.3.1`, naming the
+        # independent implementation the claim was made against, and the skip
+        # path prints its reason where a reader can see it.
         env:
           THEYOS_REQUIRE_NOISE_INTEROP: "1"
         run: |
-          cd admin/rust/mesh-session-core-rs && cargo test --locked -- --test-threads=1 2>&1
+          cd admin/rust/mesh-session-core-rs && cargo test --locked -- --test-threads=1 --nocapture 2>&1
           cd ../mesh-session-control-model-rs && cargo test --locked -- --test-threads=1 2>&1
           cargo test --locked --features test-support,roster-sync-unratified \
             --lib --test model_invariants --test cas_multiprocess -- --test-threads=1 2>&1
