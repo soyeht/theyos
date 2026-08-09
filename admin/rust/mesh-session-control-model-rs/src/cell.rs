@@ -288,8 +288,9 @@ impl ControlRecordCell {
     /// enforcing "test-only" — in a normal (non-test) build this was a
     /// fully `pub` method, reachable by any consumer of this crate as a
     /// library, letting it write ANY record content directly. Gated behind
-    /// `test-support`, off by default; this crate's own `cargo test`
-    /// enables it via the dev-dependency-on-self declared in `Cargo.toml`.
+    /// `test-support`, off by default. The standalone full-suite command
+    /// enables it explicitly while selecting non-doctest targets; plain
+    /// `cargo test` deliberately leaves it absent.
     #[cfg(feature = "test-support")]
     pub fn seed_for_test(
         &self,

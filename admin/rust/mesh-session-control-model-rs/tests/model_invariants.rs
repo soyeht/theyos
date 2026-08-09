@@ -412,6 +412,81 @@ fn genesis_write_is_validated_against_the_stores_own_bound_identity_not_new_reco
     );
 }
 
+#[test]
+fn successor_write_rejects_an_identity_different_from_the_stores_binding() {
+    let dir = tempfile::tempdir().unwrap();
+    let cell = test_cell(dir.path().join("record"));
+    let bootstrap = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
+    {
+        let g = cell.acquire_for_mutation_for_test();
+        assert_eq!(
+            cell.seed_for_test(&g, INITIAL_REVISION, &bootstrap),
+            ReplaceOutcome::Committed
+        );
+    }
+
+    // A genesis-only test does not prove replace_exact's fixed-binding guard:
+    // the canonical-bootstrap check independently rejects a forged genesis.
+    // A revision+1 successor reaches the guard without that redundant backup.
+    let mut foreign_successor = bootstrap.clone();
+    foreign_successor.revision += 1;
+    foreign_successor.identity.hh_id = "hh_other".into();
+    let g = cell.acquire_for_mutation_for_test();
+    assert_eq!(
+        cell.seed_for_test(&g, bootstrap.revision, &foreign_successor),
+        ReplaceOutcome::KnownNoEffect,
+        "a valid successor shape must not cross the store's fixed identity binding"
+    );
+    let LoadOutcome::Exact(on_disk) = cell.load_canonical_for_test() else {
+        panic!("the rejected foreign-identity successor must leave the original exact record")
+    };
+    assert_eq!(*on_disk, bootstrap);
+}
+
+#[test]
+fn successor_write_rejects_a_purpose_different_from_the_stores_binding() {
+    let dir = tempfile::tempdir().unwrap();
+    let cell = test_cell(dir.path().join("record"));
+    let bootstrap = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
+    {
+        let g = cell.acquire_for_mutation_for_test();
+        assert_eq!(
+            cell.seed_for_test(&g, INITIAL_REVISION, &bootstrap),
+            ReplaceOutcome::Committed
+        );
+    }
+
+    // Keep this separate from the identity case so each half of the guard's
+    // `identity != ... || purpose != ...` condition is independently proved.
+    let mut foreign_successor = bootstrap.clone();
+    foreign_successor.revision += 1;
+    foreign_successor.purpose = PurposeId::RosterSync;
+    let g = cell.acquire_for_mutation_for_test();
+    assert_eq!(
+        cell.seed_for_test(&g, bootstrap.revision, &foreign_successor),
+        ReplaceOutcome::KnownNoEffect,
+        "a valid successor shape must not cross the store's fixed purpose binding"
+    );
+    let LoadOutcome::Exact(on_disk) = cell.load_canonical_for_test() else {
+        panic!("the rejected foreign-purpose successor must leave the original exact record")
+    };
+    assert_eq!(*on_disk, bootstrap);
+}
+
+#[test]
+fn missing_store_rejects_a_genesis_write_with_a_non_initial_expected_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let cell = test_cell(dir.path().join("record"));
+    let bootstrap = MeshSignerControlRecordV1::bootstrap(identity(), PurposeId::MeshSession);
+    let g = cell.acquire_for_mutation_for_test();
+    assert_eq!(
+        cell.seed_for_test(&g, INITIAL_REVISION + 1, &bootstrap),
+        ReplaceOutcome::KnownNoEffect,
+        "Missing must accept a canonical bootstrap only at INITIAL_REVISION"
+    );
+    assert_eq!(cell.load_canonical_for_test(), LoadOutcome::Missing);
+}
+
 // ── Guard binding: a MutateGuard is not interchangeable across stores ────
 // ── Cell registry: at most one live (store,locks) pair per path ─────────
 

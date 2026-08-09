@@ -66,8 +66,11 @@ path = "tests/model_invariants.rs"
 # enabling the features for every `cargo test` invocation would make that
 # doctest unexpectedly compile and fail its own "must not compile" check.
 # The two properties are proven by two separate, explicit invocations:
-#   cargo test                                            -- closed surface
-#   cargo test --features test-support,roster-sync-unratified -- full suite
+#   cargo test --locked
+#   cargo test --locked --features test-support,roster-sync-unratified \
+#     --lib --test model_invariants --test cas_multiprocess
+# The first proves the closed surface through doctests; the second runs the
+# full feature-gated suite while deliberately selecting no doctest target.
 required-features = ["test-support", "roster-sync-unratified"]
 
 [[test]]
