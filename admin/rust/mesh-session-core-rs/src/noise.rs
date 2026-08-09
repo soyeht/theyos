@@ -195,24 +195,26 @@ mod tests {
             .join("../../../scripts/noise-conformance-peer.py")
     }
 
-    /// A port nobody is using, released immediately so the peer can take it.
-    fn free_port() -> u16 {
-        let probe = TcpListener::bind(("127.0.0.1", 0)).expect("bind an ephemeral port");
-        probe.local_addr().expect("probe has an address").port()
-    }
-
     #[test]
     fn handshake_agrees_with_an_independent_noise_implementation() {
-        use std::io::{BufRead, BufReader, Write};
+        use std::io::{BufRead, BufReader, Read};
         use std::process::{Command, Stdio};
 
-        let port = free_port();
+        // Port 0: the CHILD binds and reports what it got. Picking a port here
+        // and handing it over would be a TOCTOU against the two sibling tests
+        // in this binary that also bind `:0` — and because a lost race looks
+        // like "peer produced no output", it would erode coverage silently
+        // rather than flaking visibly.
         let spawned = Command::new("uv")
             .args(["run", "--quiet", "--with", "noiseprotocol", "python"])
             .arg(peer_script())
-            .arg(port.to_string())
+            .arg("0")
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            // stderr is CAPTURED, not discarded: a nulled stderr makes a
+            // renamed script, a syntax error and an unresolvable dependency
+            // all look identical to "no Python on this machine", which is the
+            // one thing this test is allowed to skip for.
+            .stderr(Stdio::piped())
             .spawn();
 
         let Ok(mut peer) = spawned else {
@@ -232,25 +234,54 @@ mod tests {
             return;
         };
 
+        let mut stderr_pipe = peer.stderr.take().expect("peer stderr is piped");
         let mut lines = BufReader::new(peer.stdout.take().expect("peer stdout is piped")).lines();
 
-        let ready = lines
-            .next()
-            .and_then(Result::ok)
-            .unwrap_or_else(|| "PEER_UNAVAILABLE peer produced no output".to_string());
-        if ready.starts_with("PEER_UNAVAILABLE") {
+        let ready = lines.next().and_then(Result::ok);
+
+        // ONLY the script's own sentinel counts as "this environment cannot run
+        // the peer". Absent output is a broken test, not a missing interpreter,
+        // and treating the two alike is how a test reports success having
+        // proven nothing.
+        if let Some(line) = ready.as_deref()
+            && line.starts_with("PEER_UNAVAILABLE")
+        {
             let _ = peer.wait();
             assert!(
                 std::env::var_os("THEYOS_REQUIRE_NOISE_INTEROP").is_none(),
-                "THEYOS_REQUIRE_NOISE_INTEROP is set but the peer is unavailable: {ready}"
+                "THEYOS_REQUIRE_NOISE_INTEROP is set but the peer is unavailable: {line}"
             );
-            eprintln!("SKIP handshake_agrees_with_an_independent_noise_implementation: {ready}");
+            eprintln!("SKIP handshake_agrees_with_an_independent_noise_implementation: {line}");
             return;
         }
-        assert!(
-            ready.starts_with("LISTENING"),
-            "peer must announce readiness before we connect, got {ready:?}"
-        );
+
+        let ready = ready.unwrap_or_else(|| {
+            let mut diagnostic = String::new();
+            let _ = stderr_pipe.read_to_string(&mut diagnostic);
+            let _ = peer.wait();
+            panic!(
+                "the peer produced no output at all. This is a broken test, not a \
+                 missing interpreter — only the PEER_UNAVAILABLE sentinel may skip. \
+                 peer stderr: {}",
+                diagnostic.trim()
+            )
+        });
+
+        // The child owns the port. Parsing it back also proves the peer really
+        // bound one, rather than us assuming a port it never reached.
+        let port: u16 = ready
+            .strip_prefix("LISTENING ")
+            .unwrap_or_else(|| {
+                let mut diagnostic = String::new();
+                let _ = stderr_pipe.read_to_string(&mut diagnostic);
+                panic!(
+                    "expected `LISTENING <port>`, got {ready:?}; peer stderr: {}",
+                    diagnostic.trim()
+                )
+            })
+            .trim()
+            .parse()
+            .expect("peer announces a numeric port");
 
         let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the peer");
 
@@ -285,11 +316,16 @@ mod tests {
         let len = transport
             .write_message(b"ping-from-production-endpoint", &mut buf)
             .expect("encrypt a transport record");
-        let framed_len = u32::try_from(len).expect("record length fits in u32");
-        stream
-            .write_all(&framed_len.to_be_bytes())
-            .expect("write the length prefix");
-        stream.write_all(&buf[..len]).expect("write the record");
+        // The production framing, not a hand-rolled copy of it. An earlier
+        // draft wrote the length prefix inline and read the reply with
+        // `read_exact` into `vec![0u8; declared]`, which dropped the ceiling
+        // `read_length_prefixed_frame` enforces BEFORE allocating: a peer-
+        // controlled u32 then sized the allocation, and a mutated peer sending
+        // a little-endian prefix made the test allocate ~576 MiB from a 36-byte
+        // record. It also meant the transport framing the auth ceremony will
+        // actually use was the one part NOT proven against the peer.
+        wire::write_transport_record(&mut stream, &buf[..len], &far_future_deadline())
+            .expect("write the record through the production framing");
 
         let echoed = lines
             .next()
@@ -300,11 +336,8 @@ mod tests {
             "the independent peer must recover our plaintext exactly"
         );
 
-        let mut header = [0u8; 4];
-        std::io::Read::read_exact(&mut stream, &mut header).expect("read the reply length");
-        let reply_len = u32::from_be_bytes(header) as usize;
-        let mut reply = vec![0u8; reply_len];
-        std::io::Read::read_exact(&mut stream, &mut reply).expect("read the reply record");
+        let reply = wire::read_transport_record(&mut stream, &far_future_deadline())
+            .expect("read the reply through the production framing");
         let plain_len = transport
             .read_message(&reply, &mut buf)
             .expect("decrypt the peer's record");

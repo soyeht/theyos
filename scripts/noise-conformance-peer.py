@@ -89,9 +89,14 @@ def main() -> int:
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind(("127.0.0.1", port))
     listener.listen(1)
+    # Report the port the kernel ACTUALLY assigned, which is not the argument
+    # when the caller passes 0. Passing 0 is the normal case: it lets the child
+    # own the port instead of the caller picking one and racing every other
+    # test in the same binary that also binds an ephemeral port.
+    bound_port = listener.getsockname()[1]
     # The caller waits for this line. Sleeping instead would make the test
     # flaky on a loaded machine for a reason that has nothing to do with Noise.
-    print(f"LISTENING {port}", flush=True)
+    print(f"LISTENING {bound_port}", flush=True)
     listener.settimeout(30)
 
     conn, _ = listener.accept()
