@@ -10,11 +10,11 @@ pessoal e não entram em documento versionado.
 
 ---
 
-## A decisão que gerou esta versão (medida 2026-08-09 @ `02783f4b`)
+## A decisão que gerou esta versão (medida 2026-08-09 @ `4a31e30f`)
 
 <!-- doc-freshness-anchor
 measured: 2026-08-09
-sha: 02783f4b397dabecfab908500071569397e00969
+sha: 4a31e30f258abcc2bcd083185e1788619a13e087
 paths:
   - admin/rust/mesh-session-core-rs/**
   - admin/rust/mesh-session-control-model-rs/**
@@ -22,6 +22,7 @@ paths:
   - admin/rust/t1-iptunnel-dev-runner-rs/**
   - admin/rust/nat-probe-rs/**
   - admin/rust/scripts/graph-gate/**
+  - scripts/noise-conformance-peer.py
   - .github/workflows/backend-ci.yml
 -->
 
@@ -212,10 +213,28 @@ linguagem, sem compartilhar crypto nem estado com o `snow`.
 hash**; e as negativas (bit flip, replay, reorder, prologue trocado) falham nos
 dois modos.
 
-> Estado: o interop ao vivo (b) já foi provado fora do repo — `snow` ↔ uma
-> implementação Python independente, com o prologue e o framing reais, derivaram
-> hash idêntico e trocaram transporte nos dois sentidos. Falta portar como teste
-> versionado e escrever (a).
+> **Estado (2026-08-09): M1a ABERTO.** Fechou-se a metade (b), e só ela.
+>
+> **(b) feito, com ressalva de automação.** O interop ao vivo está versionado
+> como teste do core: `snow` ↔ `noiseprotocol`, prologue e framing reais, cada
+> lado com chave própria, hash de handshake idêntico e transporte nos dois
+> sentidos. O comparando é **pinado** — `noiseprotocol==0.3.1` — porque numa
+> prova de conformidade a implementação externa *é* parte do vetor, e um pin
+> flutuante deixa a afirmação mudar de sujeito sem diff no repositório. O teste
+> é refusável por `THEYOS_REQUIRE_NOISE_INTEROP`, e essa escotilha existe para o
+> laptop sem `uv`, não para o CI.
+>
+> **Validado localmente nos dois modos**: com o peer disponível passa nomeando a
+> versão importada; sem o peer e com `REQUIRE` ligado falha. **A automação
+> obrigatória ainda não está na `main`** — vive num PR de CI empilhado sobre
+> este. Enquanto ela não mesclar, este teste pode pular e publicar verde, o que
+> é a mesma dívida de evidência que o M1c fechou.
+>
+> **(a) não começou.** Vetores determinísticos em harness isolado, e as
+> negativas (bit flip, replay, reorder, prologue trocado) nos dois modos. Sem
+> isso o "Pronto quando" acima não está satisfeito, e nenhuma prova de (b) o
+> substitui: uma implementação que concorda com a nossa não demonstra que ela
+> recusa o que deve recusar.
 
 ## M1b — Wire e autorização cross-language
 
