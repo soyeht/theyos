@@ -29,6 +29,7 @@ on:
       - "tests/install-nixos-test.sh"
       - "tests/nixos-install/**"
       - ".github/workflows/backend-ci.yml"
+      - ".github/workflows/backend-ci-docs-shim.yml"
   pull_request:
     paths:
       - "admin/rust/**"
@@ -41,6 +42,7 @@ on:
       - "tests/install-nixos-test.sh"
       - "tests/nixos-install/**"
       - ".github/workflows/backend-ci.yml"
+      - ".github/workflows/backend-ci-docs-shim.yml"
   workflow_dispatch:
 
 # One run per workflow per ref. A new commit supersedes the old run instead of

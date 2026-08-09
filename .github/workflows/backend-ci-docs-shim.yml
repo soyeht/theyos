@@ -22,11 +22,28 @@
 #                                                build. SILENT — see #461.
 #
 # The second is not drift between the lists; it is a path both lists forgot, so
-# reviewing them against each other cannot find it. That is why `scripts/**` was
-# added below: it held 37 Python files, 7 of them CI gates, and — since the
-# mesh-session Noise interop test spawns `scripts/noise-conformance-peer.py` —
-# breaking that peer was a `scripts/`-only diff that merged green while
-# disabling the test depending on it.
+# reviewing them against each other cannot find it. Two were forgotten:
+#
+#   `scripts/**` — 37 Python files, 7 of them CI gates. And since the
+#   mesh-session Noise interop test spawns `scripts/noise-conformance-peer.py`,
+#   breaking that peer was a `scripts/`-only diff that merged green while
+#   disabling the test depending on it.
+#
+#   THIS FILE — the shim was in no list at all, including its own. A PR editing
+#   only the shim skipped the real build and was then approved by the shim's own
+#   greens: the mechanism that publishes checks on behalf of a build that did not
+#   run was exempt from that build, so it could validate its own alteration.
+#
+# One shared list closes both, because `paths` and `paths-ignore` read it with
+# INVERSE meaning — the same entry that makes a workflow fire makes the other
+# suppress:
+#
+#   file listed in backend-ci `paths`        -> real build FIRES
+#   file listed in shim `paths-ignore`       -> shim SUPPRESSED
+#
+# The `.github/workflows/backend-ci.yml` line above is the pattern already in
+# use: editing the real workflow runs the real build and is not treated as
+# docs-only. The shim now sits beside it for the same reason.
 name: Backend CI (docs-only shim)
 
 on:
@@ -42,6 +59,7 @@ on:
       - "tests/install-nixos-test.sh"
       - "tests/nixos-install/**"
       - ".github/workflows/backend-ci.yml"
+      - ".github/workflows/backend-ci-docs-shim.yml"
 
 # One run per workflow per ref. A new commit supersedes the old run instead of
 # leaving it to burn a full build on code that no longer exists.
