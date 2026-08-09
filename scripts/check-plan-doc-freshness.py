@@ -80,7 +80,7 @@ STATUSES = (STATUS_ANCHORED, STATUS_EXEMPT)
 # Emptied on 2026-08-06.  The entire planning corpus was retired when the owner
 # replanned the product, so there is no document left for the floor to name --
 # naming one that does not exist would be worse than naming none.
-REQUIRED_ANCHORED: tuple[str, ...] = ()
+REQUIRED_ANCHORED: tuple[str, ...] = ("docs/mesh-plan.md",)
 
 # Emptying the floor removes this gate's teeth, so the empty state is not a
 # quiet pass: it is a DEADLINE.  Until this date the gate reports the

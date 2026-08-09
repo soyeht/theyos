@@ -10,7 +10,21 @@ pessoal e não entram em documento versionado.
 
 ---
 
-## A decisão que gerou esta versão
+## A decisão que gerou esta versão (medida 2026-08-08 @ `4af2ed3b`)
+
+<!-- doc-freshness-anchor
+measured: 2026-08-08
+sha: 4af2ed3b20cf370d1dbfe43c7a9d4491720fbe3a
+paths:
+  - admin/rust/mesh-session-core-rs/**
+  - admin/rust/mesh-session-control-model-rs/**
+  - admin/rust/server-rs/src/claw_vpn_*
+  - admin/rust/t1-iptunnel-dev-runner-rs/**
+  - admin/rust/nat-probe-rs/**
+  - admin/rust/scripts/graph-gate/**
+  - .github/workflows/backend-ci.yml
+-->
+
 
 A v4 especificava um datapath WireGuard do zero: `boringtun`, os tipos
 `PacketCrypto` / `WireGuardDevice` / `SoyehtBind`, e um teste de interoperação
