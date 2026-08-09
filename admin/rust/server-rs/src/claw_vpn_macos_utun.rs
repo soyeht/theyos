@@ -638,8 +638,8 @@ mod tests {
 
     #[test]
     fn macos_utun_carries_a_real_kernel_packet_in_both_directions() {
-        const LOCAL: &str = "10.99.0.1";
-        const PEER: &str = "10.99.0.2";
+        const LOCAL: &str = "192.0.2.10";
+        const PEER: &str = "192.0.2.11";
 
         if !running_as_root() {
             // A skip must be loud and must be refusable. Without the escape
