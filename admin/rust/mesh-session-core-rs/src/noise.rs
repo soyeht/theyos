@@ -189,6 +189,49 @@ mod tests {
     // on the handshake hash is then evidence about the protocol rather than
     // about our own wiring.
 
+    /// The independent implementation this conformance claim is made against.
+    ///
+    /// PINNED, and it is part of the vector rather than tooling hygiene: with
+    /// an unpinned `--with noiseprotocol`, a later run agrees with a *different*
+    /// implementation than the one the claim was measured against, and nothing
+    /// in the repository changes. A floating comparand silently changes the
+    /// subject of the assertion.
+    ///
+    /// Advancing it is a deliberate act: change this constant, and the peer's
+    /// reported version must match or the test fails.
+    const PEER_NOISE_VERSION: &str = "0.3.1";
+
+    /// Kills and reaps the peer on every exit path, including a panic.
+    ///
+    /// `std::process::Child` does not kill on drop, so an assertion failing
+    /// mid-test used to leave the peer alive until its own 30 s socket timeout
+    /// retired it. That leaks a process and a port for half a minute per
+    /// failure, which is how a suite that fails once starts failing its
+    /// neighbours for unrelated reasons.
+    struct PeerGuard(Option<std::process::Child>);
+
+    impl PeerGuard {
+        /// Wait for a clean exit and assert it. Consumes the guard, so the
+        /// `Drop` path below is only ever the abnormal one.
+        fn expect_clean_exit(mut self) {
+            let mut child = self.0.take().expect("peer is taken exactly once");
+            let status = child.wait().expect("peer terminates");
+            assert!(
+                status.success(),
+                "the peer exited unsuccessfully ({status}); its handshake claims cannot be trusted"
+            );
+        }
+    }
+
+    impl Drop for PeerGuard {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
     /// Repo-relative path to the independent peer.
     fn peer_script() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -206,7 +249,9 @@ mod tests {
         // like "peer produced no output", it would erode coverage silently
         // rather than flaking visibly.
         let spawned = Command::new("uv")
-            .args(["run", "--quiet", "--with", "noiseprotocol", "python"])
+            .args(["run", "--quiet", "--with"])
+            .arg(format!("noiseprotocol=={PEER_NOISE_VERSION}"))
+            .arg("python")
             .arg(peer_script())
             .arg("0")
             .stdout(Stdio::piped())
@@ -236,6 +281,27 @@ mod tests {
 
         let mut stderr_pipe = peer.stderr.take().expect("peer stderr is piped");
         let mut lines = BufReader::new(peer.stdout.take().expect("peer stdout is piped")).lines();
+        // From here on every exit path — including a panicking assertion — kills
+        // and reaps the peer, instead of leaving it to its own 30 s timeout.
+        let peer = PeerGuard(Some(peer));
+
+        // Which implementation did we actually agree with? Asserted before any
+        // crypto claim, because a conformance result is only meaningful once the
+        // comparand is known.
+        let versions = lines
+            .next()
+            .and_then(Result::ok)
+            .unwrap_or_else(|| "PEER_VERSIONS <absent>".to_string());
+        if let Some(reported) = versions.strip_prefix("PEER_VERSIONS ") {
+            assert!(
+                reported.contains(&format!("noiseprotocol={PEER_NOISE_VERSION}")),
+                "the peer is not the pinned implementation this claim was measured \
+                 against: expected noiseprotocol={PEER_NOISE_VERSION}, peer reported {reported:?}"
+            );
+            // `cryptography` is reported and deliberately not asserted — see
+            // `report_versions` in the peer for why. It is on the record either way.
+            eprintln!("interop peer: {reported}");
+        }
 
         let ready = lines.next().and_then(Result::ok);
 
@@ -246,7 +312,7 @@ mod tests {
         if let Some(line) = ready.as_deref()
             && line.starts_with("PEER_UNAVAILABLE")
         {
-            let _ = peer.wait();
+            drop(peer);
             assert!(
                 std::env::var_os("THEYOS_REQUIRE_NOISE_INTEROP").is_none(),
                 "THEYOS_REQUIRE_NOISE_INTEROP is set but the peer is unavailable: {line}"
@@ -258,7 +324,6 @@ mod tests {
         let ready = ready.unwrap_or_else(|| {
             let mut diagnostic = String::new();
             let _ = stderr_pipe.read_to_string(&mut diagnostic);
-            let _ = peer.wait();
             panic!(
                 "the peer produced no output at all. This is a broken test, not a \
                  missing interpreter — only the PEER_UNAVAILABLE sentinel may skip. \
@@ -347,7 +412,10 @@ mod tests {
             "we must recover the independent peer's plaintext exactly"
         );
 
-        let _ = peer.wait();
+        // Not `let _ = wait()`: a peer that reached the end of its script but
+        // exited nonzero would otherwise let this test pass on claims made by a
+        // process that then failed.
+        peer.expect_clean_exit();
     }
 
     #[test]

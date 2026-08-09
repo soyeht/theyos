@@ -24,10 +24,17 @@ Deliberately NOT a general-purpose tool.  It speaks exactly the parameters in
 
 Run standalone:
 
-    uv run --with noiseprotocol python scripts/noise-conformance-peer.py <port>
+    uv run --with noiseprotocol==0.3.1 python scripts/noise-conformance-peer.py <port>
 
-It prints `LISTENING <port>` once bound -- callers must wait for that line
-rather than sleeping, then `HANDSHAKE_HASH <hex>` after the third flight.
+The version is PINNED, and that is not tidiness. In a conformance test the
+external implementation *is* part of the vector: an unpinned `--with
+noiseprotocol` means a future run can agree with a different implementation
+than the one this claim was made against, with no diff anywhere in the
+repository. A floating comparand makes the claim's subject change silently.
+
+It prints, in order: `PEER_VERSIONS ...` naming what it actually imported,
+`LISTENING <port>` once bound (callers must wait for that line rather than
+sleeping), then `HANDSHAKE_HASH <hex>` after the third flight.
 """
 
 from __future__ import annotations
@@ -79,11 +86,37 @@ def write_frame(conn: socket.socket, payload: bytes) -> None:
     conn.sendall(struct.pack(">I", len(payload)) + payload)
 
 
+def report_versions() -> None:
+    """Announce what was actually imported, before doing any crypto.
+
+    The caller asserts the `noiseprotocol` version, because that is the
+    implementation the conformance claim is made against. `cryptography` is
+    reported and deliberately NOT asserted: it is a transitive dependency
+    supplying primitives rather than the Noise state machine, and pinning it
+    here would break on Python versions this peer is otherwise indifferent to.
+    Reporting it means a drift is visible in the run's own output instead of
+    being invisible — the version is on the record either way.
+    """
+    try:
+        from importlib.metadata import version
+    except ImportError:  # pragma: no cover
+        print("PEER_VERSIONS unknown", flush=True)
+        return
+    parts = []
+    for package in ("noiseprotocol", "cryptography"):
+        try:
+            parts.append(f"{package}={version(package)}")
+        except Exception:  # noqa: BLE001 - a missing version must not abort the peer
+            parts.append(f"{package}=unknown")
+    print("PEER_VERSIONS " + " ".join(parts), flush=True)
+
+
 def main() -> int:
     if len(sys.argv) != 2:
         print("usage: noise-conformance-peer.py <port>", file=sys.stderr)
         return 2
     port = int(sys.argv[1])
+    report_versions()
 
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
