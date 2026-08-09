@@ -236,10 +236,25 @@ frames, DATA/CLOSE/REKEY.
 
 ---
 
-## M1c — CI do core · BLOQUEADOR
+## M1c — CI do core · FECHADO 2026-08-09
 
-**O núcleo do protocolo não roda em CI nenhum.** Verificado por dois caminhos
-independentes em 2026-08-08:
+**Estado atual:** o #458 (`350203a6`) adicionou aos jobs Linux e macOS as três
+invocações explícitas descritas abaixo. O #459 (`d69bc5b1`) adicionou provas
+diretas e individualmente não-vácuas dos guards de `identity`, `purpose` e
+`revision` do store. Nos logs dos dois runners, não apenas no status dos jobs,
+foram observados:
+
+- 206/206 testes do core;
+- 0 testes + 13/13 doctests do modelo de controle com a superfície fechada;
+- 4/4 testes de CAS multiprocesso e 137/137 invariantes com as features ligadas.
+
+Assim, o bloqueio de evidência que originou este marco está fechado. Isso
+**não** promove o `dev_t1_datapath`: satisfaz apenas um dos critérios de
+promoção listados acima.
+
+**Achado histórico que originou o marco.** Antes do #458, o núcleo do protocolo
+não rodava em CI nenhum. Isso foi verificado por dois caminhos independentes em
+2026-08-08:
 
 1. `admin/rust/Cargo.toml` traz `exclude = ["mesh-session-control-model-rs",
    "mesh-session-core-rs"]`, então `cargo test --workspace` nunca os alcança;
@@ -252,16 +267,17 @@ independentes em 2026-08-08:
 4. dependente com feature ligada compila o crate, mas cargo não roda teste de
    dependência.
 
-Resultado: ~206 testes do protocolo Noise e a CAS multiprocesso do modelo de
-controle passam localmente e **nunca** em automação.
+Naquela árvore, ~206 testes do protocolo Noise e a CAS multiprocesso do modelo
+de controle passavam localmente e **nunca** em automação.
 
 Isso não é dívida de cobertura, é dívida de *evidência*: a decisão de manter o
 stack Noise foi tomada porque ele tem essa cobertura. Cobertura que não executa
 não sustenta a decisão que ela justificou.
 
-**Construir:** job explícito em Linux **e** macOS — a CAS do modelo de controle
-é construída sobre `std::fs::File::lock`, cujo comportamento é específico de
-plataforma. Os testes versionados do M1a/M1b entram no mesmo gate.
+**Implementação adotada:** step explícito em Linux **e** macOS — a CAS do modelo
+de controle é construída sobre `std::fs::File::lock`, cujo comportamento é
+específico de plataforma. Os testes versionados do M1a/M1b entram no mesmo
+gate.
 
 **O modelo de controle exige DUAS invocações, e a primeira sozinha é vácua.** Os
 dois integration targets declaram
@@ -281,8 +297,8 @@ ausente por padrão. Com as features ligadas esses trechos compilam e o doctest
 reprova o próprio "não pode compilar" — medido, 5 falhas. Por isso a segunda
 seleciona targets explicitamente e não roda doctest.
 
-**Pronto quando:** os dois crates rodam em CI nos dois runners **e** a
-não-vacuidade está medida por comando, não afirmada:
+**Critério verificado:** os dois crates rodam em CI nos dois runners **e** a
+não-vacuidade foi medida por comando, não afirmada:
 
 | mutação | comando simples | comando com features |
 |---|---|---|
@@ -329,7 +345,8 @@ acoplar a biblioteca de protocolo ao `.github/`. Não é bloqueador do gate atua
 > Muda `.github/`, então vai em PR e revisão próprios — não entra de carona num
 > branch de feature.
 
-**A promoção do `dev_t1_datapath` passa a exigir M1c verde.**
+**A promoção do `dev_t1_datapath` exige M1c verde. Esse critério está satisfeito;
+os demais continuam obrigatórios.**
 
 ## M2 — TUN Linux ↔ utun macOS na LAN · MUDA DE FORMA
 
