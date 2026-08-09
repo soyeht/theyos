@@ -27,5 +27,11 @@
     "anchor block is checked whether or not it is listed here; a missing scan",
     "root scans as empty. Opting in costs one edit."
   ],
-  "documents": []
+  "documents": [
+    {
+      "path": "docs/mesh-plan.md",
+      "status": "anchored",
+      "reason": "The replacement plan the 2026-08-06 interregnum was waiting for. Enrolled 2026-08-08, about five weeks before PLAN_ENROLLMENT_DEADLINE rather than left to expire: the gate names its own remedy, and a follow-up that waits on a deadline is a failure mode this repo already has a record of. The pathspecs are wide because the document's measured claims are wide -- which crates exist and how mature they are, that the graph-gate runs 'cargo check' and not 'cargo test' on the excluded crates, that two integration targets carry required-features, and what the backend workflow does. Each rots the moment its path moves, so each is named; a narrower anchor would read fresh while the claims went stale."
+    }
+  ]
 }

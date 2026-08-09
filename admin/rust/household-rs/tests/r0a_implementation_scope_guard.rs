@@ -384,7 +384,7 @@ fn r0a_n_ratchet_names_new_targets() {
     let ratchet_path = ["owner_mesh_", "rendezvous_codec.rs"].concat();
     let r1a7 = read(package_dir().join("tests").join(ratchet_path));
     for needle in [
-        "assert_eq!(targets.len(), 208",
+        "assert_eq!(targets.len(), 210",
         "filter(|target| target.kind == \"test\")",
         "right total by two errors that cancel: the base was 152 in the tree,",
         "name == \"caveat_narrowing\"",
@@ -466,11 +466,15 @@ fn r0a_d2a_tests_stay_inline_and_off_the_cargo_target_ratchet() {
     // s1_design_guards — the +2 tests), plus one more `[[test]]` target,
     // `mesh-session-runtime-rs/tests/compile_fail_channel_mapping.rs` (the
     // trybuild runner proving the channel mapping is exhaustive — the +1
-    // test). Each increment is named so the total and its explanation
-    // cannot drift apart. D2a still keeps its focused tests in `#[cfg(test)]
-    // mod tests`, so it contributes nothing to that count; a future slice
-    // that wants an integration target has to move the ratchet deliberately
-    // rather than by accident.
+    // test), plus the `nat-probe-rs` workspace member (the M0a NAT mapping
+    // probe), which is +2 BINS rather than the +1 a new crate usually costs:
+    // it declares an explicit `[[bin]]` over `src/main.rs` and also leaves
+    // `autobins` on, so the enumerator counts that one file twice, under the
+    // bin name and again under the package name. Each increment is named so
+    // the total and its explanation cannot drift apart. D2a still keeps its
+    // focused tests in `#[cfg(test)] mod tests`, so it contributes nothing to
+    // that count; a future slice that wants an integration target has to move
+    // the ratchet deliberately rather than by accident.
     for absent in [
         "tests/device_cert.rs",
         "tests/device_admission.rs",
@@ -478,14 +482,14 @@ fn r0a_d2a_tests_stay_inline_and_off_the_cargo_target_ratchet() {
     ] {
         assert!(
             !package_dir().join(absent).exists(),
-            "D2a adds no Cargo test target; R1a.7 pins 208/157 and none of it \
+            "D2a adds no Cargo test target; R1a.7 pins 210/157 and none of it \
              is D2a's: {absent}"
         );
     }
 
     let ratchet_path = ["owner_mesh_", "rendezvous_codec.rs"].concat();
     let r1a7 = read(package_dir().join("tests").join(ratchet_path));
-    assert!(r1a7.contains("assert_eq!(targets.len(), 208"));
+    assert!(r1a7.contains("assert_eq!(targets.len(), 210"));
     assert!(r1a7.contains("right total by two errors that cancel: the base was 152 in the tree,"));
 
     // Coverage ratchet: counts the `#[test]` attribute itself, not any `fn`, so

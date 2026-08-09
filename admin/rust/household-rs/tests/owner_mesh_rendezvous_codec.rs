@@ -374,7 +374,15 @@ fn r1a7_enumerates_linked_targets_and_proves_zero_production_callers() {
     // lines down is still exactly what it says: members moved by one when
     // this crate joined, and that fact does not change just because targets
     // later did.
-    assert_eq!(members.len(), 31, "workspace member inventory changed");
+    //
+    // 31 + 1 `nat-probe-rs` (M0a NAT mapping probe). It joins as a real member
+    // for the reason `mesh-session-runtime-rs` did above: a crate outside the
+    // workspace is not built by `--workspace` and therefore has no CI at all.
+    // It ships no `tests/` dir, so it adds nothing to the test-kind count — but
+    // it adds TWO bin targets, not one. See the target count below for why; the
+    // prediction written here first said "exactly one" and the enumerator said
+    // otherwise, which is the third time this file has caught that arithmetic.
+    assert_eq!(members.len(), 32, "workspace member inventory changed");
     assert!(
         members
             .iter()
@@ -437,10 +445,28 @@ fn r1a7_enumerates_linked_targets_and_proves_zero_production_callers() {
     // are each right about half of it. The value below is what the enumerator
     // reported on the MERGED tree -- not 202 + 6, which is the arithmetic this
     // file already records as having been wrong twice.
-    assert_eq!(targets.len(), 208, "Cargo target inventory changed");
+    //
+    // 208 + 2, both from `nat-probe-rs`, and the "+1" predicted when it was
+    // added was wrong. The crate declares an explicit `[[bin]] name =
+    // "nat-probe", path = "src/main.rs"` AND leaves `autobins` at its default,
+    // so `enumerate_workspace_targets` inserts the explicit target *and* then
+    // auto-discovers the same `src/main.rs` a second time under the PACKAGE
+    // name. Two entries differing only in `name` are two members of the
+    // `BTreeSet`, so one file becomes two targets.
+    //
+    // This is an artifact of the enumerator, not of cargo, and it is not new:
+    // `server-rs` has carried the identical pair (`server` explicit,
+    // `server-rs` auto-discovered) all along — the two `any()` assertions
+    // further down pin exactly that. Left as-is rather than "fixed" with
+    // `autobins = false`, which would change the crate's manifest to make a
+    // number in this file smaller; the assertions below name both entries
+    // instead, so the pair is pinned rather than merely counted.
+    assert_eq!(targets.len(), 210, "Cargo target inventory changed");
     assert_eq!(
         targets.iter().filter(|target| target.kind == "bin").count(),
-        50
+        // 50 + 2: both of `nat-probe-rs`'s entries are bin-kind. The test and
+        // example counts below are untouched — it ships neither.
+        52
     );
     assert_eq!(
         targets
@@ -496,6 +522,21 @@ fn r1a7_enumerates_linked_targets_and_proves_zero_production_callers() {
             && target.kind == "bin"
             && target.name == "m1-household-mesh-smoke"
             && target.path == "m1-household-mesh-smoke-rs/src/main.rs"
+    }));
+    // Both halves of the nat-probe pair, named. The count alone would let the
+    // explicit bin be renamed or dropped while the auto-discovered one kept the
+    // total at 210.
+    assert!(targets.iter().any(|target| {
+        target.package == "nat-probe-rs"
+            && target.kind == "bin"
+            && target.name == "nat-probe"
+            && target.path == "nat-probe-rs/src/main.rs"
+    }));
+    assert!(targets.iter().any(|target| {
+        target.package == "nat-probe-rs"
+            && target.kind == "bin"
+            && target.name == "nat-probe-rs"
+            && target.path == "nat-probe-rs/src/main.rs"
     }));
     assert!(targets.iter().any(|target| {
         target.package == "m1-household-mesh-smoke-rs"

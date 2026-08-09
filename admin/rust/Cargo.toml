@@ -22,6 +22,7 @@ members = [
     "llm-proxy-rs",
     "m1-household-mesh-smoke-rs",
     "mesh-session-runtime-rs",
+    "nat-probe-rs",
     "session-rs",
     "server-rs",
     "store-rs",
