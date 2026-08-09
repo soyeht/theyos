@@ -8,14 +8,32 @@
 # https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/collaborating-on-repositories-with-code-quality-features/troubleshooting-required-status-checks#handling-skipped-but-required-checks
 #
 # KEEP `paths-ignore` BYTE-IDENTICAL to `on.pull_request.paths` in
-# backend-ci.yml. If the lists drift the failure mode is safe (a PR class
-# where neither workflow reports, blocking the PR again) but annoying.
+# backend-ci.yml.
+#
+# The old note here said drift's failure mode "is safe (a PR class where
+# neither workflow reports, blocking the PR again) but annoying". That covers
+# only ONE of the two ways the lists can disagree, and it is the harmless one:
+#
+#   in paths-ignore, not in backend-ci.paths  -> neither runs; PR blocked. LOUD.
+#   in NEITHER list                           -> backend-ci skips, the shim runs
+#                                                (the path is outside its ignore
+#                                                list), and the shim publishes the
+#                                                required contexts GREEN with no
+#                                                build. SILENT — see #461.
+#
+# The second is not drift between the lists; it is a path both lists forgot, so
+# reviewing them against each other cannot find it. That is why `scripts/**` was
+# added below: it held 37 Python files, 7 of them CI gates, and — since the
+# mesh-session Noise interop test spawns `scripts/noise-conformance-peer.py` —
+# breaking that peer was a `scripts/`-only diff that merged green while
+# disabling the test depending on it.
 name: Backend CI (docs-only shim)
 
 on:
   pull_request:
     paths-ignore:
       - "admin/rust/**"
+      - "scripts/**"
       - "admin/contracts/mobile-claw-vpn/v1/**"
       - "admin/contracts/owner-approval/v2/**"
       - ".env.example"
