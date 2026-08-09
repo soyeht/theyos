@@ -223,6 +223,24 @@ mod tests {
         }
     }
 
+    impl PeerGuard {
+        /// Kill the peer FIRST, then drain its stderr for a panic message.
+        ///
+        /// Order matters: reading a live child's stderr blocks until the child
+        /// closes it, which for this peer means waiting out its own 30 s socket
+        /// timeout. Killing first closes the pipe, so a broken run fails in
+        /// milliseconds with the diagnostic attached instead of stalling.
+        fn diagnose(&mut self, stderr: &mut std::process::ChildStderr) -> String {
+            if let Some(child) = self.0.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            let mut captured = String::new();
+            let _ = std::io::Read::read_to_string(stderr, &mut captured);
+            captured.trim().to_string()
+        }
+    }
+
     impl Drop for PeerGuard {
         fn drop(&mut self) {
             if let Some(mut child) = self.0.take() {
@@ -283,35 +301,25 @@ mod tests {
         let mut lines = BufReader::new(peer.stdout.take().expect("peer stdout is piped")).lines();
         // From here on every exit path — including a panicking assertion — kills
         // and reaps the peer, instead of leaving it to its own 30 s timeout.
-        let peer = PeerGuard(Some(peer));
+        let mut peer = PeerGuard(Some(peer));
 
-        // Which implementation did we actually agree with? Asserted before any
-        // crypto claim, because a conformance result is only meaningful once the
-        // comparand is known.
-        let versions = lines
-            .next()
-            .and_then(Result::ok)
-            .unwrap_or_else(|| "PEER_VERSIONS <absent>".to_string());
-        if let Some(reported) = versions.strip_prefix("PEER_VERSIONS ") {
-            assert!(
-                reported.contains(&format!("noiseprotocol={PEER_NOISE_VERSION}")),
-                "the peer is not the pinned implementation this claim was measured \
-                 against: expected noiseprotocol={PEER_NOISE_VERSION}, peer reported {reported:?}"
-            );
-            // `cryptography` is reported and deliberately not asserted — see
-            // `report_versions` in the peer for why. It is on the record either way.
-            eprintln!("interop peer: {reported}");
-        }
+        // The peer's FIRST line is one of exactly two things, and it is read as
+        // a two-variant enum rather than as a version line that might also be
+        // something else. An earlier version consumed this line unconditionally
+        // as `PEER_VERSIONS`, which made the script's own `PEER_UNAVAILABLE`
+        // sentinel UNREACHABLE: the import fails at module top, before any
+        // version can be reported, so the sentinel arrived here, was swallowed
+        // as a version line, and the run then panicked on the missing
+        // `LISTENING` instead of skipping. The "no uv" control never caught it
+        // because that control measures a spawn failure, which is a different
+        // path entirely — two skip mechanisms, one of them tested.
+        let first = lines.next().and_then(Result::ok);
 
-        let ready = lines.next().and_then(Result::ok);
-
-        // ONLY the script's own sentinel counts as "this environment cannot run
-        // the peer". Absent output is a broken test, not a missing interpreter,
-        // and treating the two alike is how a test reports success having
-        // proven nothing.
-        if let Some(line) = ready.as_deref()
-            && line.starts_with("PEER_UNAVAILABLE")
+        if first
+            .as_deref()
+            .is_some_and(|line| line.starts_with("PEER_UNAVAILABLE"))
         {
+            let line = first.expect("checked above");
             drop(peer);
             assert!(
                 std::env::var_os("THEYOS_REQUIRE_NOISE_INTEROP").is_none(),
@@ -321,14 +329,48 @@ mod tests {
             return;
         }
 
-        let ready = ready.unwrap_or_else(|| {
-            let mut diagnostic = String::new();
-            let _ = stderr_pipe.read_to_string(&mut diagnostic);
+        // Not the sentinel, so it MUST be the version line. An unrecognised
+        // first line is a hard failure: letting it through is how a peer that
+        // is not the one we think it is gets to make claims.
+        let versions = first.unwrap_or_else(|| {
+            let diagnostic = peer.diagnose(&mut stderr_pipe);
             panic!(
-                "the peer produced no output at all. This is a broken test, not a \
-                 missing interpreter — only the PEER_UNAVAILABLE sentinel may skip. \
-                 peer stderr: {}",
-                diagnostic.trim()
+                "the peer produced no output at all. Only the PEER_UNAVAILABLE \
+                 sentinel may skip. peer stderr: {diagnostic}"
+            )
+        });
+        let reported = versions.strip_prefix("PEER_VERSIONS ").unwrap_or_else(|| {
+            let diagnostic = peer.diagnose(&mut stderr_pipe);
+            panic!(
+                "expected PEER_VERSIONS or PEER_UNAVAILABLE as the peer's first \
+                 line, got {versions:?}; peer stderr: {diagnostic}"
+            )
+        });
+
+        // Token equality, not `contains`. `contains("noiseprotocol=0.3.1")` is
+        // also satisfied by 0.3.10, so a substring test would accept a
+        // different implementation than the pinned one.
+        let expected = format!("noiseprotocol={PEER_NOISE_VERSION}");
+        assert!(
+            reported.split_whitespace().any(|token| token == expected),
+            "the peer is not the pinned implementation this claim was measured \
+             against: expected {expected:?}, peer reported {reported:?}"
+        );
+        // `cryptography` is reported and deliberately not asserted — see
+        // `report_versions` in the peer for why. It is on the record either way.
+        eprintln!("interop peer: {reported}");
+
+        let ready = lines.next().and_then(Result::ok);
+
+        // ONLY the script's own sentinel counts as "this environment cannot run
+        // the peer". Absent output is a broken test, not a missing interpreter,
+        // and treating the two alike is how a test reports success having
+        // proven nothing.
+        let ready = ready.unwrap_or_else(|| {
+            let diagnostic = peer.diagnose(&mut stderr_pipe);
+            panic!(
+                "the peer announced its versions and then stopped before binding \
+                 a port. peer stderr: {diagnostic}"
             )
         });
 
