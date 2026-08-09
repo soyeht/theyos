@@ -231,22 +231,38 @@ mod tests {
         /// timeout. Killing first closes the pipe, so a broken run fails in
         /// milliseconds with the diagnostic attached instead of stalling.
         fn diagnose(&mut self, stderr: &mut std::process::ChildStderr) -> String {
-            if let Some(child) = self.0.as_mut() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
+            self.kill_tree();
             let mut captured = String::new();
             let _ = std::io::Read::read_to_string(stderr, &mut captured);
             captured.trim().to_string()
+        }
+
+        /// Kill the whole process GROUP, not just the child we hold.
+        ///
+        /// The child is `uv`, and `uv run python …` runs the interpreter as a
+        /// further child of its own. `Child::kill` reaps `uv` and leaves the
+        /// interpreter alive holding the stderr pipe open, so a subsequent
+        /// `read_to_string` still blocks until the peer's own 30 s socket
+        /// timeout — measured: a malformed-readiness control failed in 30.10 s
+        /// with the child "killed". Killing the group is what actually makes it
+        /// fast; the process group exists because `process_group(0)` is set at
+        /// spawn.
+        fn kill_tree(&mut self) {
+            if let Some(child) = self.0.as_mut() {
+                let _ = std::process::Command::new("/bin/kill")
+                    .arg("-KILL")
+                    .arg(format!("-{}", child.id()))
+                    .status();
+                let _ = child.kill();
+                let _ = child.wait();
+            }
         }
     }
 
     impl Drop for PeerGuard {
         fn drop(&mut self) {
-            if let Some(mut child) = self.0.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
+            self.kill_tree();
+            self.0.take();
         }
     }
 
@@ -258,7 +274,8 @@ mod tests {
 
     #[test]
     fn handshake_agrees_with_an_independent_noise_implementation() {
-        use std::io::{BufRead, BufReader, Read};
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio};
 
         // Port 0: the CHILD binds and reports what it got. Picking a port here
@@ -278,6 +295,9 @@ mod tests {
             // all look identical to "no Python on this machine", which is the
             // one thing this test is allowed to skip for.
             .stderr(Stdio::piped())
+            // Its own process group, so `kill_tree` can reap the interpreter
+            // `uv` spawns underneath itself and not just `uv`.
+            .process_group(0)
             .spawn();
 
         let Ok(mut peer) = spawned else {
@@ -315,9 +335,16 @@ mod tests {
         // path entirely — two skip mechanisms, one of them tested.
         let first = lines.next().and_then(Result::ok);
 
+        // `strip_prefix("PEER_UNAVAILABLE ")` with a non-empty reason, NOT
+        // `starts_with`: the latter also accepts `PEER_UNAVAILABLE_BOGUS`, so a
+        // line that merely resembles the sentinel could buy a skip. A near-miss
+        // falls through and is rejected as an unrecognised first line, which is
+        // the safe direction — the enum described in the comment above is only
+        // an enum if the grammar is exact.
         if first
             .as_deref()
-            .is_some_and(|line| line.starts_with("PEER_UNAVAILABLE"))
+            .and_then(|line| line.strip_prefix("PEER_UNAVAILABLE "))
+            .is_some_and(|reason| !reason.trim().is_empty())
         {
             let line = first.expect("checked above");
             drop(peer);
@@ -379,12 +406,8 @@ mod tests {
         let port: u16 = ready
             .strip_prefix("LISTENING ")
             .unwrap_or_else(|| {
-                let mut diagnostic = String::new();
-                let _ = stderr_pipe.read_to_string(&mut diagnostic);
-                panic!(
-                    "expected `LISTENING <port>`, got {ready:?}; peer stderr: {}",
-                    diagnostic.trim()
-                )
+                let diagnostic = peer.diagnose(&mut stderr_pipe);
+                panic!("expected `LISTENING <port>`, got {ready:?}; peer stderr: {diagnostic}")
             })
             .trim()
             .parse()
