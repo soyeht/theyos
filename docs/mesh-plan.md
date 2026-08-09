@@ -190,16 +190,22 @@ abaixo antes de tentar.
 > o passcode físico do aparelho. É gate humano, não bug — não dá para automatizar
 > em torno dele.
 
-### O passo 4 não é executável com debugger conectado
+### O passo 4 não é executável no contexto de teste anexado que foi medido
 
-**Com Xcode/XCTest attachado por USB, o keybag não fecha — mesmo com o aparelho
-fisicamente bloqueado pelo botão.** Medido em 2026-08-09, tela apagada, botão
-apertado, janela de 45,7 s cronometrada:
+**O que foi medido, e só isso:** sob XCTest/Xcode anexado via USB, os dados
+protegidos permaneceram **disponíveis** apesar do bloqueio físico do aparelho.
+Medido em 2026-08-09, tela apagada, botão apertado, janela de 45,7 s cronometrada:
 
 ```
 isProtectedDataAvailable   true      (host)
 protectedFileReadable      true      (extensão)
 ```
+
+**A CAUSA NÃO FOI ISOLADA.** O contexto medido tem pelo menos quatro variáveis
+juntas — debugger anexado, XCTest, cabo USB, e a combinação delas — e nenhuma foi
+variada isoladamente. Este documento afirma a **correlação medida**, não o
+mecanismo. Quem for atacar isso não deve começar assumindo qual componente é o
+responsável.
 
 Consequência prática, e é a parte que engana: **qualquer canary de Keychain passa
 nesse contexto**, porque a proteção não está ativa. Uma leitura bem-sucedida de um
@@ -214,16 +220,24 @@ cuja leitura deve falhar. São os observáveis em que o invariante está escrito
 leitura de Keychain funde keybag destrancado, atributo errado e caminho não
 modelado num único resultado.
 
-**O que o passo 4 exige de verdade:** app instalado, extensão já viva fazendo
-polling, **Xcode desconectado**, e o resultado gravado para leitura posterior.
-É trabalho de outra natureza, não mais uma rodada — aumentar o `sleep` ou repetir
-com o cabo conectado devolve o mesmo resultado, e isso já está provado.
+**O que o passo 4 exige:** remover o **contexto inteiro**, não um componente
+escolhido por palpite — app instalado, harness já vivo fazendo polling, **sem
+XCTest, sem debugger, e USB desconectado**, com o resultado gravado para leitura
+posterior. Remover o conjunto responde a pergunta do marco; isolar qual peça
+causa o quê é uma investigação separada, e não é o que o M0b precisa.
 
-> Não é bug da Apple e não rende Feedback: é como o sistema trata um dispositivo
-> sob sessão de debug. Achado e provado por @gianna, que recusou três vezes
-> aplicar o "conserto" (`AfterFirstUnlock`) por cima de um verde que não media
-> nada — o conserto teria fechado o marco, e o furo apareceria só em campo, com a
-> VPN não reconectando com o telefone no bolso.
+**Mais `sleep` ou mais repetições no MESMO contexto anexado não agregam
+evidência** — três rodadas já devolveram o mesmo resultado com a janela
+cronometrada, então o tempo está controlado e não é a variável.
+
+> Esta rodada não é achado de Keychain e não justifica abrir Feedback: o que se
+> mediu foi o instrumento, não o comportamento do sistema. Nenhum veredito sobre
+> a Apple é afirmado aqui — não temos medição que o sustente.
+>
+> Achado e medido por @gianna, que recusou três vezes aplicar o "conserto"
+> (`AfterFirstUnlock`) por cima de um verde que não media nada — o conserto teria
+> fechado o marco, e o furo apareceria só em campo, com a VPN não reconectando
+> com o telefone no bolso.
 
 ## M1a — Conformance Noise independente
 
