@@ -183,10 +183,47 @@ extensão**, não só no app.
 4. bloquear o aparelho e repetir 2 e 3.
 
 **Pronto quando:** os quatro passos funcionam no aparelho real.
+**Estado:** 1–3 provados em aparelho físico. **4 bloqueado por ambiente** — leia
+abaixo antes de tentar.
 
 > Bloqueio conhecido: o primeiro save de uma `NETunnelProviderManager` nova pede
 > o passcode físico do aparelho. É gate humano, não bug — não dá para automatizar
 > em torno dele.
+
+### O passo 4 não é executável com debugger conectado
+
+**Com Xcode/XCTest attachado por USB, o keybag não fecha — mesmo com o aparelho
+fisicamente bloqueado pelo botão.** Medido em 2026-08-09, tela apagada, botão
+apertado, janela de 45,7 s cronometrada:
+
+```
+isProtectedDataAvailable   true      (host)
+protectedFileReadable      true      (extensão)
+```
+
+Consequência prática, e é a parte que engana: **qualquer canary de Keychain passa
+nesse contexto**, porque a proteção não está ativa. Uma leitura bem-sucedida de um
+item `WhenUnlockedThisDeviceOnly` com o aparelho travado é sinal de **instrumento
+inválido, não de acessibilidade correta**. Três tentativas foram gastas antes
+disso ficar claro, todas devolvendo `0/0/0` de forma perfeitamente consistente
+com um keybag aberto.
+
+**Não infira o estado do keybag a partir de uma leitura de Keychain.** Observe-o
+direto: `isProtectedDataAvailable`, ou um arquivo com `NSFileProtectionComplete`
+cuja leitura deve falhar. São os observáveis em que o invariante está escrito; a
+leitura de Keychain funde keybag destrancado, atributo errado e caminho não
+modelado num único resultado.
+
+**O que o passo 4 exige de verdade:** app instalado, extensão já viva fazendo
+polling, **Xcode desconectado**, e o resultado gravado para leitura posterior.
+É trabalho de outra natureza, não mais uma rodada — aumentar o `sleep` ou repetir
+com o cabo conectado devolve o mesmo resultado, e isso já está provado.
+
+> Não é bug da Apple e não rende Feedback: é como o sistema trata um dispositivo
+> sob sessão de debug. Achado e provado por @gianna, que recusou três vezes
+> aplicar o "conserto" (`AfterFirstUnlock`) por cima de um verde que não media
+> nada — o conserto teria fechado o marco, e o furo apareceria só em campo, com a
+> VPN não reconectando com o telefone no bolso.
 
 ## M1a — Conformance Noise independente
 
