@@ -247,22 +247,34 @@ mod tests {
         /// with the child "killed". Killing the group is what actually makes it
         /// fast; the process group exists because `process_group(0)` is set at
         /// spawn.
+        /// IDEMPOTENT by taking ownership: after `diagnose` kills the group,
+        /// `self.0` used to stay `Some`, so the panic's `Drop` ran `kill_tree`
+        /// a second time against a PID that no longer existed — measured, it
+        /// printed `kill: -<pid>: No such process` into the test output. Noise
+        /// is the small cost; the real one is that a PID/PGID can be recycled
+        /// between the two calls, and the second `SIGKILL` would then land on
+        /// an unrelated process group.
         fn kill_tree(&mut self) {
-            if let Some(child) = self.0.as_mut() {
-                let _ = std::process::Command::new("/bin/kill")
-                    .arg("-KILL")
-                    .arg(format!("-{}", child.id()))
-                    .status();
-                let _ = child.kill();
-                let _ = child.wait();
-            }
+            let Some(mut child) = self.0.take() else {
+                return;
+            };
+            let _ = std::process::Command::new("/bin/kill")
+                .arg("-KILL")
+                .arg(format!("-{}", child.id()))
+                // Silenced: the normal path reaches here with the group already
+                // gone, and `kill`'s complaint about that is not a finding —
+                // printing it would train readers to skim the test's output.
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
 
     impl Drop for PeerGuard {
         fn drop(&mut self) {
             self.kill_tree();
-            self.0.take();
         }
     }
 
