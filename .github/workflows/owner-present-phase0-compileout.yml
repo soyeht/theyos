@@ -19,7 +19,10 @@ jobs:
   structural-boundary:
     name: Owner-present structural boundary
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # The 39-control matrix reached 37 real refusals at the former 90-minute
+    # ceiling and was cancelled before its final two controls and composer.
+    # Keep enough measured headroom to distinguish a verdict from cancellation.
+    timeout-minutes: 120
     steps:
       - name: Checkout theyos
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
