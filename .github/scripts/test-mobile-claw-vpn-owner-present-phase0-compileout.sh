@@ -1103,9 +1103,24 @@ expect_checker_failure workspace_cargo_alias \
 
 recipe_drift="${TMP_ROOT}/recipe-drift"
 clone_head "${recipe_drift}"
+recipe_source="${recipe_drift}/admin/rust/theyos-engine-build-rs/src/main.rs"
+if [[ "$(grep -Fc '        "--no-default-features",' "${recipe_source}")" -ne 1 ]]; then
+  echo "error: release_recipe_drift expected exactly one canonical --no-default-features argv entry" >&2
+  exit 1
+fi
 perl -0pi -e \
-  's/--no-default-features/--features dev_t1_datapath/' \
-  "${recipe_drift}/admin/rust/theyos-engine-build-rs/src/main.rs"
+  's/        "--no-default-features",/        "--features",\n        "dev_t1_datapath",/ or die "release recipe anchor did not change\n"' \
+  "${recipe_source}"
+# This mutation must create two argv entries. A single string containing a
+# space is rejected by Cargo's CLI before the production feature guard runs,
+# so it would test malformed argument construction instead of recipe drift.
+if grep -Fq '"--features dev_t1_datapath"' "${recipe_source}" \
+    || [[ "$(grep -Fc '        "--features",' "${recipe_source}")" -ne 1 ]] \
+    || [[ "$(grep -Fc '        "dev_t1_datapath",' "${recipe_source}")" -ne 1 ]] \
+    || grep -Fq '        "--no-default-features",' "${recipe_source}"; then
+  echo "error: release_recipe_drift did not produce the exact two-entry Cargo feature argv" >&2
+  exit 1
+fi
 commit_mutation "${recipe_drift}" recipe-drift
 expect_checker_failure release_recipe_drift \
   "production server binary cannot be built with DEV/test features" \
