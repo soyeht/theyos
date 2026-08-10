@@ -1,0 +1,66 @@
+{
+  "schema": "cross-repo-ffi-boundary-v2",
+  "description": [
+    "Structure of the theyos <-> consumer-repo source boundary. This file holds",
+    "STRUCTURE ONLY: discovered UniFFI surfaces, explicit surface-to-target",
+    "bindings, consumer targets, and the spelling of each immutable pin.",
+    "POLICY for pin age lives in scripts/check-cross-repo-pin-freshness.py.",
+    "",
+    "The surfaces list is not trusted as complete. The gate re-derives UniFFI",
+    "surfaces from the tree and requires exact equality. Every discovered surface",
+    "then has exactly one binding state: active against one named consumer target,",
+    "or deferred through an owned, reasoned, expiring decision. The gate never",
+    "infers that every consumer manifest consumes every discovered surface."
+  ],
+  "surfaces": [
+    {
+      "path": "admin/rust/claw-share-bridge-rs/src/lib.rs",
+      "binding": {
+        "status": "deferred",
+        "owner": "caiosalgado",
+        "reason": "No current consumer target builds this crate. RelayStreamGuestFFI deliberately implements a separate household-rs RelayStream/Noise boundary; adding an unused claw-share-bridge-rs dependency would satisfy the old predicate without creating a real consumer.",
+        "expires": "2026-08-31",
+        "tracker": "#457"
+      }
+    }
+  ],
+  "consumers": [
+    {
+      "name": "soyeht-ios",
+      "repo": "soyeht/soyeht-ios",
+      "targets": [
+        {
+          "name": "relay-stream-guest-ffi",
+          "cargo_manifests": [
+            "Native/RelayStreamGuestFFI/Cargo.toml"
+          ]
+        }
+      ],
+      "pins": [
+        {
+          "name": "vendored-source-rev",
+          "path": "Native/RelayStreamGuestFFI/Scripts/build-relay-stream-guest-ffi-xcframework.sh",
+          "kind": "shell-assigned-rev",
+          "variable": "SOURCE_REV",
+          "governs_ffi_surface": false,
+          "note": "The immutable theyos rev vendored into .vendor/theyos. The current target compiles household-rs from that checkout; it does not compile the deferred claw-share-bridge-rs UniFFI surface."
+        },
+        {
+          "name": "contract-fixture-sha",
+          "path": "scripts/cross-repo-contract.sha",
+          "kind": "bare-rev",
+          "governs_ffi_surface": false,
+          "note": "Rev the vendored owner-approval contract fixtures were copied from. Governs data, not a compiled UniFFI surface."
+        },
+        {
+          "name": "owner-site-a2-r1-corpus",
+          "path": "scripts/owner-site-a2-r1-corpus.pin",
+          "kind": "keyed-rev",
+          "key": "theyos_commit",
+          "governs_ffi_surface": false,
+          "note": "Rev the A2-R1 semantic corpus was copied from. Governs data, not a compiled UniFFI surface."
+        }
+      ]
+    }
+  ]
+}
