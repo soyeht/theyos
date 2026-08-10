@@ -278,10 +278,21 @@ mod tests {
         }
     }
 
+    // Runtime test inputs must be literals so the coverage gate can inventory
+    // them and include_bytes! adds the same dependency edge to Cargo's depfile.
+    macro_rules! repo_test_file {
+        ($path:literal) => {{
+            const _: &[u8] =
+                include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../", $path));
+            $path
+        }};
+    }
+
     /// Repo-relative path to the independent peer.
     fn peer_script() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../scripts/noise-conformance-peer.py")
+            .join("../../../")
+            .join(repo_test_file!("scripts/noise-conformance-peer.py"))
     }
 
     #[test]

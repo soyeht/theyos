@@ -33,6 +33,13 @@ gate = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = gate
 SPEC.loader.exec_module(gate)
 
+MATRIX_SCRIPT = Path(__file__).with_name("cargo_test_matrix.py")
+MATRIX_SPEC = importlib.util.spec_from_file_location("cargo_test_matrix", MATRIX_SCRIPT)
+assert MATRIX_SPEC is not None and MATRIX_SPEC.loader is not None
+matrix = importlib.util.module_from_spec(MATRIX_SPEC)
+sys.modules[MATRIX_SPEC.name] = matrix
+MATRIX_SPEC.loader.exec_module(matrix)
+
 
 BACKEND_CI = """\
 name: Backend CI
@@ -40,6 +47,20 @@ on:
   pull_request:
     paths:
       - "admin/rust/**"
+      - "scripts/**"
+      - ".github/workflows/backend-ci.yml"
+      - ".github/workflows/backend-ci-docs-shim.yml"
+"""
+
+BACKEND_SHIM = """\
+name: Backend CI (docs-only shim)
+on:
+  pull_request:
+    paths-ignore:
+      - "admin/rust/**"
+      - "scripts/**"
+      - ".github/workflows/backend-ci.yml"
+      - ".github/workflows/backend-ci-docs-shim.yml"
 """
 
 
@@ -47,6 +68,7 @@ def _build_repo(tmp: Path, lib_rs: str, build_rs: str | None = None) -> Path:
     """Lay out a minimal fake repo with one crate under admin/rust."""
     (tmp / ".github" / "workflows").mkdir(parents=True)
     (tmp / ".github" / "workflows" / "backend-ci.yml").write_text(BACKEND_CI, encoding="utf-8")
+    (tmp / ".github" / "workflows" / "backend-ci-docs-shim.yml").write_text(BACKEND_SHIM, encoding="utf-8")
 
     crate = tmp / "admin" / "rust" / "cratea"
     (crate / "src").mkdir(parents=True)
@@ -103,6 +125,18 @@ class ConsumptionCoverageTests(unittest.TestCase):
             self.assertEqual(rc, 1, out)
             self.assertIn("RED  uncovered_bytes.bin", out)
             self.assertIn("include_bytes!", out)
+
+    def test_uncovered_golden_is_counted_by_path_not_use(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = _build_repo(
+                Path(d),
+                'const A: &str = include_str!("../../../../one.md");\n'
+                'const B: &str = include_str!("../../../../one.md");\n',
+            )
+            rc, out = _run(repo)
+            self.assertEqual(rc, 1, out)
+            self.assertIn("UNCOVERED consumed paths (1)", out)
+            self.assertIn("result: FAIL (1 uncovered paths", out)
 
     def test_buildrs_read_uncovered_is_red(self):
         with tempfile.TemporaryDirectory() as d:
@@ -174,6 +208,61 @@ class ConsumptionCoverageTests(unittest.TestCase):
             )
             rc, out = _run(repo)
             self.assertEqual(rc, 2, out)  # fail closed, never an empty covered set
+
+    def test_shim_partition_drift_fails_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = _build_repo(Path(d), 'const S: &str = include_str!("sibling.txt");\n')
+            shim = repo / ".github" / "workflows" / "backend-ci-docs-shim.yml"
+            shim.write_text(BACKEND_SHIM.replace('      - "admin/rust/**"\n', ""), encoding="utf-8")
+            rc, _ = _run(repo)
+            self.assertEqual(rc, 2)
+
+    def test_runtime_literal_is_covered(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = _build_repo(Path(d), 'const _: &[u8] = repo_test_file!("scripts/peer.py");\n')
+            (repo / "scripts").mkdir()
+            (repo / "scripts" / "peer.py").write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            rc, out = _run(repo, "repo_test_file!")
+            self.assertEqual(rc, 0, out)
+            self.assertIn("repo_test_file!", out)
+
+    def test_runtime_path_bypass_is_red(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = _build_repo(Path(d), 'const S: &str = include_str!("sibling.txt");\n')
+            tests = repo / "admin" / "rust" / "cratea" / "tests"
+            tests.mkdir()
+            (tests / "runtime.rs").write_text('fn x() { let _ = root.join("scripts/untracked.py"); }\n', encoding="utf-8")
+            rc, out = _run(repo)
+            self.assertEqual(rc, 1, out)
+            self.assertIn("runtime input bypasses repo_test_file!", out)
+
+    def test_noise_previous_runtime_path_bypass_is_red(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = _build_repo(Path(d), 'const S: &str = include_str!("sibling.txt");\n')
+            source = repo / "admin" / "rust" / "cratea" / "src" / "noise.rs"
+            source.write_text('fn peer() { let _ = root.join("../../../scripts/noise-conformance-peer.py"); }\n', encoding="utf-8")
+            rc, out = _run(repo)
+            self.assertEqual(rc, 1, out)
+            self.assertIn("runtime input bypasses repo_test_file!", out)
+
+    def test_depfile_inputs_deduplicate_paths_and_exclude_git_control_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "repo"
+            target = Path(d) / "target"
+            manifest = repo / "claws" / "manifest.yml"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text("name: test\n", encoding="utf-8")
+            for name in ("one", "two", "three"):
+                depfile = target / "debug" / f"{name}.d"
+                depfile.parent.mkdir(parents=True, exist_ok=True)
+                depfile.write_text(
+                    f"out: {manifest} {repo / '.git' / 'HEAD'} {repo / '.git' / 'packed-refs'}\n",
+                    encoding="utf-8",
+                )
+            self.assertEqual(
+                matrix.depfile_inputs(target, repo),
+                {"claws/manifest.yml"},
+            )
 
 
 if __name__ == "__main__":

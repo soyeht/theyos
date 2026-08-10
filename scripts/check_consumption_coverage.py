@@ -52,7 +52,9 @@ Exit codes (matching the other scripts here):
 from __future__ import annotations
 
 import argparse
+import json
 import re
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -119,6 +121,36 @@ def parse_backend_pull_request_paths(workflow: Path) -> list[str]:
             f"parsed zero paths from {workflow} -- the workflow shape changed; "
             "update the parser or fix the file"
         )
+    return out
+
+
+def parse_shim_paths_ignore(workflow: Path) -> list[str]:
+    """Parse the shim's inverse path list and fail closed on drift."""
+    lines = workflow.read_text(encoding="utf-8").splitlines()
+    in_pr = in_paths = False
+    indent = -1
+    out: list[str] = []
+    for raw in lines:
+        if not raw.strip():
+            continue
+        leading = len(raw) - len(raw.lstrip(" "))
+        stripped = raw.strip()
+        if stripped == "pull_request:" and leading == 2:
+            in_pr, in_paths = True, False
+            continue
+        if leading <= 2 and stripped.endswith(":") and stripped != "pull_request:":
+            in_pr = in_paths = False
+        if not in_pr:
+            continue
+        if stripped == "paths-ignore:":
+            in_paths, indent = True, leading + 2
+            continue
+        if in_paths and stripped.startswith("- ") and leading == indent:
+            out.append(stripped[2:].split("#", 1)[0].strip().strip('"').strip("'"))
+        elif in_paths and not stripped.startswith("- "):
+            in_paths = False
+    if not out:
+        raise GateCannotRun(f"parsed zero paths-ignore from {workflow}")
     return out
 
 
@@ -232,6 +264,10 @@ _CMDIR_RE = re.compile(
 _READDIR_RE = re.compile(r"\bread_dir\s*\(")
 # build.rs literal read_to_string / File::open with a literal path.
 _BUILD_READ_RE = re.compile(r'(?:read_to_string|read_to_end|open)\s*\(\s*"((?:\\.|[^"\\])*)"')
+_RUNTIME_RE = re.compile(r'repo_test_file!\s*\(\s*"((?:\\.|[^"\\\n])*)"\s*\)')
+# A repo-relative runtime script can be joined directly or from a crate's
+# ../../../ root. Both bypass the literal macro and its depfile edge.
+_RUNTIME_BYPASS_RE = re.compile(r'\.join\s*\(\s*"(?:\.\./)*scripts/')
 
 RUST_SUFFIXES = (".rs",)
 
@@ -311,6 +347,12 @@ def scan_consumers(rust_root: Path, repo_root: Path) -> tuple[list[Use], list[Us
                 target = _resolve(f, lit, repo_root)
                 literal.append(Use(_rel(f, repo_root), _line_of(text, m.start()), "build.rs-read", target, m.group(0)[:80]))
 
+        for m in _RUNTIME_RE.finditer(text):
+            literal.append(Use(_rel(f, repo_root), _line_of(text, m.start()), "repo_test_file!", _unescape(m.group(1)), m.group(0)))
+        if "/tests/" in f.as_posix() or f.name == "noise.rs":
+            for m in _RUNTIME_BYPASS_RE.finditer(text):
+                declared.append(Use(_rel(f, repo_root), _line_of(text, m.start()), "runtime-path-bypass", None, m.group(0)))
+
         # DECLARED: read_dir (runtime directory listing; which files are read is
         # not statically known).
         for m in _READDIR_RE.finditer(text):
@@ -359,7 +401,7 @@ def _rel(p: Path, repo_root: Path) -> str:
 # The macro kinds this gate claims to PROVE-uncovered. If a probe for any of
 # these is planted (under --self-test-probes) and NOT seen by the parser, the
 # gate is blind in that class and must go red.
-PROVE_CLASSES = ("include_str!", "include_bytes!", "concat-cmdir", "build.rs-read")
+PROVE_CLASSES = ("include_str!", "include_bytes!", "concat-cmdir", "build.rs-read", "repo_test_file!")
 
 
 def completeness_selfcheck(literal: list[Use], probe_kinds: set[str]) -> list[str]:
@@ -381,18 +423,42 @@ def completeness_selfcheck(literal: list[Use], probe_kinds: set[str]) -> list[st
 # --------------------------------------------------------------------------- #
 
 
-def run(repo_root: Path, backend_ci: Path, probe_kinds: set[str], out=sys.stdout) -> int:
+def derive_compile_inputs(repo_root: Path) -> list[Use]:
+    result = subprocess.run(
+        [sys.executable, str(repo_root / "scripts" / "cargo_test_matrix.py"), "--derive"],
+        cwd=repo_root, text=True, capture_output=True,
+    )
+    if result.returncode:
+        raise GateCannotRun(f"fresh Cargo matrix failed:\n{result.stderr}")
+    try:
+        inputs = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise GateCannotRun(f"fresh Cargo matrix emitted invalid input inventory: {exc}") from exc
+    if not isinstance(inputs, list) or not all(isinstance(path, str) for path in inputs):
+        raise GateCannotRun("fresh Cargo matrix emitted invalid input paths")
+    return [Use("cargo-test-matrix", 0, "depfile", path, path) for path in inputs]
+
+
+def run(repo_root: Path, backend_ci: Path, probe_kinds: set[str], out=sys.stdout, derive: bool = False) -> int:
     # Resolve once: under macOS the system temp lives behind a /var -> /private/var
     # symlink, so a caller-supplied root that is not canonicalised would mismatch
     # the resolved target paths and every include would look "unresolvable".
     repo_root = repo_root.resolve()
     backend_ci = backend_ci.resolve()
     patterns = parse_backend_pull_request_paths(backend_ci)
+    shim = repo_root / ".github" / "workflows" / "backend-ci-docs-shim.yml"
+    if parse_shim_paths_ignore(shim) != patterns:
+        raise GateCannotRun("backend-ci paths and docs-shim paths-ignore differ")
+    for workflow in (".github/workflows/backend-ci.yml", ".github/workflows/backend-ci-docs-shim.yml"):
+        if workflow not in patterns:
+            raise GateCannotRun(f"real/shim self-certification missing {workflow}")
     rust_root = repo_root / "admin" / "rust"
     if not rust_root.is_dir():
         raise GateCannotRun(f"rust workspace not found at {rust_root}")
 
     literal, declared = scan_consumers(rust_root, repo_root)
+    if derive:
+        literal.extend(derive_compile_inputs(repo_root))
 
     uncovered: list[Use] = []
     covered: list[Use] = []
@@ -406,12 +472,16 @@ def run(repo_root: Path, backend_ci: Path, probe_kinds: set[str], out=sys.stdout
             uncovered.append(u)
 
     blind = completeness_selfcheck(literal, probe_kinds)
+    blind.extend(
+        f"runtime input bypasses repo_test_file!: {u.consumer}:{u.line}"
+        for u in declared if u.macro == "runtime-path-bypass"
+    )
 
     # ---- report ----
     print(f"coverage globs (from {backend_ci.relative_to(repo_root)}):", file=out)
     for p in patterns:
         print(f"  - {p}", file=out)
-    print(f"literal consumption sites scanned: {len(literal)}", file=out)
+    print(f"literal consumption uses scanned: {len(literal)}", file=out)
 
     if covered:
         print(f"\ncovered ({len(covered)}):", file=out)
@@ -419,7 +489,8 @@ def run(repo_root: Path, backend_ci: Path, probe_kinds: set[str], out=sys.stdout
             print(f"  OK   {u.target_repo_rel}  <- {u.consumer}:{u.line} ({u.macro})", file=out)
 
     if uncovered:
-        print(f"\nUNCOVERED consumed files ({len(uncovered)}) -- changing one does NOT trigger backend-ci:", file=out)
+        uncovered_paths = {u.target_repo_rel for u in uncovered}
+        print(f"\nUNCOVERED consumed paths ({len(uncovered_paths)}) -- changing one does NOT trigger backend-ci:", file=out)
         for u in sorted(uncovered, key=lambda x: (x.target_repo_rel or "", x.consumer)):
             print(f"  RED  {u.target_repo_rel}  <- {u.consumer}:{u.line} ({u.macro})", file=out)
 
@@ -447,8 +518,9 @@ def run(repo_root: Path, backend_ci: Path, probe_kinds: set[str], out=sys.stdout
 
     findings = bool(uncovered) or bool(blind)
     if findings:
+        uncovered_paths = {u.target_repo_rel for u in uncovered}
         print(
-            f"\nresult: FAIL ({len(uncovered)} uncovered, {len(blind)} blind-class)",
+            f"\nresult: FAIL ({len(uncovered_paths)} uncovered paths, {len(blind)} blind-class)",
             file=out,
         )
         return 1
@@ -468,6 +540,7 @@ def main(argv: list[str] | None = None) -> int:
         default=REPO_ROOT,
         help="repository root (default: autodetect)",
     )
+    ap.add_argument("--derive", action="store_true", help="derive compile-time inputs from the fresh shared Cargo matrix")
     ap.add_argument(
         "--backend-ci",
         type=Path,
@@ -491,7 +564,7 @@ def main(argv: list[str] | None = None) -> int:
     probe_kinds = set(args.self_test_probes)
 
     try:
-        return run(args.repo_root, backend_ci, probe_kinds)
+        return run(args.repo_root, backend_ci, probe_kinds, derive=args.derive)
     except GateCannotRun as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
