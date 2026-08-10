@@ -15,6 +15,7 @@ to and green when restored:
     the regex no longer sees) -> RED even with nothing else wrong
   * coverage-glob drift: a backend-ci.yml this parser cannot read -> exit 2
     (fail closed), never a silent empty covered set
+  * partition drift or missing self-certification in either real/shim pair -> exit 2
 """
 
 from __future__ import annotations
@@ -44,6 +45,12 @@ MATRIX_SPEC.loader.exec_module(matrix)
 BACKEND_CI = """\
 name: Backend CI
 on:
+  push:
+    paths:
+      - "admin/rust/**"
+      - "scripts/**"
+      - ".github/workflows/backend-ci.yml"
+      - ".github/workflows/backend-ci-docs-shim.yml"
   pull_request:
     paths:
       - "admin/rust/**"
@@ -63,12 +70,45 @@ on:
       - ".github/workflows/backend-ci-docs-shim.yml"
 """
 
+HOMEBREW_CI = """\
+name: Homebrew Smoke (macOS)
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "homebrew/**"
+      - ".github/workflows/homebrew-smoke-macos.yml"
+      - ".github/workflows/homebrew-smoke-docs-shim.yml"
+  pull_request:
+    paths:
+      - "homebrew/**"
+      - ".github/workflows/homebrew-smoke-macos.yml"
+      - ".github/workflows/homebrew-smoke-docs-shim.yml"
+"""
+
+HOMEBREW_SHIM = """\
+name: Homebrew Smoke (docs-only shim)
+on:
+  pull_request:
+    paths-ignore:
+      - "homebrew/**"
+      - ".github/workflows/homebrew-smoke-macos.yml"
+      - ".github/workflows/homebrew-smoke-docs-shim.yml"
+"""
+
 
 def _build_repo(tmp: Path, lib_rs: str, build_rs: str | None = None) -> Path:
     """Lay out a minimal fake repo with one crate under admin/rust."""
     (tmp / ".github" / "workflows").mkdir(parents=True)
     (tmp / ".github" / "workflows" / "backend-ci.yml").write_text(BACKEND_CI, encoding="utf-8")
     (tmp / ".github" / "workflows" / "backend-ci-docs-shim.yml").write_text(BACKEND_SHIM, encoding="utf-8")
+    (tmp / ".github" / "workflows" / "homebrew-smoke-macos.yml").write_text(
+        HOMEBREW_CI, encoding="utf-8"
+    )
+    (tmp / ".github" / "workflows" / "homebrew-smoke-docs-shim.yml").write_text(
+        HOMEBREW_SHIM, encoding="utf-8"
+    )
 
     crate = tmp / "admin" / "rust" / "cratea"
     (crate / "src").mkdir(parents=True)
@@ -214,8 +254,87 @@ class ConsumptionCoverageTests(unittest.TestCase):
             repo = _build_repo(Path(d), 'const S: &str = include_str!("sibling.txt");\n')
             shim = repo / ".github" / "workflows" / "backend-ci-docs-shim.yml"
             shim.write_text(BACKEND_SHIM.replace('      - "admin/rust/**"\n', ""), encoding="utf-8")
-            rc, _ = _run(repo)
-            self.assertEqual(rc, 2)
+            with self.assertRaisesRegex(
+                gate.GateCannotRun,
+                "backend-ci.yml pull_request paths and backend-ci-docs-shim.yml paths-ignore differ",
+            ):
+                gate.run(
+                    repo,
+                    repo / ".github" / "workflows" / "backend-ci.yml",
+                    set(),
+                    out=io.StringIO(),
+                )
+
+    def test_push_partition_drift_fails_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = _build_repo(Path(d), 'const S: &str = include_str!("sibling.txt");\n')
+            backend = repo / ".github" / "workflows" / "backend-ci.yml"
+            text = backend.read_text(encoding="utf-8")
+            push, pull_request = text.split("  pull_request:\n", 1)
+            push = push.replace('      - "admin/rust/**"\n', "")
+            backend.write_text(push + "  pull_request:\n" + pull_request, encoding="utf-8")
+            with self.assertRaisesRegex(
+                gate.GateCannotRun, "backend-ci.yml push paths and pull_request paths differ"
+            ):
+                gate.run(repo, backend, set(), out=io.StringIO())
+
+    def test_homebrew_push_partition_drift_fails_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = _build_repo(Path(d), 'const S: &str = include_str!("sibling.txt");\n')
+            real = repo / ".github" / "workflows" / "homebrew-smoke-macos.yml"
+            text = real.read_text(encoding="utf-8")
+            push, pull_request = text.split("  pull_request:\n", 1)
+            push = push.replace('      - "homebrew/**"\n', "")
+            real.write_text(push + "  pull_request:\n" + pull_request, encoding="utf-8")
+            with self.assertRaisesRegex(
+                gate.GateCannotRun,
+                "homebrew-smoke-macos.yml push paths and pull_request paths differ",
+            ):
+                gate.run(
+                    repo,
+                    repo / ".github" / "workflows" / "backend-ci.yml",
+                    set(),
+                    out=io.StringIO(),
+                )
+
+    def test_homebrew_shim_partition_drift_fails_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = _build_repo(Path(d), 'const S: &str = include_str!("sibling.txt");\n')
+            shim = repo / ".github" / "workflows" / "homebrew-smoke-docs-shim.yml"
+            shim.write_text(
+                HOMEBREW_SHIM.replace('      - "homebrew/**"\n', ""), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                gate.GateCannotRun,
+                "homebrew-smoke-macos.yml pull_request paths and "
+                "homebrew-smoke-docs-shim.yml paths-ignore differ",
+            ):
+                gate.run(
+                    repo,
+                    repo / ".github" / "workflows" / "backend-ci.yml",
+                    set(),
+                    out=io.StringIO(),
+                )
+
+    def test_homebrew_shim_self_certification_missing_fails_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = _build_repo(Path(d), 'const S: &str = include_str!("sibling.txt");\n')
+            real = repo / ".github" / "workflows" / "homebrew-smoke-macos.yml"
+            shim = repo / ".github" / "workflows" / "homebrew-smoke-docs-shim.yml"
+            missing = '      - ".github/workflows/homebrew-smoke-docs-shim.yml"\n'
+            real.write_text(HOMEBREW_CI.replace(missing, ""), encoding="utf-8")
+            shim.write_text(HOMEBREW_SHIM.replace(missing, ""), encoding="utf-8")
+            with self.assertRaisesRegex(
+                gate.GateCannotRun,
+                "homebrew-smoke-macos.yml/homebrew-smoke-docs-shim.yml "
+                "self-certification missing .github/workflows/homebrew-smoke-docs-shim.yml",
+            ):
+                gate.run(
+                    repo,
+                    repo / ".github" / "workflows" / "backend-ci.yml",
+                    set(),
+                    out=io.StringIO(),
+                )
 
     def test_runtime_literal_is_covered(self):
         with tempfile.TemporaryDirectory() as d:

@@ -14,7 +14,9 @@ The false-green class this gate exists to close (CI plan, Phase 3.1 / 3.2):
 Coverage rule.  A consumed file is *covered* when a change to it (alone) makes
 the real ``backend-ci.yml`` run -- i.e. its repo-relative path matches one of the
 ``on.pull_request.paths`` globs in ``backend-ci.yml`` (parsed live, never copied,
-because the map drifts).  Anything consumed but not covered is a hole and fails.
+because the map drifts).  The gate also requires ``on.push.paths`` to be identical
+to that list, and the docs-only shim's inverse ``paths-ignore`` list to match both.
+Anything consumed but not covered is a hole and fails.
 
 What the gate can PROVE vs what it can only DECLARE (the split is deliberate
 and is the point of the plan's completeness critique):
@@ -71,8 +73,8 @@ RUST_ROOT = REPO_ROOT / "admin" / "rust"
 # --------------------------------------------------------------------------- #
 
 
-def parse_backend_pull_request_paths(workflow: Path) -> list[str]:
-    """Return the ``on.pull_request.paths`` glob list from backend-ci.yml.
+def parse_workflow_event_paths(workflow: Path, event: str) -> list[str]:
+    """Return an ``on.<event>.paths`` glob list from a real workflow.
 
     A minimal indent-aware scan is used on purpose: it has no YAML dependency,
     and if the file's shape changes in a way this cannot parse, the gate fails
@@ -80,7 +82,7 @@ def parse_backend_pull_request_paths(workflow: Path) -> list[str]:
     """
     text = workflow.read_text(encoding="utf-8")
     lines = text.splitlines()
-    in_pull_request = False
+    in_event = False
     in_paths = False
     paths_indent = -1
     out: list[str] = []
@@ -89,16 +91,16 @@ def parse_backend_pull_request_paths(workflow: Path) -> list[str]:
             continue
         indent = len(raw) - len(raw.lstrip(" "))
         stripped = raw.strip()
-        # Top-level keys under on: appear at 2 spaces ("  pull_request:").
-        if stripped == "pull_request:" and indent == 2:
-            in_pull_request = True
+        # Top-level keys under on: appear at 2 spaces (for example "  push:").
+        if stripped == f"{event}:" and indent == 2:
+            in_event = True
             in_paths = False
             continue
-        if indent <= 2 and stripped.endswith(":") and stripped != "pull_request:":
-            in_pull_request = False
+        if indent <= 2 and stripped.endswith(":") and stripped != f"{event}:":
+            in_event = False
             in_paths = False
             continue
-        if not in_pull_request:
+        if not in_event:
             continue
         if stripped == "paths:":
             in_paths = True
@@ -118,10 +120,18 @@ def parse_backend_pull_request_paths(workflow: Path) -> list[str]:
             in_paths = False
     if not out:
         raise GateCannotRun(
-            f"parsed zero paths from {workflow} -- the workflow shape changed; "
+            f"parsed zero on.{event}.paths from {workflow} -- the workflow shape changed; "
             "update the parser or fix the file"
         )
     return out
+
+
+def parse_workflow_pull_request_paths(workflow: Path) -> list[str]:
+    return parse_workflow_event_paths(workflow, "pull_request")
+
+
+def parse_workflow_push_paths(workflow: Path) -> list[str]:
+    return parse_workflow_event_paths(workflow, "push")
 
 
 def parse_shim_paths_ignore(workflow: Path) -> list[str]:
@@ -152,6 +162,27 @@ def parse_shim_paths_ignore(workflow: Path) -> list[str]:
     if not out:
         raise GateCannotRun(f"parsed zero paths-ignore from {workflow}")
     return out
+
+
+def validate_workflow_partition(
+    real: Path,
+    shim: Path,
+    required_workflows: tuple[str, ...],
+) -> list[str]:
+    """Validate one real/shim trigger pair and return its shared path list."""
+    patterns = parse_workflow_pull_request_paths(real)
+    if parse_workflow_push_paths(real) != patterns:
+        raise GateCannotRun(f"{real.name} push paths and pull_request paths differ")
+    if parse_shim_paths_ignore(shim) != patterns:
+        raise GateCannotRun(
+            f"{real.name} pull_request paths and {shim.name} paths-ignore differ"
+        )
+    for workflow in required_workflows:
+        if workflow not in patterns:
+            raise GateCannotRun(
+                f"{real.name}/{shim.name} self-certification missing {workflow}"
+            )
+    return patterns
 
 
 class GateCannotRun(Exception):
@@ -445,13 +476,25 @@ def run(repo_root: Path, backend_ci: Path, probe_kinds: set[str], out=sys.stdout
     # the resolved target paths and every include would look "unresolvable".
     repo_root = repo_root.resolve()
     backend_ci = backend_ci.resolve()
-    patterns = parse_backend_pull_request_paths(backend_ci)
-    shim = repo_root / ".github" / "workflows" / "backend-ci-docs-shim.yml"
-    if parse_shim_paths_ignore(shim) != patterns:
-        raise GateCannotRun("backend-ci paths and docs-shim paths-ignore differ")
-    for workflow in (".github/workflows/backend-ci.yml", ".github/workflows/backend-ci-docs-shim.yml"):
-        if workflow not in patterns:
-            raise GateCannotRun(f"real/shim self-certification missing {workflow}")
+    backend_shim = repo_root / ".github" / "workflows" / "backend-ci-docs-shim.yml"
+    patterns = validate_workflow_partition(
+        backend_ci,
+        backend_shim,
+        (
+            ".github/workflows/backend-ci.yml",
+            ".github/workflows/backend-ci-docs-shim.yml",
+        ),
+    )
+    homebrew_ci = repo_root / ".github" / "workflows" / "homebrew-smoke-macos.yml"
+    homebrew_shim = repo_root / ".github" / "workflows" / "homebrew-smoke-docs-shim.yml"
+    validate_workflow_partition(
+        homebrew_ci,
+        homebrew_shim,
+        (
+            ".github/workflows/homebrew-smoke-macos.yml",
+            ".github/workflows/homebrew-smoke-docs-shim.yml",
+        ),
+    )
     rust_root = repo_root / "admin" / "rust"
     if not rust_root.is_dir():
         raise GateCannotRun(f"rust workspace not found at {rust_root}")
