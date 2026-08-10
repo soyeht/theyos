@@ -307,28 +307,32 @@ def fetch_orphan_issues(repo: str) -> list[OrphanIssue]:
 def _latest_ping(repo: str, number: int) -> datetime | None:
     js = _gh(
         [
-            "api", f"repos/{repo}/issues/{number}/comments", "--paginate",
+            "api", "--paginate", "--slurp",
+            f"repos/{repo}/issues/{number}/comments",
         ]
     )
     try:
-        comments = json.loads(js)
+        pages = json.loads(js)
     except json.JSONDecodeError as e:
         raise GateCannotRun("could not parse issue-comments response") from e
-    if not isinstance(comments, list):
-        raise GateCannotRun("issue-comments response is not an array")
+    if not isinstance(pages, list) or not pages:
+        raise GateCannotRun("issue-comments response is not a paginated array")
 
     latest: datetime | None = None
-    for comment in comments:
-        if not isinstance(comment, dict):
-            raise GateCannotRun("issue-comments entry is not an object")
-        body = comment.get("body")
-        created_at = comment.get("created_at")
-        if not isinstance(body, str) or not isinstance(created_at, str):
-            raise GateCannotRun("issue-comments entry lacks string body or created_at")
-        if "chronic-red re-ping" in body:
-            t = parse_date(created_at)
-            if latest is None or t > latest:
-                latest = t
+    for page in pages:
+        if not isinstance(page, list):
+            raise GateCannotRun("issue-comments page is not an array")
+        for comment in page:
+            if not isinstance(comment, dict):
+                raise GateCannotRun("issue-comments entry is not an object")
+            body = comment.get("body")
+            created_at = comment.get("created_at")
+            if not isinstance(body, str) or not isinstance(created_at, str):
+                raise GateCannotRun("issue-comments entry lacks string body or created_at")
+            if "chronic-red re-ping" in body:
+                t = parse_date(created_at)
+                if latest is None or t > latest:
+                    latest = t
     return latest
 
 
