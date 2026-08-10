@@ -131,10 +131,7 @@ fn quarantine_probe_exits_when_all_attempts_fail(step: &str) -> bool {
     else {
         return false;
     };
-    let Some(end) = lines[condition + 1..].iter().position(|line| *line == "fi") else {
-        return false;
-    };
-    lines[condition + 1..condition + 1 + end].contains(&"exit 1")
+    lines.get(condition + 1) == Some(&"exit 1") && lines.get(condition + 2) == Some(&"fi")
 }
 
 fn quarantine_probe_appends_aggregate(step: &str) -> bool {
@@ -455,6 +452,16 @@ fn owner_timeout_quarantine_guard_rejects_required_probe_mutations() {
     assert!(!quarantine_probe_guard_is_intact(
         &commented_aggregate_append
     ));
+
+    let nested_dead_exit = probe.replacen(
+        "            exit 1",
+        "            if false; then\n              exit 1\n            fi",
+        1,
+    );
+    assert!(!quarantine_probe_exits_when_all_attempts_fail(
+        &nested_dead_exit
+    ));
+    assert!(!quarantine_probe_guard_is_intact(&nested_dead_exit));
 }
 
 /// FR-019 "owner timed out" coverage — the active half. Distinct from
