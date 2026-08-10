@@ -175,6 +175,298 @@ assert_route_test_verdict() {
   exit 1
 }
 
+classify_store_reporter_verdict() {
+  # #477. The store mutation is refused through TWO channels and the checker can
+  # only ever reach one of them. `check-...compileout.sh` runs `cargo test` long
+  # before it reaches its own artifact-contract report, and it is `set -e`: when
+  # the mutation makes the test fail, the checker dies at the test and the report
+  # line is never printed. The expectation was not stale — the reporter is
+  # structurally unreachable. Measured on the real log of job 93385423348: the
+  # report string appears 0 times, whole-line and substring alike.
+  #
+  # Both channels assert the SAME property. The report says the published
+  # artifact contract is not status-only; the test asserts on `artifact_contract`
+  # that authority is none and the only exposed route is the status one. Accepting
+  # either is not a widening — it is naming the second enforcement point of one
+  # property.
+  #
+  # Whole-line FIXED comparison on both PASS channels. Not regex: `...` is three
+  # metacharacters, and the forgotten spelling matches any three characters —
+  # the exact looseness this suite exists to catch, inside the fix for it.
+  #
+  # The order below is: the two exact PASS channels, then build death, then
+  # recognised compile death, then WRONG_TEST. Two of those relationships are
+  # exercised by fixtures in this file; the rest are arrangement.
+  #
+  #   exact PASS before WRONG_TEST   — moving WRONG_TEST above the PASS channels
+  #     turns `verdict_line`, `order_verdict_beats_wrong_test` and
+  #     `verdict_survives_cargo_epilogue` red. Its pattern matches OUR name too.
+  #   compile before WRONG_TEST      — swapping those two turns
+  #     `compile_evidence_beats_wrong_test` red.
+  #
+  # BUILD currently precedes COMPILE, and no fixture distinguishes that pair:
+  # swapping them changes no result here, because the build-death fixture
+  # matches none of the compile signatures. No claim is made about it.
+  #
+  # Precedence alone cannot separate compile death from a wrong test. `^error: `
+  # matches cargo's test epilogue `error: test failed, to rerun pass ...`, which
+  # accompanied the failing test in the log measured for #477 and which says
+  # nothing about compilation. Under that broad pattern the wrong-test fixtures
+  # carrying the epilogue classified as compile death and WRONG_TEST did not
+  # fire on them — the same structural unreachability #477 exists to fix,
+  # reproduced inside the fix. The two branches are therefore separated by
+  # EVIDENCE, not by order: only a signature that rustc or cargo emits when a
+  # unit fails to build counts as compile death.
+  #
+  # Pure: echoes a reason and returns a status, paired — 0 with each PASS
+  # reason, 1 with each rejection reason. The caller returns on a PASS pair and,
+  # only on the others, prints a diagnostic, dumps the log and exits.
+  local test_name="$1" checker_line="$2" log="$3"
+  if grep -Fxq "${checker_line}" "${log}"; then
+    echo PASS_CHECKER
+    return 0
+  fi
+  if grep -Fxq "test ${test_name} ... FAILED" "${log}"; then
+    echo PASS_VERDICT
+    return 0
+  fi
+  if grep -Fq "failed to run custom build command" "${log}"; then
+    echo HARNESS_FAILURE_BUILD
+    return 1
+  fi
+  if grep -Eq '^error\[E[0-9]+\]: |^error: could not compile |^error: aborting due to |^error: linking with ' "${log}"; then
+    echo HARNESS_FAILURE_COMPILE
+    return 1
+  fi
+  if grep -Eq '^test mobile_claw_vpn_phase0_[a-z0-9_]+ \.\.\. FAILED$' "${log}"; then
+    echo WRONG_TEST
+    return 1
+  fi
+  echo UNKNOWN
+  return 1
+}
+
+describe_wrong_test() {
+  # The classifier already matched a line; the reader should not have to search
+  # the full log dump for the thing a regex found a moment earlier. Print BOTH
+  # complete lines — what was expected and what was actually there — because the
+  # whole point of this control is that a message must name what happened.
+  local test_name="$1" log="$2" observed
+  observed="$(grep -Em1 '^test mobile_claw_vpn_phase0_[a-z0-9_]+ \.\.\. FAILED$' "${log}")"
+  echo "expected: test ${test_name} ... FAILED"
+  echo "observed: ${observed}"
+}
+
+selftest_store_reporter() {
+  # Durable controls for the classifier above, run before any mutation so a
+  # broken oracle costs seconds instead of a full matrix. Synthetic by design:
+  # they must keep working with no network, no CI artefact and no external
+  # fixture.
+  #
+  # The fixtures below are written from literals in this function. What differs
+  # between them is where the shape came from, and that is worth knowing before
+  # reading a green as reassurance.
+  #
+  # One shape is mirrored from a retained log: the verdict fixture reproduces the
+  # line from job 93385423348, the run in which this control failed. The compile
+  # signatures are the forms rustc and cargo document; the remaining cases were
+  # constructed in review — a carriage return, interleaved stderr, an indented
+  # verdict, the report without its annotation, a wrong test. For those, no log
+  # is retained here, and nothing is asserted about whether they have occurred.
+  #
+  # What a green here establishes is narrow and exact: the classifier assigns
+  # these reasons and statuses to these bytes. It says nothing about how often
+  # any shape appears, or whether one has ever been survived in a real run.
+  local dir="${TMP_ROOT}/store-reporter-selftest"
+  local name=mobile_claw_vpn_phase0_exposes_only_authenticated_unavailable_status
+  local report='::error::published theyos-engine Phase 0 artifact contract is not status-only'
+  local verdict="test ${name} ... FAILED"
+  local failed=0
+  mkdir -p "${dir}"
+
+  _expect() { # case_name expected_reason
+    # Reason AND exit status, for every case. Asserting the reason alone left
+    # half of the classifier's documented contract untested: at the time, every
+    # caller discarded the status with `|| true`, so flipping a rejection's
+    # `return 1` to `return 0` changed no verdict anywhere and no control went
+    # red. The return value was free to drift out of agreement with the reason
+    # it accompanies, and nothing would have said so.
+    #
+    # This assertion alone already guards the classifier's declared invariant:
+    # the selftest runs before the matrix, so a mismatched status stops the run
+    # here. Reading the pair in `expect_store_reporter_failure` as well adds
+    # something different — detection of a divergence that appears while the
+    # matrix is running, reported there as ORACLE FAILURE. Neither path turns a
+    # mismatch into an accept.
+    #
+    # The status is captured through `if`, not `$(... || true)`: the substitution
+    # form discards it, `||` would suppress the very thing being measured, and a
+    # bare assignment dies under `set -e` before the pair can be inspected.
+    local case_name="$1" expected="$2" got rc expected_rc=1
+    [[ "${expected}" == PASS_* ]] && expected_rc=0
+    if got="$(classify_store_reporter_verdict "${name}" "${report}" "${dir}/${case_name}.log")"; then
+      rc=0
+    else
+      rc=$?
+    fi
+    if [[ "${got}" != "${expected}" ]]; then
+      echo "error: store reporter selftest ${case_name}: expected ${expected}, got ${got}" >&2
+      failed=1
+    fi
+    if [[ "${rc}" -ne "${expected_rc}" ]]; then
+      echo "error: store reporter selftest ${case_name}: ${expected} must exit ${expected_rc}, got rc=${rc}" >&2
+      failed=1
+    fi
+  }
+
+  _case() { # name expected line...
+    local case_name="$1" expected="$2"
+    shift 2
+    printf '%s\n' "$@" >"${dir}/${case_name}.log"
+    _expect "${case_name}" "${expected}"
+  }
+
+  _case report_line              PASS_CHECKER            'Phase 0 authority: snapshot ok' "${report}"
+  _case verdict_line             PASS_VERDICT            'running 4 tests' "${verdict}"
+  _case build_death              HARNESS_FAILURE_BUILD   "error: failed to run custom build command for \`server-rs\`"
+  _case compile_failure          HARNESS_FAILURE_COMPILE "error[E0432]: unresolved import in ${name}"
+  _case wrong_test               WRONG_TEST              'test mobile_claw_vpn_phase0_mutation_routes_are_absent ... FAILED'
+  _case loose_substring          UNKNOWN                 "note: see test ${name} ... FAILED for details"
+  _case indented_verdict         UNKNOWN                 "  ${verdict}"
+  _case silent_nonzero           UNKNOWN                 'some unrelated failure'
+  # stderr can interleave between libtest's `test NAME ... ` and its `FAILED`,
+  # because the harness merges 2>&1 into one file. A split line must never pass.
+  _case stderr_interleaved       UNKNOWN                 "test ${name} ... WARN dropping connFAILED"
+  # The report without its ::error:: annotation is deliberately NOT a pass: the
+  # accepted line is the one the checker actually emits. Fails red, never green.
+  _case report_without_annotation UNKNOWN                'published theyos-engine Phase 0 artifact contract is not status-only'
+  # Order, observed rather than asserted: each of these logs ALSO matches a later
+  # classifier, and must still come out a pass.
+  _case order_verdict_beats_wrong_test PASS_VERDICT      "${verdict}" 'test mobile_claw_vpn_phase0_mutation_routes_are_absent ... FAILED'
+  # Named for what it pins, not for the ordering it used to justify: cargo's
+  # epilogue accompanied the failing test in the log measured for #477 and must
+  # not demote that genuine verdict. It still has teeth — moving WRONG_TEST above
+  # the positives turns it red — but it no longer distinguishes the compile
+  # branch's position.
+  _case verdict_survives_cargo_epilogue PASS_VERDICT     "${verdict}" 'error: test failed, to rerun pass `-p server-rs --test claw_store_wire_contract`'
+  # Reachability. Cargo printed its epilogue alongside the failing test in the
+  # log measured for #477, so a wrong test is expected to arrive carrying it.
+  # Under a `^error: ` compile pattern this fixture classified as compile death
+  # and WRONG_TEST did not fire on it. The bare case above passes either way —
+  # only this one distinguishes them.
+  _case wrong_test_with_cargo_epilogue WRONG_TEST        'running 4 tests' \
+    'test mobile_claw_vpn_phase0_mutation_routes_are_absent ... FAILED' \
+    'failures:' \
+    'error: test failed, to rerun pass `-p server-rs --test claw_store_wire_contract`'
+  # ...and the narrowing must not cost the precedence it replaced: a recognised
+  # compile signature still outranks a stale verdict line in the same log.
+  _case compile_evidence_beats_wrong_test HARNESS_FAILURE_COMPILE \
+    'test mobile_claw_vpn_phase0_mutation_routes_are_absent ... FAILED' \
+    'error: could not compile `server-rs` (test) due to 1 previous error'
+  _case compile_without_error_code     HARNESS_FAILURE_COMPILE \
+    'error: expected one of `,` or `}`, found `;`' \
+    'error: could not compile `server-rs` (test) due to 1 previous error'
+  # The epilogue on its own says a test failed without saying which. That is
+  # genuinely unknown, and calling it compile death would be the same lie.
+  _case cargo_epilogue_alone           UNKNOWN           'running 4 tests' \
+    'error: test failed, to rerun pass `-p server-rs --test claw_store_wire_contract`'
+  # Both arms of the recogniser, pinned. Narrowing buys reachability for
+  # WRONG_TEST and could pay for it by dropping compile signatures that carry no
+  # error code and no `could not compile` line; these two constructed
+  # compile-signature cases are the forms that would fall outside the narrowed
+  # pattern, and they are asserted in the positive direction so the trade is
+  # measured rather than assumed.
+  _case compile_linker_failure         HARNESS_FAILURE_COMPILE \
+    'error: linking with `cc` failed: exit status: 1'
+  _case compile_aborting_due_to        HARNESS_FAILURE_COMPILE \
+    'error: aborting due to 3 previous errors'
+
+  # Written directly to make the CR line ending explicit at the call site —
+  # `_case` can carry one, but it would be invisible among the other arguments.
+  # Routed through the same assertion, so the status check covers it too.
+  printf 'test %s ... FAILED\r\n' "${name}" >"${dir}/crlf_verdict.log"
+  _expect crlf_verdict UNKNOWN
+
+  # The diagnostic itself is a deliverable, so it is asserted like one.
+  local expected_diagnostic observed_diagnostic
+  expected_diagnostic="expected: test ${name} ... FAILED
+observed: test mobile_claw_vpn_phase0_mutation_routes_are_absent ... FAILED"
+  observed_diagnostic="$(describe_wrong_test "${name}" "${dir}/wrong_test_with_cargo_epilogue.log")"
+  if [[ "${observed_diagnostic}" != "${expected_diagnostic}" ]]; then
+    echo "error: store reporter selftest wrong_test_diagnostic: the message does not name both complete lines" >&2
+    echo "--- expected ---" >&2; printf '%s\n' "${expected_diagnostic}" >&2
+    echo "--- got ---" >&2;      printf '%s\n' "${observed_diagnostic}" >&2
+    failed=1
+  fi
+
+  unset -f _case _expect
+  rm -rf "${dir}"
+  if [[ "${failed}" -ne 0 ]]; then
+    echo "error: the store reporter oracle is broken; refusing to run the matrix with it." >&2
+    exit 1
+  fi
+  echo "PASS store_reporter_oracle_selftest"
+}
+
+expect_store_reporter_failure() {
+  # #477 call form: the checker must refuse, and the refusal must be named by
+  # one of the two channels above. Never a bare non-zero exit.
+  local label="$1" test_name="$2" checker_line="$3" root="$4"
+  prepare_empty_authority_inputs
+  if PHASE0_TARGET="${MUTATION_TARGET}" \
+      PHASE0_BUILD_TOOL="${MUTATION_BUILD_TOOL}" \
+      PHASE0_CARGO_TARGET_DIR="${AUTHORITY_TARGET}" \
+      run_checker "${root}/${CHECKER_REL}" "${root}" >"${TMP_ROOT}/${label}.log" 2>&1; then
+    echo "error: checker accepted ${label}" >&2
+    exit 1
+  fi
+  # Reason AND status, matched as a PAIR. Two encodings of one decision diverge
+  # silently, and the earlier form here had the `case` deciding while `|| true`
+  # discarded the status — so the classifier's `return 1` had no consumer, and
+  # flipping any rejection to `return 0` changed nothing anywhere. Asserting the
+  # status in the selftest is what closes that: it runs before the matrix, so a
+  # mismatched pair stops the run. Reading it here as well adds detection of a
+  # divergence that appears once the matrix is under way.
+  #
+  # Reading it here is not enough on its own either. If the status alone decided, a
+  # `WRONG_TEST` that returned 0 would print PASS. Only the six pairs the
+  # classifier is defined to produce are acceptable; anything else is the oracle
+  # contradicting itself, which is a harder failure than any verdict it could
+  # report and is named as such.
+  local reason rc
+  if reason="$(classify_store_reporter_verdict "${test_name}" "${checker_line}" "${TMP_ROOT}/${label}.log")"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  case "${reason}:${rc}" in
+    PASS_CHECKER:0|PASS_VERDICT:0)
+      echo "PASS ${label}_refused"
+      return
+      ;;
+    HARNESS_FAILURE_BUILD:1)
+      echo "error: ${label} HARNESS FAILURE — the build died before the semantic check (failed to run custom build command); the negative control is INCONCLUSIVE, not satisfied. Fix the harness, not the expectation." >&2
+      ;;
+    HARNESS_FAILURE_COMPILE:1)
+      echo "error: ${label} HARNESS FAILURE — the checker did not compile, so neither the artifact contract report nor '${test_name}' could be reached. INCONCLUSIVE, not satisfied." >&2
+      ;;
+    WRONG_TEST:1)
+      echo "error: ${label} WRONG TEST — a mobile_claw_vpn_phase0_ test failed, but not '${test_name}', and the artifact contract report is absent. The mutation was NOT proven refused by the property this control asserts." >&2
+      describe_wrong_test "${test_name}" "${TMP_ROOT}/${label}.log" >&2
+      ;;
+    UNKNOWN:1)
+      echo "error: ${label} UNKNOWN — the checker exited non-zero but the log carries neither the exact report line nor the exact '${test_name}' libtest verdict, and no recognizable build failure. Inconclusive, never a pass." >&2
+      ;;
+    *)
+      echo "error: ${label} ORACLE FAILURE — the classifier returned the inconsistent pair (reason='${reason}', rc=${rc}). Every reason it defines pairs with exactly one status: PASS_CHECKER and PASS_VERDICT with 0, HARNESS_FAILURE_BUILD, HARNESS_FAILURE_COMPILE, WRONG_TEST and UNKNOWN with 1. An oracle that contradicts itself cannot adjudicate this mutation; nothing here is a pass." >&2
+      ;;
+  esac
+  cat "${TMP_ROOT}/${label}.log" >&2
+  exit 1
+}
+
+selftest_store_reporter
+
 commit_mutation() {
   local root="$1" label="$2"
   git -C "${root}" add -A
@@ -551,8 +843,9 @@ perl -0pi -e \
   's/pub const IP_TUNNEL_RESOURCE_COMPILED: bool = cfg!\(any\(test, feature = "dev_t1_datapath"\)\);/pub const IP_TUNNEL_RESOURCE_COMPILED: bool = true;/' \
   "${store_open}/admin/rust/server-rs/src/claw_share_relay_stream_offer_store.rs"
 commit_mutation "${store_open}" store-open
-expect_checker_failure generic_ip_tunnel_store \
-  "published theyos-engine Phase 0 artifact contract is not status-only" \
+expect_store_reporter_failure generic_ip_tunnel_store \
+  mobile_claw_vpn_phase0_exposes_only_authenticated_unavailable_status \
+  '::error::published theyos-engine Phase 0 artifact contract is not status-only' \
   "${store_open}"
 
 build_cfg="${TMP_ROOT}/build-cfg"
