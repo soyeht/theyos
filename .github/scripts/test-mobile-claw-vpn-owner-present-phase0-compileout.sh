@@ -467,6 +467,191 @@ expect_store_reporter_failure() {
 
 selftest_store_reporter
 
+classify_build_cfg_verdict() {
+  # #479. `build_cfg_crossing` injects a write of `src/handlers_misc.rs` into
+  # server-rs's build script. The refusal it is testing for IS a build-script
+  # panic, so `failed to run custom build command` is this control's success
+  # signal and every other control's harness death. The generic helper checks
+  # that string first and classifies it unconditionally as harness death, which
+  # makes the intended channel unreachable once the matrix arrives here — the
+  # same shape as #477, in a different place and for a different reason.
+  #
+  # The injected build script has TWO panics and they mean opposite things:
+  #   "Phase 0 source snapshot was writable"        the write SUCCEEDED — the
+  #                                                 boundary did not hold
+  #   "Phase 0 source mutation was blocked: <err>"  the write was refused — the
+  #                                                 boundary held, this is PASS
+  # Both produce the identical cargo wrapper line, so the wrapper line alone
+  # cannot tell a held boundary from a broken one. Only the panic text can.
+  #
+  # SNAPSHOT_WRITABLE is tested first. The two panics are mutually exclusive in
+  # a coherent log, so the order is defensive rather than load-bearing on real
+  # input; a fixture carrying both is pinned below so the alarming reading wins
+  # if they ever co-occur.
+  #
+  # Acceptance needs three facts together, not one string: the failing package,
+  # the panicking build script, and the blocked message. Any one of them alone
+  # is satisfied by logs that do not show what this control asserts.
+  #
+  # Two of the three are exercised: dropping the `server-rs/build.rs` check or
+  # loosening the blocked-message pattern each turns fixtures red. Dropping the
+  # package name from the first check changes no fixture, because every log that
+  # names a foreign package also names that package's build script, and the
+  # second check already rejects it. The package name is kept as conjunctive
+  # evidence and is recorded here as not currently exercised, rather than
+  # given a fixture built to make it look exercised.
+  #
+  # Matched with anchored patterns, not `grep -Fx`: cargo prints the panic
+  # inside its indented `Caused by:` block, so the line is not equal to the
+  # message. The alternative would be a substring match, which is the looseness
+  # #456 removed. The message text itself carries no regex metacharacters.
+  #
+  # The error inside the blocked variant is deliberately NOT pinned. What this
+  # control asserts is that the write was refused; `Read-only file system` and
+  # `Permission denied` are both refusals, and pinning one errno would make the
+  # control a report on how the snapshot happens to be protected today.
+  local log="$1"
+  if grep -Eq '^[[:space:]]*Phase 0 source snapshot was writable$' "${log}"; then
+    echo SNAPSHOT_WRITABLE
+    return 1
+  fi
+  if grep -Fq 'failed to run custom build command for `server-rs' "${log}" \
+      && grep -Eq '^[[:space:]]*thread .* panicked at server-rs/build\.rs:' "${log}" \
+      && grep -Eq '^[[:space:]]*Phase 0 source mutation was blocked: .+$' "${log}"; then
+    echo PASS_BUILD_SCRIPT_REFUSAL
+    return 0
+  fi
+  if grep -Fq 'failed to run custom build command' "${log}"; then
+    echo HARNESS_FAILURE_BUILD
+    return 1
+  fi
+  if grep -Eq '^error\[E[0-9]+\]: |^error: could not compile |^error: aborting due to |^error: linking with ' "${log}"; then
+    echo HARNESS_FAILURE_COMPILE
+    return 1
+  fi
+  echo UNKNOWN
+  return 1
+}
+
+selftest_build_cfg_reporter() {
+  # Durable controls, run before the matrix. Fixtures are written from literals
+  # in this function. One shape is mirrored from a retained log: the refusal
+  # case reproduces the lines from job 93407238709, the run in which this
+  # control was first reached. The rest are constructed here.
+  local dir="${TMP_ROOT}/build-cfg-selftest"
+  local failed=0
+  local pkg='error: failed to run custom build command for `server-rs v0.1.25 (/project/admin/rust/server-rs)`'
+  local at="    thread 'main' (7570) panicked at server-rs/build.rs:21:23:"
+  mkdir -p "${dir}"
+
+  _bexpect() { # case_name expected_reason
+    local case_name="$1" expected="$2" got rc expected_rc=1
+    [[ "${expected}" == PASS_* ]] && expected_rc=0
+    if got="$(classify_build_cfg_verdict "${dir}/${case_name}.log")"; then rc=0; else rc=$?; fi
+    if [[ "${got}" != "${expected}" ]]; then
+      echo "error: build cfg selftest ${case_name}: expected ${expected}, got ${got}" >&2
+      failed=1
+    fi
+    if [[ "${rc}" -ne "${expected_rc}" ]]; then
+      echo "error: build cfg selftest ${case_name}: ${expected} must exit ${expected_rc}, got rc=${rc}" >&2
+      failed=1
+    fi
+  }
+  _bcase() { local case_name="$1" expected="$2"; shift 2
+    printf '%s\n' "$@" >"${dir}/${case_name}.log"; _bexpect "${case_name}" "${expected}"; }
+
+  _bcase refusal_readonly    PASS_BUILD_SCRIPT_REFUSAL "${pkg}" "${at}" \
+    '    Phase 0 source mutation was blocked: Read-only file system (os error 30)'
+  # The property is "the write was refused", not one errno; a differently
+  # protected snapshot must still pass.
+  _bcase refusal_permission  PASS_BUILD_SCRIPT_REFUSAL "${pkg}" "${at}" \
+    '    Phase 0 source mutation was blocked: Permission denied (os error 13)'
+  # The boundary did NOT hold. This is the finding this whole matrix exists for
+  # and it must never be read as a refusal.
+  _bcase snapshot_writable   SNAPSHOT_WRITABLE "${pkg}" "${at}" \
+    '    Phase 0 source snapshot was writable'
+  _bcase writable_wins_over_blocked SNAPSHOT_WRITABLE "${pkg}" "${at}" \
+    '    Phase 0 source snapshot was writable' \
+    '    Phase 0 source mutation was blocked: Read-only file system (os error 30)'
+  # Each of the three required facts, removed one at a time.
+  _bcase wrong_package       HARNESS_FAILURE_BUILD \
+    'error: failed to run custom build command for `household-rs v0.1.25 (/project/admin/rust/household-rs)`' \
+    "    thread 'main' (7570) panicked at household-rs/build.rs:21:23:" \
+    '    Phase 0 source mutation was blocked: Read-only file system (os error 30)'
+  _bcase wrong_build_script  HARNESS_FAILURE_BUILD "${pkg}" \
+    "    thread 'main' (7570) panicked at core-rs/build.rs:9:5:" \
+    '    Phase 0 source mutation was blocked: Read-only file system (os error 30)'
+  _bcase no_panic_message    HARNESS_FAILURE_BUILD "${pkg}" "${at}" \
+    '    called `Option::unwrap()` on a `None` value'
+  # Generic build death with none of our evidence stays harness death.
+  _bcase generic_build_death HARNESS_FAILURE_BUILD \
+    'error: failed to run custom build command for `libsqlite3-sys v0.30.1`' \
+    '    Caused by: PermissionDenied'
+  # Looseness this suite has already been bitten by.
+  _bcase loose_substring     UNKNOWN \
+    'note: the checker prints Phase 0 source mutation was blocked when the snapshot holds'
+  # A truncated message is not the refusal: the panic proves an attempt, not an
+  # outcome. It lands on generic build death rather than UNKNOWN because the
+  # custom-build failure is genuinely present — this expectation was written as
+  # UNKNOWN and the selftest corrected it.
+  _bcase blocked_without_reason HARNESS_FAILURE_BUILD "${pkg}" "${at}" \
+    '    Phase 0 source mutation was blocked:'
+  _bcase compile_death       HARNESS_FAILURE_COMPILE \
+    'error[E0432]: unresolved import' \
+    'error: could not compile `server-rs` (build script) due to 1 previous error'
+  _bcase silent_nonzero      UNKNOWN 'some unrelated failure'
+
+  unset -f _bcase _bexpect
+  rm -rf "${dir}"
+  if [[ "${failed}" -ne 0 ]]; then
+    echo "error: the build cfg oracle is broken; refusing to run the matrix with it." >&2
+    exit 1
+  fi
+  echo "PASS build_cfg_oracle_selftest"
+}
+
+expect_build_cfg_refusal() {
+  # #479 call form. The PASS names the channel it matched, so the next hosted
+  # log carries the mechanism instead of only the outcome — the gap #477's
+  # receipt left open, where a pass discarded the evidence that produced it.
+  local label="$1" root="$2"
+  prepare_empty_authority_inputs
+  if PHASE0_TARGET="${MUTATION_TARGET}" \
+      PHASE0_BUILD_TOOL="${MUTATION_BUILD_TOOL}" \
+      PHASE0_CARGO_TARGET_DIR="${AUTHORITY_TARGET}" \
+      run_checker "${root}/${CHECKER_REL}" "${root}" >"${TMP_ROOT}/${label}.log" 2>&1; then
+    echo "error: checker accepted ${label}" >&2
+    exit 1
+  fi
+  local reason rc
+  if reason="$(classify_build_cfg_verdict "${TMP_ROOT}/${label}.log")"; then rc=0; else rc=$?; fi
+  case "${reason}:${rc}" in
+    PASS_BUILD_SCRIPT_REFUSAL:0)
+      echo "PASS ${label}_refused (${reason})"
+      return
+      ;;
+    SNAPSHOT_WRITABLE:1)
+      echo "error: ${label} BOUNDARY VIOLATED — the build script rewrote src/handlers_misc.rs and reported 'Phase 0 source snapshot was writable'. The published source snapshot is not read-only; this is the condition the mutation exists to detect, not a harness fault." >&2
+      ;;
+    HARNESS_FAILURE_BUILD:1)
+      echo "error: ${label} HARNESS FAILURE — a custom build command died, but not with server-rs's build script reporting that the source mutation was blocked. The intended refusal was not observed, so the control is INCONCLUSIVE, not satisfied." >&2
+      ;;
+    HARNESS_FAILURE_COMPILE:1)
+      echo "error: ${label} HARNESS FAILURE — the mutated tree did not compile, so the build script never attempted the source write. INCONCLUSIVE, not satisfied." >&2
+      ;;
+    UNKNOWN:1)
+      echo "error: ${label} UNKNOWN — the checker exited non-zero but the log carries neither the server-rs build-script refusal nor a recognizable build failure. Inconclusive, never a pass." >&2
+      ;;
+    *)
+      echo "error: ${label} ORACLE FAILURE — the classifier returned the inconsistent pair (reason='${reason}', rc=${rc}). PASS_BUILD_SCRIPT_REFUSAL pairs with 0; SNAPSHOT_WRITABLE, HARNESS_FAILURE_BUILD, HARNESS_FAILURE_COMPILE and UNKNOWN pair with 1. An oracle that contradicts itself cannot adjudicate this mutation." >&2
+      ;;
+  esac
+  cat "${TMP_ROOT}/${label}.log" >&2
+  exit 1
+}
+
+selftest_build_cfg_reporter
+
 commit_mutation() {
   local root="$1" label="$2"
   git -C "${root}" add -A
@@ -854,9 +1039,7 @@ perl -0pi -e \
   's#emit_build_git_sha\(\);#emit_build_git_sha();\n    println!("cargo:rustc-cfg=owner_present_hidden");\n    let source = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("src/handlers_misc.rs");\n    let bytes = std::fs::read(&source).unwrap();\n    match std::fs::write(&source, &bytes) {\n        Ok(()) => panic!("Phase 0 source snapshot was writable"),\n        Err(error) => panic!("Phase 0 source mutation was blocked: {error}"),\n    }#' \
   "${build_cfg}/admin/rust/server-rs/build.rs"
 commit_mutation "${build_cfg}" build-cfg
-expect_checker_failure build_cfg_crossing \
-  "Phase 0 source mutation was blocked" \
-  "${build_cfg}"
+expect_build_cfg_refusal build_cfg_crossing "${build_cfg}"
 
 build_tool_codegen="${TMP_ROOT}/build-tool-codegen"
 clone_head "${build_tool_codegen}"
@@ -1103,9 +1286,24 @@ expect_checker_failure workspace_cargo_alias \
 
 recipe_drift="${TMP_ROOT}/recipe-drift"
 clone_head "${recipe_drift}"
+recipe_source="${recipe_drift}/admin/rust/theyos-engine-build-rs/src/main.rs"
+if [[ "$(grep -Fc '        "--no-default-features",' "${recipe_source}")" -ne 1 ]]; then
+  echo "error: release_recipe_drift expected exactly one canonical --no-default-features argv entry" >&2
+  exit 1
+fi
 perl -0pi -e \
-  's/--no-default-features/--features dev_t1_datapath/' \
-  "${recipe_drift}/admin/rust/theyos-engine-build-rs/src/main.rs"
+  's/        "--no-default-features",/        "--features",\n        "dev_t1_datapath",/ or die "release recipe anchor did not change\n"' \
+  "${recipe_source}"
+# This mutation must create two argv entries. A single string containing a
+# space is rejected by Cargo's CLI before the production feature guard runs,
+# so it would test malformed argument construction instead of recipe drift.
+if grep -Fq '"--features dev_t1_datapath"' "${recipe_source}" \
+    || [[ "$(grep -Fc '        "--features",' "${recipe_source}")" -ne 1 ]] \
+    || [[ "$(grep -Fc '        "dev_t1_datapath",' "${recipe_source}")" -ne 1 ]] \
+    || grep -Fq '        "--no-default-features",' "${recipe_source}"; then
+  echo "error: release_recipe_drift did not produce the exact two-entry Cargo feature argv" >&2
+  exit 1
+fi
 commit_mutation "${recipe_drift}" recipe-drift
 expect_checker_failure release_recipe_drift \
   "production server binary cannot be built with DEV/test features" \

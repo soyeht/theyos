@@ -151,18 +151,35 @@ def make_manifest(
     root: Path,
     *,
     surface_files: list[str] | None = None,
+    bindings: list[dict[str, object]] | None = None,
     pins: list[dict[str, object]] | None = None,
     cargo_manifests: list[str] | None = None,
 ) -> Path:
+    paths = surface_files or ["admin/rust/demo-rs/src/lib.rs"]
+    if bindings is None:
+        bindings = [
+            {"status": "active", "consumer": "demo-consumer", "target": "ffi"}
+            for _ in paths
+        ]
+    if len(bindings) != len(paths):
+        raise ValueError("one binding is required per synthetic surface")
     manifest = {
         "schema": checker.SCHEMA,
-        "surface_files": surface_files or ["admin/rust/demo-rs/src/lib.rs"],
+        "surfaces": [
+            {"path": path, "binding": binding}
+            for path, binding in zip(paths, bindings, strict=True)
+        ],
         "consumers": [
             {
                 "name": "demo-consumer",
-                "cargo_manifests": cargo_manifests
-                if cargo_manifests is not None
-                else ["Native/Ffi/Cargo.toml"],
+                "targets": [
+                    {
+                        "name": "ffi",
+                        "cargo_manifests": cargo_manifests
+                        if cargo_manifests is not None
+                        else ["Native/Ffi/Cargo.toml"],
+                    }
+                ],
                 "pins": pins
                 or [
                     {
@@ -245,7 +262,10 @@ class SurfaceExtractionTests(unittest.TestCase):
         # Exercised against the real bytes in the repo, not a fixture copy. A
         # read failure fails the test; it never degrades to "nothing to check".
         proc = subprocess.run(
-            ("git", "show", f"origin/main:{checker.load_manifest(checker.REPO_ROOT / checker.DEFAULT_MANIFEST)['surface_files'][0]}"),
+            (
+                "git", "show",
+                f"origin/main:{checker.load_manifest(checker.REPO_ROOT / checker.DEFAULT_MANIFEST)['surfaces'][0]['path']}",
+            ),
             cwd=checker.REPO_ROOT, check=False, stdout=subprocess.PIPE, text=True,
         )
         self.assertEqual(0, proc.returncode, "could not read the declared surface file")
@@ -431,7 +451,7 @@ class GateTests(unittest.TestCase):
         pins = [
             {"name": "vendored-source-rev", "path": "Scripts/build.sh",
              "kind": "shell-assigned-rev", "variable": "SOURCE_REV",
-             "governs_ffi_surface": False},
+             "governs_ffi_surface": True},
         ]
         report = self.harness.run(
             manifest_path=make_manifest(self.root, pins=pins), consumer_root=consumer,
@@ -486,7 +506,7 @@ class GateTests(unittest.TestCase):
         write(consumer, "scripts/contract.sha", f"{self.repo['base']}\n")
         pins = [
             {"name": "ffi-cargo-rev", "path": "Native/Ffi/Cargo.toml", "kind": "cargo-git-rev",
-             "dependency": "demo-rs", "governs_ffi_surface": False},
+             "dependency": "demo-rs", "governs_ffi_surface": True},
             {"name": "contract-sha", "path": "scripts/contract.sha", "kind": "bare-rev",
              "governs_ffi_surface": False},
         ]
@@ -520,9 +540,91 @@ class GateTests(unittest.TestCase):
             '[package]\nname = "ffi"\nversion = "0.1.0"\n\n[dependencies]\nunrelated = "1"\n',
         )
         write(consumer, "scripts/contract.sha", f"{self.repo['tip']}\n")
-        pins = [{"name": "contract-sha", "path": "scripts/contract.sha", "kind": "bare-rev"}]
+        pins = [
+            {
+                "name": "contract-sha",
+                "path": "scripts/contract.sha",
+                "kind": "bare-rev",
+                "governs_ffi_surface": True,
+            }
+        ]
         report = self.harness.run(manifest_path=make_manifest(self.root, pins=pins), consumer_root=consumer)
-        self.assert_failure(report, "does not depend on demo-rs, which carries cross-repo FFI surface")
+        self.assert_failure(report, "is bound to admin/rust/demo-rs/src/lib.rs but does not depend")
+
+    def test_deferred_surface_does_not_infer_a_consumer_binding(self) -> None:
+        consumer = make_consumer(self.root, self.repo["tip"], depends_on=None)
+        binding = {
+            "status": "deferred",
+            "owner": "boundary-owner",
+            "reason": "No current target builds this distinct FFI surface.",
+            "expires": "2099-01-01",
+        }
+        pins = [
+            {
+                "name": "contract-sha",
+                "path": "scripts/contract.sha",
+                "kind": "bare-rev",
+                "governs_ffi_surface": False,
+            }
+        ]
+        report = self.harness.run(
+            manifest_path=make_manifest(self.root, bindings=[binding], pins=pins),
+            consumer_root=consumer,
+        )
+        self.assertEqual([], report.errors)
+        self.assertTrue(any("explicitly deferred" in note for note in report.notes))
+
+    def test_expired_deferred_surface_is_red(self) -> None:
+        consumer = make_consumer(self.root, self.repo["tip"], depends_on=None)
+        binding = {
+            "status": "deferred",
+            "owner": "boundary-owner",
+            "reason": "No current target builds this surface.",
+            "expires": "2000-01-01",
+        }
+        pins = [
+            {
+                "name": "contract-sha",
+                "path": "scripts/contract.sha",
+                "kind": "bare-rev",
+                "governs_ffi_surface": False,
+            }
+        ]
+        report = self.harness.run(
+            manifest_path=make_manifest(self.root, bindings=[binding], pins=pins),
+            consumer_root=consumer,
+        )
+        self.assert_failure(report, "deferred surface admin/rust/demo-rs/src/lib.rs expired")
+
+    def test_active_binding_requires_a_real_target_and_governing_pin(self) -> None:
+        good = json.loads(make_manifest(self.root).read_text(encoding="utf-8"))
+        path = self.root / "bad-binding.json"
+        cases = {
+            "unknown target": {
+                **good,
+                "surfaces": [{
+                    "path": "admin/rust/demo-rs/src/lib.rs",
+                    "binding": {"status": "active", "consumer": "demo-consumer", "target": "absent"},
+                }],
+            },
+            "no governing pin": {
+                **good,
+                "consumers": [{
+                    **good["consumers"][0],
+                    "pins": [{
+                        "name": "contract-sha",
+                        "path": "scripts/contract.sha",
+                        "kind": "bare-rev",
+                        "governs_ffi_surface": False,
+                    }],
+                }],
+            },
+        }
+        for label, payload in cases.items():
+            with self.subTest(case=label):
+                path.write_text(json.dumps(payload), encoding="utf-8")
+                with self.assertRaises(checker.Malformed):
+                    checker.load_manifest(path)
 
     # ── sweep: the declared list must equal the tree ─────────────────────────
 
@@ -587,8 +689,23 @@ class GateTests(unittest.TestCase):
         good = json.loads(make_manifest(self.root).read_text(encoding="utf-8"))
         cases: dict[str, object] = {
             "wrong schema": {**good, "schema": "other"},
-            "no surface files": {**good, "surface_files": []},
-            "surface not a list": {**good, "surface_files": "one"},
+            "no surfaces": {**good, "surfaces": []},
+            "surface not a list": {**good, "surfaces": "one"},
+            "surface without binding": {
+                **good,
+                "surfaces": [{"path": "admin/rust/demo-rs/src/lib.rs"}],
+            },
+            "deferred without owner": {
+                **good,
+                "surfaces": [{
+                    "path": "admin/rust/demo-rs/src/lib.rs",
+                    "binding": {
+                        "status": "deferred",
+                        "reason": "not wired",
+                        "expires": "2099-01-01",
+                    },
+                }],
+            },
             "no consumers": {**good, "consumers": []},
             "consumer without pins": {**good, "consumers": [{"name": "x", "pins": []}]},
             "not an object": [good],
