@@ -11,6 +11,7 @@ on:
       - "scripts/generate-brew-formula.sh"
       - "tests/nixos-install/**"
       - ".github/workflows/homebrew-smoke-macos.yml"
+      - ".github/workflows/homebrew-smoke-docs-shim.yml"
   pull_request:
     paths:
       - "admin/rust/**"
@@ -21,6 +22,7 @@ on:
       - "scripts/generate-brew-formula.sh"
       - "tests/nixos-install/**"
       - ".github/workflows/homebrew-smoke-macos.yml"
+      - ".github/workflows/homebrew-smoke-docs-shim.yml"
   workflow_dispatch:
 
 # One run per workflow per ref. A new commit supersedes the old run instead of

@@ -9,6 +9,11 @@
 #
 # KEEP `paths-ignore` BYTE-IDENTICAL to `on.pull_request.paths` in
 # homebrew-smoke-macos.yml.
+#
+# SELF-CERTIFICATION: both workflow files belong to that shared list. Editing
+# this shim must trigger the real macOS job and suppress the shim; otherwise the
+# mechanism that decides whether a required build can be skipped approves its
+# own change without running the build.
 name: Homebrew Smoke (docs-only shim)
 
 on:
@@ -22,6 +27,7 @@ on:
       - "scripts/generate-brew-formula.sh"
       - "tests/nixos-install/**"
       - ".github/workflows/homebrew-smoke-macos.yml"
+      - ".github/workflows/homebrew-smoke-docs-shim.yml"
 
 # One run per workflow per ref. A new commit supersedes the old run instead of
 # leaving it to burn a full build on code that no longer exists.
