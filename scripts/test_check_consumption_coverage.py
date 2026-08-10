@@ -15,6 +15,7 @@ to and green when restored:
     the regex no longer sees) -> RED even with nothing else wrong
   * coverage-glob drift: a backend-ci.yml this parser cannot read -> exit 2
     (fail closed), never a silent empty covered set
+  * partition drift between push, pull_request, and the docs-only shim -> exit 2
 """
 
 from __future__ import annotations
@@ -44,6 +45,12 @@ MATRIX_SPEC.loader.exec_module(matrix)
 BACKEND_CI = """\
 name: Backend CI
 on:
+  push:
+    paths:
+      - "admin/rust/**"
+      - "scripts/**"
+      - ".github/workflows/backend-ci.yml"
+      - ".github/workflows/backend-ci-docs-shim.yml"
   pull_request:
     paths:
       - "admin/rust/**"
@@ -214,8 +221,29 @@ class ConsumptionCoverageTests(unittest.TestCase):
             repo = _build_repo(Path(d), 'const S: &str = include_str!("sibling.txt");\n')
             shim = repo / ".github" / "workflows" / "backend-ci-docs-shim.yml"
             shim.write_text(BACKEND_SHIM.replace('      - "admin/rust/**"\n', ""), encoding="utf-8")
-            rc, _ = _run(repo)
-            self.assertEqual(rc, 2)
+            with self.assertRaisesRegex(
+                gate.GateCannotRun,
+                "backend-ci pull_request paths and docs-shim paths-ignore differ",
+            ):
+                gate.run(
+                    repo,
+                    repo / ".github" / "workflows" / "backend-ci.yml",
+                    set(),
+                    out=io.StringIO(),
+                )
+
+    def test_push_partition_drift_fails_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = _build_repo(Path(d), 'const S: &str = include_str!("sibling.txt");\n')
+            backend = repo / ".github" / "workflows" / "backend-ci.yml"
+            text = backend.read_text(encoding="utf-8")
+            push, pull_request = text.split("  pull_request:\n", 1)
+            push = push.replace('      - "admin/rust/**"\n', "")
+            backend.write_text(push + "  pull_request:\n" + pull_request, encoding="utf-8")
+            with self.assertRaisesRegex(
+                gate.GateCannotRun, "backend-ci push paths and pull_request paths differ"
+            ):
+                gate.run(repo, backend, set(), out=io.StringIO())
 
     def test_runtime_literal_is_covered(self):
         with tempfile.TemporaryDirectory() as d:
