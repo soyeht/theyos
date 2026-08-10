@@ -311,7 +311,7 @@ def _latest_ping(repo: str, number: int) -> datetime | None:
         ]
     )
     try:
-        comments = json.loads(js) if js.strip() else []
+        comments = json.loads(js)
     except json.JSONDecodeError as e:
         raise GateCannotRun("could not parse issue-comments response") from e
     if not isinstance(comments, list):

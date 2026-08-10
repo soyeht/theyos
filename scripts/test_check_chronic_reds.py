@@ -192,6 +192,8 @@ class LatestPingTests(unittest.TestCase):
 
     def test_latest_ping_rejects_invalid_json_and_shapes(self):
         invalid_payloads = [
+            "",
+            " \t\n",
             "not json",
             "[]\n[]",  # concatenated pages are not one valid JSON response
             json.dumps({}),
