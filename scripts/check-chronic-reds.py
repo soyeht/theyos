@@ -307,32 +307,28 @@ def fetch_orphan_issues(repo: str) -> list[OrphanIssue]:
 def _latest_ping(repo: str, number: int) -> datetime | None:
     js = _gh(
         [
-            "api", "--paginate", "--slurp",
-            f"repos/{repo}/issues/{number}/comments",
+            "api", f"repos/{repo}/issues/{number}/comments", "--paginate",
         ]
     )
     try:
-        pages = json.loads(js) if js.strip() else []
+        comments = json.loads(js) if js.strip() else []
     except json.JSONDecodeError as e:
         raise GateCannotRun("could not parse issue-comments response") from e
-    if not isinstance(pages, list):
-        raise GateCannotRun("issue-comments response is not a paginated array")
+    if not isinstance(comments, list):
+        raise GateCannotRun("issue-comments response is not an array")
 
     latest: datetime | None = None
-    for page in pages:
-        if not isinstance(page, list):
-            raise GateCannotRun("issue-comments page is not an array")
-        for comment in page:
-            if not isinstance(comment, dict):
-                raise GateCannotRun("issue-comments entry is not an object")
-            body = comment.get("body")
-            created_at = comment.get("created_at")
-            if not isinstance(body, str) or not isinstance(created_at, str):
-                raise GateCannotRun("issue-comments entry lacks string body or created_at")
-            if "chronic-red re-ping" in body:
-                t = parse_date(created_at)
-                if latest is None or t > latest:
-                    latest = t
+    for comment in comments:
+        if not isinstance(comment, dict):
+            raise GateCannotRun("issue-comments entry is not an object")
+        body = comment.get("body")
+        created_at = comment.get("created_at")
+        if not isinstance(body, str) or not isinstance(created_at, str):
+            raise GateCannotRun("issue-comments entry lacks string body or created_at")
+        if "chronic-red re-ping" in body:
+            t = parse_date(created_at)
+            if latest is None or t > latest:
+                latest = t
     return latest
 
 
