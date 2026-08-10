@@ -112,13 +112,66 @@ run_checker() {
 }
 
 prepare_empty_authority_inputs() {
-  # The authority build populates its target with 0444 (read-only) source
-  # copies; clearing it for the next mutation needs u+w first. This is a
-  # transient cleanup step — the build itself never receives write permission,
-  # so the read-only posture the boundary enforces is unchanged.
+  # The frozen CARGO_HOME is `chmod -R a-w`, so every source cargo copies out of
+  # it lands 0444 in the target dir (fs::copy propagates the mode). Clearing the
+  # target for the next mutation therefore needs u+w first.
+  #
+  # What u+w applies to is the build's own OUTPUT directory, which the build has
+  # always been allowed to write — it is not a relaxation of the boundary. The
+  # read-only posture the boundary actually enforces lives on the INPUTS
+  # (SNAPSHOT, BUILD_SNAPSHOT, CARGO_HOME), which stay a-w and are never touched
+  # here.
   chmod -R u+w "${AUTHORITY_TARGET}" 2>/dev/null || true
   rm -rf "${AUTHORITY_TARGET}"
   mkdir -p "${AUTHORITY_TARGET}"
+}
+
+prepare_route_test_target() {
+  # ROUTE_TEST_TARGET is reused across every route command instead of being
+  # recreated, because these builds are the expensive ones and the cache is what
+  # keeps this suite affordable. Reuse is exactly why it needs u+w: the previous
+  # command left 0444 copies behind (same fs::copy propagation as above), and the
+  # next one cannot overwrite them — that is the libsqlite3-sys PermissionDenied
+  # that killed the build and masked the negative control for 9 commits.
+  #
+  # Deliberately no `rm -rf`: clearing it would restore correctness by throwing
+  # the cache away, which is the fix we are not making. Same scope as above —
+  # this is the build's own output dir, and the frozen inputs are untouched.
+  mkdir -p "${ROUTE_TEST_TARGET}"
+  chmod -R u+w "${ROUTE_TEST_TARGET}" 2>/dev/null || true
+}
+
+assert_route_test_verdict() {
+  # A non-zero exit from `cargo test` proves nothing on its own here: the route
+  # tests are SUPPOSED to fail, and a build that dies before libtest ever starts
+  # exits non-zero too. Worse, cargo's own diagnostics quote the test name being
+  # filtered, so a substring match on that name accepts build death as a semantic
+  # negative — a false green in the one control that exists to catch false
+  # greens.
+  #
+  # Only the exact libtest verdict line proves the test ran AND rejected the
+  # mutation. It is checked first precisely because it is positive evidence: a
+  # test that really failed can never be reclassified as a harness fault by a
+  # stray 'error:' in its panic output. Everything else is inconclusive, and is
+  # reported as inconclusive — never as success.
+  local label="$1" test_name="$2" log="$3"
+  if grep -Eq "^test ${test_name} \.\.\. FAILED$" "${log}"; then
+    echo "PASS ${label}_refused"
+    return
+  fi
+  if grep -Fq "failed to run custom build command" "${log}"; then
+    echo "error: ${label} HARNESS FAILURE — the build died before libtest started (failed to run custom build command); '${test_name}' never ran, so the negative control is INCONCLUSIVE, not satisfied. Fix the harness, not the expectation." >&2
+    cat "${log}" >&2
+    exit 1
+  fi
+  if grep -Eq '^error(\[E[0-9]+\])?: |^error: could not compile ' "${log}"; then
+    echo "error: ${label} HARNESS FAILURE — the route test did not compile, so '${test_name}' never ran. The negative control is INCONCLUSIVE, not satisfied." >&2
+    cat "${log}" >&2
+    exit 1
+  fi
+  echo "error: ${label} UNKNOWN — cargo test exited non-zero but the log has no '^test ${test_name} ... FAILED' verdict and no recognizable build failure. The mutation was NOT proven refused; this is inconclusive, never a pass." >&2
+  cat "${log}" >&2
+  exit 1
 }
 
 commit_mutation() {
@@ -180,6 +233,7 @@ expect_checker_failure_any() {
 
 expect_route_test_failure() {
   local label="$1" root="$2"
+  prepare_route_test_target
   if CARGO_TARGET_DIR="${ROUTE_TEST_TARGET}" \
       cargo test \
         --manifest-path "${root}/admin/rust/Cargo.toml" \
@@ -192,17 +246,14 @@ expect_route_test_failure() {
     echo "error: real Phase 0 route composer accepted ${label}" >&2
     exit 1
   fi
-  if ! grep -Fq "mobile_claw_vpn_phase0_mutation_routes_are_absent" \
-      "${TMP_ROOT}/${label}.log"; then
-    echo "error: ${label} did not fail in the real Phase 0 route composer test" >&2
-    cat "${TMP_ROOT}/${label}.log" >&2
-    exit 1
-  fi
-  echo "PASS ${label}_refused"
+  assert_route_test_verdict "${label}" \
+    mobile_claw_vpn_phase0_mutation_routes_are_absent \
+    "${TMP_ROOT}/${label}.log"
 }
 
 run_complete_route_test() {
   local root="$1" log="$2"
+  prepare_route_test_target
   CARGO_TARGET_DIR="${ROUTE_TEST_TARGET}" \
     cargo test \
       --manifest-path "${root}/admin/rust/Cargo.toml" \
@@ -220,16 +271,12 @@ expect_complete_route_test_failure() {
     echo "error: complete production app accepted ${label}" >&2
     exit 1
   fi
-  if ! grep -Fq \
-      "mobile_claw_vpn_phase0_complete_production_app_rejects_mutation_routes" \
-      "${TMP_ROOT}/${label}.log"; then
-    echo "error: ${label} did not fail in the complete production app test" >&2
-    cat "${TMP_ROOT}/${label}.log" >&2
-    exit 1
-  fi
-  echo "PASS ${label}_refused"
+  assert_route_test_verdict "${label}" \
+    mobile_claw_vpn_phase0_complete_production_app_rejects_mutation_routes \
+    "${TMP_ROOT}/${label}.log"
 }
 
+prepare_route_test_target
 if CARGO_TARGET_DIR="${ROUTE_TEST_TARGET}" \
     cargo check \
       --manifest-path "${REPO_ROOT}/admin/rust/Cargo.toml" \
@@ -387,6 +434,7 @@ else
   echo "PASS path_docker_injection_ignored (fixed Docker path unavailable on this host)"
 fi
 
+prepare_route_test_target
 if CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS='--cfg feature="dev_t1_datapath" --cfg feature="dev_claw_share_mint" -C debug-assertions=yes' \
     CARGO_TARGET_DIR="${ROUTE_TEST_TARGET}" \
     "${BUILD_TOOL_BIN}" build "${HOST_TARGET}" cargo \
@@ -403,6 +451,7 @@ UNTRUSTED_CARGO_HOME="${TMP_ROOT}/untrusted-cargo-home"
 mkdir -p "${UNTRUSTED_CARGO_HOME}"
 printf '%s\n' '[build]' 'rustflags = ["--cfg", "owner_present_hidden"]' > \
   "${UNTRUSTED_CARGO_HOME}/config.toml"
+prepare_route_test_target
 if CARGO_HOME="${UNTRUSTED_CARGO_HOME}" \
     CARGO_TARGET_DIR="${ROUTE_TEST_TARGET}" \
     "${BUILD_TOOL_BIN}" build "${HOST_TARGET}" cargo \
@@ -677,6 +726,7 @@ environment_clear_removed="${TMP_ROOT}/environment-clear-removed"
 clone_head "${environment_clear_removed}"
 perl -0pi -e 's/    command\.env_clear\(\);/    \/\/ mutation removed env_clear/' \
   "${environment_clear_removed}/admin/rust/theyos-engine-build-rs/src/main.rs"
+prepare_route_test_target
 if CARGO_TARGET_DIR="${ROUTE_TEST_TARGET}" \
     cargo test \
       --manifest-path "${environment_clear_removed}/admin/rust/Cargo.toml" \
