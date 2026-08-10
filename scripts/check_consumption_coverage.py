@@ -265,7 +265,9 @@ _READDIR_RE = re.compile(r"\bread_dir\s*\(")
 # build.rs literal read_to_string / File::open with a literal path.
 _BUILD_READ_RE = re.compile(r'(?:read_to_string|read_to_end|open)\s*\(\s*"((?:\\.|[^"\\])*)"')
 _RUNTIME_RE = re.compile(r'repo_test_file!\s*\(\s*"((?:\\.|[^"\\\n])*)"\s*\)')
-_RUNTIME_BYPASS_RE = re.compile(r'\.join\s*\(\s*"scripts/')
+# A repo-relative runtime script can be joined directly or from a crate's
+# ../../../ root. Both bypass the literal macro and its depfile edge.
+_RUNTIME_BYPASS_RE = re.compile(r'\.join\s*\(\s*"(?:\.\./)*scripts/')
 
 RUST_SUFFIXES = (".rs",)
 
@@ -429,10 +431,12 @@ def derive_compile_inputs(repo_root: Path) -> list[Use]:
     if result.returncode:
         raise GateCannotRun(f"fresh Cargo matrix failed:\n{result.stderr}")
     try:
-        paths = json.loads(result.stdout)
+        inputs = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
         raise GateCannotRun(f"fresh Cargo matrix emitted invalid input inventory: {exc}") from exc
-    return [Use("cargo-test-matrix", 0, "depfile", path, path) for path in paths]
+    if not isinstance(inputs, list) or not all(isinstance(path, str) for path in inputs):
+        raise GateCannotRun("fresh Cargo matrix emitted invalid input paths")
+    return [Use("cargo-test-matrix", 0, "depfile", path, path) for path in inputs]
 
 
 def run(repo_root: Path, backend_ci: Path, probe_kinds: set[str], out=sys.stdout, derive: bool = False) -> int:
@@ -477,7 +481,7 @@ def run(repo_root: Path, backend_ci: Path, probe_kinds: set[str], out=sys.stdout
     print(f"coverage globs (from {backend_ci.relative_to(repo_root)}):", file=out)
     for p in patterns:
         print(f"  - {p}", file=out)
-    print(f"literal consumption sites scanned: {len(literal)}", file=out)
+    print(f"literal consumption uses scanned: {len(literal)}", file=out)
 
     if covered:
         print(f"\ncovered ({len(covered)}):", file=out)
@@ -485,7 +489,8 @@ def run(repo_root: Path, backend_ci: Path, probe_kinds: set[str], out=sys.stdout
             print(f"  OK   {u.target_repo_rel}  <- {u.consumer}:{u.line} ({u.macro})", file=out)
 
     if uncovered:
-        print(f"\nUNCOVERED consumed files ({len(uncovered)}) -- changing one does NOT trigger backend-ci:", file=out)
+        uncovered_paths = {u.target_repo_rel for u in uncovered}
+        print(f"\nUNCOVERED consumed paths ({len(uncovered_paths)}) -- changing one does NOT trigger backend-ci:", file=out)
         for u in sorted(uncovered, key=lambda x: (x.target_repo_rel or "", x.consumer)):
             print(f"  RED  {u.target_repo_rel}  <- {u.consumer}:{u.line} ({u.macro})", file=out)
 
@@ -513,8 +518,9 @@ def run(repo_root: Path, backend_ci: Path, probe_kinds: set[str], out=sys.stdout
 
     findings = bool(uncovered) or bool(blind)
     if findings:
+        uncovered_paths = {u.target_repo_rel for u in uncovered}
         print(
-            f"\nresult: FAIL ({len(uncovered)} uncovered, {len(blind)} blind-class)",
+            f"\nresult: FAIL ({len(uncovered_paths)} uncovered paths, {len(blind)} blind-class)",
             file=out,
         )
         return 1

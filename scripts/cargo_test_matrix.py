@@ -4,7 +4,8 @@
 The matrix is derived from Cargo metadata and manifests; workflows must not keep
 their own package, excluded-workspace, or required-feature lists. ``--derive``
 uses a fresh target directory so depfiles describe this commit, never a warm
-build's historical inputs.
+build's historical inputs. Its output is a deduplicated set of repository paths:
+coverage is defined over inputs/files, not historical source occurrence counts.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ class Row:
     name: str
     manifest: Path | None
     features: tuple[str, ...] = ()
+    package: str | None = None
 
 
 def cargo_metadata() -> dict:
@@ -46,6 +48,13 @@ def matrix() -> list[Row]:
     excluded = tuple(root_toml["workspace"].get("exclude", ()))
     rows = [Row("workspace", None)]
     rows.extend(Row(f"excluded:{path}", RUST / path / "Cargo.toml") for path in excluded)
+    feature_rows = [
+        Row(f"feature:{package['name']}:{feature}", None, (feature,), package["name"])
+        for package in metadata["packages"]
+        for feature in package["features"]
+        if feature != "default"
+    ]
+    rows.extend(sorted(feature_rows, key=lambda row: row.name))
     manifests = [Path(package["manifest_path"]) for package in metadata["packages"]]
     manifests.extend(RUST / path / "Cargo.toml" for path in excluded)
     for manifest in sorted(set(manifests)):
@@ -59,6 +68,11 @@ def matrix() -> list[Row]:
 
 
 def command(row: Row) -> list[str]:
+    if row.package:
+        return [
+            "cargo", "check", "--locked", "--package", row.package,
+            "--all-targets", "--features", ",".join(row.features),
+        ]
     args = ["cargo", "test", "--locked"]
     if row.manifest is None:
         args.append("--workspace")
@@ -76,9 +90,11 @@ def fresh_target() -> Path:
     return target
 
 
-def depfile_inputs(target: Path) -> set[str]:
+def depfile_inputs(target: Path, repo_root: Path = ROOT) -> set[str]:
+    """Return the deduplicated repository input paths from fresh depfiles."""
+    repo_root = repo_root.resolve()
     inputs: set[str] = set()
-    for depfile in target.rglob("*.d"):
+    for depfile in sorted(target.rglob("*.d")):
         try:
             text = depfile.read_text(encoding="utf-8")
         except UnicodeDecodeError:
@@ -88,7 +104,7 @@ def depfile_inputs(target: Path) -> set[str]:
             if not candidate.is_absolute():
                 continue
             try:
-                inputs.add(candidate.resolve().relative_to(ROOT).as_posix())
+                inputs.add(candidate.resolve().relative_to(repo_root).as_posix())
             except ValueError:
                 continue
     return inputs
@@ -117,7 +133,12 @@ def main() -> int:
     args = parser.parse_args()
     if args.print:
         for row in matrix():
-            print(json.dumps({"name": row.name, "manifest": str(row.manifest or RUST / "Cargo.toml"), "features": row.features}))
+            print(json.dumps({
+                "name": row.name,
+                "manifest": str(row.manifest or RUST / "Cargo.toml"),
+                "package": row.package,
+                "features": row.features,
+            }))
         return 0
     if args.derive:
         return run_compile(True)

@@ -118,8 +118,6 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: "admin/rust -> target"
-      - name: Compile shared Cargo consumption matrix
-        run: python3 scripts/cargo_test_matrix.py --ci-compile
       - name: Clippy (deny warnings)
         run: cd admin/rust && cargo clippy --workspace -- -D warnings 2>&1
       - name: Clippy (dev datapath feature, all targets)
@@ -153,18 +151,7 @@ jobs:
         # Debug profile on purpose: server-rs/src/main.rs carries a
         # `not(debug_assertions)` compile_error! refusing DEV features in
         # release, so debug exercises the surface without touching that guard.
-        run: |
-          cd admin/rust
-          cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[] | . as $p | ($p.features|keys[]) | select(.!="default") | "\($p.name)\t\(.)"' \
-            | sort >/tmp/feature-surface.tsv
-          rc=0
-          while IFS=$'\t' read -r pkg feat; do
-            echo "::group::check ${pkg} --features ${feat}"
-            cargo check --locked -p "${pkg}" --all-targets --features "${feat}" || { echo "::error::${pkg} fails to compile with --features ${feat}"; rc=1; }
-            echo "::endgroup::"
-          done </tmp/feature-surface.tsv
-          exit $rc
+        run: python3 scripts/cargo_test_matrix.py --ci-compile
       - name: Build workspace
         run: cd admin/rust && cargo build --workspace 2>&1
       - name: Populate the registry for the WHOLE resolve graph
@@ -408,8 +395,6 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: "admin/rust -> target"
-      - name: Compile shared Cargo consumption matrix
-        run: python3 scripts/cargo_test_matrix.py --ci-compile
       - name: Clippy (deny warnings)
         run: cd admin/rust && cargo clippy --workspace -- -D warnings 2>&1
       - name: Clippy (dev datapath feature, all targets)
@@ -443,18 +428,7 @@ jobs:
         # Debug profile on purpose: server-rs/src/main.rs carries a
         # `not(debug_assertions)` compile_error! refusing DEV features in
         # release, so debug exercises the surface without touching that guard.
-        run: |
-          cd admin/rust
-          cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[] | . as $p | ($p.features|keys[]) | select(.!="default") | "\($p.name)\t\(.)"' \
-            | sort >/tmp/feature-surface.tsv
-          rc=0
-          while IFS=$'\t' read -r pkg feat; do
-            echo "::group::check ${pkg} --features ${feat}"
-            cargo check --locked -p "${pkg}" --all-targets --features "${feat}" || { echo "::error::${pkg} fails to compile with --features ${feat}"; rc=1; }
-            echo "::endgroup::"
-          done </tmp/feature-surface.tsv
-          exit $rc
+        run: python3 scripts/cargo_test_matrix.py --ci-compile
       - name: Build workspace
         run: cd admin/rust && cargo build --workspace 2>&1
       - name: Populate the registry for the WHOLE resolve graph
