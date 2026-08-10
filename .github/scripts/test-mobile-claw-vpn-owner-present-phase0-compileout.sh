@@ -16,7 +16,13 @@ if [[ "${HOST_TARGET}" != *-apple-darwin ]]; then
   MUTATION_TARGET=x86_64-unknown-linux-musl
   MUTATION_BUILD_TOOL=cross
 fi
-SHARED_TARGET="${TMP_ROOT}/target"
+# Separate cargo target dirs. The authority build writes 0444 (read-only)
+# source copies inside its target; a route test (or a later mutation build)
+# that writes into the SAME dir hits PermissionDenied (errno 13) on the second
+# overwrite — a harness artefact, not a boundary verdict. Splitting the two
+# removes the contention without relaxing any boundary constraint.
+AUTHORITY_TARGET="${TMP_ROOT}/authority-target"
+ROUTE_TEST_TARGET="${TMP_ROOT}/route-test-target"
 if ! grep -Fq \
     'build_tool_version "$(run_clean "${BUILD_TOOL_BIN}" --version)"' \
     "${REPO_ROOT}/${CHECKER_REL}"; then
@@ -106,9 +112,13 @@ run_checker() {
 }
 
 prepare_empty_authority_inputs() {
-  chmod -R u+w "${SHARED_TARGET}" 2>/dev/null || true
-  rm -rf "${SHARED_TARGET}"
-  mkdir -p "${SHARED_TARGET}"
+  # The authority build populates its target with 0444 (read-only) source
+  # copies; clearing it for the next mutation needs u+w first. This is a
+  # transient cleanup step — the build itself never receives write permission,
+  # so the read-only posture the boundary enforces is unchanged.
+  chmod -R u+w "${AUTHORITY_TARGET}" 2>/dev/null || true
+  rm -rf "${AUTHORITY_TARGET}"
+  mkdir -p "${AUTHORITY_TARGET}"
 }
 
 commit_mutation() {
@@ -122,9 +132,14 @@ expect_checker_failure() {
   prepare_empty_authority_inputs
   if PHASE0_TARGET="${MUTATION_TARGET}" \
       PHASE0_BUILD_TOOL="${MUTATION_BUILD_TOOL}" \
-      PHASE0_CARGO_TARGET_DIR="${SHARED_TARGET}" \
+      PHASE0_CARGO_TARGET_DIR="${AUTHORITY_TARGET}" \
       run_checker "${root}/${CHECKER_REL}" "${root}" >"${TMP_ROOT}/${label}.log" 2>&1; then
     echo "error: checker accepted ${label}" >&2
+    exit 1
+  fi
+  if grep -Fq "failed to run custom build command" "${TMP_ROOT}/${label}.log"; then
+    echo "error: ${label} HARNESS FAILURE — the build died before the semantic check (failed to run custom build command); the negative control is INCONCLUSIVE, not satisfied. Fix the harness, not the expectation." >&2
+    cat "${TMP_ROOT}/${label}.log" >&2
     exit 1
   fi
   if ! grep -Fq "${expected}" "${TMP_ROOT}/${label}.log"; then
@@ -141,9 +156,14 @@ expect_checker_failure_any() {
   prepare_empty_authority_inputs
   if PHASE0_TARGET="${MUTATION_TARGET}" \
       PHASE0_BUILD_TOOL="${MUTATION_BUILD_TOOL}" \
-      PHASE0_CARGO_TARGET_DIR="${SHARED_TARGET}" \
+      PHASE0_CARGO_TARGET_DIR="${AUTHORITY_TARGET}" \
       run_checker "${root}/${CHECKER_REL}" "${root}" >"${TMP_ROOT}/${label}.log" 2>&1; then
     echo "error: checker accepted ${label}" >&2
+    exit 1
+  fi
+  if grep -Fq "failed to run custom build command" "${TMP_ROOT}/${label}.log"; then
+    echo "error: ${label} HARNESS FAILURE — the build died before the semantic check (failed to run custom build command); the negative control is INCONCLUSIVE, not satisfied. Fix the harness, not the expectation." >&2
+    cat "${TMP_ROOT}/${label}.log" >&2
     exit 1
   fi
   local expected
@@ -160,7 +180,7 @@ expect_checker_failure_any() {
 
 expect_route_test_failure() {
   local label="$1" root="$2"
-  if CARGO_TARGET_DIR="${SHARED_TARGET}" \
+  if CARGO_TARGET_DIR="${ROUTE_TEST_TARGET}" \
       cargo test \
         --manifest-path "${root}/admin/rust/Cargo.toml" \
         --locked \
@@ -183,7 +203,7 @@ expect_route_test_failure() {
 
 run_complete_route_test() {
   local root="$1" log="$2"
-  CARGO_TARGET_DIR="${SHARED_TARGET}" \
+  CARGO_TARGET_DIR="${ROUTE_TEST_TARGET}" \
     cargo test \
       --manifest-path "${root}/admin/rust/Cargo.toml" \
       --locked \
@@ -210,7 +230,7 @@ expect_complete_route_test_failure() {
   echo "PASS ${label}_refused"
 }
 
-if CARGO_TARGET_DIR="${SHARED_TARGET}" \
+if CARGO_TARGET_DIR="${ROUTE_TEST_TARGET}" \
     cargo check \
       --manifest-path "${REPO_ROOT}/admin/rust/Cargo.toml" \
       --locked \
@@ -244,7 +264,7 @@ prepare_empty_authority_inputs
 if CROSS_CONTAINER_OPTS='--volume=/tmp/untrusted:/claws:ro' \
     PHASE0_TARGET="${MUTATION_TARGET}" \
     PHASE0_BUILD_TOOL="${MUTATION_BUILD_TOOL}" \
-    PHASE0_CARGO_TARGET_DIR="${SHARED_TARGET}" \
+    PHASE0_CARGO_TARGET_DIR="${AUTHORITY_TARGET}" \
     run_checker "${REPO_ROOT}/${CHECKER_REL}" >"${TMP_ROOT}/cross-env.log" 2>&1; then
   echo "error: canonical build accepted external CROSS_CONTAINER_OPTS" >&2
   exit 1
@@ -261,7 +281,7 @@ for docker_override in \
       "${docker_override}" \
       PHASE0_TARGET="${MUTATION_TARGET}" \
       PHASE0_BUILD_TOOL="${MUTATION_BUILD_TOOL}" \
-      PHASE0_CARGO_TARGET_DIR="${SHARED_TARGET}" \
+      PHASE0_CARGO_TARGET_DIR="${AUTHORITY_TARGET}" \
       "${REPO_ROOT}/${CHECKER_REL}" >"${TMP_ROOT}/${docker_name}.log" 2>&1; then
     echo "error: canonical build accepted external ${docker_name}" >&2
     exit 1
@@ -279,7 +299,7 @@ if env -u CARGO_HOME -u RUSTUP_HOME \
     PHASE0_RUSTUP_HOME="${UNTRUSTED_RUSTUP_HOME}" \
     PHASE0_TARGET=unsupported-phase0-target \
     PHASE0_BUILD_TOOL=cross \
-    PHASE0_CARGO_TARGET_DIR="${SHARED_TARGET}" \
+    PHASE0_CARGO_TARGET_DIR="${AUTHORITY_TARGET}" \
     "${REPO_ROOT}/${CHECKER_REL}" >"${TMP_ROOT}/rustup-home.log" 2>&1; then
   echo "error: canonical build accepted caller-selected PHASE0_RUSTUP_HOME" >&2
   exit 1
@@ -306,7 +326,7 @@ chmod 755 "${FAKE_TOOL_BIN}/git"
 if PATH="${FAKE_TOOL_BIN}:${PATH}" \
     PHASE0_TARGET="${MUTATION_TARGET}" \
     PHASE0_BUILD_TOOL=unsupported \
-    PHASE0_CARGO_TARGET_DIR="${SHARED_TARGET}" \
+    PHASE0_CARGO_TARGET_DIR="${AUTHORITY_TARGET}" \
     run_checker "${REPO_ROOT}/${CHECKER_REL}" >"${TMP_ROOT}/path-tools.log" 2>&1; then
   echo "error: canonical build accepted an unsupported build tool" >&2
   exit 1
@@ -327,7 +347,7 @@ prepare_empty_authority_inputs
 if PATH="${FAKE_TOOL_BIN}:${PATH}" \
     PHASE0_TARGET="${MUTATION_TARGET}" \
     PHASE0_BUILD_TOOL=unsupported \
-    PHASE0_CARGO_TARGET_DIR="${SHARED_TARGET}" \
+    PHASE0_CARGO_TARGET_DIR="${AUTHORITY_TARGET}" \
     GIT_WRAPPER_LOG="${GIT_WRAPPER_LOG}" \
     run_checker "${REPO_ROOT}/${CHECKER_REL}" >"${TMP_ROOT}/path-git.log" 2>&1; then
   echo "error: canonical build accepted an unsupported build tool with a PATH Git wrapper" >&2
@@ -351,7 +371,7 @@ if [[ -x /usr/bin/docker && "${HOST_TARGET}" != *-apple-darwin ]]; then
       PHASE0_TARGET=x86_64-unknown-linux-musl \
       PHASE0_BUILD_TOOL=cross \
       PHASE0_DOCKER_HOST=tcp://127.0.0.1:1 \
-      PHASE0_CARGO_TARGET_DIR="${SHARED_TARGET}" \
+      PHASE0_CARGO_TARGET_DIR="${AUTHORITY_TARGET}" \
       run_checker "${REPO_ROOT}/${CHECKER_REL}" >"${TMP_ROOT}/path-docker.log" 2>&1; then
     echo "error: canonical build accepted an external Docker authority" >&2
     exit 1
@@ -368,7 +388,7 @@ else
 fi
 
 if CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS='--cfg feature="dev_t1_datapath" --cfg feature="dev_claw_share_mint" -C debug-assertions=yes' \
-    CARGO_TARGET_DIR="${SHARED_TARGET}" \
+    CARGO_TARGET_DIR="${ROUTE_TEST_TARGET}" \
     "${BUILD_TOOL_BIN}" build "${HOST_TARGET}" cargo \
     >"${TMP_ROOT}/target-rustflags.log" 2>&1; then
   echo "error: canonical build accepted target-specific Rust flags" >&2
@@ -384,7 +404,7 @@ mkdir -p "${UNTRUSTED_CARGO_HOME}"
 printf '%s\n' '[build]' 'rustflags = ["--cfg", "owner_present_hidden"]' > \
   "${UNTRUSTED_CARGO_HOME}/config.toml"
 if CARGO_HOME="${UNTRUSTED_CARGO_HOME}" \
-    CARGO_TARGET_DIR="${SHARED_TARGET}" \
+    CARGO_TARGET_DIR="${ROUTE_TEST_TARGET}" \
     "${BUILD_TOOL_BIN}" build "${HOST_TARGET}" cargo \
     >"${TMP_ROOT}/cargo-home-config.log" 2>&1; then
   echo "error: canonical build accepted a Cargo home config" >&2
@@ -657,7 +677,7 @@ environment_clear_removed="${TMP_ROOT}/environment-clear-removed"
 clone_head "${environment_clear_removed}"
 perl -0pi -e 's/    command\.env_clear\(\);/    \/\/ mutation removed env_clear/' \
   "${environment_clear_removed}/admin/rust/theyos-engine-build-rs/src/main.rs"
-if CARGO_TARGET_DIR="${SHARED_TARGET}" \
+if CARGO_TARGET_DIR="${ROUTE_TEST_TARGET}" \
     cargo test \
       --manifest-path "${environment_clear_removed}/admin/rust/Cargo.toml" \
       --locked \
