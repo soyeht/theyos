@@ -184,14 +184,55 @@ extensão**, não só no app.
 4. bloquear o aparelho e repetir 2 e 3.
 
 **Pronto quando:** os quatro passos funcionam no aparelho real.
-**Estado:** 1–3 provados em aparelho físico. **4 bloqueado por ambiente** — leia
-abaixo antes de tentar.
+**Estado:** 1–4 provados em aparelho físico. **M0b FECHADO** — o passo 4 foi
+medido de verdade em 2026-08-10, sem debugger/XCTest/USB anexado (ver "O passo
+4 foi resolvido" abaixo); a seção logo depois documenta a medição anterior,
+inválida, e por que ela não podia ser usada.
 
 > Bloqueio conhecido: o primeiro save de uma `NETunnelProviderManager` nova pede
 > o passcode físico do aparelho. É gate humano, não bug — não dá para automatizar
 > em torno dele.
 
-### O passo 4 não é executável no contexto de teste anexado que foi medido
+### O passo 4 foi resolvido: medição real, sem contexto anexado, 2026-08-10
+
+A correção não foi isolar qual componente do contexto anexado causava o
+problema (debugger, XCTest, USB) — foi removê-lo por inteiro, como a seção
+abaixo já apontava que seria necessário. Solução: o app host (soyeht-ios)
+ganhou um gatilho `soyeht://debug/m0b-lock-canary-start?delaySeconds=N`
+(Dev-only, `#if DEBUG`) que só prepara os itens de Keychain e chama
+`startVPNTunnel` — a leitura de verdade acontece **dentro da extensão**,
+numa `Task.detached` que dorme `N` segundos antes de ler, porque um
+`NEPacketTunnelProvider` que já reportou "conectado" é o tipo de processo
+em background que o iOS mantém vivo, ao contrário do app host, que seria
+suspenso ao travar a tela. Fluxo: instalar via `devicectl` (nunca
+`xcodebuild test`/Xcode Run, que sempre anexam), abrir o link pelo app
+Notas (evita a barra de endereço do Safari tratar o esquema customizado
+como busca), travar o aparelho na hora, esperar, e ler o resultado depois
+por `devicectl device copy from --domain-type appGroupDataContainer` — sem
+tocar no aparelho de novo durante a janela medida.
+
+Resultado real, aparelho travado de verdade, sem nada anexado:
+
+```
+whenUnlockedStatus       -25308   (errSecInteractionNotAllowed — correto)
+afterFirstUnlockStatus   0        (errSecSuccess — correto, prova a premissa do M4)
+whenPasscodeSetStatus    -25308   (errSecInteractionNotAllowed — correto)
+protectedFileReadable    false    (keybag genuinamente travado — ao contrário da medição inválida abaixo)
+trigger                  "delayed"
+```
+
+O observável independente (`protectedFileReadable`) virou `false` desta
+vez — era `true` na medição inválida abaixo mesmo com o aparelho travado, e
+é exatamente esse observável que prova que agora o keybag travou de
+verdade. Os três `kSecAttrAccessible*` bateram com o esperado. A premissa
+do M4 (reconexão em background sobrevive o aparelho travado, via
+`AfterFirstUnlockThisDeviceOnly`) está provada, não assumida.
+
+Medido por @gianna com @Caio travando o aparelho fisicamente no momento
+certo — a parte que nenhuma automação podia fazer sem reintroduzir o
+mesmo contexto anexado que invalidou a primeira medição.
+
+### O passo 4 não era executável no contexto de teste anexado que foi medido primeiro (histórico)
 
 **O que foi medido, e só isso:** sob XCTest/Xcode anexado via USB, os dados
 protegidos permaneceram **disponíveis** apesar do bloqueio físico do aparelho.
