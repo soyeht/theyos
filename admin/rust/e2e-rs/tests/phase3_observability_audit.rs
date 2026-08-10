@@ -37,7 +37,7 @@ mod phase3_support;
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::http::StatusCode;
 use household_rs::KeyBackingPolicy;
@@ -97,6 +97,55 @@ fn contains_constant_time(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
         .any(|w| bool::from(w.ct_eq(needle)))
+}
+
+const OWNER_TIMEOUT_QUARANTINE_CUTOFF: u64 = 1_787_011_200;
+
+fn quarantine_is_live(now: u64, cutoff: u64) -> bool {
+    now < cutoff
+}
+
+fn quarantine_probe_step(workflow: &str) -> &str {
+    let start = workflow
+        .find("      - name: Quarantine probe (issue #470)")
+        .expect("issue #470 probe step is present");
+    let after_start = &workflow[start..];
+    let end = after_start
+        .find("\n      - name:")
+        .unwrap_or(after_start.len());
+    &after_start[..end]
+}
+
+fn active_lines(input: &str) -> impl Iterator<Item = &str> {
+    input
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+}
+
+fn quarantine_probe_exits_when_all_attempts_fail(step: &str) -> bool {
+    let lines: Vec<_> = active_lines(step).collect();
+    let Some(condition) = lines
+        .iter()
+        .position(|line| *line == "if [[ \"${passes}\" -eq 0 ]]; then")
+    else {
+        return false;
+    };
+    lines.get(condition + 1) == Some(&"exit 1") && lines.get(condition + 2) == Some(&"fi")
+}
+
+fn quarantine_probe_appends_aggregate(step: &str) -> bool {
+    let lines: Vec<_> = active_lines(step).collect();
+    lines.windows(2).any(|window| {
+        window[0] == "printf 'QUARANTINE_PROBE_470 attempts=5 passes=%s failures=%s\\n' \\"
+            && window[1] == "\"${passes}\" \"${failures}\" >> \"${GITHUB_STEP_SUMMARY}\""
+    })
+}
+
+fn quarantine_probe_guard_is_intact(step: &str) -> bool {
+    !active_lines(step).any(|line| line.starts_with("continue-on-error:"))
+        && quarantine_probe_exits_when_all_attempts_fail(step)
+        && quarantine_probe_appends_aggregate(step)
 }
 
 #[tokio::test]
@@ -286,6 +335,135 @@ async fn test_phase3_happy_path_observability_is_complete_and_leak_free() {
     );
 }
 
+#[test]
+fn owner_timeout_quarantine_has_not_expired() {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after the Unix epoch")
+        .as_secs();
+    assert!(
+        quarantine_is_live(now, OWNER_TIMEOUT_QUARANTINE_CUTOFF),
+        "issue #470 quarantine for @gloria expired at 2026-08-18T00:00:00Z; re-evaluate test_owner_timeout_aborts_window_and_emits_tracing"
+    );
+}
+
+#[test]
+fn owner_timeout_quarantine_cutoff_is_exclusive() {
+    assert!(quarantine_is_live(
+        OWNER_TIMEOUT_QUARANTINE_CUTOFF - 1,
+        OWNER_TIMEOUT_QUARANTINE_CUTOFF
+    ));
+    assert!(!quarantine_is_live(
+        OWNER_TIMEOUT_QUARANTINE_CUTOFF,
+        OWNER_TIMEOUT_QUARANTINE_CUTOFF
+    ));
+}
+
+#[test]
+fn owner_timeout_quarantine_probe_contract_is_enforced() {
+    let workflow = include_str!("../../../../.github/workflows/backend-ci.yml");
+    let probe = quarantine_probe_step(workflow);
+
+    assert!(
+        probe.contains("# QUARANTINE_PROBE_470_BEGIN")
+            && probe.contains("# QUARANTINE_PROBE_470_END"),
+        "issue #470 probe markers must remain inside the probe step"
+    );
+    assert!(
+        probe.contains("for attempt in 1 2 3 4 5; do"),
+        "issue #470 probe must make five attempts"
+    );
+    assert!(
+        probe.contains("cargo test --locked -p e2e-rs --test phase3_observability_audit"),
+        "issue #470 probe must run the observability audit test binary with a locked resolution"
+    );
+    assert!(
+        probe.contains("--ignored --exact test_owner_timeout_aborts_window_and_emits_tracing"),
+        "issue #470 probe must select the quarantined test exactly"
+    );
+    assert!(
+        probe.contains("QUARANTINE_PROBE_470 attempts=5 passes=%s failures=%s"),
+        "issue #470 probe must emit its machine-readable aggregate"
+    );
+    assert!(
+        probe.contains("GITHUB_STEP_SUMMARY"),
+        "issue #470 probe must write its evidence to the step summary"
+    );
+    assert!(
+        quarantine_probe_guard_is_intact(probe),
+        "issue #470 probe step must prohibit continue-on-error, connect all-five-failed to exit 1, and append the aggregate to the step summary"
+    );
+}
+
+#[test]
+fn owner_timeout_quarantine_guard_rejects_required_probe_mutations() {
+    let workflow = include_str!("../../../../.github/workflows/backend-ci.yml");
+    let probe = quarantine_probe_step(workflow);
+
+    let step_level_continue = probe.replacen(
+        "        run:",
+        "        continue-on-error: true\n        run:",
+        1,
+    );
+    assert!(step_level_continue.contains("continue-on-error"));
+    assert!(!quarantine_probe_guard_is_intact(&step_level_continue));
+
+    let missing_exit = probe.replacen("            exit 1", "            :", 1);
+    assert!(!quarantine_probe_exits_when_all_attempts_fail(
+        &missing_exit
+    ));
+    assert!(!quarantine_probe_guard_is_intact(&missing_exit));
+
+    let missing_aggregate_append = probe.replacen(
+        "\"${passes}\" \"${failures}\" >> \"${GITHUB_STEP_SUMMARY}\"",
+        "\"${passes}\" \"${failures}\"",
+        1,
+    );
+    assert!(!quarantine_probe_appends_aggregate(
+        &missing_aggregate_append
+    ));
+    assert!(!quarantine_probe_guard_is_intact(&missing_aggregate_append));
+
+    let commented_sequence = probe
+        .replacen(
+            "          if [[ \"${passes}\" -eq 0 ]]; then",
+            "          # if [[ \"${passes}\" -eq 0 ]]; then",
+            1,
+        )
+        .replacen("            exit 1", "            # exit 1", 1)
+        .replacen(
+            "          fi\n          # QUARANTINE_PROBE_470_END",
+            "          # fi\n          # QUARANTINE_PROBE_470_END",
+            1,
+        );
+    assert!(!quarantine_probe_exits_when_all_attempts_fail(
+        &commented_sequence
+    ));
+    assert!(!quarantine_probe_guard_is_intact(&commented_sequence));
+
+    let commented_aggregate_append = probe.replacen(
+        "\"${passes}\" \"${failures}\" >> \"${GITHUB_STEP_SUMMARY}\"",
+        "# \"${passes}\" \"${failures}\" >> \"${GITHUB_STEP_SUMMARY}\"",
+        1,
+    );
+    assert!(!quarantine_probe_appends_aggregate(
+        &commented_aggregate_append
+    ));
+    assert!(!quarantine_probe_guard_is_intact(
+        &commented_aggregate_append
+    ));
+
+    let nested_dead_exit = probe.replacen(
+        "            exit 1",
+        "            if false; then\n              exit 1\n            fi",
+        1,
+    );
+    assert!(!quarantine_probe_exits_when_all_attempts_fail(
+        &nested_dead_exit
+    ));
+    assert!(!quarantine_probe_guard_is_intact(&nested_dead_exit));
+}
+
 /// FR-019 "owner timed out" coverage — the active half. Distinct from
 /// `owner_events.long_poll.timeout` (HTTP keep-alive returning 204):
 /// THIS test exercises the runtime watchdog that fires when the
@@ -294,6 +472,20 @@ async fn test_phase3_happy_path_observability_is_complete_and_leak_free() {
 /// `JoinCancelled{reason="timeout"}` owner event so the iPhone's
 /// long-poll wakes up with the cancellation, and emit
 /// `pair_machine.owner_timed_out` for the audit trail.
+///
+/// Issue #470 quarantine: 4 of 23 hosted-Linux verdict-bearing attempts failed
+/// across 20 runs; the exact cause and rate remain unisolated.
+/// Attempt Wilson95 is [7.0%, 37.1%]; run-cluster Wilson95 is [8.1%, 41.6%].
+/// Three rerun second attempts passed. Owner: @gloria. Expiry: 2026-08-17.
+/// Separately, Saira's macOS-local sweep of predecessor 9e27e8ec had one
+/// failure followed by four passes; fe159617 had five passes. Neither result is
+/// included in the hosted-Linux count, and the macOS cause and rate are not
+/// established.
+/// The expiry guard below makes the quarantine fail closed on 2026-08-18.
+/// 0/5 detects total breakage immediately but partial degradation more slowly;
+/// the mandatory expiry review covers that middle range. A green probe run is
+/// not evidence that the flake rate stayed constant.
+#[ignore = "issue #470: owner-timeout flake observed across environments; expires 2026-08-17"]
 #[tokio::test]
 async fn test_owner_timeout_aborts_window_and_emits_tracing() {
     let (buf, _guard) = install_capture();

@@ -10,11 +10,11 @@ pessoal e não entram em documento versionado.
 
 ---
 
-## A decisão que gerou esta versão (medida 2026-08-10 @ `bf02285d`)
+## A decisão que gerou esta versão (medida 2026-08-10 @ `9e27e8ec`)
 
 <!-- doc-freshness-anchor
 measured: 2026-08-10
-sha: bf02285db5eee5b8f8d19071bd223ad438fdaf74
+sha: 9e27e8ec75823389907f0bbcdf30b61cecf1b17c
 paths:
   - admin/rust/mesh-session-core-rs/**
   - admin/rust/mesh-session-control-model-rs/**
