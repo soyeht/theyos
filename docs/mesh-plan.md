@@ -10,11 +10,11 @@ pessoal e não entram em documento versionado.
 
 ---
 
-## A decisão que gerou esta versão (medida 2026-08-09 @ `02783f4b`)
+## A decisão que gerou esta versão (medida 2026-08-10 @ `9e27e8ec`)
 
 <!-- doc-freshness-anchor
-measured: 2026-08-09
-sha: 02783f4b397dabecfab908500071569397e00969
+measured: 2026-08-10
+sha: 9e27e8ec75823389907f0bbcdf30b61cecf1b17c
 paths:
   - admin/rust/mesh-session-core-rs/**
   - admin/rust/mesh-session-control-model-rs/**
@@ -22,6 +22,7 @@ paths:
   - admin/rust/t1-iptunnel-dev-runner-rs/**
   - admin/rust/nat-probe-rs/**
   - admin/rust/scripts/graph-gate/**
+  - scripts/noise-conformance-peer.py
   - .github/workflows/backend-ci.yml
 -->
 
@@ -263,10 +264,37 @@ linguagem, sem compartilhar crypto nem estado com o `snow`.
 hash**; e as negativas (bit flip, replay, reorder, prologue trocado) falham nos
 dois modos.
 
-> Estado: o interop ao vivo (b) já foi provado fora do repo — `snow` ↔ uma
-> implementação Python independente, com o prologue e o framing reais, derivaram
-> hash idêntico e trocaram transporte nos dois sentidos. Falta portar como teste
-> versionado e escrever (a).
+> **Estado (2026-08-10): M1a ABERTO.** Fechou-se a metade (b), e só ela.
+>
+> **(b) feito e exigido em automação.** O interop ao vivo está versionado
+> como teste do core: `snow` ↔ `noiseprotocol`, prologue e framing reais, cada
+> lado com chave própria, hash de handshake idêntico e transporte nos dois
+> sentidos. O comparando é **pinado** — `noiseprotocol==0.3.1` — porque numa
+> prova de conformidade a implementação externa *é* parte do vetor, e um pin
+> flutuante deixa a afirmação mudar de sujeito sem diff no repositório. O teste
+> é refusável por `THEYOS_REQUIRE_NOISE_INTEROP`, e essa escotilha existe para o
+> laptop sem `uv`, não para o CI.
+>
+> **Exigido no CI, nos dois runners.** `THEYOS_REQUIRE_NOISE_INTEROP=1` está no
+> step que roda os workspace members excluídos, e o `uv` é instalado **antes**
+> dele. A ordem é carga estrutural, não arrumação: com a ordem anterior o step
+> tomava o ramo "sem uv" e publicava verde sem provar nada. Medido nos três
+> modos — peer presente com `REQUIRE` passa; peer ausente com `REQUIRE` falha
+> (exit 101); peer ausente sem `REQUIRE` pula, porque a escotilha existe para o
+> laptop sem `uv` e não para o CI.
+>
+> A evidência é **positiva e nominal**, não ausência de aviso: o log de cada
+> runner carrega `interop peer: noiseprotocol=0.3.1`, nomeando a implementação
+> contra a qual a afirmação foi feita. Ausência da palavra `SKIP` **não** serve
+> de prova — o libtest captura o stdout de um teste que passa, então um skip
+> bem-sucedido produz log byte-idêntico ao de um handshake real. Por isso o
+> `--nocapture` naquele comando é evidência, e removê-lo cega o gate.
+>
+> **(a) não começou.** Vetores determinísticos em harness isolado, e as
+> negativas (bit flip, replay, reorder, prologue trocado) nos dois modos. Sem
+> isso o "Pronto quando" acima não está satisfeito, e nenhuma prova de (b) o
+> substitui: uma implementação que concorda com a nossa não demonstra que ela
+> recusa o que deve recusar.
 
 ## M1b — Wire e autorização cross-language
 
