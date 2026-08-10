@@ -142,7 +142,8 @@ prepare_route_test_target() {
 }
 
 assert_route_test_verdict() {
-  # A non-zero exit from `cargo test` proves nothing on its own here: the route
+  # Used by every negative control in this script that runs a real test, route or
+  # not. A non-zero exit from `cargo test` proves nothing on its own here: these
   # tests are SUPPOSED to fail, and a build that dies before libtest ever starts
   # exits non-zero too. Worse, cargo's own diagnostics quote the test name being
   # filtered, so a substring match on that name accepts build death as a semantic
@@ -165,7 +166,7 @@ assert_route_test_verdict() {
     exit 1
   fi
   if grep -Eq '^error(\[E[0-9]+\])?: |^error: could not compile ' "${log}"; then
-    echo "error: ${label} HARNESS FAILURE — the route test did not compile, so '${test_name}' never ran. The negative control is INCONCLUSIVE, not satisfied." >&2
+    echo "error: ${label} HARNESS FAILURE — the selected test did not compile, so '${test_name}' never ran. The negative control is INCONCLUSIVE, not satisfied." >&2
     cat "${log}" >&2
     exit 1
   fi
@@ -737,9 +738,18 @@ if CARGO_TARGET_DIR="${ROUTE_TEST_TARGET}" \
   echo "error: helper tests accepted removal of env_clear" >&2
   exit 1
 fi
-grep -Fq "child_process_environment_is_positive_allowlist" \
+# Same class as the route oracles, same script: a bare substring grep for the
+# test name accepted build death as a semantic negative here too.
+#
+# The name carries a `tests::` prefix and the bare name would be WRONG: this test
+# lives in `mod tests` in theyos-engine-build-rs/src/main.rs, so libtest prints
+# the module path. Confirmed by running the test and reading what libtest
+# actually printed, not by reading the source. An anchored pattern that can never
+# match would be a guard that stopped guarding, which is the exact defect this
+# fix exists to close.
+assert_route_test_verdict environment_clear_removal \
+  'tests::child_process_environment_is_positive_allowlist' \
   "${TMP_ROOT}/environment-clear-removed.log"
-echo "PASS environment_clear_removal_refused"
 
 external_path_dependency="${TMP_ROOT}/external-path-dependency"
 clone_head "${external_path_dependency}"
