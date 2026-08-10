@@ -10,11 +10,11 @@ pessoal e não entram em documento versionado.
 
 ---
 
-## A decisão que gerou esta versão (medida 2026-08-09 @ `4a31e30f`)
+## A decisão que gerou esta versão (medida 2026-08-10 @ `bf02285d`)
 
 <!-- doc-freshness-anchor
-measured: 2026-08-09
-sha: 4a31e30f258abcc2bcd083185e1788619a13e087
+measured: 2026-08-10
+sha: bf02285db5eee5b8f8d19071bd223ad438fdaf74
 paths:
   - admin/rust/mesh-session-core-rs/**
   - admin/rust/mesh-session-control-model-rs/**
@@ -213,9 +213,9 @@ linguagem, sem compartilhar crypto nem estado com o `snow`.
 hash**; e as negativas (bit flip, replay, reorder, prologue trocado) falham nos
 dois modos.
 
-> **Estado (2026-08-09): M1a ABERTO.** Fechou-se a metade (b), e só ela.
+> **Estado (2026-08-10): M1a ABERTO.** Fechou-se a metade (b), e só ela.
 >
-> **(b) feito, com ressalva de automação.** O interop ao vivo está versionado
+> **(b) feito e exigido em automação.** O interop ao vivo está versionado
 > como teste do core: `snow` ↔ `noiseprotocol`, prologue e framing reais, cada
 > lado com chave própria, hash de handshake idêntico e transporte nos dois
 > sentidos. O comparando é **pinado** — `noiseprotocol==0.3.1` — porque numa
@@ -224,11 +224,20 @@ dois modos.
 > é refusável por `THEYOS_REQUIRE_NOISE_INTEROP`, e essa escotilha existe para o
 > laptop sem `uv`, não para o CI.
 >
-> **Validado localmente nos dois modos**: com o peer disponível passa nomeando a
-> versão importada; sem o peer e com `REQUIRE` ligado falha. **A automação
-> obrigatória ainda não está na `main`** — vive num PR de CI empilhado sobre
-> este. Enquanto ela não mesclar, este teste pode pular e publicar verde, o que
-> é a mesma dívida de evidência que o M1c fechou.
+> **Exigido no CI, nos dois runners.** `THEYOS_REQUIRE_NOISE_INTEROP=1` está no
+> step que roda os workspace members excluídos, e o `uv` é instalado **antes**
+> dele. A ordem é carga estrutural, não arrumação: com a ordem anterior o step
+> tomava o ramo "sem uv" e publicava verde sem provar nada. Medido nos três
+> modos — peer presente com `REQUIRE` passa; peer ausente com `REQUIRE` falha
+> (exit 101); peer ausente sem `REQUIRE` pula, porque a escotilha existe para o
+> laptop sem `uv` e não para o CI.
+>
+> A evidência é **positiva e nominal**, não ausência de aviso: o log de cada
+> runner carrega `interop peer: noiseprotocol=0.3.1`, nomeando a implementação
+> contra a qual a afirmação foi feita. Ausência da palavra `SKIP` **não** serve
+> de prova — o libtest captura o stdout de um teste que passa, então um skip
+> bem-sucedido produz log byte-idêntico ao de um handshake real. Por isso o
+> `--nocapture` naquele comando é evidência, e removê-lo cega o gate.
 >
 > **(a) não começou.** Vetores determinísticos em harness isolado, e as
 > negativas (bit flip, replay, reorder, prologue trocado) nos dois modos. Sem
