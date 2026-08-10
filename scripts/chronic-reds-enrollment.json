@@ -3,5 +3,27 @@
   "_comment": "Phase 3.5 declarations: every chronic red on main must have an owner + an expiry. The chronic-red gate reads this; a red matched here (and not expired) is DECLARED and the gate does not open an issue for it. A red NOT matched here is ORPHAN and the gate opens/re-pings a deduped issue. The blocking tooth (promote to required after expiry) is a DECLARED admin escalation, never fabricated by the gate.",
   "oncall": "caiosalgado",
   "sla_hours": 24,
-  "reds": []
+  "reds": [
+    {
+      "check": "Consumption coverage gate",
+      "owner": "caiosalgado",
+      "expires": "2026-08-12",
+      "issue": 455,
+      "reason": "#461 remains open while the current gate's reported 8-site/4-file coverage gap is addressed; keep this red visible but owned."
+    },
+    {
+      "check": "Owner-present structural boundary",
+      "owner": "caiosalgado",
+      "expires": "2026-08-12",
+      "issue": 479,
+      "reason": "#477 is merged; #479 owns the newly observable build_cfg_crossing oracle defect that is now the first structural-boundary red."
+    },
+    {
+      "check": "Repo hygiene gates",
+      "owner": "caiosalgado",
+      "expires": "2026-08-14",
+      "issue": 457,
+      "reason": "The remaining cross-repo consumer/pin debt needs a portability fix, one coherent theyos pin, and a proved soyeht-ios consumer build."
+    }
+  ]
 }
