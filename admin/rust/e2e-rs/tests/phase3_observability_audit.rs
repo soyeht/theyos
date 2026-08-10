@@ -116,30 +116,39 @@ fn quarantine_probe_step(workflow: &str) -> &str {
     &after_start[..end]
 }
 
-fn quarantine_probe_exits_when_all_attempts_fail(step: &str) -> bool {
-    let Some((_, after_condition)) = step.split_once("if [[ \"${passes}\" -eq 0 ]]; then") else {
-        return false;
-    };
-    let Some((condition_body, _)) = after_condition.split_once("fi") else {
-        return false;
-    };
-    condition_body.contains("exit 1")
+fn active_lines(input: &str) -> impl Iterator<Item = &str> {
+    input
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
 }
 
-fn quarantine_probe_appends_aggregate(step: &str) -> bool {
-    let Some((_, after_aggregate)) =
-        step.rsplit_once("QUARANTINE_PROBE_470 attempts=5 passes=%s failures=%s")
+fn quarantine_probe_exits_when_all_attempts_fail(step: &str) -> bool {
+    let lines: Vec<_> = active_lines(step).collect();
+    let Some(condition) = lines
+        .iter()
+        .position(|line| *line == "if [[ \"${passes}\" -eq 0 ]]; then")
     else {
         return false;
     };
-    let Some((aggregate_write, _)) = after_aggregate.split_once("if [[") else {
+    let Some(end) = lines[condition + 1..].iter().position(|line| *line == "fi") else {
         return false;
     };
-    aggregate_write.contains(">> \"${GITHUB_STEP_SUMMARY}\"")
+    lines[condition + 1..condition + 1 + end]
+        .iter()
+        .any(|line| *line == "exit 1")
+}
+
+fn quarantine_probe_appends_aggregate(step: &str) -> bool {
+    let lines: Vec<_> = active_lines(step).collect();
+    lines.windows(2).any(|window| {
+        window[0] == "printf 'QUARANTINE_PROBE_470 attempts=5 passes=%s failures=%s\\n' \\"
+            && window[1] == "\"${passes}\" \"${failures}\" >> \"${GITHUB_STEP_SUMMARY}\""
+    })
 }
 
 fn quarantine_probe_guard_is_intact(step: &str) -> bool {
-    !step.contains("continue-on-error")
+    !active_lines(step).any(|line| line.starts_with("continue-on-error:"))
         && quarantine_probe_exits_when_all_attempts_fail(step)
         && quarantine_probe_appends_aggregate(step)
 }
@@ -419,6 +428,35 @@ fn owner_timeout_quarantine_guard_rejects_required_probe_mutations() {
         &missing_aggregate_append
     ));
     assert!(!quarantine_probe_guard_is_intact(&missing_aggregate_append));
+
+    let commented_sequence = probe
+        .replacen(
+            "          if [[ \"${passes}\" -eq 0 ]]; then",
+            "          # if [[ \"${passes}\" -eq 0 ]]; then",
+            1,
+        )
+        .replacen("            exit 1", "            # exit 1", 1)
+        .replacen(
+            "          fi\n          # QUARANTINE_PROBE_470_END",
+            "          # fi\n          # QUARANTINE_PROBE_470_END",
+            1,
+        );
+    assert!(!quarantine_probe_exits_when_all_attempts_fail(
+        &commented_sequence
+    ));
+    assert!(!quarantine_probe_guard_is_intact(&commented_sequence));
+
+    let commented_aggregate_append = probe.replacen(
+        "\"${passes}\" \"${failures}\" >> \"${GITHUB_STEP_SUMMARY}\"",
+        "# \"${passes}\" \"${failures}\" >> \"${GITHUB_STEP_SUMMARY}\"",
+        1,
+    );
+    assert!(!quarantine_probe_appends_aggregate(
+        &commented_aggregate_append
+    ));
+    assert!(!quarantine_probe_guard_is_intact(
+        &commented_aggregate_append
+    ));
 }
 
 /// FR-019 "owner timed out" coverage — the active half. Distinct from
@@ -434,9 +472,10 @@ fn owner_timeout_quarantine_guard_rejects_required_probe_mutations() {
 /// across 20 runs; the exact cause and rate remain unisolated.
 /// Attempt Wilson95 is [7.0%, 37.1%]; run-cluster Wilson95 is [8.1%, 41.6%].
 /// Three rerun second attempts passed. Owner: @gloria. Expiry: 2026-08-17.
-/// Separately, on macOS local at this same SHA, attempt 1 failed and attempts
-/// 2-5 passed; that environment observation is not included in the hosted-Linux
-/// count, and its macOS cause and rate are not established.
+/// Separately, Saira's macOS-local sweep of predecessor 9e27e8ec had one
+/// failure followed by four passes; fe159617 had five passes. Neither result is
+/// included in the hosted-Linux count, and the macOS cause and rate are not
+/// established.
 /// The expiry guard below makes the quarantine fail closed on 2026-08-18.
 /// 0/5 detects total breakage immediately but partial degradation more slowly;
 /// the mandatory expiry review covers that middle range. A green probe run is
