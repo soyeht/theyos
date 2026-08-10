@@ -245,7 +245,7 @@ class ConsumptionCoverageTests(unittest.TestCase):
             self.assertEqual(rc, 1, out)
             self.assertIn("runtime input bypasses repo_test_file!", out)
 
-    def test_depfile_inputs_deduplicate_paths(self):
+    def test_depfile_inputs_deduplicate_paths_and_exclude_git_control_files(self):
         with tempfile.TemporaryDirectory() as d:
             repo = Path(d) / "repo"
             target = Path(d) / "target"
@@ -255,7 +255,10 @@ class ConsumptionCoverageTests(unittest.TestCase):
             for name in ("one", "two", "three"):
                 depfile = target / "debug" / f"{name}.d"
                 depfile.parent.mkdir(parents=True, exist_ok=True)
-                depfile.write_text(f"out: {manifest}\n", encoding="utf-8")
+                depfile.write_text(
+                    f"out: {manifest} {repo / '.git' / 'HEAD'} {repo / '.git' / 'packed-refs'}\n",
+                    encoding="utf-8",
+                )
             self.assertEqual(
                 matrix.depfile_inputs(target, repo),
                 {"claws/manifest.yml"},

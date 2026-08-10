@@ -90,6 +90,11 @@ def fresh_target() -> Path:
     return target
 
 
+def is_versionable_repo_path(path: str) -> bool:
+    """Exclude Git's mutable control files from the PR input projection."""
+    return path != ".git" and not path.startswith(".git/")
+
+
 def depfile_inputs(target: Path, repo_root: Path = ROOT) -> set[str]:
     """Return the deduplicated repository input paths from fresh depfiles."""
     repo_root = repo_root.resolve()
@@ -104,9 +109,11 @@ def depfile_inputs(target: Path, repo_root: Path = ROOT) -> set[str]:
             if not candidate.is_absolute():
                 continue
             try:
-                inputs.add(candidate.resolve().relative_to(repo_root).as_posix())
+                repo_rel = candidate.resolve().relative_to(repo_root).as_posix()
             except ValueError:
                 continue
+            if is_versionable_repo_path(repo_rel):
+                inputs.add(repo_rel)
     return inputs
 
 
