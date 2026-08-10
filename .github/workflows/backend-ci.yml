@@ -118,6 +118,8 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: "admin/rust -> target"
+      - name: Compile shared Cargo consumption matrix
+        run: python3 scripts/cargo_test_matrix.py --ci-compile
       - name: Clippy (deny warnings)
         run: cd admin/rust && cargo clippy --workspace -- -D warnings 2>&1
       - name: Clippy (dev datapath feature, all targets)
@@ -406,6 +408,8 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: "admin/rust -> target"
+      - name: Compile shared Cargo consumption matrix
+        run: python3 scripts/cargo_test_matrix.py --ci-compile
       - name: Clippy (deny warnings)
         run: cd admin/rust && cargo clippy --workspace -- -D warnings 2>&1
       - name: Clippy (dev datapath feature, all targets)

@@ -40,6 +40,20 @@ on:
   pull_request:
     paths:
       - "admin/rust/**"
+      - "scripts/**"
+      - ".github/workflows/backend-ci.yml"
+      - ".github/workflows/backend-ci-docs-shim.yml"
+"""
+
+BACKEND_SHIM = """\
+name: Backend CI (docs-only shim)
+on:
+  pull_request:
+    paths-ignore:
+      - "admin/rust/**"
+      - "scripts/**"
+      - ".github/workflows/backend-ci.yml"
+      - ".github/workflows/backend-ci-docs-shim.yml"
 """
 
 
@@ -47,6 +61,7 @@ def _build_repo(tmp: Path, lib_rs: str, build_rs: str | None = None) -> Path:
     """Lay out a minimal fake repo with one crate under admin/rust."""
     (tmp / ".github" / "workflows").mkdir(parents=True)
     (tmp / ".github" / "workflows" / "backend-ci.yml").write_text(BACKEND_CI, encoding="utf-8")
+    (tmp / ".github" / "workflows" / "backend-ci-docs-shim.yml").write_text(BACKEND_SHIM, encoding="utf-8")
 
     crate = tmp / "admin" / "rust" / "cratea"
     (crate / "src").mkdir(parents=True)
@@ -174,6 +189,33 @@ class ConsumptionCoverageTests(unittest.TestCase):
             )
             rc, out = _run(repo)
             self.assertEqual(rc, 2, out)  # fail closed, never an empty covered set
+
+    def test_shim_partition_drift_fails_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = _build_repo(Path(d), 'const S: &str = include_str!("sibling.txt");\n')
+            shim = repo / ".github" / "workflows" / "backend-ci-docs-shim.yml"
+            shim.write_text(BACKEND_SHIM.replace('      - "admin/rust/**"\n', ""), encoding="utf-8")
+            rc, _ = _run(repo)
+            self.assertEqual(rc, 2)
+
+    def test_runtime_literal_is_covered(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = _build_repo(Path(d), 'const _: &[u8] = repo_test_file!("scripts/peer.py");\n')
+            (repo / "scripts").mkdir()
+            (repo / "scripts" / "peer.py").write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            rc, out = _run(repo, "repo_test_file!")
+            self.assertEqual(rc, 0, out)
+            self.assertIn("repo_test_file!", out)
+
+    def test_runtime_path_bypass_is_red(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = _build_repo(Path(d), 'const S: &str = include_str!("sibling.txt");\n')
+            tests = repo / "admin" / "rust" / "cratea" / "tests"
+            tests.mkdir()
+            (tests / "runtime.rs").write_text('fn x() { let _ = root.join("scripts/untracked.py"); }\n', encoding="utf-8")
+            rc, out = _run(repo)
+            self.assertEqual(rc, 1, out)
+            self.assertIn("runtime input bypasses repo_test_file!", out)
 
 
 if __name__ == "__main__":

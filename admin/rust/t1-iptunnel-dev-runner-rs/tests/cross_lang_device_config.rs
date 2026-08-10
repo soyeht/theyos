@@ -25,6 +25,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+macro_rules! repo_test_file {
+    ($path:literal) => {{
+        const _: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../", $path));
+        $path
+    }};
+}
+
 /// Repo root — three levels above this crate's manifest dir
 /// (`<root>/admin/rust/t1-iptunnel-dev-runner-rs`).
 fn repo_root() -> PathBuf {
@@ -37,7 +44,9 @@ fn repo_root() -> PathBuf {
 
 /// Absolute path to the Python validator under test.
 fn python_validator() -> PathBuf {
-    let path = repo_root().join("scripts/validate-t1-device-session-config.py");
+    let path = repo_root().join(repo_test_file!(
+        "scripts/validate-t1-device-session-config.py"
+    ));
     assert!(
         path.is_file(),
         "python validator not found at {}",
