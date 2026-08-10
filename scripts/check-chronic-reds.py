@@ -366,9 +366,15 @@ def _latest_ping(repo: str, number: int) -> datetime | None:
     return latest
 
 
-def execute(actions: list[Action], repo: str, dry_run: bool, out=sys.stdout) -> None:
+def execute(
+    actions: list[Action], repo: str, dry_run: bool, expected_sha: str, out=sys.stdout
+) -> None:
     for a in actions:
         title = f"{ISSUE_TITLE_PREFIX}{a.context}"
+        if not dry_run and main_tip_sha(repo) != expected_sha:
+            raise GateCannotRun(
+                "main tip changed during chronic-red execution; refusing the next write"
+            )
         if a.kind == "create":
             body = (
                 f"chronic-red orphan: `{a.context}` is failing on `main` and has no owner+expiry "
@@ -441,8 +447,12 @@ def run(repo: str, enrollment: Path, dry_run: bool, out=sys.stdout) -> int:
             print(f"  ORPH {ctx}", file=out)
 
     if c.actions:
+        if not dry_run and main_tip_sha(repo) != sha:
+            raise GateCannotRun(
+                "main tip changed during chronic-red observation; refusing to execute actions"
+            )
         print(f"\nactions ({len(c.actions)}):", file=out)
-        execute(c.actions, repo, dry_run, out=out)
+        execute(c.actions, repo, dry_run, expected_sha=sha, out=out)
 
     findings = bool(c.orphans) or bool(c.expired)
     if findings:

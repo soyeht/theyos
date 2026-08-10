@@ -258,6 +258,69 @@ class RunTests(unittest.TestCase):
         execute.assert_not_called()
         self.assertIn("main tip: fresh-main-sha", out.getvalue())
 
+    def test_main_change_between_observation_and_write_fails_closed(self):
+        success = {"Owner-present structural boundary": observation("completed", "success")}
+        existing = [issue(456, "Owner-present structural boundary", last_ping_days_ago=1)]
+        with (
+            patch.object(gate, "load_enrollment", return_value=(ONCALL, SLA, [])),
+            patch.object(gate, "main_tip_sha", side_effect=["observed-sha", "newer-sha"]),
+            patch.object(gate, "fetch_check_observations", return_value=success),
+            patch.object(gate, "fetch_orphan_issues", return_value=existing),
+            patch.object(gate, "execute") as execute,
+        ):
+            with self.assertRaises(gate.GateCannotRun):
+                gate.run("owner/repo", Path("unused"), dry_run=False, out=StringIO())
+        execute.assert_not_called()
+
+    def test_stable_main_allows_explicit_green_close(self):
+        success = {"Owner-present structural boundary": observation("completed", "success")}
+        existing = [issue(456, "Owner-present structural boundary", last_ping_days_ago=1)]
+        with (
+            patch.object(gate, "load_enrollment", return_value=(ONCALL, SLA, [])),
+            patch.object(gate, "main_tip_sha", return_value="current-sha") as main_tip,
+            patch.object(gate, "fetch_check_observations", return_value=success),
+            patch.object(gate, "fetch_orphan_issues", return_value=existing),
+            patch.object(gate, "execute") as execute,
+        ):
+            result = gate.run("owner/repo", Path("unused"), dry_run=False, out=StringIO())
+        self.assertEqual(result, 0)
+        self.assertEqual(main_tip.call_count, 2)
+        self.assertEqual([action.kind for action in execute.call_args.args[0]], ["close"])
+        self.assertEqual(execute.call_args.kwargs["expected_sha"], "current-sha")
+
+
+class ExecuteTests(unittest.TestCase):
+    def test_stable_main_allows_every_write_in_the_batch(self):
+        actions = [
+            gate.Action(kind="close", context="First", number=1),
+            gate.Action(kind="close", context="Second", number=2),
+        ]
+        with (
+            patch.object(gate, "main_tip_sha", return_value="current-sha") as main_tip,
+            patch.object(gate, "_gh") as gh,
+        ):
+            gate.execute(
+                actions, "owner/repo", dry_run=False, expected_sha="current-sha", out=StringIO()
+            )
+        self.assertEqual(main_tip.call_count, 2)
+        self.assertEqual(gh.call_count, 2)
+
+    def test_main_change_between_writes_stops_before_the_second_action(self):
+        actions = [
+            gate.Action(kind="close", context="First", number=1),
+            gate.Action(kind="close", context="Second", number=2),
+        ]
+        with (
+            patch.object(gate, "main_tip_sha", side_effect=["current-sha", "newer-sha"]),
+            patch.object(gate, "_gh") as gh,
+        ):
+            with self.assertRaises(gate.GateCannotRun):
+                gate.execute(
+                    actions, "owner/repo", dry_run=False, expected_sha="current-sha", out=StringIO()
+                )
+        self.assertEqual(gh.call_count, 1)
+        self.assertEqual(gh.call_args.args[0][0:3], ["issue", "close", "1"])
+
 
 class ParseDateTests(unittest.TestCase):
     def test_bare_date_is_end_of_day_utc(self):
