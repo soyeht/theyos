@@ -81,6 +81,14 @@ class OrphanIssue:
     last_ping: datetime | None  # time of the latest re-ping comment, or None
 
 
+@dataclass(frozen=True)
+class CheckObservation:
+    """Latest exact check-run observation for one context on the current SHA."""
+
+    status: str
+    conclusion: str | None
+
+
 @dataclass
 class Action:
     kind: str  # "create" | "reping" | "close"
@@ -154,21 +162,25 @@ def _declared_for(context: str, declared: list[Declared]) -> Declared | None:
 
 
 def classify(
-    failing: list[str],
+    observations: dict[str, CheckObservation],
     declared: list[Declared],
     orphans_issues: list[OrphanIssue],
     now: datetime,
     oncall: str,
     sla: timedelta,
 ) -> Classification:
-    """Pure decision logic. Given the currently-failing check contexts, the
-    declarations, and the existing orphan issues, produce findings + actions.
+    """Pure decision logic over current-SHA check observations.
 
     This is the unit the negative control exercises: orphan->create(assignee,
     deadline=now+sla); existing orphan whose last ping is older than sla->
-    reping; orphan whose check went green->close.
+    reping; orphan closes only after an explicit completed-success observation.
+    Absence of a failure is not proof of green.
     """
-    failing_set = set(failing)
+    failing_set = {
+        name
+        for name, observation in observations.items()
+        if observation.status == "completed" and observation.conclusion == "failure"
+    }
     declared_ok: list[str] = []
     expired: list[tuple[str, datetime]] = []
     orphan_ctxs: list[str] = []
@@ -202,10 +214,14 @@ def classify(
         if (now - since) >= sla:
             actions.append(Action("reping", ctx, number=oi.number))
 
-    # Close orphan issues whose check is no longer failing (went green). A red
-    # that became DECLARED is left for the human to reconcile with the registry.
+    # Close only on positive evidence from this SHA. Queued, in-progress,
+    # absent, and inconclusive observations deliberately leave the issue open.
+    # A red that became DECLARED is left for the human to reconcile manually.
     for oi in orphans_issues:
-        if oi.context not in failing_set:
+        observation = observations.get(oi.context)
+        if observation is not None and (
+            observation.status == "completed" and observation.conclusion == "success"
+        ):
             actions.append(Action("close", oi.context, number=oi.number))
 
     return Classification(declared_ok, expired, orphan_ctxs, actions)
@@ -232,12 +248,14 @@ def main_tip_sha(repo: str) -> str:
     return _gh(["api", f"repos/{repo}/branches/main", "-q", ".commit.sha"]).strip()
 
 
-def fetch_failing_contexts(repo: str, sha: str) -> list[str]:
-    """Return the set of check-context names whose latest completed run on `sha`
-    concluded 'failure'. Dedup by name, latest completed_at wins (re-runs don't
-    double-count a red -- a green re-run clears it)."""
-    # Paginate the check-runs endpoint, keep only completed, latest per name.
-    runs: dict[str, dict] = {}
+def fetch_check_observations(repo: str, sha: str) -> dict[str, CheckObservation]:
+    """Return the latest exact context observation for the current main SHA.
+
+    The newest run id wins for a context. This prevents an in-progress rerun
+    from being mistaken for an older completed success, which would make close
+    destructive under incomplete current-SHA observation.
+    """
+    runs: dict[str, tuple[int, CheckObservation]] = {}
     page = 1
     while True:
         js = _gh(
@@ -252,25 +270,37 @@ def fetch_failing_contexts(repo: str, sha: str) -> list[str]:
             ]
         )
         try:
-            batch = json.loads(js) if js.strip() else []
-        except json.JSONDecodeError:
-            raise GateCannotRun("could not parse check-runs response")
+            batch = json.loads(js)
+        except json.JSONDecodeError as e:
+            raise GateCannotRun("could not parse check-runs response") from e
+        if not isinstance(batch, list):
+            raise GateCannotRun("check-runs response is not an array")
         if not batch:
             break
         for cr in batch:
-            if cr.get("status") != "completed":
-                continue
+            if not isinstance(cr, dict):
+                raise GateCannotRun("check-runs entry is not an object")
+            run_id = cr.get("id")
             name = cr.get("name")
-            completed = cr.get("completed_at") or ""
+            status = cr.get("status")
+            conclusion = cr.get("conclusion")
+            if type(run_id) is not int or not isinstance(name, str) or not name:
+                raise GateCannotRun("check-runs entry lacks integer id or string name")
+            if not isinstance(status, str) or not status:
+                raise GateCannotRun("check-runs entry lacks string status")
+            if conclusion is not None and not isinstance(conclusion, str):
+                raise GateCannotRun("check-runs entry has non-string conclusion")
+            if status == "completed" and not conclusion:
+                raise GateCannotRun("completed check-runs entry lacks conclusion")
             cur = runs.get(name)
-            if cur is None or completed >= (cur.get("completed_at") or ""):
-                runs[name] = cr
+            if cur is None or run_id > cur[0]:
+                runs[name] = (run_id, CheckObservation(status, conclusion))
         if len(batch) < 100:
             break
         page += 1
-        if page > 20:  # hard cap; 2000 check-runs is well beyond any real SHA
-            break
-    return sorted(name for name, cr in runs.items() if cr.get("conclusion") == "failure")
+        if page > 20:
+            raise GateCannotRun("check-runs pagination exceeded 2000 entries")
+    return {name: observation for name, (_, observation) in runs.items()}
 
 
 def _parse_context_from_title(title: str) -> str | None:
@@ -336,9 +366,15 @@ def _latest_ping(repo: str, number: int) -> datetime | None:
     return latest
 
 
-def execute(actions: list[Action], repo: str, dry_run: bool, out=sys.stdout) -> None:
+def execute(
+    actions: list[Action], repo: str, dry_run: bool, expected_sha: str, out=sys.stdout
+) -> None:
     for a in actions:
         title = f"{ISSUE_TITLE_PREFIX}{a.context}"
+        if not dry_run and main_tip_sha(repo) != expected_sha:
+            raise GateCannotRun(
+                "main tip changed during chronic-red execution; refusing the next write"
+            )
         if a.kind == "create":
             body = (
                 f"chronic-red orphan: `{a.context}` is failing on `main` and has no owner+expiry "
@@ -386,14 +422,17 @@ def execute(actions: list[Action], repo: str, dry_run: bool, out=sys.stdout) -> 
 def run(repo: str, enrollment: Path, dry_run: bool, out=sys.stdout) -> int:
     oncall, sla, declared = load_enrollment(enrollment)
     sha = main_tip_sha(repo)
-    failing = fetch_failing_contexts(repo, sha)
+    observations = fetch_check_observations(repo, sha)
     orphan_issues = fetch_orphan_issues(repo)
     now = datetime.now(timezone.utc)
 
-    c = classify(failing, declared, orphan_issues, now, oncall, sla)
+    c = classify(observations, declared, orphan_issues, now, oncall, sla)
 
     print(f"main tip: {sha} @ {now:%Y-%m-%d %H:%M:%SZ}", file=out)
-    print(f"failing check contexts on main: {len(failing)}", file=out)
+    print(
+        f"failing check contexts on main: {len(c.orphans) + len(c.declared_ok) + len(c.expired)}",
+        file=out,
+    )
     if c.declared_ok:
         print("\nDECLARED (owned + within expiry):", file=out)
         for ctx in c.declared_ok:
@@ -408,8 +447,12 @@ def run(repo: str, enrollment: Path, dry_run: bool, out=sys.stdout) -> int:
             print(f"  ORPH {ctx}", file=out)
 
     if c.actions:
+        if not dry_run and main_tip_sha(repo) != sha:
+            raise GateCannotRun(
+                "main tip changed during chronic-red observation; refusing to execute actions"
+            )
         print(f"\nactions ({len(c.actions)}):", file=out)
-        execute(c.actions, repo, dry_run, out=out)
+        execute(c.actions, repo, dry_run, expected_sha=sha, out=out)
 
     findings = bool(c.orphans) or bool(c.expired)
     if findings:
