@@ -134,9 +134,7 @@ fn quarantine_probe_exits_when_all_attempts_fail(step: &str) -> bool {
     let Some(end) = lines[condition + 1..].iter().position(|line| *line == "fi") else {
         return false;
     };
-    lines[condition + 1..condition + 1 + end]
-        .iter()
-        .any(|line| *line == "exit 1")
+    lines[condition + 1..condition + 1 + end].contains(&"exit 1")
 }
 
 fn quarantine_probe_appends_aggregate(step: &str) -> bool {
