@@ -20,10 +20,12 @@ inputs, asserting exactly the contract:
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 SCRIPT = Path(__file__).with_name("check-chronic-reds.py")
 SPEC = importlib.util.spec_from_file_location("check_chronic_reds", SCRIPT)
@@ -145,6 +147,68 @@ class ParseDateTests(unittest.TestCase):
     def test_iso_datetime_is_utc_normalized(self):
         dt = gate.parse_date("2026-08-09T10:00:00Z")
         self.assertEqual(dt.tzinfo, timezone.utc)
+
+
+class LatestPingTests(unittest.TestCase):
+    def comment(self, body: str, created_at: str) -> dict[str, str]:
+        return {"body": body, "created_at": created_at}
+
+    def latest(self, pages: list[list[dict[str, str]]]):
+        with patch.object(gate, "_gh", return_value=json.dumps(pages)) as mocked:
+            actual = gate._latest_ping("owner/repo", 17)
+        self.assertEqual(
+            mocked.call_args.args[0],
+            ["api", "--paginate", "--slurp", "repos/owner/repo/issues/17/comments"],
+        )
+        return actual
+
+    def test_latest_ping_accepts_zero_comments(self):
+        self.assertIsNone(self.latest([[]]))
+
+    def test_latest_ping_reads_one_comment(self):
+        actual = self.latest([[self.comment("chronic-red re-ping", "2026-08-10T12:00:00Z")]])
+        self.assertEqual(actual, datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc))
+
+    def test_latest_ping_uses_the_newest_of_multiple_comments(self):
+        actual = self.latest(
+            [[
+                self.comment("chronic-red re-ping", "2026-08-09T12:00:00Z"),
+                self.comment("ordinary discussion", "2026-08-10T11:00:00Z"),
+                self.comment("chronic-red re-ping", "2026-08-10T12:00:00Z"),
+            ]]
+        )
+        self.assertEqual(actual, datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc))
+
+    def test_latest_ping_flattens_all_fourteen_pages(self):
+        # `--slurp` preserves each remote page as an inner array. The latest
+        # ping can be on the final page and must not be silently ignored.
+        pages = [
+            [self.comment("ordinary discussion", f"2026-08-{day:02d}T12:00:00Z")]
+            for day in range(1, 14)
+        ]
+        pages.append([self.comment("chronic-red re-ping", "2026-08-14T12:00:00Z")])
+        actual = self.latest(pages)
+        self.assertEqual(actual, datetime(2026, 8, 14, 12, 0, tzinfo=timezone.utc))
+
+    def test_latest_ping_rejects_invalid_json_and_shapes(self):
+        invalid_payloads = [
+            "",
+            " \t\n",
+            "not json",
+            "[]\n[]",  # concatenated pages are not one valid JSON response
+            json.dumps({}),
+            json.dumps([]),  # `--slurp` always returns at least one page
+            json.dumps([{}]),
+            json.dumps([["not an object"]]),
+            json.dumps([[{"body": "x"}]]),
+            json.dumps([[{"body": 7, "created_at": "2026-08-10T12:00:00Z"}]]),
+            json.dumps([[{"body": "x", "created_at": 7}]]),
+            json.dumps([[{"body": "chronic-red re-ping", "created_at": "not-a-date"}]]),
+        ]
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload), patch.object(gate, "_gh", return_value=payload):
+                with self.assertRaises(gate.GateCannotRun):
+                    gate._latest_ping("owner/repo", 17)
 
 
 if __name__ == "__main__":
