@@ -37,7 +37,7 @@ mod phase3_support;
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::http::StatusCode;
 use household_rs::KeyBackingPolicy;
@@ -97,6 +97,12 @@ fn contains_constant_time(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
         .any(|w| bool::from(w.ct_eq(needle)))
+}
+
+const OWNER_TIMEOUT_QUARANTINE_CUTOFF: u64 = 1_787_011_200;
+
+fn quarantine_is_live(now: u64, cutoff: u64) -> bool {
+    now < cutoff
 }
 
 #[tokio::test]
@@ -286,6 +292,70 @@ async fn test_phase3_happy_path_observability_is_complete_and_leak_free() {
     );
 }
 
+#[test]
+fn owner_timeout_quarantine_has_not_expired() {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after the Unix epoch")
+        .as_secs();
+    assert!(
+        quarantine_is_live(now, OWNER_TIMEOUT_QUARANTINE_CUTOFF),
+        "issue #470 quarantine for @gloria expired at 2026-08-18T00:00:00Z; re-evaluate test_owner_timeout_aborts_window_and_emits_tracing"
+    );
+}
+
+#[test]
+fn owner_timeout_quarantine_cutoff_is_exclusive() {
+    assert!(quarantine_is_live(
+        OWNER_TIMEOUT_QUARANTINE_CUTOFF - 1,
+        OWNER_TIMEOUT_QUARANTINE_CUTOFF
+    ));
+    assert!(!quarantine_is_live(
+        OWNER_TIMEOUT_QUARANTINE_CUTOFF,
+        OWNER_TIMEOUT_QUARANTINE_CUTOFF
+    ));
+}
+
+#[test]
+fn owner_timeout_quarantine_probe_contract_is_enforced() {
+    let workflow = include_str!("../../../../.github/workflows/backend-ci.yml");
+    let (_, after_begin) = workflow
+        .split_once("# QUARANTINE_PROBE_470_BEGIN")
+        .expect("issue #470 probe begin marker is present");
+    let (probe, _) = after_begin
+        .split_once("# QUARANTINE_PROBE_470_END")
+        .expect("issue #470 probe end marker is present");
+
+    assert!(
+        probe.contains("for attempt in 1 2 3 4 5; do"),
+        "issue #470 probe must make five attempts"
+    );
+    assert!(
+        probe.contains("cargo test --locked -p e2e-rs --test phase3_observability_audit"),
+        "issue #470 probe must run the observability audit test binary with a locked resolution"
+    );
+    assert!(
+        probe.contains("--ignored --exact test_owner_timeout_aborts_window_and_emits_tracing"),
+        "issue #470 probe must select the quarantined test exactly"
+    );
+    assert!(
+        probe.contains("QUARANTINE_PROBE_470 attempts=5 passes=%s failures=%s"),
+        "issue #470 probe must emit its machine-readable aggregate"
+    );
+    assert!(
+        probe.contains("GITHUB_STEP_SUMMARY"),
+        "issue #470 probe must write its evidence to the step summary"
+    );
+    assert!(
+        probe.contains("if [[ \"${passes}\" -eq 0 ]]; then"),
+        "issue #470 probe must fail when all five attempts fail"
+    );
+    assert!(
+        !probe.contains("continue-on-error"),
+        "issue #470 probe must not hide a persistent failure"
+    );
+}
+
 /// FR-019 "owner timed out" coverage — the active half. Distinct from
 /// `owner_events.long_poll.timeout` (HTTP keep-alive returning 204):
 /// THIS test exercises the runtime watchdog that fires when the
@@ -294,6 +364,16 @@ async fn test_phase3_happy_path_observability_is_complete_and_leak_free() {
 /// `JoinCancelled{reason="timeout"}` owner event so the iPhone's
 /// long-poll wakes up with the cancellation, and emit
 /// `pair_machine.owner_timed_out` for the audit trail.
+///
+/// Issue #470 quarantine: 4 of 23 verdict-bearing attempts failed across 20
+/// runs, with Linux observed; the exact cause and rate remain unisolated.
+/// Attempt Wilson95 is [7.0%, 37.1%]; run-cluster Wilson95 is [8.1%, 41.6%].
+/// Three rerun second attempts passed. Owner: @gloria. Expiry: 2026-08-17.
+/// The expiry guard below makes the quarantine fail closed on 2026-08-18.
+/// 0/5 detects total breakage immediately but partial degradation more slowly;
+/// the mandatory expiry review covers that middle range. A green probe run is
+/// not evidence that the flake rate stayed constant.
+#[ignore = "issue #470: Linux-observed owner-timeout flake; expires 2026-08-17"]
 #[tokio::test]
 async fn test_owner_timeout_aborts_window_and_emits_tracing() {
     let (buf, _guard) = install_capture();
