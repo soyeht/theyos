@@ -51,6 +51,10 @@ on:
     paths-ignore:
       - "admin/rust/**"
       - "scripts/**"
+      - "PORTS.md"
+      - "admin/contracts/claw-store/v1/claw-store-household-v1.json"
+      - "admin/contracts/claw-store/v1/contract.json"
+      - "claws/manifest.yml"
       - "admin/contracts/mobile-claw-vpn/v1/**"
       - "admin/contracts/owner-approval/v2/**"
       - ".env.example"
