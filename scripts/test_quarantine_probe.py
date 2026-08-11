@@ -21,8 +21,9 @@ def cargo_output(
     if status is not None:
         lines.append(f"test {TEST_NAME} ... {status}")
     if duration_s is not None:
-        summary_status = "ok" if status == "ok" else "FAILED"
-        passed, failed = ("1", "0") if status == "ok" else ("0", "1")
+        summary_status = "FAILED" if status == "FAILED" else "ok"
+        passed = "1" if status == "ok" else "0"
+        failed = "1" if status == "FAILED" else "0"
         lines.append(
             f"test result: {summary_status}. {passed} passed; {failed} failed; "
             f"finished in {duration_s}s"
@@ -40,9 +41,12 @@ class QuarantineProbeTests(unittest.TestCase):
         self.addCleanup(environment.stop)
 
     def test_zero_selected_is_invalid_even_when_cargo_returns_zero(self) -> None:
-        observation = classify_cargo_output(cargo_output(count=0), 0, TEST_NAME)
+        observation = classify_cargo_output(
+            cargo_output(count=0, duration_s="0.37"), 0, TEST_NAME
+        )
         self.assertEqual(observation.result, "INVALID")
         self.assertEqual(observation.selected, 0)
+        self.assertEqual(observation.duration_s, "0.37")
 
     def test_valid_pass_requires_one_exact_result_and_zero_returncode(self) -> None:
         observation = classify_cargo_output(
