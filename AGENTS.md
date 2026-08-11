@@ -24,6 +24,11 @@ itself; callers must not supply a body file or other payload channel. An
 unsupported external writer remains blocked until a reviewed adapter and
 adversarial test are added.
 
+`git push` is intentionally not an adapter: its externally visible text is
+the history already authored, not stdin. Create every commit message through
+the guarded `git commit` adapter, then push without adding new prose. Custom
+merge, tag, release, or e-mail text needs its own reviewed adapter first.
+
 Soyeht pane handles are internal routing identifiers. Never place them in an
 external payload. Write `agent-khai` or `internal agent Khai`, without an
 at-sign. HTML entities that render as an at-sign are also prohibited because

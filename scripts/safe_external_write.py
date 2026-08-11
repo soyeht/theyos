@@ -19,7 +19,9 @@ child requires ``--stdin`` so the child receives the exact bytes that passed
 validation; payload files are check-only and cannot introduce a read-after-
 validation race. Executed commands use a closed grammar: the wrapper itself
 adds the stdin-reading body/message flag. Unsupported writers are check-only
-until a reviewed adapter is added.
+until a reviewed adapter is added. ``git push`` is intentionally outside the
+execution grammar because its published text is existing history, not stdin;
+commit messages are guarded when they are created.
 """
 
 from __future__ import annotations
