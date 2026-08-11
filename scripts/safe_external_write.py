@@ -21,7 +21,9 @@ validation race. Executed commands use a closed grammar: the wrapper itself
 adds the stdin-reading body/message flag. Unsupported writers are check-only
 until a reviewed adapter is added. ``git push`` is intentionally outside the
 execution grammar because its published text is existing history, not stdin;
-commit messages are guarded when they are created.
+commit messages are guarded when they are created. GitHub adapters are
+intentionally pinned to ``github.com/soyeht/theyos``; another repository
+requires an explicit code change and review rather than a runtime override.
 """
 
 from __future__ import annotations
