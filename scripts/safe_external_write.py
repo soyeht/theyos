@@ -32,12 +32,13 @@ from typing import Sequence
 # rule distinguishes ordinary e-mail addresses (foo@example.com) from mentions
 # after whitespace, punctuation, Markdown, or pasted diff prefixes.  Known
 # false positives such as docs/@types and rare local-parts ending in '-', '_',
-# or '.' should be encoded as &#64; rather than weakening the predicate.
+# or '.' should be rewritten without an at-sign or explicitly allowlisted rather
+# than weakening the predicate.
 MENTION_PATTERN = re.compile(
     r"(?<![A-Za-z0-9])@([A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?)"
 )
 ENTITY_MENTION_PATTERN = re.compile(
-    r"(?<![A-Za-z0-9])(?:&#0*64;|&#x0*40;|&commat;)"
+    r"(?<![A-Za-z0-9])(?:&#0*64;?|&#x0*40;?|&commat;)"
     r"([A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?)",
     re.IGNORECASE,
 )

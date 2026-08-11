@@ -76,6 +76,8 @@ class MentionSyntaxTests(unittest.TestCase):
             "&#x40;khai",
             "&#x040;khai",
             "&#X40;Khai",
+            "&#64khai",
+            "&#x40khai",
             "&commat;khai",
         )
         for payload in cases:
