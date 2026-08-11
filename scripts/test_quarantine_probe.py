@@ -75,7 +75,11 @@ class QuarantineProbeTests(unittest.TestCase):
 
     def test_timeout_is_invalid_not_a_test_failure(self) -> None:
         def timeout_runner(*_args, **_kwargs):
-            raise subprocess.TimeoutExpired(cmd="cargo", timeout=1)
+            raise subprocess.TimeoutExpired(
+                cmd="cargo",
+                timeout=1,
+                output=cargo_output(count=1, status="FAILED"),
+            )
 
         with tempfile.TemporaryDirectory() as directory:
             summary = Path(directory) / "summary"

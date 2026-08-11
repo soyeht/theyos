@@ -119,6 +119,7 @@ def run_probe(
     )
     passes = failures = invalid = 0
     for attempt in range(1, config.attempts + 1):
+        timed_out = False
         try:
             completed = runner(
                 command,
@@ -131,6 +132,7 @@ def run_probe(
                 timeout=config.attempt_timeout_seconds,
             )
         except subprocess.TimeoutExpired as error:
+            timed_out = True
             captured = error.stdout or ""
             if isinstance(captured, bytes):
                 captured = captured.decode(errors="replace")
@@ -140,8 +142,10 @@ def run_probe(
                 stdout=f"{captured}\nPROBE_TIMEOUT seconds={config.attempt_timeout_seconds}\n",
             )
         print(completed.stdout, end="" if completed.stdout.endswith("\n") else "\n")
-        observation = classify_cargo_output(
-            completed.stdout, completed.returncode, config.test
+        observation = (
+            Observation("INVALID", 0, "attempt-timeout")
+            if timed_out
+            else classify_cargo_output(completed.stdout, completed.returncode, config.test)
         )
         if observation.result == "PASS":
             passes += 1
