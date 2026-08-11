@@ -23,6 +23,11 @@ RUNNING_RE = re.compile(r"^running (?P<count>\d+) tests?$", re.MULTILINE)
 TEST_RESULT_RE = re.compile(
     r"^test (?P<name>\S+) \.\.\. (?P<status>ok|FAILED)$", re.MULTILINE
 )
+TEST_DURATION_RE = re.compile(
+    r"^test result: (?:ok|FAILED)\. .* finished in "
+    r"(?P<duration>[0-9]+(?:\.[0-9]+)?)s$",
+    re.MULTILINE,
+)
 
 
 @dataclass(frozen=True)
@@ -30,6 +35,7 @@ class Observation:
     result: str
     selected: int
     reason: str = ""
+    duration_s: str = "unknown"
 
 
 @dataclass(frozen=True)
@@ -42,8 +48,19 @@ class ProbeConfig:
     attempt_timeout_seconds: int = 30
 
 
+def _cargo_duration(output: str) -> str:
+    """Return Cargo's aggregate test-harness duration when it is unambiguous.
+
+    This includes test-harness overhead and does not directly measure the
+    quarantined test's internal timing assertion.
+    """
+    durations = [match.group("duration") for match in TEST_DURATION_RE.finditer(output)]
+    return durations[0] if len(durations) == 1 else "unknown"
+
+
 def classify_cargo_output(output: str, returncode: int, expected_test: str) -> Observation:
     """Classify a Cargo transcript without treating return code zero as proof."""
+    duration_s = _cargo_duration(output)
     selected_counts = [int(match.group("count")) for match in RUNNING_RE.finditer(output)]
     result_lines = [
         (match.group("name"), match.group("status"))
@@ -52,20 +69,21 @@ def classify_cargo_output(output: str, returncode: int, expected_test: str) -> O
 
     if selected_counts != [1]:
         rendered = ",".join(str(count) for count in selected_counts) or "none"
-        return Observation("INVALID", 0, f"selected-counts={rendered}")
+        return Observation("INVALID", 0, f"selected-counts={rendered}", duration_s)
     if len(result_lines) != 1 or result_lines[0][0] != expected_test:
         names = ",".join(name for name, _ in result_lines) or "none"
-        return Observation("INVALID", 1, f"result-tests={names}")
+        return Observation("INVALID", 1, f"result-tests={names}", duration_s)
 
     status = result_lines[0][1]
     if status == "ok" and returncode == 0:
-        return Observation("PASS", 1)
+        return Observation("PASS", 1, duration_s=duration_s)
     if status == "FAILED" and returncode != 0:
-        return Observation("FAIL", 1)
+        return Observation("FAIL", 1, duration_s=duration_s)
     return Observation(
         "INVALID",
         1,
         f"status={status}-returncode={returncode}",
+        duration_s,
     )
 
 
@@ -116,7 +134,7 @@ def run_probe(
         "cluster=single_job no_pooling=true clean_run_is_not_a_rate_claim=true",
         summary,
     )
-    passes = failures = invalid = 0
+    passes = failures = invalid = duration_known = duration_unknown = 0
     for attempt in range(1, config.attempts + 1):
         timed_out = False
         try:
@@ -152,17 +170,23 @@ def run_probe(
             failures += 1
         else:
             invalid += 1
+        if observation.duration_s == "unknown":
+            duration_unknown += 1
+        else:
+            duration_known += 1
         reason = f" reason={_safe_label(observation.reason)}" if observation.reason else ""
         _emit(
             f"PROBE_{config.issue} os={runner_os} job={runner_job} "
             f"attempt={attempt} selected={observation.selected} "
-            f"result={observation.result} rc={completed.returncode}{reason}",
+            f"result={observation.result} rc={completed.returncode} "
+            f"duration_s={observation.duration_s}{reason}",
             summary,
         )
 
     _emit(
         f"PROBE_{config.issue} os={runner_os} job={runner_job} "
-        f"attempts={config.attempts} passes={passes} failures={failures} invalid={invalid}",
+        f"attempts={config.attempts} passes={passes} failures={failures} invalid={invalid} "
+        f"duration_known={duration_known} duration_unknown={duration_unknown}",
         summary,
     )
     return 2 if invalid else 0
