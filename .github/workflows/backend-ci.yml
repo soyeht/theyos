@@ -71,6 +71,73 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
+  quarantine-isolation-probes:
+    name: Quarantine isolation probes (${{ matrix.os }}, non-required)
+    runs-on: ${{ matrix.os }}
+    # The cold prebuild is outside the per-attempt timer. Once built, the 40
+    # sequential observations have a 10s ceiling each (6m40s worst case), so
+    # the job has ample room to publish both deterministic summaries.
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install native test dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y openssh-server pkg-config libdbus-1-dev libkeyutils-dev
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "admin/rust -> target"
+      - name: Probe harness self-tests
+        run: |
+          python3 -m py_compile scripts/quarantine_probe.py scripts/test_quarantine_probe.py
+          python3 scripts/test_quarantine_probe.py
+      - name: Build both quarantined test binaries
+        working-directory: admin/rust
+        run: |
+          cargo test --locked -p vmrunner-rs --lib --no-run
+          cargo test --locked -p household-rs --lib --no-run
+      - name: Probe issue 438 (create_guard cleanup)
+        id: probe_438
+        continue-on-error: true
+        run: |
+          python3 scripts/quarantine_probe.py \
+            --issue 438 \
+            --attempts 20 \
+            --attempt-timeout-seconds 10 \
+            --package vmrunner-rs \
+            --test create_guard::tests::cleanup_quarantines_real_term_ignoring_survivor_after_force_attempts
+      - name: Probe issue 450 (pair_machine delayed restart)
+        id: probe_450
+        continue-on-error: true
+        run: |
+          python3 scripts/quarantine_probe.py \
+            --issue 450 \
+            --attempts 20 \
+            --attempt-timeout-seconds 10 \
+            --package household-rs \
+            --test pair_machine::tests::delayed_restart_response_never_sleeps_against_a_stale_budget
+      - name: Require valid probe instruments
+        if: always()
+        env:
+          PROBE_438_OUTCOME: ${{ steps.probe_438.outcome }}
+          PROBE_450_OUTCOME: ${{ steps.probe_450.outcome }}
+        run: |
+          if [[ "${PROBE_438_OUTCOME}" != "success" || "${PROBE_450_OUTCOME}" != "success" ]]; then
+            echo "::error::At least one quarantine probe was invalid; inspect PROBE_* invalid counts"
+            exit 1
+          fi
+
   build-and-test-linux:
     name: Build & Test (Rust / Linux)
     runs-on: ubuntu-latest
