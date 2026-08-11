@@ -105,11 +105,40 @@ fn quarantine_is_live(now: u64, cutoff: u64) -> bool {
     now < cutoff
 }
 
-fn quarantine_probe_step(workflow: &str) -> &str {
+fn workflow_job_block<'a>(workflow: &'a str, job: &str) -> &'a str {
+    let marker = format!("\n  {job}:\n");
     let start = workflow
-        .find("      - name: Quarantine probe (issue #470)")
-        .expect("issue #470 probe step is present");
+        .find(&marker)
+        .map(|index| index + 1)
+        .unwrap_or_else(|| panic!("workflow job {job} is present"));
     let after_start = &workflow[start..];
+    let end = after_start
+        .match_indices('\n')
+        .filter_map(|(index, _)| {
+            after_start
+                .get(index + 1..)
+                .map(|remainder| (index, remainder))
+        })
+        .find_map(|(index, remainder)| {
+            let line = remainder.lines().next().unwrap_or_default();
+            (line.starts_with("  ") && !line.starts_with("    ") && line.trim_end().ends_with(':'))
+                .then_some(index)
+        })
+        .unwrap_or(after_start.len());
+    &after_start[..end]
+}
+
+fn quarantine_probe_is_in_required_linux_job(workflow: &str) -> bool {
+    workflow_job_block(workflow, "build-and-test-linux")
+        .contains("      - name: Quarantine probe (issue #470)")
+}
+
+fn quarantine_probe_step(workflow: &str) -> &str {
+    let linux_job = workflow_job_block(workflow, "build-and-test-linux");
+    let start = linux_job
+        .find("      - name: Quarantine probe (issue #470)")
+        .expect("issue #470 probe step is present in required Linux job");
+    let after_start = &linux_job[start..];
     let end = after_start
         .find("\n      - name:")
         .unwrap_or(after_start.len());
@@ -123,18 +152,61 @@ fn active_lines(input: &str) -> impl Iterator<Item = &str> {
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
 }
 
+fn quarantine_probe_command(step: &str) -> Option<String> {
+    let lines: Vec<_> = active_lines(step).collect();
+    let starts: Vec<_> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            line.starts_with("python3 scripts/quarantine_probe.py")
+                .then_some(index)
+        })
+        .collect();
+    let [start] = starts.as_slice() else {
+        return None;
+    };
+
+    let mut command = Vec::new();
+    for line in &lines[*start..] {
+        let continues = line.ends_with('\\');
+        command.push(line.trim_end_matches('\\').trim());
+        if !continues {
+            return Some(command.join(" "));
+        }
+    }
+    None
+}
+
 fn quarantine_probe_guard_is_intact(step: &str) -> bool {
-    let command = active_lines(step).collect::<Vec<_>>().join(" ");
-    !command.contains("continue-on-error:")
-        && command.contains("python3 scripts/test_quarantine_probe.py")
-        && command.contains("python3 scripts/quarantine_probe.py")
-        && command.contains("--issue 470")
-        && command.contains("--attempts 5")
-        && command.contains("--attempt-timeout-seconds 120")
-        && command.contains("--package e2e-rs")
-        && command.contains("--test-target phase3_observability_audit")
-        && command.contains("--test test_owner_timeout_aborts_window_and_emits_tracing")
-        && command.contains("--require-pass")
+    let active: Vec<_> = active_lines(step).collect();
+    let Some(command) = quarantine_probe_command(step) else {
+        return false;
+    };
+    let command_tokens: Vec<_> = command.split_whitespace().collect();
+    !active
+        .iter()
+        .any(|line| line.starts_with("continue-on-error:"))
+        && active
+            .iter()
+            .any(|line| *line == "python3 scripts/test_quarantine_probe.py")
+        && command_tokens
+            == [
+                "python3",
+                "scripts/quarantine_probe.py",
+                "--issue",
+                "470",
+                "--attempts",
+                "5",
+                "--attempt-timeout-seconds",
+                "120",
+                "--package",
+                "e2e-rs",
+                "--test-target",
+                "phase3_observability_audit",
+                "--test",
+                "test_owner_timeout_aborts_window_and_emits_tracing",
+                "--require-pass",
+            ]
 }
 
 #[tokio::test]
@@ -351,6 +423,10 @@ fn owner_timeout_quarantine_cutoff_is_exclusive() {
 #[test]
 fn owner_timeout_quarantine_probe_contract_is_enforced() {
     let workflow = include_str!("../../../../.github/workflows/backend-ci.yml");
+    assert!(
+        quarantine_probe_is_in_required_linux_job(workflow),
+        "issue #470 probe must remain inside the required build-and-test-linux job"
+    );
     let probe = quarantine_probe_step(workflow);
 
     assert!(
@@ -379,7 +455,11 @@ fn owner_timeout_quarantine_guard_rejects_required_probe_mutations() {
 
     for required_argument in [
         "python3 scripts/test_quarantine_probe.py",
+        "python3 scripts/quarantine_probe.py",
+        "--issue 470",
         "--attempts 5",
+        "--attempt-timeout-seconds 120",
+        "--package e2e-rs",
         "--test-target phase3_observability_audit",
         "--test test_owner_timeout_aborts_window_and_emits_tracing",
         "--require-pass",
@@ -390,6 +470,29 @@ fn owner_timeout_quarantine_guard_rejects_required_probe_mutations() {
             "removing {required_argument} must break the required probe contract"
         );
     }
+
+    let detached_required_policy = probe
+        .replacen(
+            "            --test test_owner_timeout_aborts_window_and_emits_tracing \\",
+            "            --test test_owner_timeout_aborts_window_and_emits_tracing",
+            1,
+        )
+        .replacen(
+            "            --require-pass",
+            "          echo --require-pass",
+            1,
+        );
+    assert!(detached_required_policy.contains("echo --require-pass"));
+    assert!(!quarantine_probe_guard_is_intact(&detached_required_policy));
+
+    let without_required_probe = workflow.replacen(probe, "", 1);
+    let moved_to_non_required =
+        without_required_probe.replacen("    steps:\n", &format!("    steps:\n{probe}"), 1);
+    assert!(moved_to_non_required.contains("Quarantine probe (issue #470)"));
+    assert!(
+        !quarantine_probe_is_in_required_linux_job(&moved_to_non_required),
+        "moving the intact probe text outside the required Linux job must break containment"
+    );
 }
 
 /// FR-019 "owner timed out" coverage — the active half. Distinct from
