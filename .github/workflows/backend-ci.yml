@@ -768,6 +768,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: External write safety guard self-tests
+        run: |
+          python3 -m py_compile \
+            scripts/safe_external_write.py \
+            scripts/test_safe_external_write.py
+          python3 scripts/test_safe_external_write.py
+
       - name: Check for bash invocations in Rust source
         run: |
           # Fail on any Command::new("bash") or /bin/bash in operational Rust code.
