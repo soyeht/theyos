@@ -30,4 +30,5 @@ notification must be explicitly authorized and passed through
 The wrapper rejects mention syntax after punctuation, Markdown, newlines, and
 pasted diff prefixes. It deliberately fails closed on ambiguous strings such
 as scoped package paths and rare e-mail local-parts. Do not weaken the regular
-expression to make such input pass; encode the display-only at-sign instead.
+expression to make such input pass; rewrite the text without an at-sign or use
+an explicitly authorized allowlist entry.
