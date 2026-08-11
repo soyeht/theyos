@@ -123,29 +123,18 @@ fn active_lines(input: &str) -> impl Iterator<Item = &str> {
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
 }
 
-fn quarantine_probe_exits_when_all_attempts_fail(step: &str) -> bool {
-    let lines: Vec<_> = active_lines(step).collect();
-    let Some(condition) = lines
-        .iter()
-        .position(|line| *line == "if [[ \"${passes}\" -eq 0 ]]; then")
-    else {
-        return false;
-    };
-    lines.get(condition + 1) == Some(&"exit 1") && lines.get(condition + 2) == Some(&"fi")
-}
-
-fn quarantine_probe_appends_aggregate(step: &str) -> bool {
-    let lines: Vec<_> = active_lines(step).collect();
-    lines.windows(2).any(|window| {
-        window[0] == "printf 'QUARANTINE_PROBE_470 attempts=5 passes=%s failures=%s\\n' \\"
-            && window[1] == "\"${passes}\" \"${failures}\" >> \"${GITHUB_STEP_SUMMARY}\""
-    })
-}
-
 fn quarantine_probe_guard_is_intact(step: &str) -> bool {
-    !active_lines(step).any(|line| line.starts_with("continue-on-error:"))
-        && quarantine_probe_exits_when_all_attempts_fail(step)
-        && quarantine_probe_appends_aggregate(step)
+    let command = active_lines(step).collect::<Vec<_>>().join(" ");
+    !command.contains("continue-on-error:")
+        && command.contains("python3 scripts/test_quarantine_probe.py")
+        && command.contains("python3 scripts/quarantine_probe.py")
+        && command.contains("--issue 470")
+        && command.contains("--attempts 5")
+        && command.contains("--attempt-timeout-seconds 120")
+        && command.contains("--package e2e-rs")
+        && command.contains("--test-target phase3_observability_audit")
+        && command.contains("--test test_owner_timeout_aborts_window_and_emits_tracing")
+        && command.contains("--require-pass")
 }
 
 #[tokio::test]
@@ -370,28 +359,8 @@ fn owner_timeout_quarantine_probe_contract_is_enforced() {
         "issue #470 probe markers must remain inside the probe step"
     );
     assert!(
-        probe.contains("for attempt in 1 2 3 4 5; do"),
-        "issue #470 probe must make five attempts"
-    );
-    assert!(
-        probe.contains("cargo test --locked -p e2e-rs --test phase3_observability_audit"),
-        "issue #470 probe must run the observability audit test binary with a locked resolution"
-    );
-    assert!(
-        probe.contains("--ignored --exact test_owner_timeout_aborts_window_and_emits_tracing"),
-        "issue #470 probe must select the quarantined test exactly"
-    );
-    assert!(
-        probe.contains("QUARANTINE_PROBE_470 attempts=5 passes=%s failures=%s"),
-        "issue #470 probe must emit its machine-readable aggregate"
-    );
-    assert!(
-        probe.contains("GITHUB_STEP_SUMMARY"),
-        "issue #470 probe must write its evidence to the step summary"
-    );
-    assert!(
         quarantine_probe_guard_is_intact(probe),
-        "issue #470 probe step must prohibit continue-on-error, connect all-five-failed to exit 1, and append the aggregate to the step summary"
+        "issue #470 required probe must use the validated integration-test selector, make five attempts, reject invalid instruments, and require at least one pass"
     );
 }
 
@@ -408,60 +377,19 @@ fn owner_timeout_quarantine_guard_rejects_required_probe_mutations() {
     assert!(step_level_continue.contains("continue-on-error"));
     assert!(!quarantine_probe_guard_is_intact(&step_level_continue));
 
-    let missing_exit = probe.replacen("            exit 1", "            :", 1);
-    assert!(!quarantine_probe_exits_when_all_attempts_fail(
-        &missing_exit
-    ));
-    assert!(!quarantine_probe_guard_is_intact(&missing_exit));
-
-    let missing_aggregate_append = probe.replacen(
-        "\"${passes}\" \"${failures}\" >> \"${GITHUB_STEP_SUMMARY}\"",
-        "\"${passes}\" \"${failures}\"",
-        1,
-    );
-    assert!(!quarantine_probe_appends_aggregate(
-        &missing_aggregate_append
-    ));
-    assert!(!quarantine_probe_guard_is_intact(&missing_aggregate_append));
-
-    let commented_sequence = probe
-        .replacen(
-            "          if [[ \"${passes}\" -eq 0 ]]; then",
-            "          # if [[ \"${passes}\" -eq 0 ]]; then",
-            1,
-        )
-        .replacen("            exit 1", "            # exit 1", 1)
-        .replacen(
-            "          fi\n          # QUARANTINE_PROBE_470_END",
-            "          # fi\n          # QUARANTINE_PROBE_470_END",
-            1,
+    for required_argument in [
+        "python3 scripts/test_quarantine_probe.py",
+        "--attempts 5",
+        "--test-target phase3_observability_audit",
+        "--test test_owner_timeout_aborts_window_and_emits_tracing",
+        "--require-pass",
+    ] {
+        let mutation = probe.replacen(required_argument, "", 1);
+        assert!(
+            !quarantine_probe_guard_is_intact(&mutation),
+            "removing {required_argument} must break the required probe contract"
         );
-    assert!(!quarantine_probe_exits_when_all_attempts_fail(
-        &commented_sequence
-    ));
-    assert!(!quarantine_probe_guard_is_intact(&commented_sequence));
-
-    let commented_aggregate_append = probe.replacen(
-        "\"${passes}\" \"${failures}\" >> \"${GITHUB_STEP_SUMMARY}\"",
-        "# \"${passes}\" \"${failures}\" >> \"${GITHUB_STEP_SUMMARY}\"",
-        1,
-    );
-    assert!(!quarantine_probe_appends_aggregate(
-        &commented_aggregate_append
-    ));
-    assert!(!quarantine_probe_guard_is_intact(
-        &commented_aggregate_append
-    ));
-
-    let nested_dead_exit = probe.replacen(
-        "            exit 1",
-        "            if false; then\n              exit 1\n            fi",
-        1,
-    );
-    assert!(!quarantine_probe_exits_when_all_attempts_fail(
-        &nested_dead_exit
-    ));
-    assert!(!quarantine_probe_guard_is_intact(&nested_dead_exit));
+    }
 }
 
 /// FR-019 "owner timed out" coverage — the active half. Distinct from

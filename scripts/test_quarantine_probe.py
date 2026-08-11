@@ -8,7 +8,12 @@ from unittest import mock
 import os
 from pathlib import Path
 
-from quarantine_probe import ProbeConfig, classify_cargo_output, run_probe
+from quarantine_probe import (
+    ProbeConfig,
+    cargo_test_command,
+    classify_cargo_output,
+    run_probe,
+)
 
 
 TEST_NAME = "crate::tests::quarantined_test"
@@ -39,6 +44,53 @@ class QuarantineProbeTests(unittest.TestCase):
         )
         environment.start()
         self.addCleanup(environment.stop)
+
+    def test_cargo_command_selects_library_target_by_default(self) -> None:
+        config = ProbeConfig("999", 1, "fixture", TEST_NAME, Path("workspace"))
+        self.assertEqual(
+            cargo_test_command(config),
+            (
+                "cargo",
+                "test",
+                "--locked",
+                "-p",
+                "fixture",
+                "--lib",
+                "--",
+                "--ignored",
+                "--exact",
+                TEST_NAME,
+                "--test-threads=1",
+            ),
+        )
+
+    def test_cargo_command_selects_named_integration_test_target(self) -> None:
+        config = ProbeConfig(
+            "470",
+            5,
+            "e2e-rs",
+            TEST_NAME,
+            Path("workspace"),
+            test_target="phase3_observability_audit",
+            require_pass=True,
+        )
+        self.assertEqual(
+            cargo_test_command(config),
+            (
+                "cargo",
+                "test",
+                "--locked",
+                "-p",
+                "e2e-rs",
+                "--test",
+                "phase3_observability_audit",
+                "--",
+                "--ignored",
+                "--exact",
+                TEST_NAME,
+                "--test-threads=1",
+            ),
+        )
 
     def test_zero_selected_is_invalid_even_when_cargo_returns_zero(self) -> None:
         observation = classify_cargo_output(
@@ -136,6 +188,107 @@ class QuarantineProbeTests(unittest.TestCase):
                 summary.read_text(encoding="utf-8"),
             )
 
+    def test_required_policy_fails_when_all_valid_attempts_fail(self) -> None:
+        runner = mock.Mock(
+            return_value=subprocess.CompletedProcess(
+                args=[],
+                returncode=101,
+                stdout=cargo_output(count=1, status="FAILED", duration_s="0.41"),
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            summary = Path(directory) / "summary"
+            rc = run_probe(
+                ProbeConfig(
+                    "470",
+                    2,
+                    "fixture",
+                    TEST_NAME,
+                    Path(directory),
+                    require_pass=True,
+                ),
+                runner=runner,
+                summary=summary,
+            )
+            self.assertEqual(rc, 1)
+            self.assertIn(
+                "attempts=2 passes=0 failures=2 invalid=0",
+                summary.read_text(encoding="utf-8"),
+            )
+
+    def test_required_policy_passes_after_one_valid_pass(self) -> None:
+        runner = mock.Mock(
+            side_effect=[
+                subprocess.CompletedProcess(
+                    args=[],
+                    returncode=101,
+                    stdout=cargo_output(count=1, status="FAILED", duration_s="0.41"),
+                ),
+                subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout=cargo_output(count=1, status="ok", duration_s="0.37"),
+                ),
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            summary = Path(directory) / "summary"
+            rc = run_probe(
+                ProbeConfig(
+                    "470",
+                    2,
+                    "fixture",
+                    TEST_NAME,
+                    Path(directory),
+                    require_pass=True,
+                ),
+                runner=runner,
+                summary=summary,
+            )
+            self.assertEqual(rc, 0)
+            self.assertIn(
+                "attempts=2 passes=1 failures=1 invalid=0",
+                summary.read_text(encoding="utf-8"),
+            )
+
+    def test_invalid_instrument_overrides_a_valid_required_pass(self) -> None:
+        runner = mock.Mock(
+            side_effect=[
+                subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout=cargo_output(count=1, status="ok", duration_s="0.37"),
+                ),
+                subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout=cargo_output(count=0, duration_s="0.00"),
+                ),
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            summary = Path(directory) / "summary"
+            rc = run_probe(
+                ProbeConfig(
+                    "470",
+                    2,
+                    "fixture",
+                    TEST_NAME,
+                    Path(directory),
+                    require_pass=True,
+                ),
+                runner=runner,
+                summary=summary,
+            )
+            self.assertEqual(rc, 2)
+            self.assertIn(
+                "attempts=2 passes=1 failures=0 invalid=1",
+                summary.read_text(encoding="utf-8"),
+            )
+
     def test_harness_rejects_vacuous_success(self) -> None:
         def empty_runner(*_args, **_kwargs):
             return subprocess.CompletedProcess(
@@ -145,7 +298,14 @@ class QuarantineProbeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             summary = Path(directory) / "summary"
             rc = run_probe(
-                ProbeConfig("999", 1, "fixture", TEST_NAME, Path(directory)),
+                ProbeConfig(
+                    "999",
+                    1,
+                    "fixture",
+                    TEST_NAME,
+                    Path(directory),
+                    require_pass=True,
+                ),
                 runner=empty_runner,
                 summary=summary,
             )

@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Run one quarantined Rust test repeatedly without turning flakes into a gate.
+"""Run one quarantined Rust test repeatedly with an explicit result policy.
 
-A test PASS or FAIL is an observation and leaves the probe successful.  A
-vacant selector, build/toolchain error, or ambiguous Cargo transcript is an
-invalid instrument and fails the probe job.  This distinction is load-bearing:
-`cargo test` exits zero when `--exact` selects no tests.
+By default, a test PASS or FAIL is an observation and leaves the probe
+successful.  ``--require-pass`` preserves required containment by failing when
+every valid attempt fails.  A vacant selector, build/toolchain error, timeout,
+or ambiguous Cargo transcript always means an invalid instrument and fails the
+probe.  This distinction is load-bearing: ``cargo test`` exits zero when
+``--exact`` selects no tests.
 """
 
 from __future__ import annotations
@@ -46,6 +48,8 @@ class ProbeConfig:
     test: str
     workspace: Path
     attempt_timeout_seconds: int = 30
+    test_target: str | None = None
+    require_pass: bool = False
 
 
 def _cargo_duration(output: str) -> str:
@@ -90,6 +94,24 @@ def classify_cargo_output(output: str, returncode: int, expected_test: str) -> O
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 
 
+def cargo_test_command(config: ProbeConfig) -> tuple[str, ...]:
+    """Build the exact Cargo selector for a library or integration-test target."""
+    target = ("--test", config.test_target) if config.test_target else ("--lib",)
+    return (
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        config.package,
+        *target,
+        "--",
+        "--ignored",
+        "--exact",
+        config.test,
+        "--test-threads=1",
+    )
+
+
 def _safe_label(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value) or "unknown"
 
@@ -107,19 +129,7 @@ def run_probe(
     runner: Runner = subprocess.run,
     summary: Path | None = None,
 ) -> int:
-    command: Sequence[str] = (
-        "cargo",
-        "test",
-        "--locked",
-        "-p",
-        config.package,
-        "--lib",
-        "--",
-        "--ignored",
-        "--exact",
-        config.test,
-        "--test-threads=1",
-    )
+    command: Sequence[str] = cargo_test_command(config)
     environment = os.environ.copy()
     environment["CARGO_TERM_COLOR"] = "never"
     runner_os = _safe_label(environment.get("RUNNER_OS", "local"))
@@ -131,7 +141,8 @@ def run_probe(
     )
     _emit(
         f"PROBE_NOTE issue={config.issue} attempts={config.attempts} "
-        "cluster=single_job no_pooling=true clean_run_is_not_a_rate_claim=true",
+        "cluster=single_job no_pooling=true clean_run_is_not_a_rate_claim=true "
+        f"require_pass={str(config.require_pass).lower()}",
         summary,
     )
     passes = failures = invalid = duration_known = duration_unknown = 0
@@ -189,7 +200,11 @@ def run_probe(
         f"duration_known={duration_known} duration_unknown={duration_unknown}",
         summary,
     )
-    return 2 if invalid else 0
+    if invalid:
+        return 2
+    if config.require_pass and passes == 0:
+        return 1
+    return 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -197,9 +212,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--issue", required=True)
     parser.add_argument("--attempts", required=True, type=int)
     parser.add_argument("--package", required=True)
+    parser.add_argument("--test-target")
     parser.add_argument("--test", required=True)
     parser.add_argument("--workspace", type=Path, default=Path("admin/rust"))
     parser.add_argument("--attempt-timeout-seconds", type=int, default=30)
+    parser.add_argument("--require-pass", action="store_true")
     args = parser.parse_args()
     if args.attempts < 1:
         parser.error("--attempts must be positive")
@@ -221,6 +238,8 @@ def main() -> int:
             test=args.test,
             workspace=args.workspace,
             attempt_timeout_seconds=args.attempt_timeout_seconds,
+            test_target=args.test_target,
+            require_pass=args.require_pass,
         ),
         summary=Path(summary_value) if summary_value else None,
     )
