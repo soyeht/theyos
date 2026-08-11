@@ -702,6 +702,82 @@ pub fn pair_window_ttl_secs_from_env(env_var: &str) -> u64 {
     )
 }
 
+/// Resolve the Phase-3 recovery timeout used by the actual server bootstrap.
+/// Keeping this helper on the call path makes the production wiring directly
+/// testable and prevents the bootstrap from drifting back to a fixed constant.
+#[must_use]
+fn phase3_recovery_timeout() -> household_rs::pair_machine::RecoveryTimeoutResolution {
+    household_rs::pair_machine::recovery_timeout_from_env()
+}
+
+/// Publication decision produced by boot-time Phase-3 recovery.
+#[derive(Debug)]
+#[must_use]
+pub enum BootstrapPhase3Recovery {
+    /// Recovery completed (including the no-evidence fast path); startup may
+    /// continue toward authority and listener publication.
+    Continue(household_rs::pair_machine::RecoveryOutcome),
+    /// Recovery remained indeterminate; startup persisted `Recovering` and must
+    /// return without publishing authority or listeners.
+    RefusePublication,
+}
+
+/// Run Phase-3 recovery with the same resolved policy used by server startup.
+///
+/// Keeping policy resolution, tracing, fail-closed persistence, and the
+/// recovery call in one function gives integration tests the exact production
+/// path without starting a listener. The caller must hold the startup
+/// lifecycle-exclusive guard.
+pub async fn recover_phase3_with_bootstrap_policy(
+    state_dir: &Path,
+    pair_machine_window: &PairMachineWindow,
+    lifecycle_guard: &LifecycleWriteGuard,
+) -> BootstrapPhase3Recovery {
+    let recovery_timeout = phase3_recovery_timeout();
+    tracing::info!(
+        stage = "bootstrap.phase3_recovery_policy",
+        timeout_secs = recovery_timeout.timeout.as_secs(),
+        timeout_source = recovery_timeout.source.as_str(),
+        timeout_env = household_rs::pair_machine::RECOVERY_TIMEOUT_ENV,
+        "resolved boot-time Phase 3 recovery policy"
+    );
+    match pair_machine_window
+        .recover_phase3_under_lifecycle(state_dir, lifecycle_guard, recovery_timeout.timeout)
+        .await
+    {
+        Ok(outcome) => {
+            tracing::info!(
+                stage = "bootstrap.phase3_recovery",
+                outcome = ?outcome,
+                "boot-time Phase 3 recovery inspection completed"
+            );
+            BootstrapPhase3Recovery::Continue(outcome)
+        }
+        Err(error) => {
+            tracing::error!(
+                stage = "bootstrap.phase3_recovery_failed",
+                error = %error,
+                "boot-time Phase 3 recovery is indeterminate; refusing to \
+                 publish identity or listeners"
+            );
+            if let Err(state_error) =
+                bootstrap_state::persist(state_dir, BootstrapState::Recovering)
+            {
+                tracing::error!(
+                    stage = "bootstrap.phase3_recovery_fail_stop_persist_failed",
+                    error = %state_error,
+                );
+            } else if let Err(sync_error) = lifecycle_guard.sync_state_root() {
+                tracing::error!(
+                    stage = "bootstrap.phase3_recovery_fail_stop_sync_failed",
+                    error = %sync_error,
+                );
+            }
+            BootstrapPhase3Recovery::RefusePublication
+        }
+    }
+}
+
 /// Bring up the household identity listener at server startup.
 ///
 /// On a fresh, uninitialized state directory, `/identity` returns 503 until
@@ -815,46 +891,18 @@ pub async fn bootstrap_household(
     // state from this process is required. Any error while recovery evidence
     // exists is fail-stop: publishing the pre-Shamir N=1 identity after M2 may
     // have committed N=2 would create two live authorities.
-    let phase3_recovery_completed = match pair_machine_window
-        .recover_phase3_under_lifecycle(
-            &state_dir,
-            &lifecycle_guard,
-            household_rs::pair_machine::RECOVERY_TIMEOUT,
-        )
-        .await
+    let phase3_recovery_completed = match recover_phase3_with_bootstrap_policy(
+        &state_dir,
+        &pair_machine_window,
+        &lifecycle_guard,
+    )
+    .await
     {
-        Ok(outcome) => {
-            let completed = !matches!(
-                outcome,
-                household_rs::pair_machine::RecoveryOutcome::NotApplicable
-            );
-            tracing::info!(
-                stage = "bootstrap.phase3_recovery",
-                outcome = ?outcome,
-                "boot-time Phase 3 recovery inspection completed"
-            );
-            completed
-        }
-        Err(e) => {
-            tracing::error!(
-                stage = "bootstrap.phase3_recovery_failed",
-                error = %e,
-                "boot-time Phase 3 recovery is indeterminate; refusing to \
-                 publish identity or listeners"
-            );
-            if let Err(state_error) =
-                bootstrap_state::persist(&state_dir, BootstrapState::Recovering)
-            {
-                tracing::error!(
-                    stage = "bootstrap.phase3_recovery_fail_stop_persist_failed",
-                    error = %state_error,
-                );
-            } else if let Err(sync_error) = lifecycle_guard.sync_state_root() {
-                tracing::error!(
-                    stage = "bootstrap.phase3_recovery_fail_stop_sync_failed",
-                    error = %sync_error,
-                );
-            }
+        BootstrapPhase3Recovery::Continue(outcome) => !matches!(
+            outcome,
+            household_rs::pair_machine::RecoveryOutcome::NotApplicable
+        ),
+        BootstrapPhase3Recovery::RefusePublication => {
             // Drop lifecycle-exclusive without constructing or publishing
             // LoadedIdentity, routers, Bonjour, or any listener. A later cold
             // start retries the retained exact recovery evidence.
@@ -2318,6 +2366,90 @@ mod tests {
     use household_rs::household_mesh_log::{LogEntry, MeshEvent};
     use household_rs::keys::{IdentityKey, P256Keypair};
     use household_rs::person_cert::SignOwnerOptions;
+
+    static RECOVERY_TIMEOUT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct RecoveryTimeoutEnvRestore(Option<std::ffi::OsString>);
+
+    #[allow(unsafe_code)]
+    impl Drop for RecoveryTimeoutEnvRestore {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => {
+                    // SAFETY: every mutation of this process-global variable in
+                    // this test binary is serialized by RECOVERY_TIMEOUT_ENV_LOCK.
+                    unsafe {
+                        std::env::set_var(household_rs::pair_machine::RECOVERY_TIMEOUT_ENV, value);
+                    }
+                }
+                None => {
+                    // SAFETY: see the serialized-environment invariant above.
+                    unsafe {
+                        std::env::remove_var(household_rs::pair_machine::RECOVERY_TIMEOUT_ENV);
+                    }
+                }
+            }
+        }
+    }
+
+    #[allow(unsafe_code)]
+    fn with_recovery_timeout_env<T>(value: Option<&str>, inspect: impl FnOnce() -> T) -> T {
+        let _lock = RECOVERY_TIMEOUT_ENV_LOCK
+            .lock()
+            .expect("recovery-timeout env lock poisoned");
+        let _restore = RecoveryTimeoutEnvRestore(std::env::var_os(
+            household_rs::pair_machine::RECOVERY_TIMEOUT_ENV,
+        ));
+        match value {
+            Some(value) => {
+                // SAFETY: this helper holds RECOVERY_TIMEOUT_ENV_LOCK until the
+                // original value is restored by _restore.
+                unsafe {
+                    std::env::set_var(household_rs::pair_machine::RECOVERY_TIMEOUT_ENV, value);
+                }
+            }
+            None => {
+                // SAFETY: see the serialized-environment invariant above.
+                unsafe {
+                    std::env::remove_var(household_rs::pair_machine::RECOVERY_TIMEOUT_ENV);
+                }
+            }
+        }
+        inspect()
+    }
+
+    #[test]
+    fn server_bootstrap_uses_the_shared_recovery_timeout_policy() {
+        use household_rs::pair_machine::{
+            RECOVERY_TIMEOUT, RecoveryTimeoutResolution, RecoveryTimeoutSource,
+        };
+
+        for raw in [None, Some("invalid"), Some("0"), Some("301")] {
+            let resolved = with_recovery_timeout_env(raw, phase3_recovery_timeout);
+            let expected_source = if raw.is_none() {
+                RecoveryTimeoutSource::Default
+            } else {
+                RecoveryTimeoutSource::RejectedEnvironment
+            };
+            assert_eq!(
+                resolved,
+                RecoveryTimeoutResolution {
+                    timeout: RECOVERY_TIMEOUT,
+                    source: expected_source,
+                },
+                "raw value {raw:?} must preserve the production ceiling"
+            );
+        }
+        for (raw, seconds) in [("1", 1), ("300", 300)] {
+            assert_eq!(
+                with_recovery_timeout_env(Some(raw), phase3_recovery_timeout),
+                RecoveryTimeoutResolution {
+                    timeout: Duration::from_secs(seconds),
+                    source: RecoveryTimeoutSource::Environment,
+                }
+            );
+        }
+    }
 
     #[test]
     fn terminal_replay_keeps_the_listener_only_for_real_lock_contention() {
