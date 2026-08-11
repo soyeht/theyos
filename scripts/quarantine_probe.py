@@ -111,10 +111,9 @@ def run_probe(
         f"PROBE_COMMAND issue={config.issue} command={shlex.join(command)}",
         summary,
     )
-    detection_probability = 1.0 - (0.95**config.attempts)
     _emit(
         f"PROBE_NOTE issue={config.issue} attempts={config.attempts} "
-        f"detect_at_5pct={detection_probability:.3f} clean_run_is_not_a_rate_claim=true",
+        "cluster=single_job no_pooling=true clean_run_is_not_a_rate_claim=true",
         summary,
     )
     passes = failures = invalid = 0

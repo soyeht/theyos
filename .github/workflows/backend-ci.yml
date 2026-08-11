@@ -74,7 +74,10 @@ jobs:
   quarantine-isolation-probes:
     name: Quarantine isolation probes (${{ matrix.os }}, non-required)
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # The cold prebuild is outside the per-attempt timer. Once built, the 40
+    # sequential observations have a 10s ceiling each (6m40s worst case), so
+    # the job has ample room to publish both deterministic summaries.
+    timeout-minutes: 45
     permissions:
       contents: read
     strategy:
@@ -99,6 +102,11 @@ jobs:
         run: |
           python3 -m py_compile scripts/quarantine_probe.py scripts/test_quarantine_probe.py
           python3 scripts/test_quarantine_probe.py
+      - name: Build both quarantined test binaries
+        working-directory: admin/rust
+        run: |
+          cargo test --locked -p vmrunner-rs --lib --no-run
+          cargo test --locked -p household-rs --lib --no-run
       - name: Probe issue 438 (create_guard cleanup)
         id: probe_438
         continue-on-error: true
@@ -106,6 +114,7 @@ jobs:
           python3 scripts/quarantine_probe.py \
             --issue 438 \
             --attempts 20 \
+            --attempt-timeout-seconds 10 \
             --package vmrunner-rs \
             --test create_guard::tests::cleanup_quarantines_real_term_ignoring_survivor_after_force_attempts
       - name: Probe issue 450 (pair_machine delayed restart)
@@ -115,6 +124,7 @@ jobs:
           python3 scripts/quarantine_probe.py \
             --issue 450 \
             --attempts 20 \
+            --attempt-timeout-seconds 10 \
             --package household-rs \
             --test pair_machine::tests::delayed_restart_response_never_sleeps_against_a_stale_budget
       - name: Require valid probe instruments
