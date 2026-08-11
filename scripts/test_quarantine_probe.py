@@ -4,6 +4,8 @@ from __future__ import annotations
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
+import os
 from pathlib import Path
 
 from quarantine_probe import ProbeConfig, classify_cargo_output, run_probe
@@ -20,6 +22,14 @@ def cargo_output(*, count: int, status: str | None = None) -> str:
 
 
 class QuarantineProbeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        environment = mock.patch.dict(
+            os.environ,
+            {"RUNNER_OS": "fixture-os", "GITHUB_JOB": "fixture-job"},
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+
     def test_zero_selected_is_invalid_even_when_cargo_returns_zero(self) -> None:
         observation = classify_cargo_output(cargo_output(count=0), 0, TEST_NAME)
         self.assertEqual(observation.result, "INVALID")
@@ -49,7 +59,8 @@ class QuarantineProbeTests(unittest.TestCase):
             )
             self.assertEqual(rc, 0)
             self.assertIn(
-                "PROBE_999 os=local job=local attempts=1 passes=0 failures=1 invalid=0",
+                "PROBE_999 os=fixture-os job=fixture-job "
+                "attempts=1 passes=0 failures=1 invalid=0",
                 summary.read_text(encoding="utf-8"),
             )
 
