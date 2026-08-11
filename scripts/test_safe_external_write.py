@@ -217,6 +217,22 @@ class ExecutionBoundaryTests(unittest.TestCase):
         self.assertEqual(2, code)
         run.assert_not_called()
 
+    def test_closed_grammar_rejects_other_payload_sources_and_push(self) -> None:
+        cases = (
+            ["gh", "pr", "edit", "489", "--body-file=/tmp/unvalidated"],
+            ["gh", "pr", "edit", "489", "-b", "unvalidated"],
+            ["gh", "pr", "create", "--fill"],
+            ["gh", "pr", "create", "--template", "/tmp/unvalidated"],
+            ["gh", "issue", "create", "--recover", "draft"],
+            ["gh", "api", "repos/example/repo/issues", "--input", "/tmp/unvalidated"],
+            ["git", "commit", "-m", "unvalidated"],
+            ["git", "push"],
+        )
+        for command in cases:
+            with self.subTest(command=command):
+                with self.assertRaises(guard.UnsafeCommand):
+                    guard.prepare_command(command)
+
     def test_check_only_is_green_for_name_without_at_sign(self) -> None:
         payload = self._payload_file("display agent-khai without notifying")
         stdout = io.StringIO()
