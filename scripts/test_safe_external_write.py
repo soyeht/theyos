@@ -135,10 +135,12 @@ class ExecutionBoundaryTests(unittest.TestCase):
             mock.patch.object(guard.sys, "stdin", self._stdin(payload)),
             mock.patch.object(guard.subprocess, "run", return_value=completed) as run,
         ):
-            code = guard.main(["--stdin", "--", "gh", "issue", "comment", "--body-file", "-"])
+            code = guard.main(["--stdin", "--", "gh", "issue", "comment", "123"])
         self.assertEqual(17, code)
         run.assert_called_once_with(
-            ["gh", "issue", "comment", "--body-file", "-"], input=payload, check=False
+            ["gh", "issue", "comment", "123", "--body-file", "-"],
+            input=payload,
+            check=False,
         )
 
     def test_mention_in_command_argument_blocks_clean_stdin(self) -> None:
@@ -151,6 +153,70 @@ class ExecutionBoundaryTests(unittest.TestCase):
         self.assertEqual(2, code)
         run.assert_not_called()
 
+    def test_rejects_unvalidated_body_file_channel(self) -> None:
+        payload = b"clean body"
+        with (
+            mock.patch.object(guard.sys, "stdin", self._stdin(payload)),
+            mock.patch.object(guard.subprocess, "run") as run,
+        ):
+            code = guard.main(
+                [
+                    "--stdin",
+                    "--",
+                    "gh",
+                    "issue",
+                    "comment",
+                    "123",
+                    "--body-file",
+                    "/tmp/unvalidated",
+                ]
+            )
+        self.assertEqual(2, code)
+        run.assert_not_called()
+
+    def test_rejects_short_body_file_alias(self) -> None:
+        payload = b"clean body"
+        with (
+            mock.patch.object(guard.sys, "stdin", self._stdin(payload)),
+            mock.patch.object(guard.subprocess, "run") as run,
+        ):
+            code = guard.main(
+                ["--stdin", "--", "gh", "issue", "edit", "123", "-F", "/tmp/unvalidated"]
+            )
+        self.assertEqual(2, code)
+        run.assert_not_called()
+
+    def test_rejects_shell_and_environment_indirection(self) -> None:
+        payload = b"clean body"
+        with (
+            mock.patch.object(guard.sys, "stdin", self._stdin(payload)),
+            mock.patch.object(guard.subprocess, "run") as run,
+        ):
+            code = guard.main(["--stdin", "--", "sh", "-c", "gh pr edit 1 --body $BODY"])
+        self.assertEqual(2, code)
+        run.assert_not_called()
+
+    def test_git_commit_adapter_injects_message_stdin(self) -> None:
+        payload = b"safe commit message"
+        completed = mock.Mock(returncode=0)
+        with (
+            mock.patch.object(guard.sys, "stdin", self._stdin(payload)),
+            mock.patch.object(guard.subprocess, "run", return_value=completed) as run,
+        ):
+            code = guard.main(["--stdin", "--", "git", "commit"])
+        self.assertEqual(0, code)
+        run.assert_called_once_with(["git", "commit", "-F", "-"], input=payload, check=False)
+
+    def test_rejects_alternate_git_message_channel(self) -> None:
+        payload = b"safe commit message"
+        with (
+            mock.patch.object(guard.sys, "stdin", self._stdin(payload)),
+            mock.patch.object(guard.subprocess, "run") as run,
+        ):
+            code = guard.main(["--stdin", "--", "git", "commit", "-F", "/tmp/unsafe"])
+        self.assertEqual(2, code)
+        run.assert_not_called()
+
     def test_check_only_is_green_for_name_without_at_sign(self) -> None:
         payload = self._payload_file("display agent-khai without notifying")
         stdout = io.StringIO()
@@ -158,6 +224,15 @@ class ExecutionBoundaryTests(unittest.TestCase):
             code = guard.main(["--payload-file", payload])
         self.assertEqual(0, code)
         self.assertIn("OK", stdout.getvalue())
+
+    def test_allowlist_is_visible_in_success_output(self) -> None:
+        payload = self._payload_file("intentional @Khai")
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = guard.main(["--payload-file", payload, "--allow-mention", "khai"])
+        self.assertEqual(0, code)
+        self.assertIn("WAIVER", stderr.getvalue())
+        self.assertIn("khai", stderr.getvalue())
 
 
 if __name__ == "__main__":

@@ -14,11 +14,15 @@ validated, for example:
 
 ```sh
 printf '%s' "$FINAL_BODY" | python3 scripts/safe_external_write.py --stdin -- \
-  gh issue comment 123 --body-file -
+  gh issue comment 123
 ```
 
 `--payload-file` is check-only and cannot execute a child. The wrapper also
-validates command arguments so an unsafe title cannot bypass a clean body.
+validates command arguments so an unsafe title cannot bypass a clean body. It
+uses a closed command grammar and adds the stdin-reading body/message flag
+itself; callers must not supply a body file or other payload channel. An
+unsupported external writer remains blocked until a reviewed adapter and
+adversarial test are added.
 
 Soyeht pane handles are internal routing identifiers. Never place them in an
 external payload. Write `agent-khai` or `internal agent Khai`, without an
