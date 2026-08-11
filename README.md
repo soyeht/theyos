@@ -1,6 +1,8 @@
-# theyOS
+# Soyeht
 
-An operating system for AI agents. Each agent ("claw") gets its own isolated virtual machine with full computer access — terminal, filesystem, networking, dev tools. You manage everything from a single admin panel or the iOS app.
+Soyeht — an agent-orchestrator operating system. Early beta, under active development; not yet a stable release. Backend, web frontend, a macOS app, and Linux distribution are functional today; Windows and Android are planned.
+
+Each agent ("claw") gets its own isolated virtual machine with full computer access — terminal, filesystem, networking, dev tools. You manage everything from a single admin panel or the iOS app.
 
 ## Why
 
