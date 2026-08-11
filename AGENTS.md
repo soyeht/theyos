@@ -24,6 +24,10 @@ itself; callers must not supply a body file or other payload channel. An
 unsupported external writer remains blocked until a reviewed adapter and
 adversarial test are added.
 
+GitHub adapters are pinned to `github.com/soyeht/theyos`. Caller-supplied
+`--repo` and inherited `GH_REPO`/`GH_HOST` cannot redirect a validated payload
+to another destination.
+
 `git push` is intentionally not an adapter: its externally visible text is
 the history already authored, not stdin. Create every commit message through
 the guarded `git commit` adapter, then push without adding new prose. Custom

@@ -27,6 +27,7 @@ commit messages are guarded when they are created.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -49,6 +50,8 @@ ENTITY_MENTION_PATTERN = re.compile(
     r"([A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?)",
     re.IGNORECASE,
 )
+SAFE_GITHUB_HOST = "github.com"
+SAFE_GITHUB_REPO = "soyeht/theyos"
 
 
 @dataclass(frozen=True)
@@ -127,7 +130,7 @@ GH_COMMANDS: dict[tuple[str, str], tuple[int, int, frozenset[str], frozenset[str
     ("issue", "comment"): (
         1,
         1,
-        frozenset({"--repo"}),
+        frozenset(),
         frozenset({"--create-if-none", "--edit-last"}),
     ),
     ("issue", "create"): (
@@ -142,7 +145,6 @@ GH_COMMANDS: dict[tuple[str, str], tuple[int, int, frozenset[str], frozenset[str
                 "--milestone",
                 "--parent",
                 "--project",
-                "--repo",
                 "--title",
                 "--type",
             }
@@ -168,7 +170,6 @@ GH_COMMANDS: dict[tuple[str, str], tuple[int, int, frozenset[str], frozenset[str
                 "--remove-label",
                 "--remove-project",
                 "--remove-sub-issue",
-                "--repo",
                 "--title",
                 "--type",
             }
@@ -178,7 +179,7 @@ GH_COMMANDS: dict[tuple[str, str], tuple[int, int, frozenset[str], frozenset[str
     ("pr", "comment"): (
         0,
         1,
-        frozenset({"--repo"}),
+        frozenset(),
         frozenset({"--create-if-none", "--edit-last"}),
     ),
     ("pr", "create"): (
@@ -192,7 +193,6 @@ GH_COMMANDS: dict[tuple[str, str], tuple[int, int, frozenset[str], frozenset[str
                 "--label",
                 "--milestone",
                 "--project",
-                "--repo",
                 "--reviewer",
                 "--title",
             }
@@ -214,7 +214,6 @@ GH_COMMANDS: dict[tuple[str, str], tuple[int, int, frozenset[str], frozenset[str
                 "--remove-label",
                 "--remove-project",
                 "--remove-reviewer",
-                "--repo",
                 "--title",
             }
         ),
@@ -223,7 +222,7 @@ GH_COMMANDS: dict[tuple[str, str], tuple[int, int, frozenset[str], frozenset[str
     ("pr", "review"): (
         0,
         1,
-        frozenset({"--repo"}),
+        frozenset(),
         frozenset({"--approve", "--comment", "--request-changes"}),
     ),
 }
@@ -298,6 +297,16 @@ def prepare_command(command: Sequence[str]) -> list[str]:
     return command + ["--body-file", "-"]
 
 
+def child_environment(command: Sequence[str]) -> dict[str, str] | None:
+    """Pin GitHub writers to this repository instead of inheriting a destination."""
+    if not command or command[0] != "gh":
+        return None
+    environment = os.environ.copy()
+    environment["GH_HOST"] = SAFE_GITHUB_HOST
+    environment["GH_REPO"] = SAFE_GITHUB_REPO
+    return environment
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     payload, forwarded_stdin = _read_payload(args)
@@ -353,7 +362,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     try:
-        completed = subprocess.run(prepared_command, input=forwarded_stdin, check=False)
+        completed = subprocess.run(
+            prepared_command,
+            input=forwarded_stdin,
+            check=False,
+            env=child_environment(prepared_command),
+        )
     except FileNotFoundError as error:
         print(f"external write command not found: {error.filename}", file=sys.stderr)
         return 127

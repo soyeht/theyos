@@ -141,7 +141,11 @@ class ExecutionBoundaryTests(unittest.TestCase):
             ["gh", "issue", "comment", "123", "--body-file", "-"],
             input=payload,
             check=False,
+            env=mock.ANY,
         )
+        child_env = run.call_args.kwargs["env"]
+        self.assertEqual("github.com", child_env["GH_HOST"])
+        self.assertEqual("soyeht/theyos", child_env["GH_REPO"])
 
     def test_mention_in_command_argument_blocks_clean_stdin(self) -> None:
         payload = b"clean body"
@@ -205,7 +209,9 @@ class ExecutionBoundaryTests(unittest.TestCase):
         ):
             code = guard.main(["--stdin", "--", "git", "commit"])
         self.assertEqual(0, code)
-        run.assert_called_once_with(["git", "commit", "-F", "-"], input=payload, check=False)
+        run.assert_called_once_with(
+            ["git", "commit", "-F", "-"], input=payload, check=False, env=None
+        )
 
     def test_rejects_alternate_git_message_channel(self) -> None:
         payload = b"safe commit message"
@@ -227,11 +233,23 @@ class ExecutionBoundaryTests(unittest.TestCase):
             ["gh", "api", "repos/example/repo/issues", "--input", "/tmp/unvalidated"],
             ["git", "commit", "-m", "unvalidated"],
             ["git", "push"],
+            ["gh", "issue", "create", "--title", "safe", "--repo", "other/repo"],
         )
         for command in cases:
             with self.subTest(command=command):
                 with self.assertRaises(guard.UnsafeCommand):
                     guard.prepare_command(command)
+
+    def test_github_destination_overrides_inherited_environment(self) -> None:
+        with mock.patch.dict(
+            guard.os.environ,
+            {"GH_HOST": "enterprise.invalid", "GH_REPO": "other/repo"},
+            clear=False,
+        ):
+            environment = guard.child_environment(["gh", "issue", "comment"])
+        assert environment is not None
+        self.assertEqual("github.com", environment["GH_HOST"])
+        self.assertEqual("soyeht/theyos", environment["GH_REPO"])
 
     def test_check_only_is_green_for_name_without_at_sign(self) -> None:
         payload = self._payload_file("display agent-khai without notifying")
