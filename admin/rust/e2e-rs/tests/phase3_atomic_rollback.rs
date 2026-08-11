@@ -681,6 +681,7 @@ async fn test_m1_crash_during_step13_is_idempotent() {
 // T096: recovery timeout rolls back when M2 permanently lost
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "failure-injection")]
 #[tokio::test]
 async fn test_recovery_timeout_rolls_back_when_m2_permanently_lost() {
     // Per FR-013a: when M2 is permanently unreachable after approval,
@@ -707,26 +708,59 @@ async fn test_recovery_timeout_rolls_back_when_m2_permanently_lost() {
         .await
         .expect("simulate v2 approval claim before crash");
 
-    // Use a short test timeout (200ms) — the production constant is
-    // 5 minutes (RECOVERY_TIMEOUT), and the regression here is "the
-    // driver respects whatever timeout it was given AND only rolls
-    // back AFTER that timeout has elapsed".
-    let test_timeout = Duration::from_millis(200);
+    // The dedicated CI step sets the production bootstrap's bounded env
+    // override. Fail fast when invoked without it instead of waiting for the
+    // 300s default: this test proves that server startup consumes the shared
+    // policy on the real fail-closed path.
+    let resolved_timeout = household_rs::pair_machine::recovery_timeout_from_env();
+    assert_eq!(
+        resolved_timeout.source,
+        household_rs::pair_machine::RecoveryTimeoutSource::Environment,
+        "run this test with {} set to a bounded short timeout",
+        household_rs::pair_machine::RECOVERY_TIMEOUT_ENV
+    );
+    assert!(
+        resolved_timeout.timeout <= Duration::from_secs(5),
+        "the failure-injection test must use a short bounded timeout"
+    );
+
+    let lifecycle = household_rs::household_lifecycle::HouseholdLifecycleLock::open_verified(
+        founder.dir.path(),
+    )
+    .expect("open founder lifecycle lock");
+    let lifecycle_guard = lifecycle
+        .lock_exclusive()
+        .expect("lock founder lifecycle exclusively for bootstrap recovery");
+    let recovered_window = PairMachineWindow::with_persistence_under_lifecycle(
+        founder.dir.path().to_path_buf(),
+        &lifecycle_guard,
+    )
+    .expect("open founder pair-machine namespace under lifecycle");
     let start = Instant::now();
-    let outcome =
-        household_rs::pair_machine::recover_phase3_ceremony(founder.dir.path(), test_timeout)
-            .await;
+    let outcome = server_rs::household_bootstrap::recover_phase3_with_bootstrap_policy(
+        founder.dir.path(),
+        &recovered_window,
+        &lifecycle_guard,
+    )
+    .await;
     let elapsed = start.elapsed();
     assert!(
         matches!(
             outcome,
-            Err(household_rs::pair_machine::RecoveryError::FinalizeOutcomeIndeterminate)
+            server_rs::household_bootstrap::BootstrapPhase3Recovery::RefusePublication
         ),
-        "expected FinalizeOutcomeIndeterminate past timeout, got {outcome:?}"
+        "bootstrap must refuse publication past an indeterminate timeout, got {outcome:?}"
     );
     assert!(
-        elapsed >= test_timeout,
-        "recovery gave up too early: elapsed {elapsed:?} < timeout {test_timeout:?}"
+        elapsed >= resolved_timeout.timeout,
+        "recovery gave up too early: elapsed {elapsed:?} < timeout {:?}",
+        resolved_timeout.timeout
+    );
+    assert_eq!(
+        household_rs::bootstrap_state::load(founder.dir.path())
+            .expect("load fail-closed bootstrap state"),
+        household_rs::bootstrap_state::BootstrapState::Recovering,
+        "the exact server path must persist Recovering before refusing publication"
     );
 
     // FR-013a (revised): the driver fails closed past timeout and

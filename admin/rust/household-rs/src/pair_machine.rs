@@ -1883,11 +1883,11 @@ impl FinalizeRetryPolicy {
         maximum_sleep: Duration::from_secs(FINALIZE_RESTART_RETRY_AFTER_SECS),
     };
 
-    /// The production policy, with the retry budget read from the test-only
-    /// [`RECOVERY_TIMEOUT_ENV`] env var (clamped, defaulting to
-    /// [`RECOVERY_TIMEOUT`]). Non-`const` on purpose: a `const` cannot read the
-    /// process environment, and making the budget injectable is the whole point.
-    /// Every other field is the production value; only `budget` is affected.
+    /// The production policy, with the retry budget read from
+    /// [`RECOVERY_TIMEOUT_ENV`] (clamped, defaulting to [`RECOVERY_TIMEOUT`]).
+    /// Non-`const` on purpose: a `const` cannot read the process environment,
+    /// and making the budget injectable is the whole point. Every other field
+    /// is the production value; only `budget` is affected.
     ///
     /// Safety of the knob: a launched finalize POST is `MayHaveTakenEffect`, so
     /// an elapsed budget fails closed (`FinalizeOutcomeIndeterminate`, all
@@ -1898,11 +1898,12 @@ impl FinalizeRetryPolicy {
     /// least one probe happens: a budget nobody can spend probing is not a
     /// timeout, it is a skipped question.
     ///
-    /// The env path is test-only in fact — production never sets
-    /// [`RECOVERY_TIMEOUT_ENV`]; it exists to drop the ~300s finalize retry the
-    /// three `phase3_atomic_rollback` tests each wait out against an unreachable
-    /// M2 (before the handler returns 500) to ~1-2s, which is what those tests
-    /// actually prove.
+    /// CI sets the env to drop the ~300s finalize retry the three
+    /// `phase3_atomic_rollback` tests each wait out against an unreachable M2
+    /// (before the handler returns 500) to ~1-2s, which is what those tests
+    /// actually prove. The server bootstrap also resolves this policy, so a
+    /// production process with the env set can shorten (but never lengthen) its
+    /// recovery budget. Callers must log the resolved value and source.
     ///
     /// Discovered property (negative control, falsifies "only shortens"): on the
     /// `recovers_to_commit` path, a budget exhausted WITHOUT a finalize-POST
@@ -1916,21 +1917,53 @@ impl FinalizeRetryPolicy {
     ///
     /// Floor caveat: at the 1s floor, a pathologically slow runner could spend
     /// the whole budget before any probe happens (zero attempts). That is
-    /// acceptable for the test-only path this knob serves; it must never apply
-    /// to production, where the budget is [`RECOVERY_TIMEOUT`] (300s) regardless.
+    /// acceptable for the explicit override path. With no valid override,
+    /// production keeps [`RECOVERY_TIMEOUT`] (300s) byte for byte.
     #[must_use]
     fn production() -> Self {
         Self {
-            budget: recovery_timeout_from_env(),
+            budget: recovery_timeout_from_env().timeout,
             ..Self::PRODUCTION
         }
     }
 }
 
-/// Env var carrying the Phase-3 finalize-retry budget, in seconds. Test-only:
-/// absent means [`RECOVERY_TIMEOUT`], byte for byte the behaviour that shipped
+/// Env var carrying the Phase-3 finalize-retry budget, in seconds. Absent or
+/// invalid means [`RECOVERY_TIMEOUT`], byte for byte the behaviour that shipped
 /// before this knob existed.
-const RECOVERY_TIMEOUT_ENV: &str = "THEYOS_PHASE3_RECOVERY_TIMEOUT_SECS";
+pub const RECOVERY_TIMEOUT_ENV: &str = "THEYOS_PHASE3_RECOVERY_TIMEOUT_SECS";
+
+/// Provenance of the effective Phase-3 recovery timeout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryTimeoutSource {
+    /// The environment variable was absent, so the production default applies.
+    Default,
+    /// A valid, bounded environment override applies.
+    Environment,
+    /// The environment variable was present but invalid or outside the bounds.
+    RejectedEnvironment,
+}
+
+impl RecoveryTimeoutSource {
+    /// Stable tracing label for the timeout source.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Environment => "environment",
+            Self::RejectedEnvironment => "rejected_environment",
+        }
+    }
+}
+
+/// Effective Phase-3 recovery timeout and the source that selected it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecoveryTimeoutResolution {
+    /// Bounded timeout passed to the Phase-3 recovery loop.
+    pub timeout: Duration,
+    /// Provenance of the effective value for tracing and audit.
+    pub source: RecoveryTimeoutSource,
+}
 
 /// Floor for the injected budget (seconds). See [`FinalizeRetryPolicy::production`].
 const RECOVERY_TIMEOUT_MIN_SECS: u64 = 1;
@@ -1950,17 +1983,39 @@ fn clamp_recovery_timeout(parsed: Option<u64>) -> Duration {
         .map_or(RECOVERY_TIMEOUT, Duration::from_secs)
 }
 
+fn resolve_recovery_timeout(raw: Option<&str>) -> RecoveryTimeoutResolution {
+    let Some(raw) = raw else {
+        return RecoveryTimeoutResolution {
+            timeout: RECOVERY_TIMEOUT,
+            source: RecoveryTimeoutSource::Default,
+        };
+    };
+    let parsed = raw.parse::<u64>().ok();
+    let timeout = clamp_recovery_timeout(parsed);
+    let source = if parsed
+        .is_some_and(|secs| (RECOVERY_TIMEOUT_MIN_SECS..=RECOVERY_TIMEOUT_MAX_SECS).contains(&secs))
+    {
+        RecoveryTimeoutSource::Environment
+    } else {
+        RecoveryTimeoutSource::RejectedEnvironment
+    };
+    RecoveryTimeoutResolution { timeout, source }
+}
+
 /// Read the Phase-3 finalize-retry budget from [`RECOVERY_TIMEOUT_ENV`],
 /// clamped to [`RECOVERY_TIMEOUT_MIN_SECS`]..=[`RECOVERY_TIMEOUT_MAX_SECS`] and
-/// defaulting to [`RECOVERY_TIMEOUT`]. Single owner for that read — do not
-/// re-implement the parse/clamp/default at call sites.
+/// defaulting to [`RECOVERY_TIMEOUT`]. This is the single owner for that read;
+/// call sites must not re-implement the parse/clamp/default policy.
 #[must_use]
-fn recovery_timeout_from_env() -> Duration {
-    clamp_recovery_timeout(
-        std::env::var(RECOVERY_TIMEOUT_ENV)
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok()),
-    )
+pub fn recovery_timeout_from_env() -> RecoveryTimeoutResolution {
+    match std::env::var(RECOVERY_TIMEOUT_ENV) {
+        Ok(value) => resolve_recovery_timeout(Some(&value)),
+        Err(std::env::VarError::NotPresent) => resolve_recovery_timeout(None),
+        Err(std::env::VarError::NotUnicode(_)) => RecoveryTimeoutResolution {
+            timeout: RECOVERY_TIMEOUT,
+            source: RecoveryTimeoutSource::RejectedEnvironment,
+        },
+    }
 }
 
 pub fn machine_cert_hash(cert: &MachineCert) -> Result<[u8; 32], HouseholdError> {
@@ -3154,8 +3209,9 @@ pub enum RecoveryError {
 ///   recovery evidence. A launched exact POST is `MayHaveTakenEffect`, so mere
 ///   unreachability never authorizes returning the founder to N=1.
 ///
-/// `recovery_timeout` is `RECOVERY_TIMEOUT` in production (5 minutes).
-/// Tests pass a shorter deadline.
+/// `recovery_timeout` defaults to [`RECOVERY_TIMEOUT`] in production (5
+/// minutes). The server bootstrap may pass the bounded, explicitly configured
+/// shorter value from [`recovery_timeout_from_env`].
 ///
 /// The driver is idempotent: re-running it after partial completion
 /// converges to the same outcome.
@@ -4166,6 +4222,36 @@ mod tests {
             Duration::from_secs(RECOVERY_TIMEOUT_MAX_SECS),
             RECOVERY_TIMEOUT
         );
+    }
+
+    #[test]
+    fn recovery_timeout_resolution_records_default_override_and_rejection() {
+        assert_eq!(
+            resolve_recovery_timeout(None),
+            RecoveryTimeoutResolution {
+                timeout: RECOVERY_TIMEOUT,
+                source: RecoveryTimeoutSource::Default,
+            }
+        );
+        for raw in ["invalid", "0", "301"] {
+            assert_eq!(
+                resolve_recovery_timeout(Some(raw)),
+                RecoveryTimeoutResolution {
+                    timeout: RECOVERY_TIMEOUT,
+                    source: RecoveryTimeoutSource::RejectedEnvironment,
+                },
+                "raw value {raw:?} must fail back to the production ceiling"
+            );
+        }
+        for (raw, seconds) in [("1", 1), ("300", 300)] {
+            assert_eq!(
+                resolve_recovery_timeout(Some(raw)),
+                RecoveryTimeoutResolution {
+                    timeout: Duration::from_secs(seconds),
+                    source: RecoveryTimeoutSource::Environment,
+                }
+            );
+        }
     }
 
     #[test]
