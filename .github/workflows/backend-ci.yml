@@ -275,30 +275,19 @@ jobs:
       - name: Quarantine probe (issue #470)
         run: |
           # QUARANTINE_PROBE_470_BEGIN
-          cd admin/rust
-          passes=0
-          failures=0
-          for attempt in 1 2 3 4 5; do
-            if cargo test --locked -p e2e-rs --test phase3_observability_audit \
-              -- --ignored --exact test_owner_timeout_aborts_window_and_emits_tracing \
-              --test-threads=1; then
-              rc=0
-              passes=$((passes + 1))
-            else
-              rc=$?
-              failures=$((failures + 1))
-            fi
-            printf 'QUARANTINE_PROBE_470 attempt=%s rc=%s\n' "${attempt}" "${rc}"
-            printf 'QUARANTINE_PROBE_470 attempt=%s rc=%s\n' "${attempt}" "${rc}" \
-              >> "${GITHUB_STEP_SUMMARY}"
-          done
-          printf 'QUARANTINE_PROBE_470 attempts=5 passes=%s failures=%s\n' \
-            "${passes}" "${failures}"
-          printf 'QUARANTINE_PROBE_470 attempts=5 passes=%s failures=%s\n' \
-            "${passes}" "${failures}" >> "${GITHUB_STEP_SUMMARY}"
-          if [[ "${passes}" -eq 0 ]]; then
-            exit 1
-          fi
+          # Preserve the required 0/5 containment while refusing cargo's rc=0
+          # for a vacant --exact selector. The full workspace test immediately
+          # above prebuilds this target; 120s bounds a hung attempt without
+          # conflating the observed ~44s runtime with an invalid instrument.
+          python3 scripts/test_quarantine_probe.py
+          python3 scripts/quarantine_probe.py \
+            --issue 470 \
+            --attempts 5 \
+            --attempt-timeout-seconds 120 \
+            --package e2e-rs \
+            --test-target phase3_observability_audit \
+            --test test_owner_timeout_aborts_window_and_emits_tracing \
+            --require-pass
           # QUARANTINE_PROBE_470_END
       - name: Install uv (two suites shell out to it)
         # ORDER IS LOAD-BEARING, and it is why this step moved up. It used to sit
