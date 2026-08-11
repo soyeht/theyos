@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import calendar
 import json
 import re
 import subprocess
@@ -15,9 +16,9 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_MANIFEST = "admin/contracts/cross-repo/v1/ios_ffi_boundary_v1.json"
+DEFAULT_MANIFEST = "admin/contracts/cross-repo/v2/ios_ffi_boundary_v2.json"
 DEFAULT_TARGET_REV = "origin/main"
-SCHEMA = "cross-repo-ffi-boundary-v1"
+SCHEMA = "cross-repo-ffi-boundary-v2"
 
 EXIT_OK = 0
 EXIT_VIOLATION = 1
@@ -26,6 +27,7 @@ EXIT_CANNOT_EVALUATE = 3
 
 SECONDS_PER_DAY = 86400
 REV_RE = re.compile(r"^[0-9a-f]{40}$")
+DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 
 # Every syntactic form that puts an item on the uniffi-exported surface.
 # ONE token list feeds BOTH consumers -- the tree sweep and the per-file
@@ -597,18 +599,101 @@ def load_manifest(path: Path) -> dict[str, object]:
         raise Malformed("boundary manifest must be a JSON object")
     if parsed.get("schema") != SCHEMA:
         raise Malformed(f"boundary manifest schema must be {SCHEMA}")
-    declared = parsed.get("surface_files")
-    if not isinstance(declared, list) or not declared or not all(isinstance(p, str) and p for p in declared):
-        raise Malformed("boundary manifest surface_files must be a non-empty list of paths")
+    surfaces = parsed.get("surfaces")
+    if not isinstance(surfaces, list) or not surfaces:
+        raise Malformed("boundary manifest surfaces must be a non-empty list")
+    surface_paths: set[str] = set()
+    active_refs: list[tuple[str, str, str]] = []
+    for surface in surfaces:
+        if not isinstance(surface, dict):
+            raise Malformed("boundary manifest surface entries must be objects")
+        surface_path = surface.get("path")
+        if not isinstance(surface_path, str) or not surface_path:
+            raise Malformed("boundary manifest surface path must be a non-empty string")
+        if surface_path in surface_paths:
+            raise Malformed(f"boundary manifest declares surface path more than once: {surface_path}")
+        surface_paths.add(surface_path)
+        binding = surface.get("binding")
+        if not isinstance(binding, dict):
+            raise Malformed(f"boundary manifest surface {surface_path} declares no binding")
+        status = binding.get("status")
+        if status == "active":
+            consumer_name = binding.get("consumer")
+            target_name = binding.get("target")
+            if not isinstance(consumer_name, str) or not consumer_name:
+                raise Malformed(f"active surface {surface_path} declares no consumer")
+            if not isinstance(target_name, str) or not target_name:
+                raise Malformed(f"active surface {surface_path} declares no target")
+            if any(key in binding for key in ("owner", "reason", "expires")):
+                raise Malformed(f"active surface {surface_path} mixes active and deferred fields")
+            active_refs.append((surface_path, consumer_name, target_name))
+        elif status == "deferred":
+            for key in ("owner", "reason", "expires"):
+                value = binding.get(key)
+                if not isinstance(value, str) or not value:
+                    raise Malformed(f"deferred surface {surface_path} declares no {key}")
+            if any(key in binding for key in ("consumer", "target")):
+                raise Malformed(f"deferred surface {surface_path} must not claim an active consumer or target")
+            expires = str(binding["expires"])
+            if not DATE_RE.fullmatch(expires):
+                raise Malformed(f"deferred surface {surface_path} expiry must be YYYY-MM-DD")
+            try:
+                time.strptime(expires, "%Y-%m-%d")
+            except ValueError as error:
+                raise Malformed(f"deferred surface {surface_path} expiry is not a real date") from error
+        else:
+            raise Malformed(f"boundary manifest surface {surface_path} has unknown binding status")
     consumers = parsed.get("consumers")
     if not isinstance(consumers, list) or not consumers:
         raise Malformed("boundary manifest consumers must be a non-empty list")
+    target_refs: set[tuple[str, str]] = set()
+    consumer_names: set[str] = set()
+    governing_consumers: set[str] = set()
     for consumer in consumers:
         if not isinstance(consumer, dict):
             raise Malformed("boundary manifest consumer entries must be objects")
+        consumer_name = consumer.get("name")
+        if not isinstance(consumer_name, str) or not consumer_name:
+            raise Malformed("boundary manifest consumer declares no name")
+        if consumer_name in consumer_names:
+            raise Malformed(f"boundary manifest declares consumer more than once: {consumer_name}")
+        consumer_names.add(consumer_name)
+        targets = consumer.get("targets")
+        if not isinstance(targets, list) or not targets:
+            raise Malformed(f"boundary manifest consumer {consumer_name} declares no targets")
+        for target in targets:
+            if not isinstance(target, dict):
+                raise Malformed(f"boundary manifest consumer {consumer_name} target must be an object")
+            target_name = target.get("name")
+            manifests = target.get("cargo_manifests")
+            if not isinstance(target_name, str) or not target_name:
+                raise Malformed(f"boundary manifest consumer {consumer_name} target declares no name")
+            if (consumer_name, target_name) in target_refs:
+                raise Malformed(
+                    f"boundary manifest consumer {consumer_name} declares target more than once: {target_name}"
+                )
+            if not isinstance(manifests, list) or not manifests \
+                    or not all(isinstance(item, str) and item for item in manifests):
+                raise Malformed(
+                    f"boundary manifest consumer {consumer_name} target {target_name} "
+                    "declares no cargo_manifests"
+                )
+            target_refs.add((consumer_name, target_name))
         pins = consumer.get("pins")
         if not isinstance(pins, list) or not pins:
             raise Malformed("boundary manifest consumer declares no pins")
+        if any(isinstance(pin, dict) and pin.get("governs_ffi_surface") is True for pin in pins):
+            governing_consumers.add(consumer_name)
+    for surface_path, consumer_name, target_name in active_refs:
+        if (consumer_name, target_name) not in target_refs:
+            raise Malformed(
+                f"active surface {surface_path} names unknown consumer target "
+                f"{consumer_name}/{target_name}"
+            )
+        if consumer_name not in governing_consumers:
+            raise Malformed(
+                f"active surface {surface_path} has no FFI-governing pin for consumer {consumer_name}"
+            )
     return parsed
 
 
@@ -666,11 +751,45 @@ def check_surface_extractable(report: Report, target: str, declared: list[str]) 
             )
 
 
-def check_surface_coverage(
-    report: Report, target: str, declared: list[str], consumer_name: str, dependencies: set[str]
+def check_deferred_surface_expiry(report: Report, surfaces: list[dict[str, object]], now: int) -> None:
+    """A surface may be unconsumed only through an owned, expiring declaration."""
+    for surface in surfaces:
+        binding = surface["binding"]
+        assert isinstance(binding, dict)
+        if binding["status"] != "deferred":
+            continue
+        path = str(surface["path"])
+        expires = str(binding["expires"])
+        end_of_day_utc = calendar.timegm(time.strptime(expires, "%Y-%m-%d")) + SECONDS_PER_DAY - 1
+        if now > end_of_day_utc:
+            report.fail(
+                f"deferred surface {path} expired on {expires}; assign a real consumer target "
+                "or renew the owned decision with current evidence"
+            )
+        else:
+            report.note(
+                f"surface {path} is explicitly deferred through {expires} "
+                f"(owner {binding['owner']}): {binding['reason']}"
+            )
+
+
+def check_active_surface_coverage(
+    report: Report,
+    target: str,
+    surfaces: list[dict[str, object]],
+    consumer_name: str,
+    target_name: str,
+    dependencies: set[str],
 ) -> None:
-    """Every crate carrying cross-repo surface must actually be consumed."""
-    for path in declared:
+    """Only surfaces explicitly bound to this consumer target must be dependencies."""
+    for surface in surfaces:
+        binding = surface["binding"]
+        assert isinstance(binding, dict)
+        if binding["status"] != "active" \
+                or binding["consumer"] != consumer_name \
+                or binding["target"] != target_name:
+            continue
+        path = str(surface["path"])
         if blob_at(target, path) is None:
             # Already named precisely by check_surface_extractable. Raising
             # here would abort the run and throw away every finding collected
@@ -683,8 +802,8 @@ def check_surface_coverage(
             continue
         if crate not in dependencies:
             report.fail(
-                f"consumer {consumer_name} does not depend on {crate}, which carries cross-repo "
-                f"FFI surface ({path}); the surface ships in theyos and reaches no consumer build"
+                f"consumer target {consumer_name}/{target_name} is bound to {path} but does not "
+                f"depend on its crate {crate}; the declared binding does not reach that build"
             )
 
 
@@ -779,19 +898,22 @@ def run(
 ) -> Report:
     report = Report()
     manifest = load_manifest(manifest_path)
-    declared = [str(p) for p in manifest["surface_files"]]
+    surfaces = manifest["surfaces"]
+    assert isinstance(surfaces, list)
+    declared = [str(surface["path"]) for surface in surfaces]
     target = resolve_commit(target_rev)
 
     check_threshold_provenance(report, now)
     check_surface_sweep(report, target, declared)
     check_surface_extractable(report, target, declared)
+    check_deferred_surface_expiry(report, surfaces, now)
 
     if surface_only:
         report.skip("pin ancestry (a) -- needs the consumer checkout")
         report.skip("pin distance in days and commits (b) -- needs the consumer checkout")
         report.skip("FFI surface drift since the pin (c) -- needs the consumer checkout")
         report.skip("pin agreement (d) -- needs the consumer checkout")
-        report.skip("surface-crate coverage (e) -- needs the consumer checkout")
+        report.skip("active surface-to-target coverage (e) -- needs the consumer checkout")
         return report
 
     if consumer_root is None:
@@ -804,12 +926,19 @@ def run(
 
     for consumer in manifest["consumers"]:
         name = str(consumer.get("name", "<unnamed>"))
-        manifests = [str(m) for m in consumer.get("cargo_manifests", [])]
-        if manifests:
+        active_paths = [
+            str(surface["path"])
+            for surface in surfaces
+            if surface["binding"]["status"] == "active"
+            and surface["binding"]["consumer"] == name
+        ]
+        for consumer_target in consumer["targets"]:
+            target_name = str(consumer_target["name"])
+            manifests = [str(m) for m in consumer_target["cargo_manifests"]]
             dependencies = consumer_dependency_names(consumer_root, manifests)
-            check_surface_coverage(report, target, declared, name, dependencies)
-        else:
-            report.skip(f"surface-crate coverage for {name} -- no cargo_manifests declared")
+            check_active_surface_coverage(
+                report, target, surfaces, name, target_name, dependencies
+            )
 
         dated: list[tuple[str, str, int]] = []
         for pin in consumer["pins"]:
@@ -817,8 +946,8 @@ def run(
             rev = read_pin(consumer_root, pin)
             pin_ts = check_pin_freshness(report, pin_name, rev, target, now)
             dated.append((pin_name, rev, pin_ts))
-            if pin.get("governs_ffi_surface") is True:
-                check_surface_drift(report, pin_name, rev, target, declared)
+            if pin.get("governs_ffi_surface") is True and active_paths:
+                check_surface_drift(report, pin_name, rev, target, active_paths)
         check_pin_agreement(report, dated)
 
     return report
@@ -829,8 +958,8 @@ def main(argv: list[str] | None = None) -> int:
         description=(
             "Fail when a consumer repo's pin on theyos has stopped telling the "
             "truth: a pin off the mainline, a pin too far behind in days or "
-            "commits, disagreeing pins, a cross-repo FFI surface the consumer "
-            "does not consume, or an FFI surface that moved since the pin. "
+            "commits, disagreeing pins, a false surface-to-target binding, an "
+            "expired deferred surface, or an active FFI surface that moved since the pin. "
             "Output names repo-relative paths only; the consumer checkout path "
             "is never echoed."
         )
@@ -878,7 +1007,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.print_surface:
             manifest = load_manifest(Path(args.manifest))
             target = resolve_commit(args.target_rev)
-            surface, missing = surface_at(target, [str(p) for p in manifest["surface_files"]])
+            surface, missing = surface_at(
+                target, [str(entry["path"]) for entry in manifest["surfaces"]]
+            )
             for path in missing:
                 print(f"MISSING {path}")
             for path, items in sorted(surface.items()):

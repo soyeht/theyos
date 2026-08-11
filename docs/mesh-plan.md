@@ -10,11 +10,11 @@ pessoal e não entram em documento versionado.
 
 ---
 
-## A decisão que gerou esta versão (medida 2026-08-10 @ `9e27e8ec`)
+## A decisão que gerou esta versão (medida 2026-08-10 @ `2ba76e3f`)
 
 <!-- doc-freshness-anchor
 measured: 2026-08-10
-sha: 9e27e8ec75823389907f0bbcdf30b61cecf1b17c
+sha: 2ba76e3feab8fe4cb10f6a16ea1eb0400962c8b6
 paths:
   - admin/rust/mesh-session-core-rs/**
   - admin/rust/mesh-session-control-model-rs/**
@@ -184,10 +184,102 @@ extensão**, não só no app.
 4. bloquear o aparelho e repetir 2 e 3.
 
 **Pronto quando:** os quatro passos funcionam no aparelho real.
+**Estado:** 1–4 provados em aparelho físico. **M0b FECHADO** — o passo 4 foi
+medido de verdade em 2026-08-10, sem debugger/XCTest/USB anexado (ver "O passo
+4 foi resolvido" abaixo); a seção logo depois documenta a medição anterior,
+inválida, e por que ela não podia ser usada.
 
 > Bloqueio conhecido: o primeiro save de uma `NETunnelProviderManager` nova pede
 > o passcode físico do aparelho. É gate humano, não bug — não dá para automatizar
 > em torno dele.
+
+### O passo 4 foi resolvido: medição real, sem contexto anexado, 2026-08-10
+
+A correção não foi isolar qual componente do contexto anexado causava o
+problema (debugger, XCTest, USB) — foi removê-lo por inteiro, como a seção
+abaixo já apontava que seria necessário. Solução: o app host (soyeht-ios)
+ganhou um gatilho `soyeht://debug/m0b-lock-canary-start?delaySeconds=N`
+(Dev-only, `#if DEBUG`) que só prepara os itens de Keychain e chama
+`startVPNTunnel` — a leitura de verdade acontece **dentro da extensão**,
+numa `Task.detached` que dorme `N` segundos antes de ler, porque um
+`NEPacketTunnelProvider` que já reportou "conectado" é o tipo de processo
+em background que o iOS mantém vivo, ao contrário do app host, que seria
+suspenso ao travar a tela. Fluxo: instalar via `devicectl` (nunca
+`xcodebuild test`/Xcode Run, que sempre anexam), abrir o link pelo app
+Notas (evita a barra de endereço do Safari tratar o esquema customizado
+como busca), travar o aparelho na hora, esperar, e ler o resultado depois
+por `devicectl device copy from --domain-type appGroupDataContainer` — sem
+tocar no aparelho de novo durante a janela medida.
+
+Resultado real, aparelho travado de verdade, sem nada anexado:
+
+```
+whenUnlockedStatus       -25308   (errSecInteractionNotAllowed — correto)
+afterFirstUnlockStatus   0        (errSecSuccess — correto, prova a premissa do M4)
+whenPasscodeSetStatus    -25308   (errSecInteractionNotAllowed — correto)
+protectedFileReadable    false    (keybag genuinamente travado — ao contrário da medição inválida abaixo)
+trigger                  "delayed"
+```
+
+O observável independente (`protectedFileReadable`) virou `false` desta
+vez — era `true` na medição inválida abaixo mesmo com o aparelho travado, e
+é exatamente esse observável que prova que agora o keybag travou de
+verdade. Os três `kSecAttrAccessible*` bateram com o esperado. A premissa
+do M4 (reconexão em background sobrevive o aparelho travado, via
+`AfterFirstUnlockThisDeviceOnly`) está provada, não assumida.
+
+Medido por @gianna com @Caio travando o aparelho fisicamente no momento
+certo — a parte que nenhuma automação podia fazer sem reintroduzir o
+mesmo contexto anexado que invalidou a primeira medição.
+
+### O passo 4 não era executável no contexto de teste anexado que foi medido primeiro (histórico)
+
+**O que foi medido, e só isso:** sob XCTest/Xcode anexado via USB, os dados
+protegidos permaneceram **disponíveis** apesar do bloqueio físico do aparelho.
+Medido em 2026-08-09, tela apagada, botão apertado, janela de 45,7 s cronometrada:
+
+```
+isProtectedDataAvailable   true      (host)
+protectedFileReadable      true      (extensão)
+```
+
+**A CAUSA NÃO FOI ISOLADA.** O contexto medido tem pelo menos quatro variáveis
+juntas — debugger anexado, XCTest, cabo USB, e a combinação delas — e nenhuma foi
+variada isoladamente. Este documento afirma a **correlação medida**, não o
+mecanismo. Quem for atacar isso não deve começar assumindo qual componente é o
+responsável.
+
+Consequência prática, e é a parte que engana: **qualquer canary de Keychain passa
+nesse contexto**, porque a proteção não está ativa. Uma leitura bem-sucedida de um
+item `WhenUnlockedThisDeviceOnly` com o aparelho travado é sinal de **instrumento
+inválido, não de acessibilidade correta**. Três tentativas foram gastas antes
+disso ficar claro, todas devolvendo `0/0/0` de forma perfeitamente consistente
+com um keybag aberto.
+
+**Não infira o estado do keybag a partir de uma leitura de Keychain.** Observe-o
+direto: `isProtectedDataAvailable`, ou um arquivo com `NSFileProtectionComplete`
+cuja leitura deve falhar. São os observáveis em que o invariante está escrito; a
+leitura de Keychain funde keybag destrancado, atributo errado e caminho não
+modelado num único resultado.
+
+**O que o passo 4 exige:** remover o **contexto inteiro**, não um componente
+escolhido por palpite — app instalado, harness já vivo fazendo polling, **sem
+XCTest, sem debugger, e USB desconectado**, com o resultado gravado para leitura
+posterior. Remover o conjunto responde a pergunta do marco; isolar qual peça
+causa o quê é uma investigação separada, e não é o que o M0b precisa.
+
+**Mais `sleep` ou mais repetições no MESMO contexto anexado não agregam
+evidência** — três rodadas já devolveram o mesmo resultado com a janela
+cronometrada, então o tempo está controlado e não é a variável.
+
+> Esta rodada não é achado de Keychain e não justifica abrir Feedback: o que se
+> mediu foi o instrumento, não o comportamento do sistema. Nenhum veredito sobre
+> a Apple é afirmado aqui — não temos medição que o sustente.
+>
+> Achado e medido por @gianna, que recusou três vezes aplicar o "conserto"
+> (`AfterFirstUnlock`) por cima de um verde que não media nada — o conserto teria
+> fechado o marco, e o furo apareceria só em campo, com a VPN não reconectando
+> com o telefone no bolso.
 
 ## M1a — Conformance Noise independente
 

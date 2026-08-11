@@ -35,7 +35,7 @@ jobs:
   coverage:
     name: Consumption coverage gate
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 25
 
     steps:
       - name: Checkout theyos
@@ -48,13 +48,16 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v5
 
+      - name: Setup Rust for fresh consumption derivation
+        uses: dtolnay/rust-toolchain@stable
+
       # continue-on-error per step + a summary + a final fail step: one signal
       # going red must not hide the other, and a gate that cannot show red is
       # not a gate. Mirrors Repo Hygiene on purpose.
       - name: Gate — consumption coverage
         id: coverage
         continue-on-error: true
-        run: uv run scripts/check_consumption_coverage.py
+        run: uv run scripts/check_consumption_coverage.py --derive
 
       - name: Gate self-tests
         id: selftest

@@ -21,6 +21,10 @@ on:
     paths:
       - "admin/rust/**"
       - "scripts/**"
+      - "PORTS.md"
+      - "admin/contracts/claw-store/v1/claw-store-household-v1.json"
+      - "admin/contracts/claw-store/v1/contract.json"
+      - "claws/manifest.yml"
       - "admin/contracts/mobile-claw-vpn/v1/**"
       - "admin/contracts/owner-approval/v2/**"
       - ".env.example"
@@ -34,6 +38,10 @@ on:
     paths:
       - "admin/rust/**"
       - "scripts/**"
+      - "PORTS.md"
+      - "admin/contracts/claw-store/v1/claw-store-household-v1.json"
+      - "admin/contracts/claw-store/v1/contract.json"
+      - "claws/manifest.yml"
       - "admin/contracts/mobile-claw-vpn/v1/**"
       - "admin/contracts/owner-approval/v2/**"
       - ".env.example"
@@ -151,18 +159,7 @@ jobs:
         # Debug profile on purpose: server-rs/src/main.rs carries a
         # `not(debug_assertions)` compile_error! refusing DEV features in
         # release, so debug exercises the surface without touching that guard.
-        run: |
-          cd admin/rust
-          cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[] | . as $p | ($p.features|keys[]) | select(.!="default") | "\($p.name)\t\(.)"' \
-            | sort >/tmp/feature-surface.tsv
-          rc=0
-          while IFS=$'\t' read -r pkg feat; do
-            echo "::group::check ${pkg} --features ${feat}"
-            cargo check --locked -p "${pkg}" --all-targets --features "${feat}" || { echo "::error::${pkg} fails to compile with --features ${feat}"; rc=1; }
-            echo "::endgroup::"
-          done </tmp/feature-surface.tsv
-          exit $rc
+        run: python3 scripts/cargo_test_matrix.py --ci-compile
       - name: Build workspace
         run: cd admin/rust && cargo build --workspace 2>&1
       - name: Populate the registry for the WHOLE resolve graph
@@ -439,18 +436,7 @@ jobs:
         # Debug profile on purpose: server-rs/src/main.rs carries a
         # `not(debug_assertions)` compile_error! refusing DEV features in
         # release, so debug exercises the surface without touching that guard.
-        run: |
-          cd admin/rust
-          cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[] | . as $p | ($p.features|keys[]) | select(.!="default") | "\($p.name)\t\(.)"' \
-            | sort >/tmp/feature-surface.tsv
-          rc=0
-          while IFS=$'\t' read -r pkg feat; do
-            echo "::group::check ${pkg} --features ${feat}"
-            cargo check --locked -p "${pkg}" --all-targets --features "${feat}" || { echo "::error::${pkg} fails to compile with --features ${feat}"; rc=1; }
-            echo "::endgroup::"
-          done </tmp/feature-surface.tsv
-          exit $rc
+        run: python3 scripts/cargo_test_matrix.py --ci-compile
       - name: Build workspace
         run: cd admin/rust && cargo build --workspace 2>&1
       - name: Populate the registry for the WHOLE resolve graph
