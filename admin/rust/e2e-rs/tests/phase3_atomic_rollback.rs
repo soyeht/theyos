@@ -678,12 +678,12 @@ async fn test_m1_crash_during_step13_is_idempotent() {
 }
 
 // ---------------------------------------------------------------------------
-// T096: recovery timeout rolls back when M2 permanently lost
+// T096: recovery timeout refuses publication when M2 is permanently lost
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "failure-injection")]
 #[tokio::test]
-async fn test_recovery_timeout_rolls_back_when_m2_permanently_lost() {
+async fn test_recovery_timeout_refuses_publication_when_m2_permanently_lost() {
     // Per FR-013a: when M2 is permanently unreachable after approval,
     // M1's recovery driver loops on probes until RECOVERY_TIMEOUT
     // elapses. This test reuses the T067 setup (M2 server stopped
@@ -737,12 +737,26 @@ async fn test_recovery_timeout_rolls_back_when_m2_permanently_lost() {
     )
     .expect("open founder pair-machine namespace under lifecycle");
     let start = Instant::now();
-    let outcome = server_rs::household_bootstrap::recover_phase3_with_bootstrap_policy(
-        founder.dir.path(),
-        &recovered_window,
-        &lifecycle_guard,
+    // An assertion on the lower bound alone would still pass if the server
+    // silently regressed to the fixed 300s budget. Bound the real call from
+    // above as well: CI configures 1s, and ten additional seconds are ample for
+    // the deliberately unreachable local M2 plus fail-closed persistence.
+    let wall_clock_limit = resolved_timeout.timeout + Duration::from_secs(10);
+    let outcome = tokio::time::timeout(
+        wall_clock_limit,
+        server_rs::household_bootstrap::recover_phase3_with_bootstrap_policy(
+            founder.dir.path(),
+            &recovered_window,
+            &lifecycle_guard,
+        ),
     )
-    .await;
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "bootstrap recovery exceeded {wall_clock_limit:?}; the bounded environment override \
+             was not consumed by the real recovery loop"
+        )
+    });
     let elapsed = start.elapsed();
     assert!(
         matches!(

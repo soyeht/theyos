@@ -199,12 +199,12 @@ jobs:
         # production RECOVERY_TIMEOUT) are skipped here and run in their own
         # step below with THEYOS_PHASE3_RECOVERY_TIMEOUT_SECS=1, so this step no
         # longer carries ~900s of finalize-retry wait. The skip is by exact
-        # name; the tests themselves are unchanged.
+        # name; keep these selectors paired with the dedicated step below.
         run: |
           cd admin/rust && cargo test --workspace -- --test-threads=1 \
             --skip test_m1_crash_between_step10_and_step11_recovers_to_rollback \
             --skip test_m2_disconnect_after_approval_rolls_back \
-            --skip test_recovery_timeout_rolls_back_when_m2_permanently_lost 2>&1
+            --skip test_recovery_timeout_refuses_publication_when_m2_permanently_lost 2>&1
       - name: Quarantine probe (issue #470)
         run: |
           # QUARANTINE_PROBE_470_BEGIN
@@ -341,7 +341,7 @@ jobs:
             --test phase3_atomic_rollback -- --test-threads=1 \
             test_m1_crash_between_step10_and_step11_recovers_to_rollback \
             test_m2_disconnect_after_approval_rolls_back \
-            test_recovery_timeout_rolls_back_when_m2_permanently_lost 2>&1
+            test_recovery_timeout_refuses_publication_when_m2_permanently_lost 2>&1
       - name: Feature-gated compile-fail proofs (mesh-session-runtime)
         # `cargo test --workspace` runs with DEFAULT features, so any trybuild
         # case inside a `#[cfg(feature = "...")]` test fn is never executed --
@@ -476,12 +476,12 @@ jobs:
         # production RECOVERY_TIMEOUT) are skipped here and run in their own
         # step below with THEYOS_PHASE3_RECOVERY_TIMEOUT_SECS=1, so this step no
         # longer carries ~900s of finalize-retry wait. The skip is by exact
-        # name; the tests themselves are unchanged.
+        # name; keep these selectors paired with the dedicated step below.
         run: |
           cd admin/rust && cargo test --workspace -- --test-threads=1 \
             --skip test_m1_crash_between_step10_and_step11_recovers_to_rollback \
             --skip test_m2_disconnect_after_approval_rolls_back \
-            --skip test_recovery_timeout_rolls_back_when_m2_permanently_lost 2>&1
+            --skip test_recovery_timeout_refuses_publication_when_m2_permanently_lost 2>&1
       - name: Install uv (two suites shell out to it)
         # ORDER IS LOAD-BEARING, and it is why this step moved up. It used to sit
         # further down, immediately before the datapath step that needed it. The
@@ -590,7 +590,7 @@ jobs:
             --test phase3_atomic_rollback -- --test-threads=1 \
             test_m1_crash_between_step10_and_step11_recovers_to_rollback \
             test_m2_disconnect_after_approval_rolls_back \
-            test_recovery_timeout_rolls_back_when_m2_permanently_lost 2>&1
+            test_recovery_timeout_refuses_publication_when_m2_permanently_lost 2>&1
       - name: Feature-gated compile-fail proofs (mesh-session-runtime)
         # `cargo test --workspace` runs with DEFAULT features, so any trybuild
         # case inside a `#[cfg(feature = "...")]` test fn is never executed --
