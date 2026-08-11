@@ -8,13 +8,13 @@ to the child command.
 
 Examples:
 
-  python3 scripts/safe_external_write.py --payload-file /tmp/body -- \
-      gh issue comment 123 --body-file /tmp/body
-
   printf '%s' "$BODY" | python3 scripts/safe_external_write.py --stdin -- \
       gh pr create --body-file - ...
 
-With no command after ``--``, the program performs a check only.
+With no command after ``--``, the program performs a check only. Executing a
+child requires ``--stdin`` so the child receives the exact bytes that passed
+validation; payload files are check-only and cannot introduce a read-after-
+validation race.
 """
 
 from __future__ import annotations
@@ -36,6 +36,11 @@ from typing import Sequence
 MENTION_PATTERN = re.compile(
     r"(?<![A-Za-z0-9])@([A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?)"
 )
+ENTITY_MENTION_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])(?:&#0*64;|&#x0*40;|&commat;)"
+    r"([A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -49,15 +54,17 @@ def find_mentions(payload: str, allowed: frozenset[str] = frozenset()) -> tuple[
     """Return non-allowlisted mention-shaped tokens with 1-based locations."""
     normalized_allowed = {name.lower() for name in allowed}
     found: list[Mention] = []
-    for match in MENTION_PATTERN.finditer(payload):
-        username = match.group(1)
-        if username.lower() in normalized_allowed:
-            continue
-        start = match.start()
-        line = payload.count("\n", 0, start) + 1
-        previous_newline = payload.rfind("\n", 0, start)
-        column = start - previous_newline
-        found.append(Mention(username=username, line=line, column=column))
+    for pattern in (MENTION_PATTERN, ENTITY_MENTION_PATTERN):
+        for match in pattern.finditer(payload):
+            username = match.group(1)
+            if username.lower() in normalized_allowed:
+                continue
+            start = match.start()
+            line = payload.count("\n", 0, start) + 1
+            previous_newline = payload.rfind("\n", 0, start)
+            column = start - previous_newline
+            found.append(Mention(username=username, line=line, column=column))
+    found.sort(key=lambda mention: (mention.line, mention.column, mention.username.lower()))
     return tuple(found)
 
 
@@ -106,7 +113,17 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     payload, forwarded_stdin = _read_payload(args)
-    blocked = find_mentions(payload, frozenset(args.allow_mention))
+    command = list(args.command)
+    if command and command[0] == "--":
+        command = command[1:]
+
+    allowed = frozenset(args.allow_mention)
+    blocked = find_mentions(payload, allowed)
+    # Titles and inline message fragments are command arguments rather than
+    # stdin for several CLIs. Validate them too; checking only the body would
+    # leave another outbound text channel unguarded.
+    blocked_command = find_mentions("\n".join(command), allowed)
+    blocked = blocked + blocked_command
     if blocked:
         print("BLOCKED: outbound payload contains mention-shaped tokens:", file=sys.stderr)
         for mention in blocked:
@@ -115,18 +132,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                 file=sys.stderr,
             )
         print(
-            "Use a name without @ or encode the display-only token as &#64;. "
-            "Allowlist only a deliberately authorized GitHub notification.",
+            "Use a name without an at-sign. HTML entity encodings are also blocked "
+            "because rendered text can be copied back into a live mention. Allowlist "
+            "only a deliberately authorized GitHub notification.",
             file=sys.stderr,
         )
         return 2
 
-    command = list(args.command)
-    if command and command[0] == "--":
-        command = command[1:]
     if not command:
         print("OK: outbound payload contains no unapproved GitHub mentions")
         return 0
+
+    if not args.stdin:
+        print(
+            "BLOCKED: executing an external write requires --stdin so the child "
+            "receives the exact payload bytes that were validated",
+            file=sys.stderr,
+        )
+        return 2
 
     try:
         completed = subprocess.run(command, input=forwarded_stdin, check=False)

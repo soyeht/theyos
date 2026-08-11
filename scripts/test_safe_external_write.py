@@ -69,6 +69,22 @@ class MentionSyntaxTests(unittest.TestCase):
             with self.subTest(payload=payload):
                 self.assertTrue(guard.find_mentions(payload))
 
+    def test_blocks_entity_encoded_mentions_that_can_be_copied_from_rendered_text(self) -> None:
+        cases = (
+            "&#64;khai",
+            "&#064;khai",
+            "&#x40;khai",
+            "&#x040;khai",
+            "&#X40;Khai",
+            "&commat;khai",
+        )
+        for payload in cases:
+            with self.subTest(payload=payload):
+                self.assertTrue(guard.find_mentions(payload))
+
+    def test_entity_encoded_email_is_not_a_mention(self) -> None:
+        self.assertEqual((), guard.find_mentions("noreply&#64;example.com"))
+
     def test_allowlist_is_case_insensitive_and_does_not_hide_another_mention(self) -> None:
         self.assertEqual((), guard.find_mentions("@Khai", frozenset({"khai"})))
         found = guard.find_mentions("@Khai and @ilia", frozenset({"khai"}))
@@ -96,16 +112,45 @@ class ExecutionBoundaryTests(unittest.TestCase):
         run.assert_not_called()
         self.assertIn("BLOCKED", stderr.getvalue())
 
-    def test_clean_payload_executes_exact_child_and_propagates_status(self) -> None:
-        payload = self._payload_file("credit agent-khai")
-        completed = mock.Mock(returncode=17)
-        with mock.patch.object(guard.subprocess, "run", return_value=completed) as run:
-            code = guard.main(["--payload-file", payload, "--", "gh", "issue", "comment"])
-        self.assertEqual(17, code)
-        run.assert_called_once_with(["gh", "issue", "comment"], input=None, check=False)
+    def _stdin(self, body: bytes) -> mock.Mock:
+        stream = mock.Mock()
+        stream.buffer.read.return_value = body
+        return stream
 
-    def test_check_only_is_green_for_entity_encoded_display(self) -> None:
-        payload = self._payload_file("display &#64;khai without notifying")
+    def test_payload_file_is_check_only_and_cannot_execute_child(self) -> None:
+        payload = self._payload_file("credit agent-khai")
+        stderr = io.StringIO()
+        with mock.patch.object(guard.subprocess, "run") as run, contextlib.redirect_stderr(stderr):
+            code = guard.main(["--payload-file", payload, "--", "gh", "issue", "comment"])
+        self.assertEqual(2, code)
+        run.assert_not_called()
+        self.assertIn("requires --stdin", stderr.getvalue())
+
+    def test_clean_stdin_executes_exact_child_and_propagates_status(self) -> None:
+        payload = b"credit agent-khai"
+        completed = mock.Mock(returncode=17)
+        with (
+            mock.patch.object(guard.sys, "stdin", self._stdin(payload)),
+            mock.patch.object(guard.subprocess, "run", return_value=completed) as run,
+        ):
+            code = guard.main(["--stdin", "--", "gh", "issue", "comment", "--body-file", "-"])
+        self.assertEqual(17, code)
+        run.assert_called_once_with(
+            ["gh", "issue", "comment", "--body-file", "-"], input=payload, check=False
+        )
+
+    def test_mention_in_command_argument_blocks_clean_stdin(self) -> None:
+        payload = b"clean body"
+        with (
+            mock.patch.object(guard.sys, "stdin", self._stdin(payload)),
+            mock.patch.object(guard.subprocess, "run") as run,
+        ):
+            code = guard.main(["--stdin", "--", "gh", "pr", "create", "--title", "credit @khai"])
+        self.assertEqual(2, code)
+        run.assert_not_called()
+
+    def test_check_only_is_green_for_name_without_at_sign(self) -> None:
+        payload = self._payload_file("display agent-khai without notifying")
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
             code = guard.main(["--payload-file", payload])
