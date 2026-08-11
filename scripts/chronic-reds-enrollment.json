@@ -5,20 +5,6 @@
   "sla_hours": 24,
   "reds": [
     {
-      "check": "Consumption coverage gate",
-      "owner": "caiosalgado",
-      "expires": "2026-08-12",
-      "issue": 455,
-      "reason": "#461 remains open while the current gate's reported 8-site/4-file coverage gap is addressed; keep this red visible but owned."
-    },
-    {
-      "check": "Owner-present structural boundary",
-      "owner": "caiosalgado",
-      "expires": "2026-08-12",
-      "issue": 479,
-      "reason": "#477 is merged; #479 owns the newly observable build_cfg_crossing oracle defect that is now the first structural-boundary red."
-    },
-    {
       "check": "Repo hygiene gates",
       "owner": "caiosalgado",
       "expires": "2026-08-14",
