@@ -183,12 +183,20 @@ fn quarantine_probe_guard_is_intact(step: &str) -> bool {
         return false;
     };
     let command_tokens: Vec<_> = command.split_whitespace().collect();
-    !active
-        .iter()
-        .any(|line| line.starts_with("continue-on-error:"))
-        && active
-            .iter()
-            .any(|line| *line == "python3 scripts/test_quarantine_probe.py")
+    active
+        == [
+            "- name: Quarantine probe (issue #470)",
+            "run: |",
+            "python3 scripts/test_quarantine_probe.py",
+            "python3 scripts/quarantine_probe.py \\",
+            "--issue 470 \\",
+            "--attempts 5 \\",
+            "--attempt-timeout-seconds 120 \\",
+            "--package e2e-rs \\",
+            "--test-target phase3_observability_audit \\",
+            "--test test_owner_timeout_aborts_window_and_emits_tracing \\",
+            "--require-pass",
+        ]
         && command_tokens
             == [
                 "python3",
@@ -484,6 +492,29 @@ fn owner_timeout_quarantine_guard_rejects_required_probe_mutations() {
         );
     assert!(detached_required_policy.contains("echo --require-pass"));
     assert!(!quarantine_probe_guard_is_intact(&detached_required_policy));
+
+    let dead_branch = probe
+        .replacen(
+            "          python3 scripts/quarantine_probe.py \\\n",
+            "          if false; then\n          python3 scripts/quarantine_probe.py \\\n",
+            1,
+        )
+        .replacen(
+            "            --require-pass\n",
+            "            --require-pass\n          fi\n",
+            1,
+        );
+    assert!(dead_branch.contains("if false; then"));
+    assert!(dead_branch.contains("\n          fi\n"));
+    assert_eq!(
+        quarantine_probe_command(&dead_branch),
+        quarantine_probe_command(probe),
+        "the dead-branch mutant must preserve the exact harness command"
+    );
+    assert!(
+        !quarantine_probe_guard_is_intact(&dead_branch),
+        "an exact command hidden in a dead shell branch must break the required probe contract"
+    );
 
     let without_required_probe = workflow.replacen(probe, "", 1);
     let moved_to_non_required =
