@@ -150,9 +150,13 @@ jobs:
     # prove. Drop this back when the retry policy becomes injectable.
     # (B1) The retry budget is now injectable; the three slow tests run with
     # THEYOS_PHASE3_RECOVERY_TIMEOUT_SECS=1 in a separate step, so this job no
-    # longer carries the ~300s×3. timeout-minutes stays at 50 for headroom;
-    # lower it as its own measured change.
-    timeout-minutes: 50
+    # longer carries the ~300s×3. The remaining cost is the cold all-targets
+    # build: with no warm cache it has measured into the low-20-minute range on
+    # ubuntu-latest, and with the full suite on top the job has crossed 50 and
+    # been cancelled mid-suite (which measures nothing). 50 gave no real
+    # headroom, so it is raised to 75; lower it as its own measured change once
+    # the compile is cached or trimmed.
+    timeout-minutes: 75
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -449,8 +453,11 @@ jobs:
     # phase3_atomic_rollback is what those tests prove, not overhead to trim.
     # (B1) Same protocol as Linux: the three slow tests now run in a separate
     # step with the injected 1s budget, so the wait no longer sits in the
-    # serialised step. timeout-minutes stays at 50 for headroom.
-    timeout-minutes: 50
+    # serialised step. The cold all-targets build is slower here — measured
+    # into the high-20-minute range on macos-15 — so with the suite on top the
+    # job also crosses 50. 50 gave no real headroom; raised to 75, to be
+    # lowered again once the compile is cached or trimmed.
+    timeout-minutes: 75
     steps:
       - name: Checkout
         uses: actions/checkout@v5

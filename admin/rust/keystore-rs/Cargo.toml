@@ -42,10 +42,12 @@ rand_core = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { workspace = true }
 
-# unix (Linux + macOS): raw O_NOFOLLOW open + fstat for create_only's
-# reinspection step (file_backend.rs::secure_open_regular_nofollow). std
-# doesn't expose O_NOFOLLOW or geteuid(); libc is already an approved direct
-# dependency elsewhere in this workspace (server-rs's VPN backends).
+# Unix targets: raw O_NOFOLLOW open + fstat for create_only's reinspection
+# step (file_backend.rs::secure_open_regular_nofollow), plus errno_slot's
+# per-OS accessor. std doesn't expose O_NOFOLLOW or geteuid(); libc is already
+# an approved direct dependency elsewhere in this workspace (server-rs's VPN
+# backends). This block is load-bearing on every cfg(unix) target the crate
+# builds for, so it is not enumerated by name.
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 

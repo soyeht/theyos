@@ -1591,16 +1591,22 @@ pub(crate) struct DirHandle {
     fd: OwnedFd,
 }
 
-/// This thread's `errno` slot. The two supported targets name it
+/// This thread's `errno` slot. The supported target families name it
 /// differently, and `readdir` needs it cleared to separate end-of-stream
 /// from failure — `std::io::Error::last_os_error()` can only read it.
+///
+/// The Darwin arm must cover iOS as well as macOS: the Apple client
+/// cross-compiles this crate for `aarch64-apple-ios(-sim)`, where the rest of
+/// this module compiles in under plain `cfg(unix)` and `__error` is libc's
+/// accessor exactly as on macOS. A macOS-only arm leaves those targets with
+/// call sites but no definition (E0425).
 #[cfg(all(unix, target_os = "linux"))]
 #[allow(unsafe_code)]
 unsafe fn errno_slot() -> *mut libc::c_int {
     // SAFETY: libc's own accessor; valid for this thread.
     unsafe { libc::__errno_location() }
 }
-#[cfg(all(unix, target_os = "macos"))]
+#[cfg(all(unix, any(target_os = "macos", target_os = "ios")))]
 #[allow(unsafe_code)]
 unsafe fn errno_slot() -> *mut libc::c_int {
     // SAFETY: libc's own accessor; valid for this thread.
