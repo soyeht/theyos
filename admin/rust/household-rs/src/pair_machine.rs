@@ -2168,7 +2168,8 @@ fn post_finalize_until_ack(
             Ok(FinalizePostOutcome::RestartRequired(server_delay)) => {
                 ambiguous_attempt_observed = true;
                 let remaining = policy.budget.saturating_sub(started.elapsed());
-                let delay = server_delay.min(policy.maximum_sleep).min(remaining);
+                let delay =
+                    bounded_finalize_restart_delay(server_delay, policy.maximum_sleep, remaining);
                 std::thread::sleep(delay);
             }
             Err(
@@ -2213,6 +2214,14 @@ fn post_finalize_until_ack(
             Err(error) => return Err(error.into_ceremony()),
         }
     }
+}
+
+fn bounded_finalize_restart_delay(
+    server_delay: Duration,
+    maximum_sleep: Duration,
+    remaining: Duration,
+) -> Duration {
+    server_delay.min(maximum_sleep).min(remaining)
 }
 
 #[must_use]
@@ -4198,6 +4207,42 @@ mod tests {
             request_timeout: Duration::from_millis(200),
             maximum_sleep: Duration::from_millis(5),
         }
+    }
+
+    #[test]
+    fn finalize_restart_delay_is_bounded_by_current_budget_and_policy() {
+        assert_eq!(
+            bounded_finalize_restart_delay(
+                Duration::from_millis(500),
+                Duration::from_secs(1),
+                Duration::from_millis(250),
+            ),
+            Duration::from_millis(250),
+        );
+        assert_eq!(
+            bounded_finalize_restart_delay(
+                Duration::from_millis(500),
+                Duration::from_millis(200),
+                Duration::from_millis(250),
+            ),
+            Duration::from_millis(200),
+        );
+        assert_eq!(
+            bounded_finalize_restart_delay(
+                Duration::from_millis(100),
+                Duration::from_millis(200),
+                Duration::from_millis(250),
+            ),
+            Duration::from_millis(100),
+        );
+        assert_eq!(
+            bounded_finalize_restart_delay(
+                Duration::from_millis(500),
+                Duration::from_secs(1),
+                Duration::ZERO,
+            ),
+            Duration::ZERO,
+        );
     }
 
     #[test]
