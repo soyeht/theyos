@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+from quarantine_probe import ProbeConfig, classify_cargo_output, run_probe
+
+
+TEST_NAME = "crate::tests::quarantined_test"
+
+
+def cargo_output(*, count: int, status: str | None = None) -> str:
+    lines = [f"running {count} test" + ("s" if count != 1 else "")]
+    if status is not None:
+        lines.append(f"test {TEST_NAME} ... {status}")
+    return "\n".join(lines) + "\n"
+
+
+class QuarantineProbeTests(unittest.TestCase):
+    def test_zero_selected_is_invalid_even_when_cargo_returns_zero(self) -> None:
+        observation = classify_cargo_output(cargo_output(count=0), 0, TEST_NAME)
+        self.assertEqual(observation.result, "INVALID")
+        self.assertEqual(observation.selected, 0)
+
+    def test_valid_pass_requires_one_exact_result_and_zero_returncode(self) -> None:
+        observation = classify_cargo_output(
+            cargo_output(count=1, status="ok"), 0, TEST_NAME
+        )
+        self.assertEqual(observation.result, "PASS")
+        self.assertEqual(observation.selected, 1)
+
+    def test_harness_observes_deliberate_failure_without_becoming_a_gate(self) -> None:
+        def failing_runner(*_args, **_kwargs):
+            return subprocess.CompletedProcess(
+                args=[],
+                returncode=101,
+                stdout=cargo_output(count=1, status="FAILED"),
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            summary = Path(directory) / "summary"
+            rc = run_probe(
+                ProbeConfig("999", 1, "fixture", TEST_NAME, Path(directory)),
+                runner=failing_runner,
+                summary=summary,
+            )
+            self.assertEqual(rc, 0)
+            self.assertIn(
+                "PROBE_999 os=local job=local attempts=1 passes=0 failures=1 invalid=0",
+                summary.read_text(encoding="utf-8"),
+            )
+
+    def test_harness_rejects_vacuous_success(self) -> None:
+        def empty_runner(*_args, **_kwargs):
+            return subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=cargo_output(count=0)
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            summary = Path(directory) / "summary"
+            rc = run_probe(
+                ProbeConfig("999", 1, "fixture", TEST_NAME, Path(directory)),
+                runner=empty_runner,
+                summary=summary,
+            )
+            self.assertEqual(rc, 2)
+            self.assertIn("invalid=1", summary.read_text(encoding="utf-8"))
+
+    def test_build_error_is_invalid_not_a_test_failure(self) -> None:
+        observation = classify_cargo_output("error: could not compile\n", 101, TEST_NAME)
+        self.assertEqual(observation.result, "INVALID")
+
+    def test_timeout_is_invalid_not_a_test_failure(self) -> None:
+        def timeout_runner(*_args, **_kwargs):
+            raise subprocess.TimeoutExpired(cmd="cargo", timeout=1)
+
+        with tempfile.TemporaryDirectory() as directory:
+            summary = Path(directory) / "summary"
+            rc = run_probe(
+                ProbeConfig("999", 1, "fixture", TEST_NAME, Path(directory), 1),
+                runner=timeout_runner,
+                summary=summary,
+            )
+            self.assertEqual(rc, 2)
+            self.assertIn("invalid=1", summary.read_text(encoding="utf-8"))
+
+
+if __name__ == "__main__":
+    unittest.main()
