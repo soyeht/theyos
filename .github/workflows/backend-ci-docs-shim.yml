@@ -64,6 +64,9 @@ on:
       - "tests/nixos-install/**"
       - ".github/workflows/backend-ci.yml"
       - ".github/workflows/backend-ci-docs-shim.yml"
+      - ".github/workflows/owner-present-phase0-integrity.yml"
+      - ".github/workflows/release-linux.yml"
+      - ".github/workflows/release-macos.yml"
 
 # One run per workflow per ref. A new commit supersedes the old run instead of
 # leaving it to burn a full build on code that no longer exists.
