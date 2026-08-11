@@ -1,10 +1,12 @@
-# theyOS
+# Soyeht
 
-An operating system for AI agents. Each agent ("claw") gets its own isolated virtual machine with full computer access — terminal, filesystem, networking, dev tools. You manage everything from a single admin panel or the iOS app.
+Soyeht — an agent-orchestrator operating system. Early beta, under active development; not yet a stable release. Backend, web frontend, a macOS app, and Linux distribution are functional today; Windows and Android are planned.
+
+Each agent ("claw") gets its own isolated virtual machine with full computer access — terminal, filesystem, networking, dev tools. You manage everything from a single admin panel or the iOS app.
 
 ## Why
 
-AI coding agents need a real computer to operate, not just an API. theyOS gives each agent its own VM with:
+AI coding agents need a real computer to operate, not just an API. Soyeht gives each agent its own VM with:
 
 - A full OS (macOS or Linux) with terminal, package managers, and dev tools pre-installed
 - Isolation between agents — one agent can't see or break another's environment
@@ -13,7 +15,7 @@ AI coding agents need a real computer to operate, not just an API. theyOS gives 
 
 ## Linux vs macOS
 
-theyOS runs on both platforms with different strengths:
+Soyeht runs on both platforms with different strengths:
 
 | | Linux (Firecracker) | macOS (Virtualization Framework) |
 |---|---|---|
@@ -47,7 +49,7 @@ support.
 
 ### Linux — NixOS flake module
 
-Add theyOS as a flake input and enable the module — the same method the curl installer uses under the hood:
+Add Soyeht as a flake input and enable the module — the same method the curl installer uses under the hood:
 
 ```nix
 # flake.nix
@@ -123,7 +125,7 @@ grep SOYEHT_ADMIN_PASSWORD ~/.theyos/.env
 
 ## iOS App
 
-The iOS app (iSoyehtTerm) connects to your theyOS server via QR code. From your phone you can:
+The iOS app (iSoyehtTerm) connects to your Soyeht server via QR code. From your phone you can:
 
 - View and manage all agent instances
 - Open terminal sessions to any agent's VM
