@@ -26,25 +26,30 @@
 # would go green while checking nothing. That retarget is a coverage change and
 # belongs in its own reviewed step, not smuggled into an extraction.
 #
-# ## Why this is shell, against a repo policy that says it should not be
+# ## Why this is shell, and why it lives HERE
 #
-# P28 forbids operational shell scripts under `scripts/`, and the `no-bash-policy`
-# job enforces it — by `find scripts/ -name '*.sh'`. This file has no extension,
-# so that gate does not see it. That is a gap in the gate's predicate, not
-# permission, and it is written here rather than left for someone to discover.
-#
-# The case for shell anyway: this content IS shell. It was lifted verbatim out of
-# `run:` blocks, which GitHub executes as bash, so keeping it as literal shell is
-# what lets `check-backend-rust-equivalence.py` compare the two surfaces line for
-# line. A Python driver would have to carry the same commands as quoted strings
-# through `subprocess`, which adds a quoting layer, breaks byte-fidelity with the
+# This content IS shell. It was lifted verbatim out of `run:` blocks, which GitHub
+# executes as bash, so keeping it as literal shell is what lets
+# `check-backend-rust-equivalence.py` compare the two surfaces line for line. A
+# Python driver would have to carry the same commands as quoted strings through
+# `subprocess`, which adds a quoting layer, breaks byte-fidelity with the
 # workflow, and makes the equivalence proof weaker exactly where it matters most.
-# No shell is being introduced — it is being moved, and P28's target is
-# operations written in shell instead of Rust, not the body of a CI step.
 #
-# If a reviewer disagrees, the honest fixes are to widen the gate to catch
-# extensionless scripts (which would then flag this file, and it should be
-# listed) or to move it under the existing allowlist. Neither is decided here.
+# It lives in `admin/rust/scripts/` — the namespace that already holds CI and
+# build-support scripts such as `graph-gate/run_gate.sh` and
+# `lint-apns-payload.sh` — and NOT under the repository-root `scripts/`, which is
+# the namespace P28 governs.
+#
+# An earlier revision sat under the former repository-root `scripts/ci`
+# location and argued that the policy's checker did not see it, because that
+# checker matches `*.sh` and this file has no extension. Review was right to
+# refuse that: an artifact that depends on a detector's blind spot is not
+# compliant, it is undetected, and writing the gap down does not convert it into
+# permission. The location is the fix; nothing here claims a waiver.
+#
+# The retired path is described rather than spelled out on purpose — a guard in
+# `check-backend-rust-phase-wiring.py` greps every one of these files for that
+# literal, so writing it here would make this comment a stale reference.
 #
 # ## Why the phase bodies are byte-for-byte copies
 #
@@ -104,12 +109,22 @@
 #
 # ## Usage
 #
-#   scripts/ci/backend-rust --list          print the phase names, in order
-#   scripts/ci/backend-rust <phase>         run one phase (what CI does)
-#   scripts/ci/backend-rust all             run every phase in order
+#   admin/rust/scripts/backend-rust --list          print the phase names, in order
+#   admin/rust/scripts/backend-rust <phase>         run one phase (what CI does)
+#   admin/rust/scripts/backend-rust all             run every phase in order
 set -Eeuo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# THREE levels, because this file lives at admin/rust/scripts/<name>. It was two
+# when the file sat two levels down, and the relocation silently broke it: the
+# path arithmetic is a function of the file's DEPTH, and moving a file changes
+# that without changing a single character of the line.
+#
+# Nothing in the text-level battery could see it. `bash -n` parses the assignment
+# and never runs it; the wiring and equivalence checkers read this file as text.
+# All three stayed green while every phase would have failed on its first `cd`
+# into <repo>/admin/admin/rust. That is why `--check-root` below exists and why
+# the gate executes it rather than grepping for the right number of dots.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 
 # Order is the workflow's order and it is load-bearing in two places:
 # `fetch-locked` must precede `test-serialised` (the msrv invariant test runs
@@ -463,6 +478,24 @@ main() {
   fi
   validate_registry || return $?
   case "$1" in
+    --check-root)
+      # Print the RESOLVED root and prove it is the repository, by looking for a
+      # marker only the real root has. Exists so the wiring gate can test this by
+      # VALUE — running the script and comparing to `git rev-parse --show-toplevel`
+      # — instead of counting `../` in the source. A textual check would have to
+      # know this file's depth, which is exactly the fact that changes when the
+      # file moves, so it would agree with whatever the file says and confirm
+      # nothing.
+      if [ ! -d "$REPO_ROOT/.git" ] && [ ! -f "$REPO_ROOT/.git" ]; then
+        printf 'REPO_ROOT does not look like a repository root: %s\n' "$REPO_ROOT" >&2
+        return 1
+      fi
+      if [ ! -d "$REPO_ROOT/admin/rust" ]; then
+        printf 'REPO_ROOT/admin/rust missing, so phases would fail: %s\n' "$REPO_ROOT" >&2
+        return 1
+      fi
+      printf '%s\n' "$REPO_ROOT"
+      ;;
     --list | -l)
       printf '%s\n' "${PHASES[@]}"
       ;;

@@ -204,17 +204,17 @@ jobs:
         with:
           workspaces: "admin/rust -> target"
       - name: Clippy (deny warnings)
-        run: scripts/ci/backend-rust clippy-workspace
+        run: admin/rust/scripts/backend-rust clippy-workspace
       - name: Clippy (dev datapath feature, all targets)
-        run: scripts/ci/backend-rust clippy-datapath
+        run: admin/rust/scripts/backend-rust clippy-datapath
       - name: Feature surface compiles (all targets)
-        run: scripts/ci/backend-rust feature-surface
+        run: admin/rust/scripts/backend-rust feature-surface
       - name: Build workspace
-        run: scripts/ci/backend-rust build
+        run: admin/rust/scripts/backend-rust build
       - name: Populate the registry for the WHOLE resolve graph
-        run: scripts/ci/backend-rust fetch-locked
+        run: admin/rust/scripts/backend-rust fetch-locked
       - name: Run tests (serialised)
-        run: scripts/ci/backend-rust test-serialised
+        run: admin/rust/scripts/backend-rust test-serialised
       - name: Quarantine probe (issue #470)
         run: |
           # QUARANTINE_PROBE_470_BEGIN
@@ -256,15 +256,15 @@ jobs:
         #      installed (repo convention: run Python via `uv run`)".
         uses: astral-sh/setup-uv@v5
       - name: Excluded workspace members (mesh-session core + control model)
-        run: scripts/ci/backend-rust excluded-members
+        run: admin/rust/scripts/backend-rust excluded-members
       - name: Slow phase3 rollback tests (injected budget)
-        run: scripts/ci/backend-rust slow-phase3
+        run: admin/rust/scripts/backend-rust slow-phase3
       - name: Feature-gated compile-fail proofs (mesh-session-runtime)
-        run: scripts/ci/backend-rust compile-fail-proofs
+        run: admin/rust/scripts/backend-rust compile-fail-proofs
       - name: Feature-gated datapath tests (dev_t1_datapath)
-        run: scripts/ci/backend-rust datapath-tests
+        run: admin/rust/scripts/backend-rust datapath-tests
       - name: APNS dispatcher opacity lint (Constitution III source-level gate)
-        run: scripts/ci/backend-rust apns-lint
+        run: admin/rust/scripts/backend-rust apns-lint
 
   build-and-test-macos:
     name: Build & Test (Rust / macOS)
@@ -293,17 +293,17 @@ jobs:
         with:
           workspaces: "admin/rust -> target"
       - name: Clippy (deny warnings)
-        run: scripts/ci/backend-rust clippy-workspace
+        run: admin/rust/scripts/backend-rust clippy-workspace
       - name: Clippy (dev datapath feature, all targets)
-        run: scripts/ci/backend-rust clippy-datapath
+        run: admin/rust/scripts/backend-rust clippy-datapath
       - name: Feature surface compiles (all targets)
-        run: scripts/ci/backend-rust feature-surface
+        run: admin/rust/scripts/backend-rust feature-surface
       - name: Build workspace
-        run: scripts/ci/backend-rust build
+        run: admin/rust/scripts/backend-rust build
       - name: Populate the registry for the WHOLE resolve graph
-        run: scripts/ci/backend-rust fetch-locked
+        run: admin/rust/scripts/backend-rust fetch-locked
       - name: Run tests (serialised)
-        run: scripts/ci/backend-rust test-serialised
+        run: admin/rust/scripts/backend-rust test-serialised
       - name: Install uv (two suites shell out to it)
         # ORDER IS LOAD-BEARING, and it is why this step moved up. It used to sit
         # further down, immediately before the datapath step that needed it. The
@@ -328,15 +328,15 @@ jobs:
         #      installed (repo convention: run Python via `uv run`)".
         uses: astral-sh/setup-uv@v5
       - name: Excluded workspace members (mesh-session core + control model)
-        run: scripts/ci/backend-rust excluded-members
+        run: admin/rust/scripts/backend-rust excluded-members
       - name: Slow phase3 rollback tests (injected budget)
-        run: scripts/ci/backend-rust slow-phase3
+        run: admin/rust/scripts/backend-rust slow-phase3
       - name: Feature-gated compile-fail proofs (mesh-session-runtime)
-        run: scripts/ci/backend-rust compile-fail-proofs
+        run: admin/rust/scripts/backend-rust compile-fail-proofs
       - name: Feature-gated datapath tests (dev_t1_datapath)
-        run: scripts/ci/backend-rust datapath-tests
+        run: admin/rust/scripts/backend-rust datapath-tests
       - name: APNS dispatcher opacity lint (Constitution III source-level gate)
-        run: scripts/ci/backend-rust apns-lint
+        run: admin/rust/scripts/backend-rust apns-lint
 
   validate-bridge:
     name: ClawShareBridge (B3-0 slice)

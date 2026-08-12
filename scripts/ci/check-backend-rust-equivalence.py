@@ -6,7 +6,7 @@ The predicate is **containment**: every line that lived inside a `run:` block of
 exist, verbatim after whitespace normalisation, somewhere in the pair
 
     .github/workflows/backend-ci.yml   (what stayed: provisioning)
-    scripts/ci/backend-rust            (what moved: the pipeline)
+    admin/rust/scripts/backend-rust            (what moved: the pipeline)
 
 Comments are included in the check on purpose. The comments in this workflow are
 load-bearing — they carry measurements, dates and the reasons a flag exists — so
@@ -60,7 +60,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ".github/workflows/backend-ci.yml"
-COMMAND = "scripts/ci/backend-rust"
+COMMAND = "admin/rust/scripts/backend-rust"
 
 # The two jobs whose `run:` bodies are the subject. Named rather than discovered
 # so that a job appearing or disappearing is a visible edit to this file, not a
@@ -262,7 +262,7 @@ def main() -> int:
     # PRECONDITION, not a check. Before the command file exists, the "new" pair
     # is just the unchanged workflow, so containment is trivially true and the
     # green means nothing. The first run of this checker printed
-    # "OK: all 46 lines survive" with scripts/ci/backend-rust absent — a pass
+    # "OK: all 46 lines survive" with admin/rust/scripts/backend-rust absent — a pass
     # about a transformation that had not happened.
     command_text = read_worktree(COMMAND).strip()
     if not command_text:

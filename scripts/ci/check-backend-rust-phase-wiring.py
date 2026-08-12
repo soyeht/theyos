@@ -7,13 +7,13 @@ gate's subject survives every merge. It is meant to sit in CI forever.
 
 Three sets, per job, compared for EQUALITY and UNIQUENESS:
 
-    A  PHASES=( ... ) in scripts/ci/backend-rust      the registry
+    A  PHASES=( ... ) in admin/rust/scripts/backend-rust      the registry
     B  the phase_* functions defined there            what can execute
     C  the phases each workflow job actually invokes  what CI runs
 
 ## Why this is not a tidiness check
 
-`scripts/ci/backend-rust all` is a published interface — it is how the pipeline
+`admin/rust/scripts/backend-rust all` is a published interface — it is how the pipeline
 is run outside GitHub, and it is what a benchmark measures. `all` and `--list`
 are driven by PHASES. Before the runtime fix that landed with this file,
 `run_phase` resolved `phase_${name//-/_}` directly and never consulted PHASES, so
@@ -69,14 +69,21 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-COMMAND = REPO_ROOT / "scripts/ci/backend-rust"
+COMMAND = REPO_ROOT / "admin/rust/scripts/backend-rust"
+# Where it used to be, ASSEMBLED FROM PARTS so the literal never appears in this
+# file. A guard that searches for a string it also contains flags itself: the
+# first version of this check reported its own source as a stale reference and
+# went red on a clean tree. Splitting the constant is the mechanical fix — an
+# exclusion list for "the guard's own file" would work today and rot the moment
+# the check moves or gains a second reader.
+RETIRED_PATH = "scripts/ci/" + "backend-rust"
 WORKFLOW = REPO_ROOT / ".github/workflows/backend-ci.yml"
 
 JOBS = ("build-and-test-linux", "build-and-test-macos")
 EXPECTED_COMMON = 11
 SELF = "scripts/ci/check-backend-rust-phase-wiring.py"
 
-PHASE_CALL = re.compile(r"^scripts/ci/backend-rust ([a-z0-9][a-z0-9-]*)$")
+PHASE_CALL = re.compile(r"^admin/rust/scripts/backend-rust ([a-z0-9][a-z0-9-]*)$")
 SELF_TEST_CMD = f"python3 {SELF} --self-test"
 LIVE_CMD = f"python3 {SELF}"
 
@@ -383,6 +390,97 @@ def assert_wired(jobs: dict, wf_shell: str | None) -> list[str]:
     return errs
 
 
+def assert_command_location(wf: str, cmd_path: Path) -> list[str]:
+    """The dispatcher must live outside the repository-root `scripts/` namespace,
+    and nothing may still reference where it used to be.
+
+    Both halves exist because of a real review BLOCK. The command first shipped
+    under the repository-root `scripts/` tree (see `RETIRED_PATH`), and its own
+    header argued that the no-bash policy check did not flag it because that
+    check matches `*.sh` and this file has no extension. That reasoning was
+    refused, correctly: an artifact that survives by a detector's blind spot is
+    undetected, not compliant, and documenting the gap does not turn it into
+    permission.
+
+    The retired path is referred to indirectly here, and `RETIRED_PATH` is
+    assembled from parts, for the same reason: this function greps for that
+    string, so any file spelling it out — including this one — becomes a hit.
+    A guard whose prose can trip it is a guard that gets an exclusion list, and
+    exclusion lists are where guards go to stop guarding.
+
+    So the location is now the compliance, which means the location needs teeth —
+    otherwise the next move back is silent. This fails if the executable reappears
+    under root `scripts/`, and fails if the workflow or either checker still cites
+    the retired path.
+    """
+    errs = []
+    rel = cmd_path.relative_to(REPO_ROOT).as_posix()
+    if rel.startswith("scripts/"):
+        errs.append(
+            f"the dispatcher is at {rel}, inside the repository-root `scripts/` "
+            "namespace that P28 governs. It lives in admin/rust/scripts/ "
+            "deliberately; moving it back needs a policy decision, not an edit."
+        )
+    # The COMMAND ITSELF is on this list, and it was the surface I missed. My
+    # first sweep covered only the files I had edited — workflow and the two
+    # checkers — and reported "0 residual references" while the moved script
+    # still carried four: one narrative line and, worse, three usage examples
+    # that are operational instructions telling a reader to run a path that no
+    # longer exists. A relocation's most likely stale reference is inside the
+    # thing relocated.
+    stale = [p for p in (WORKFLOW, COMMAND, Path(__file__).resolve(),
+                         REPO_ROOT / "scripts/ci/check-backend-rust-equivalence.py")
+             if p.exists() and RETIRED_PATH in p.read_text()]
+    if stale:
+        errs.append(
+            f"the retired path {RETIRED_PATH!r} is still cited in "
+            f"{[p.name for p in stale]} — a reference to where the command used "
+            "to be will not run it, and will not fail loudly either."
+        )
+    return errs
+
+
+def assert_root_resolves(cmd_path: Path) -> list[str]:
+    """RUN the command's `--check-root` and require the repository root back.
+
+    Tested by value because the textual form cannot be tested at all. The line is
+
+        REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+
+    and the correct number of `../` is a function of THIS FILE'S DEPTH. A grep
+    that knows the right count has to be told the depth — the very fact that
+    changes when the file moves — so it would agree with whatever the file says
+    and confirm nothing.
+
+    This defect was live and shipped past every text-level check I had: the file
+    moved one level deeper, the line kept its two `../`, and REPO_ROOT resolved
+    to <repo>/admin. `bash -n` parses the assignment without running it; this
+    gate and the equivalence checker read the file as text. All green, and every
+    phase would have failed on its first `cd` into <repo>/admin/admin/rust.
+
+    Executed from a temporary cwd, so a resolution that secretly depends on the
+    caller's directory fails here instead of in CI.
+    """
+    import subprocess
+    import tempfile
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            p = subprocess.run((str(cmd_path), "--check-root"), cwd=tmp,
+                               capture_output=True, text=True, timeout=30)
+    except OSError as e:
+        return [f"could not execute {cmd_path.name} --check-root: {e}"]
+    if p.returncode != 0:
+        return [f"{cmd_path.name} --check-root failed (rc={p.returncode}): "
+                f"{p.stderr.strip()[:200]}"]
+    resolved = Path(p.stdout.strip())
+    if resolved != REPO_ROOT:
+        return [f"{cmd_path.name} resolves REPO_ROOT to {resolved}, expected "
+                f"{REPO_ROOT} — the path arithmetic does not match the file's "
+                "depth, and every phase's `cd` would land in the wrong tree"]
+    return []
+
+
 def judged_jobs() -> tuple[str, ...]:
     """The jobs this gate governs: the two Rust jobs and the job hosting the gate."""
     return JOBS + (CONTRACT_JOB,)
@@ -468,6 +566,8 @@ def evaluate(cmd: str, wf: str) -> tuple[list[str], dict[str, int]]:
             f"EXPECTED_COMMON in {SELF} is the number to update, deliberately."
         )
 
+    errs += assert_command_location(wf, COMMAND)
+    errs += assert_root_resolves(COMMAND)
     errs += assert_job_keys(jobs)
     errs += assert_wired(jobs, wf_shell)
     counts = {"PHASES": len(reg), "functions": len(fns)}
@@ -695,7 +795,7 @@ MALFORMED = "MALFORMED:"             # prefix: the case must RAISE, not return
 def fail_open_cases(wf: str, victim: str, step: str) -> list[tuple[str, str]]:
     """Every way a step can be in the file and still not gate anything.
 
-    In all of them the text `scripts/ci/backend-rust <victim>` remains plainly
+    In all of them the text `admin/rust/scripts/backend-rust <victim>` remains plainly
     visible in the job: a reviewer skimming the diff sees the invocation, and any
     grep over the job body finds it. What changes is whether the step runs
     unconditionally and whether its exit status becomes the step's status.
@@ -746,7 +846,7 @@ def fail_open_cases(wf: str, victim: str, step: str) -> list[tuple[str, str]]:
         ("wrapped in `echo`, so it only prints", phase_step(line.replace("run: ", "run: echo ")), R_MISSING),
         (
             "moved into a block scalar, which can hide a wrapper",
-            phase_step(f"        run: |\n          scripts/ci/backend-rust {victim}\n"),
+            phase_step(f"        run: |\n          admin/rust/scripts/backend-rust {victim}\n"),
             R_MISSING,
         ),
         ("`uses:` a composite action instead of `run:`", phase_step(f"        uses: ./.github/actions/{victim}\n"), R_MISSING),
@@ -959,7 +1059,7 @@ def assert_pin_is_deliberate(cmd: str, wf: str, victim: str, step: str) -> None:
     wf12 = wf.replace(
         f"        {step}\n",
         f"        {step}\n      - name: New phase\n"
-        f"        run: scripts/ci/backend-rust new-phase\n",
+        f"        run: admin/rust/scripts/backend-rust new-phase\n",
     )
     if cmd12 == cmd or wf12 == wf:
         raise SystemExit(
@@ -991,13 +1091,13 @@ def self_test(cmd: str, wf: str) -> None:
     """
     victim = registry(cmd)[-1]
     fn = f"phase_{victim.replace('-', '_')}"
-    step = f"run: scripts/ci/backend-rust {victim}"
+    step = f"run: admin/rust/scripts/backend-rust {victim}"
     macos_at = wf.index("  build-and-test-macos:")
 
     cases: list[tuple[str, str, str, str]] = [
         ("function defined but absent from PHASES", cmd.replace(f"  {victim}\n)", ")"), wf, R_ORPHAN),
         ("PHASES entry with no function", re.sub(rf"{fn}\(\) \{{.*?\n\}}\n", "", cmd, flags=re.S), wf, R_UNDEFINED),
-        ("workflow invokes a non-member", cmd, wf.replace(step, "run: scripts/ci/backend-rust ghost-phase", 1), R_NONMEMBER),
+        ("workflow invokes a non-member", cmd, wf.replace(step, "run: admin/rust/scripts/backend-rust ghost-phase", 1), R_NONMEMBER),
         ("phase missing from one job only", cmd, wf[:macos_at] + wf[macos_at:].replace(f"        {step}\n", "", 1), R_MISSING),
         ("duplicate entry in PHASES", cmd.replace(f"  {victim}\n)", f"  {victim}\n  {victim}\n)"), wf, R_DUP_REG),
         ("invocation present only in a comment", cmd, wf.replace(f"        {step}", f"        run: /bin/true\n        # {step}", 1), R_MISSING),
