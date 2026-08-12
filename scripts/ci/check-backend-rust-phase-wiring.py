@@ -80,33 +80,45 @@ PHASE_CALL = re.compile(r"^scripts/ci/backend-rust ([a-z0-9][a-z0-9-]*)$")
 SELF_TEST_CMD = f"python3 {SELF} --self-test"
 LIVE_CMD = f"python3 {SELF}"
 
-# Attributes that make a step or a job stop being an unconditional, load-bearing
+# Step attributes that stop a step being an unconditional, load-bearing
 # invocation. `shell` sits with the other two because changing the shell changes
 # how a failure propagates, which is the property being asserted.
-#
-# The two levels are listed separately because they are not the same set, and
-# collapsing them is what hid `needs` for a whole review cycle: it is a job key
-# with no step-level meaning, so a single shared tuple had no natural place for
-# it and it was simply never considered.
 STEP_DISQUALIFYING = ("if", "continue-on-error", "shell")
 
-# `needs` belongs here and its absence was a real fail-open, found in review.
+# ---------------------------------------------------------------------------
+# THE JOB-LEVEL CONTRACT IS AN ALLOW-LIST, AND THAT IS THE WHOLE POINT.
 #
-# The property, stated precisely rather than dramatically: `needs` makes a judged
-# job CONDITIONAL ON ANOTHER JOB'S OUTCOME. If the dependency is skipped, this
-# job can be skipped without any failure of its own. If the dependency fails, the
-# workflow may well already be red upstream — but this job has stopped proving
-# its own 11 phases, and that is the thing the contract is about. Every step
-# below it still reads as unconditional, and this gate would still count a full
-# set of invocations for a job that ran nothing.
+# Three review rounds were spent adding one forbidden key at a time — `if`,
+# `continue-on-error`, `shell`, then `needs` — and each round a reviewer found
+# more: an empty `strategy.matrix.include`, `environment`, `concurrency` with
+# cancel-in-progress, `container`, `defaults.run.working-directory`. Every one
+# leaves the steps textually unconditional and this gate counting a full set of
+# invocations for a job that may run nothing.
 #
-# The requirement is that both judged jobs are load-bearing BY THEMSELVES. A red
-# arriving from somewhere else is not this gate's evidence.
+# The lesson is not "we missed five keys". It is that ENUMERATING BY KEY IS THE
+# WRONG AXIS: the set of job keys is a surface GitHub owns and extends, so a
+# sweep by name-list only ever finds the names already on the list. What the
+# contract actually says is positive —
 #
-# Any `needs` disqualifies, including an empty one and any future spelling. A
-# legitimate dependency on these jobs is not forbidden; it is required to be a
-# visible decision here, the same contract the other three already carry.
-JOB_DISQUALIFYING = STEP_DISQUALIFYING + ("needs",)
+#     each judged job must prove its own phases, by itself
+#
+# — and that is not expressible as a negative list over somebody else's
+# vocabulary. So the boundary is inverted: these keys are permitted, everything
+# else stops the gate until a human looks at it.
+#
+# THE COST IS DELIBERATE AND IS STATED HERE RATHER THAN DISCOVERED LATER.
+# Adding `permissions:`, `env:` or any other perfectly legitimate key to a judged
+# job will turn this gate RED. That is the intended behaviour: a new top-level
+# key on a job whose only purpose is to prove 11 phases is a review event, even
+# when it is benign. Clearing it means adding the key here — one line, visible in
+# the diff, with the self-test's teeth applying to the new shape.
+#
+# The scope is deliberately narrow. Only the three judged jobs are governed;
+# every other job in the workflow is outside this gate's universe and may carry
+# whatever it needs. A control in `--self-test` proves that widening the universe
+# to all jobs turns the self-test RED.
+CONTRACT_JOB = "backend-rust-command-contract"
+JOB_KEY_ALLOWLIST = frozenset({"name", "runs-on", "timeout-minutes"})
 
 
 class Malformed(SystemExit):
@@ -277,8 +289,6 @@ def load_bearing(job: dict, step: dict, wf_shell: str | None) -> bool:
     """
     if wf_shell is not None or job["defaults_shell"] is not None:
         return False
-    if any(a in job["attrs"] for a in JOB_DISQUALIFYING):
-        return False
     return not any(a in step for a in STEP_DISQUALIFYING)
 
 
@@ -373,10 +383,42 @@ def assert_wired(jobs: dict, wf_shell: str | None) -> list[str]:
     return errs
 
 
+def judged_jobs() -> tuple[str, ...]:
+    """The jobs this gate governs: the two Rust jobs and the job hosting the gate."""
+    return JOBS + (CONTRACT_JOB,)
+
+
+def assert_job_keys(jobs: dict) -> list[str]:
+    """Every top-level key on a judged job must be on the allow-list.
+
+    Fail-closed, and it names the job, the offending key and the allow-list, so
+    the reader is not left guessing what would satisfy it. An empty value fails
+    exactly like a populated one — `needs:` with nothing under it disqualifies a
+    job just as thoroughly as `needs: [x]`, and a parser that reads the value
+    would have to understand every spelling to know that.
+
+    `steps` is not on the list because it is not stored as an attribute; it is
+    the section this gate walks, and its own rules (exactly one, never merged)
+    live in the parser.
+    """
+    errs = []
+    for name in judged_jobs():
+        unknown = sorted(set(jobs[name]["attrs"]) - JOB_KEY_ALLOWLIST)
+        if unknown:
+            errs.append(
+                f"{name}: unknown top-level key(s) {unknown} — a judged job may "
+                f"carry only {sorted(JOB_KEY_ALLOWLIST)} plus `steps`. A new key "
+                "here is a review event even when legitimate: it can stop the "
+                "job running while every step still reads as unconditional. Add "
+                "it to JOB_KEY_ALLOWLIST deliberately, with teeth."
+            )
+    return errs
+
+
 def evaluate(cmd: str, wf: str) -> tuple[list[str], dict[str, int]]:
     reg, fns = registry(cmd), functions(cmd)
     jobs, wf_shell = parse_workflow(wf)
-    for name in JOBS:
+    for name in judged_jobs():
         if name not in jobs:
             raise Malformed(f"job {name} not found — this gate's subject moved")
     per_job = {j: invoked(jobs[j], wf_shell) for j in JOBS}
@@ -426,6 +468,7 @@ def evaluate(cmd: str, wf: str) -> tuple[list[str], dict[str, int]]:
             f"EXPECTED_COMMON in {SELF} is the number to update, deliberately."
         )
 
+    errs += assert_job_keys(jobs)
     errs += assert_wired(jobs, wf_shell)
     counts = {"PHASES": len(reg), "functions": len(fns)}
     counts.update({j: len(v) for j, v in per_job.items()})
@@ -645,6 +688,7 @@ R_UNDEFINED = "in PHASES but not defined"
 R_DUP_REG = "PHASES contains duplicates"
 R_SELF_TEST = "`--self-test` invocation"
 R_LIVE = "load-bearing live invocation"
+R_UNKNOWN_KEY = "unknown top-level key"   # the allow-list, now the job boundary
 MALFORMED = "MALFORMED:"             # prefix: the case must RAISE, not return
 
 
@@ -706,18 +750,23 @@ def fail_open_cases(wf: str, victim: str, step: str) -> list[tuple[str, str]]:
             R_MISSING,
         ),
         ("`uses:` a composite action instead of `run:`", phase_step(f"        uses: ./.github/actions/{victim}\n"), R_MISSING),
-        # --- the whole job stops being load-bearing --------------------------
-        ("job conditional (`if:` on build-and-test-linux)", job_attr("    if: always()\n"), R_MISSING),
-        ("job advisory (`continue-on-error:` on the job)", job_attr("    continue-on-error: true\n"), R_MISSING),
-        (
-            "job-level `defaults.run.shell`",
-            job_attr("    defaults:\n      run:\n        shell: bash\n"),
-            R_MISSING,
-        ),
+        # --- the job stops proving its own phases -----------------------------
+        #
+        # Every case below is now caught by the ALLOW-LIST, not by a per-key
+        # rule, and their expected reason says so. That is the point: three
+        # review rounds added `if`, `continue-on-error`, `shell`, `needs` one at
+        # a time, and each round produced more — matrix, environment,
+        # concurrency, container, working-directory. They are kept as named
+        # cases anyway, because a case that names the exact YAML fails when
+        # someone rewrites the boundary and forgets one; the allow-list is the
+        # rule, these are its witnesses.
+        ("job conditional (`if:`)", job_attr("    if: always()\n"), R_UNKNOWN_KEY),
+        ("job advisory (`continue-on-error:`)", job_attr("    continue-on-error: true\n"), R_UNKNOWN_KEY),
+        ("job-level `defaults.run.shell`", job_attr("    defaults:\n      run:\n        shell: bash\n"), R_UNKNOWN_KEY),
         # --- `needs:`, in every spelling -------------------------------------
         #
-        # All four forms are here because review measured that the FAIL-OPEN is
-        # identical across them while what the parser stores is not:
+        # All four remain because the FAIL-OPEN is identical across them while
+        # what the parser stores is not:
         #
         #   needs: [x]      attrs['needs'] = '[x]'      members visible
         #   needs: x        attrs['needs'] = 'x'        members visible
@@ -725,17 +774,30 @@ def fail_open_cases(wf: str, victim: str, step: str) -> list[tuple[str, str]]:
         #   needs:          attrs['needs'] = ''         MEMBERS LOST — the block
         #     - x                                       list is skipped entirely
         #
-        # That asymmetry decides the predicate. Testing key PRESENCE catches all
-        # four; anything transitive ("only disqualify if the needed job is
-        # itself conditional") is structurally blind to the block form, because
-        # there are no members left to follow — it would look like a smarter fix
-        # and cover the class minus one form, which is precisely the defect being
-        # closed here. Each form is its own case so that a future change to the
-        # predicate cannot quietly lose one.
-        ("job `needs:` — flow list", job_attr("    needs: [installer-tests]\n"), R_MISSING),
-        ("job `needs:` — bare scalar", job_attr("    needs: installer-tests\n"), R_MISSING),
-        ("job `needs:` — quoted flow list", job_attr("    needs: ['installer-tests']\n"), R_MISSING),
-        ("job `needs:` — BLOCK list (members not parsed)", job_attr("    needs:\n      - installer-tests\n"), R_MISSING),
+        # Key PRESENCE catches all four; anything transitive ("only disqualify
+        # if the needed job is itself conditional") is structurally blind to the
+        # block form, because no members survive to follow. The allow-list is
+        # presence-based for exactly this reason.
+        ("job `needs:` — flow list", job_attr("    needs: [installer-tests]\n"), R_UNKNOWN_KEY),
+        ("job `needs:` — bare scalar", job_attr("    needs: installer-tests\n"), R_UNKNOWN_KEY),
+        ("job `needs:` — quoted flow list", job_attr("    needs: ['installer-tests']\n"), R_UNKNOWN_KEY),
+        ("job `needs:` — BLOCK list (members not parsed)", job_attr("    needs:\n      - installer-tests\n"), R_UNKNOWN_KEY),
+        # --- the forms a NEGATIVE list would have missed ----------------------
+        #
+        # None of these was on any blacklist; all five were green before the
+        # allow-list and are red after it, without being named by the predicate.
+        ("empty matrix (`strategy.matrix.include: []`)", job_attr("    strategy:\n      matrix:\n        include: []\n"), R_UNKNOWN_KEY),
+        ("`environment:` (can gate on required reviewers)", job_attr("    environment: production\n"), R_UNKNOWN_KEY),
+        ("`concurrency:` with cancel-in-progress", job_attr("    concurrency:\n      group: x\n      cancel-in-progress: true\n"), R_UNKNOWN_KEY),
+        ("`container:`", job_attr("    container: alpine\n"), R_UNKNOWN_KEY),
+        ("`defaults.run.working-directory` — the sibling of the one key read", job_attr("    defaults:\n      run:\n        working-directory: admin/rust\n"), R_UNKNOWN_KEY),
+        # --- the deliberate cost, asserted rather than left implicit ----------
+        #
+        # `permissions:` is legitimate and harmless. It is RED here on purpose:
+        # a new top-level key on a job whose whole job is to prove 11 phases is a
+        # review event even when benign. If this case ever stops being red, the
+        # allow-list has been widened without anyone deciding to widen it.
+        ("`permissions:` — LEGITIMATE, and red by design", job_attr("    permissions:\n      contents: read\n"), R_UNKNOWN_KEY),
         # --- the document model itself ---------------------------------------
         (
             "a second `steps:` section in one job",
@@ -852,6 +914,25 @@ def universe_controls(wf: str) -> list[tuple[str, str]]:
             "an unrelated JOB given `needs:`",
             wf.replace("  installer-tests:\n",
                        "  installer-tests:\n    needs: [no-bash-policy]\n", 1),
+        ),
+        # The allow-list's blast radius, asserted. An unjudged job carrying EVERY
+        # form the allow-list rejects must still be green: the universe is three
+        # jobs, and a gate that reached further would red on ordinary workflow
+        # edits made by people who have never heard of it.
+        (
+            "an unrelated JOB carrying every rejected form at once",
+            wf.replace(
+                "  installer-tests:\n",
+                "  installer-tests:\n"
+                "    needs: [no-bash-policy]\n"
+                "    if: always()\n"
+                "    continue-on-error: true\n"
+                "    environment: production\n"
+                "    container: alpine\n"
+                "    permissions:\n      contents: read\n"
+                "    strategy:\n      matrix:\n        include: []\n",
+                1,
+            ),
         ),
     ]
 

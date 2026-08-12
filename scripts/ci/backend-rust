@@ -85,11 +85,22 @@
 # regression.
 #
 # Provenance, because it has been misattributed once already: those three flags
-# arrived with the original extraction, not with the later errexit fix. The fix
-# addressed one thing — under the earlier `( ... ) || rc=$?`, bash suppressed
-# errexit for the subshell while `-u` still aborted and `pipefail` still computed
-# the pipe's status with nothing to act on it. Restoring errexit is the whole
-# delta; no new class of strictness was introduced with it.
+# arrived with the original extraction, not with the later errexit fix.
+#
+# What that fix actually changed, measured per flag rather than asserted. Under
+# the earlier `( ... ) || rc=$?` bash suppressed errexit for the subshell, and
+# only errexit:
+#
+#   -u        still fatal — an unbound variable aborted regardless
+#   pipefail  still computed the pipe's status. Without errexit a failing
+#             INTERMEDIATE pipeline could continue and have its status
+#             overwritten by a later command; a TERMINAL one still set the
+#             subshell's status, which the `||` then acted on
+#   errexit   suppressed — this is the whole delta the fix restores
+#
+# The intermediate/terminal split is why the earlier wording here ("nothing to
+# act on it") was wrong and was corrected in review: it was generalised from the
+# intermediate case alone, and the terminal case behaves the other way.
 #
 # ## Usage
 #
