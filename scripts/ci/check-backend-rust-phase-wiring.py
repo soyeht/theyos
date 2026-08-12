@@ -63,6 +63,7 @@ the workflow diff, not this file.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 from pathlib import Path
@@ -192,6 +193,117 @@ def evaluate(cmd: str, wf: str) -> tuple[list[str], dict[str, int]]:
     return errs, counts
 
 
+def harness(cmd: str, phases: list[str], extra: str = "") -> str:
+    """The real header and the real dispatcher, with toy phases spliced in.
+
+    Faithfulness is the entire point and it rests on this splice: everything
+    outside `PHASES=( ... )` and the `phase_*` bodies is copied verbatim, so
+    `validate_registry`, `run_phase` and `main` under test are the ones that
+    ship. Weaken the membership check in the real file and these runtime cases
+    inherit the weakening and fail — which is asserted below rather than
+    assumed, because a harness that quietly reimplemented the dispatcher would
+    keep passing while the shipped code rotted.
+
+    Toy phases rather than the real ones because the real bodies invoke cargo.
+    """
+    head = cmd[: cmd.index("PHASES=(")]
+    tail = cmd[cmd.index("usage() {") :]
+    body = "PHASES=(\n" + "".join(f"  {p}\n" for p in phases) + ")\n\n"
+    for p in dict.fromkeys(phases):
+        body += f'phase_{p.replace("-", "_")}() {{ echo "RAN-{p}"; }}\n'
+    return head + body + extra + "\n" + tail
+
+
+def run_harness(text: str, arg: str) -> tuple[int, str]:
+    import subprocess
+    import tempfile
+
+    with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as fh:
+        fh.write(text)
+        path = fh.name
+    try:
+        p = subprocess.run(
+            ("bash", path, arg), capture_output=True, text=True, timeout=60
+        )
+        return p.returncode, p.stdout + p.stderr
+    finally:
+        os.unlink(path)
+
+
+def runtime_self_test(cmd: str) -> None:
+    """Prove the dispatcher refuses everything outside the registry.
+
+    The structural gate above cannot see this layer at all. Measured: delete the
+    membership test from `run_phase` and the three sets are untouched, so the
+    structural gate stays green while a `phase_*` function outside PHASES
+    becomes directly callable again — rc=0, body executed. Without the cases
+    below, this file would certify a dispatcher whose registry had stopped
+    governing it.
+    """
+    ok = harness(cmd, ["one", "two", "three"], 'phase_orphan() { echo "RAN-orphan"; }')
+    dup = harness(cmd, ["one", "one", "two"])
+
+    rc, _ = run_harness(ok, "no-such-phase")
+    if rc == 0:
+        raise SystemExit("RUNTIME SELF-TEST FAILED: unknown phase name exited 0")
+    print("  self-test  runtime: unknown name refused")
+
+    rc, out = run_harness(ok, "orphan")
+    if rc == 0 or "RAN-orphan" in out:
+        raise SystemExit(
+            "RUNTIME SELF-TEST FAILED: a phase_* function outside PHASES was "
+            f"dispatchable (rc={rc}, body ran={'RAN-orphan' in out}). The "
+            "registry has stopped governing execution."
+        )
+    print("  self-test  runtime: unregistered function refused, body did not run")
+
+    rc, out = run_harness(dup, "one")
+    if rc == 0 or "RAN-one" in out:
+        raise SystemExit(
+            f"RUNTIME SELF-TEST FAILED: duplicate PHASES entry ran anyway (rc={rc})"
+        )
+    print("  self-test  runtime: duplicate registry entry refused before dispatch")
+
+    rc, out = run_harness(ok, "two")
+    if rc != 0 or out.count("RAN-two") != 1:
+        raise SystemExit(
+            f"RUNTIME SELF-TEST FAILED: a valid phase ran {out.count('RAN-two')} "
+            f"time(s) with rc={rc}, expected exactly 1 and rc=0"
+        )
+    print("  self-test  runtime: a valid phase runs exactly once")
+
+    rc, out = run_harness(ok, "all")
+    ran = [ln[4:] for ln in out.splitlines() if ln.startswith("RAN-")]
+    if rc != 0 or ran != ["one", "two", "three"]:
+        raise SystemExit(
+            f"RUNTIME SELF-TEST FAILED: `all` ran {ran}, expected each phase once "
+            "in registry order"
+        )
+    print("  self-test  runtime: `all` runs each phase once, in registry order")
+
+    # NEGATIVE CONTROL on the runtime cases themselves. Strip the membership
+    # test out of the copy under test; the orphan case MUST start passing. If it
+    # does not, these cases are not bound to the shipped dispatcher — they would
+    # be testing the harness's own text and would survive the defect they exist
+    # to catch.
+    start = cmd.find("  # MEMBERSHIP FIRST")
+    end = cmd.find('  local fn="phase_${phase//-/_}"')
+    if start == -1 or end == -1 or end <= start:
+        raise SystemExit(
+            "RUNTIME SELF-TEST INVALID: cannot locate the membership check in "
+            "run_phase, so its removal cannot be simulated"
+        )
+    crippled = harness(cmd[:start] + cmd[end:], ["one", "two"], 'phase_orphan() { echo "RAN-orphan"; }')
+    rc, out = run_harness(crippled, "orphan")
+    if rc != 0 or "RAN-orphan" not in out:
+        raise SystemExit(
+            "RUNTIME SELF-TEST INVALID: with the membership check removed the "
+            f"orphan case still refused (rc={rc}). These cases are not measuring "
+            "the shipped dispatcher."
+        )
+    print("  self-test  runtime: negative control — removing the check reopens it")
+
+
 def self_test(cmd: str, wf: str) -> None:
     """Every mutation below must be caught. If one is not, refuse to report.
 
@@ -229,6 +341,8 @@ def self_test(cmd: str, wf: str) -> None:
     if errs:
         raise SystemExit(f"SELF-TEST FAILED: the unmutated tree is red: {errs}")
     print("  self-test  clean tree stays green")
+
+    runtime_self_test(cmd)
 
 
 def main() -> int:
