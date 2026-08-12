@@ -469,6 +469,36 @@ jobs:
             *) echo "::error::graph gate reported SKIPs (${summary}); a skipped configuration is not a pass"; exit 1 ;;
           esac
 
+  backend-rust-command-contract:
+    name: Backend Rust command contract
+    # Its own job, under its own name, deliberately not folded into
+    # "No-Bash Policy Check". That job publishes a context whose name promises a
+    # bash policy; a phase-wiring contract riding inside it would be a different
+    # guarantee reported under a false label, and a required context is read by
+    # its name — nobody inspects which steps produced it.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Phase wiring gate self-test
+        # First, because a three-set comparison that has never been observed to
+        # fail is indistinguishable from one that returns success
+        # unconditionally. This mutates the pair in memory — a function dropped
+        # from PHASES, an entry with no function, an invocation demoted to a
+        # comment, this gate's own step replaced by an echo — and requires each
+        # to be caught before any real verdict is allowed to print.
+        run: |
+          python3 -m py_compile scripts/ci/check-backend-rust-phase-wiring.py
+          python3 scripts/ci/check-backend-rust-phase-wiring.py --self-test
+      - name: Phase wiring gate (live)
+        # PHASES must equal the phase_* functions must equal the phases each Rust
+        # job actually invokes, per job and without duplicates. `backend-rust all`
+        # is a published interface; if the registry stops governing execution the
+        # enumeration and the executed set drift apart, and the quiet direction —
+        # `all` covering less than CI — goes unnoticed.
+        run: python3 scripts/ci/check-backend-rust-phase-wiring.py
+
   no-bash-policy:
     name: No-Bash Policy Check
     runs-on: ubuntu-latest

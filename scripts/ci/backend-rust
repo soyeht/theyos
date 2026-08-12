@@ -329,12 +329,53 @@ usage() {
   printf '  %s\n' "${PHASES[@]}" >&2
 }
 
+validate_registry() {
+  # PHASES is the registry, so it has to be well-formed before it can govern
+  # anything. Checked once, at startup, on every invocation — a duplicate here
+  # would make `all` run a phase twice and would make the membership test below
+  # ambiguous.
+  local seen=() p q
+  for p in "${PHASES[@]}"; do
+    for q in "${seen[@]-}"; do
+      if [ "$p" = "$q" ]; then
+        printf 'PHASES contains a duplicate: %s\n' "$p" >&2
+        return 2
+      fi
+    done
+    if ! declare -F "phase_${p//-/_}" >/dev/null; then
+      printf 'PHASES lists %s but phase_%s() is not defined\n' "$p" "${p//-/_}" >&2
+      return 2
+    fi
+    seen+=("$p")
+  done
+}
+
 run_phase() {
   local phase="$1"
+
+  # MEMBERSHIP FIRST, and this ordering is the whole point. Resolving
+  # `phase_${name//-/_}` by `declare -F` and calling it — which is what this
+  # function used to do — never consults PHASES, so a phase_* function that
+  # exists but was left out of the array was still dispatchable: its own CI step
+  # passed, rc=0, while `--list` omitted it and `all` skipped it in silence.
+  # That splits the published enumeration from what actually executes, and this
+  # command publishes `all` as its interface. Measured before the fix: a defined
+  # but unlisted phase returned 0 on a direct call and never appeared in `all`.
+  #
+  # So PHASES is the registry, not a display list, and nothing outside it runs.
+  local known=0 p
+  for p in "${PHASES[@]}"; do
+    [ "$p" = "$phase" ] && known=$((known + 1))
+  done
+  if ((known == 0)); then
+    printf 'unknown phase: %s (not a member of PHASES)\n' "$phase" >&2
+    usage
+    return 2
+  fi
+
   local fn="phase_${phase//-/_}"
   if ! declare -F "$fn" >/dev/null; then
-    printf 'unknown phase: %s\n' "$phase" >&2
-    usage
+    printf 'phase %s is registered but phase_%s() is missing\n' "$phase" "${phase//-/_}" >&2
     return 2
   fi
 
@@ -367,6 +408,7 @@ main() {
     usage
     return 2
   fi
+  validate_registry || return $?
   case "$1" in
     --list | -l)
       printf '%s\n' "${PHASES[@]}"
