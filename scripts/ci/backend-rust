@@ -60,9 +60,13 @@
 #
 # ## Each phase runs in a subshell, starting at the repository root
 #
-# That reproduces a GitHub step exactly: a step begins in $GITHUB_WORKSPACE with
-# only job-level env, so a `cd` or an `export` in one step is invisible to the
-# next. Without the subshell the copied bodies would be wrong in two ways at
+# That reproduces a GitHub step's STARTING STATE — cwd and environment
+# isolation, nothing wider. A step begins in $GITHUB_WORKSPACE with only
+# job-level env, so a `cd` or an `export` in one step is invisible to the next.
+# The equivalence claimed here is exactly that and stops there: shell strictness
+# differs, and the section below says how.
+#
+# Without the subshell the copied bodies would be wrong in two ways at
 # once — `clippy-workspace` leaves the shell inside `admin/rust`, so the next
 # phase's `cd admin/rust` fails, and `excluded-members` would leak
 # THEYOS_REQUIRE_NOISE_INTEROP into every phase after it. Both are scope
@@ -71,11 +75,21 @@
 #
 # ## Shell strictness
 #
-# GitHub runs `run:` blocks under `bash -e`; this script adds `-u`, `-o pipefail`
-# and `-E`. That is stricter, so it is a behaviour change worth stating rather
-# than assuming away — and today it is provably empty: no phase body contains a
-# pipeline or references a variable, so there is nothing for the extra flags to
-# act on. They exist for what gets added next.
+# GitHub runs `run:` blocks under `bash -e`; this script's top-level `set` adds
+# `-u`, `-o pipefail` and `-E`. That is stricter, so it is a behaviour change
+# worth stating rather than assuming away — and today its radius is measured and
+# empty: across the 11 phase bodies there are zero pipelines and zero variable
+# references, so the extra flags have nothing to act on. They exist for what
+# gets added next, and a future body with an unset variable or a pipeline goes
+# RED by this contract, which is a deliberate review point rather than a
+# regression.
+#
+# Provenance, because it has been misattributed once already: those three flags
+# arrived with the original extraction, not with the later errexit fix. The fix
+# addressed one thing — under the earlier `( ... ) || rc=$?`, bash suppressed
+# errexit for the subshell while `-u` still aborted and `pipefail` still computed
+# the pipe's status with nothing to act on it. Restoring errexit is the whole
+# delta; no new class of strictness was introduced with it.
 #
 # ## Usage
 #

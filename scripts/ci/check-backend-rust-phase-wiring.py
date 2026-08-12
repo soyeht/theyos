@@ -80,10 +80,33 @@ PHASE_CALL = re.compile(r"^scripts/ci/backend-rust ([a-z0-9][a-z0-9-]*)$")
 SELF_TEST_CMD = f"python3 {SELF} --self-test"
 LIVE_CMD = f"python3 {SELF}"
 
-# Attributes that make a step or job stop being an unconditional, load-bearing
-# invocation. `shell` is here with the other two because changing the shell
-# changes how a failure propagates, which is the property being asserted.
-DISQUALIFYING = ("if", "continue-on-error", "shell")
+# Attributes that make a step or a job stop being an unconditional, load-bearing
+# invocation. `shell` sits with the other two because changing the shell changes
+# how a failure propagates, which is the property being asserted.
+#
+# The two levels are listed separately because they are not the same set, and
+# collapsing them is what hid `needs` for a whole review cycle: it is a job key
+# with no step-level meaning, so a single shared tuple had no natural place for
+# it and it was simply never considered.
+STEP_DISQUALIFYING = ("if", "continue-on-error", "shell")
+
+# `needs` belongs here and its absence was a real fail-open, found in review.
+#
+# The property, stated precisely rather than dramatically: `needs` makes a judged
+# job CONDITIONAL ON ANOTHER JOB'S OUTCOME. If the dependency is skipped, this
+# job can be skipped without any failure of its own. If the dependency fails, the
+# workflow may well already be red upstream — but this job has stopped proving
+# its own 11 phases, and that is the thing the contract is about. Every step
+# below it still reads as unconditional, and this gate would still count a full
+# set of invocations for a job that ran nothing.
+#
+# The requirement is that both judged jobs are load-bearing BY THEMSELVES. A red
+# arriving from somewhere else is not this gate's evidence.
+#
+# Any `needs` disqualifies, including an empty one and any future spelling. A
+# legitimate dependency on these jobs is not forbidden; it is required to be a
+# visible decision here, the same contract the other three already carry.
+JOB_DISQUALIFYING = STEP_DISQUALIFYING + ("needs",)
 
 
 class Malformed(SystemExit):
@@ -161,7 +184,12 @@ def parse_workflow(text: str) -> tuple[dict, str | None]:
         if indent == 2 and body.endswith(":") and not body.startswith("- "):
             close_step()
             job = body[:-1]
-            jobs[job] = {"attrs": {}, "defaults_shell": None, "steps": []}
+            jobs[job] = {
+                "attrs": {},
+                "defaults_shell": None,
+                "steps": [],
+                "seen_steps": False,
+            }
             in_steps = False
             continue
 
@@ -171,6 +199,24 @@ def parse_workflow(text: str) -> tuple[dict, str | None]:
         if indent == 4:
             close_step()
             in_steps = body == "steps:"
+            if in_steps:
+                # A SECOND `steps:` in one job is refused, never merged. Tracked
+                # on the job itself rather than inferred from `in_steps`, which
+                # is reset by every intervening key and so cannot answer "has
+                # this job already had a steps section?".
+                #
+                # Merging was the old behaviour and it modelled no YAML that
+                # exists: every real parser either errors on a duplicate key or
+                # keeps exactly one of the two. A gate whose document model is
+                # weaker than the one CI uses can be handed a file where the
+                # list it reads is not the list that runs.
+                if jobs[job]["seen_steps"]:
+                    raise Malformed(
+                        f"job {job}: a second `steps:` section — duplicate keys "
+                        "are not merged, and this gate refuses to guess which "
+                        "list runs"
+                    )
+                jobs[job]["seen_steps"] = True
             if not in_steps and ":" in body:
                 key, _, val = body.partition(":")
                 key = key.strip()
@@ -216,8 +262,6 @@ def parse_workflow(text: str) -> tuple[dict, str | None]:
             if key in step:
                 raise Malformed(f"job {job}: duplicated step key {key!r}")
             step[key] = val
-            if key == "run":
-                step["run_is_block"] = val.startswith("|") or val.startswith(">")
 
     close_step()
     return jobs, wf_shell
@@ -233,19 +277,33 @@ def load_bearing(job: dict, step: dict, wf_shell: str | None) -> bool:
     """
     if wf_shell is not None or job["defaults_shell"] is not None:
         return False
-    if any(a in job["attrs"] for a in DISQUALIFYING):
+    if any(a in job["attrs"] for a in JOB_DISQUALIFYING):
         return False
-    return not any(a in step for a in DISQUALIFYING)
+    return not any(a in step for a in STEP_DISQUALIFYING)
 
 
 def command_of(step: dict) -> str | None:
-    """The step's command, only if it is a one-line `run:` scalar.
+    """The step's `run:` value, whatever it is. Matching happens at the caller.
 
-    A block scalar returns None: a candidate command must be exactly the
-    invocation, so no wrapper, prefix, pipeline, `;`, `||` or `&` can ride along.
+    A candidate command must be EXACTLY the invocation — no wrapper, prefix,
+    pipeline, `;`, `||` or `&` riding along — and that is enforced by the
+    anchored comparisons in `invoked` and `gate_steps`, not here.
+
+    Block scalars need no special case, and an earlier version's `run_is_block`
+    flag was dead code: for `run: |` this narrow parser records the header `|`
+    as the value, which matches no command. Review measured it — removing the
+    flag entirely left all mutations, controls and runtime cases passing, so the
+    guard's comment credited a protection nothing exercised. It is gone rather
+    than paired with a new case invented to justify it.
+
+    What keeps the block-scalar mutation honest is the mutation itself: it must
+    stay RED through the missing-phase diagnosis. If anyone later widens this
+    function to reconstruct a block scalar's body, that case turns green and the
+    self-test fails, which is the alarm the dead flag was pretending to be.
+
     `uses:` is not `run:` and can never satisfy this contract.
     """
-    if "run" not in step or step.get("run_is_block"):
+    if "run" not in step:
         return None
     return step["run"] or None
 
@@ -573,6 +631,23 @@ def runtime_self_test(cmd: str) -> None:
     print("  self-test  runtime: negative control — removing the check reopens it")
 
 
+# The one error the count tripwire raises. Filtered out before a mutation is
+# allowed to count as caught: it fires as a co-symptom on almost every real
+# failure, so a mutation that produced ONLY this would be red for a reason that
+# says nothing about the defect it models.
+TRIPWIRE_MARK = "the jobs share"
+
+# Expected-reason fragments, named once so a case and its assertion cannot drift.
+R_MISSING = "never invokes"          # a phase the job no longer runs
+R_NONMEMBER = "invokes non-members"  # a phase not in the registry
+R_ORPHAN = "defined but not in PHASES"
+R_UNDEFINED = "in PHASES but not defined"
+R_DUP_REG = "PHASES contains duplicates"
+R_SELF_TEST = "`--self-test` invocation"
+R_LIVE = "load-bearing live invocation"
+MALFORMED = "MALFORMED:"             # prefix: the case must RAISE, not return
+
+
 def fail_open_cases(wf: str, victim: str, step: str) -> list[tuple[str, str]]:
     """Every way a step can be in the file and still not gate anything.
 
@@ -609,34 +684,71 @@ def fail_open_cases(wf: str, victim: str, step: str) -> list[tuple[str, str]]:
         return phase_step(f"        {step}{s}\n")
 
     linux = "  build-and-test-linux:\n"
+
+    def job_attr(text: str) -> str:
+        return wf.replace(linux, linux + text, 1)
+
     cases = [
         # --- the step is present but conditional or advisory -----------------
-        ("step conditional (`if: always()` — it still RUNS)", attr("if: always()")),
-        ("step advisory (`continue-on-error: true`)", attr("continue-on-error: true")),
-        ("step under a custom shell", attr("shell: bash")),
+        ("step conditional (`if: always()` — it still RUNS)", attr("if: always()"), R_MISSING),
+        ("step advisory (`continue-on-error: true`)", attr("continue-on-error: true"), R_MISSING),
+        ("step under a custom shell", attr("shell: bash"), R_MISSING),
         # --- the command runs but its status is discarded --------------------
-        ("status discarded by `|| true`", suffix(" || true")),
-        ("status replaced by a following `;` command", suffix("; true")),
-        ("status taken by the last stage of a pipeline", suffix(" | tee /dev/null")),
-        ("backgrounded with `&` — the step waits for nothing", suffix(" &")),
+        ("status discarded by `|| true`", suffix(" || true"), R_MISSING),
+        ("status replaced by a following `;` command", suffix("; true"), R_MISSING),
+        ("status taken by the last stage of a pipeline", suffix(" | tee /dev/null"), R_MISSING),
+        ("backgrounded with `&` — the step waits for nothing", suffix(" &"), R_MISSING),
         # --- the command is not the command ----------------------------------
-        ("wrapped in `echo`, so it only prints", phase_step(line.replace("run: ", "run: echo "))),
+        ("wrapped in `echo`, so it only prints", phase_step(line.replace("run: ", "run: echo ")), R_MISSING),
         (
             "moved into a block scalar, which can hide a wrapper",
             phase_step(f"        run: |\n          scripts/ci/backend-rust {victim}\n"),
+            R_MISSING,
         ),
-        ("`uses:` a composite action instead of `run:`", phase_step(f"        uses: ./.github/actions/{victim}\n")),
+        ("`uses:` a composite action instead of `run:`", phase_step(f"        uses: ./.github/actions/{victim}\n"), R_MISSING),
         # --- the whole job stops being load-bearing --------------------------
-        ("job conditional (`if:` on build-and-test-linux)", wf.replace(linux, linux + "    if: always()\n", 1)),
-        ("job advisory (`continue-on-error:` on the job)", wf.replace(linux, linux + "    continue-on-error: true\n", 1)),
+        ("job conditional (`if:` on build-and-test-linux)", job_attr("    if: always()\n"), R_MISSING),
+        ("job advisory (`continue-on-error:` on the job)", job_attr("    continue-on-error: true\n"), R_MISSING),
         (
             "job-level `defaults.run.shell`",
-            wf.replace(linux, linux + "    defaults:\n      run:\n        shell: bash\n", 1),
+            job_attr("    defaults:\n      run:\n        shell: bash\n"),
+            R_MISSING,
+        ),
+        # --- `needs:`, in every spelling -------------------------------------
+        #
+        # All four forms are here because review measured that the FAIL-OPEN is
+        # identical across them while what the parser stores is not:
+        #
+        #   needs: [x]      attrs['needs'] = '[x]'      members visible
+        #   needs: x        attrs['needs'] = 'x'        members visible
+        #   needs: ['x']    attrs['needs'] = "['x']"    members visible
+        #   needs:          attrs['needs'] = ''         MEMBERS LOST — the block
+        #     - x                                       list is skipped entirely
+        #
+        # That asymmetry decides the predicate. Testing key PRESENCE catches all
+        # four; anything transitive ("only disqualify if the needed job is
+        # itself conditional") is structurally blind to the block form, because
+        # there are no members left to follow — it would look like a smarter fix
+        # and cover the class minus one form, which is precisely the defect being
+        # closed here. Each form is its own case so that a future change to the
+        # predicate cannot quietly lose one.
+        ("job `needs:` — flow list", job_attr("    needs: [installer-tests]\n"), R_MISSING),
+        ("job `needs:` — bare scalar", job_attr("    needs: installer-tests\n"), R_MISSING),
+        ("job `needs:` — quoted flow list", job_attr("    needs: ['installer-tests']\n"), R_MISSING),
+        ("job `needs:` — BLOCK list (members not parsed)", job_attr("    needs:\n      - installer-tests\n"), R_MISSING),
+        # --- the document model itself ---------------------------------------
+        (
+            "a second `steps:` section in one job",
+            wf.replace("  build-and-test-macos:\n",
+                       "    steps:\n      - name: the only list that runs\n"
+                       "        run: echo nothing\n  build-and-test-macos:\n", 1),
+            MALFORMED + "a second `steps:` section",
         ),
         # --- the whole WORKFLOW stops being load-bearing ---------------------
         (
             "workflow-level `defaults.run.shell`",
             wf.replace("\njobs:\n", "\ndefaults:\n  run:\n    shell: bash\njobs:\n", 1),
+            R_MISSING,
         ),
     ]
 
@@ -655,7 +767,8 @@ def fail_open_cases(wf: str, victim: str, step: str) -> list[tuple[str, str]]:
                 f"SELF-TEST INVALID: expected exactly 1 {name} step, found "
                 f"{wf.count(gate_line)}"
             )
-        cases.append((f"the gate's own {name} step deleted", wf.replace(gate_line, "", 1)))
+        want = R_SELF_TEST if name == "self-test" else R_LIVE
+        cases.append((f"the gate's own {name} step deleted", wf.replace(gate_line, "", 1), want))
         cases.append(
             (
                 f"the gate's own {name} step duplicated",
@@ -664,6 +777,7 @@ def fail_open_cases(wf: str, victim: str, step: str) -> list[tuple[str, str]]:
                     gate_line + f"      - name: {name} (copy)\n" + gate_line,
                     1,
                 ),
+                want,
             )
         )
 
@@ -729,6 +843,16 @@ def universe_controls(wf: str) -> list[tuple[str, str]]:
             "an unrelated JOB made conditional",
             wf.replace("  installer-tests:\n", "  installer-tests:\n    if: always()\n", 1),
         ),
+        # Paired with the four `needs:` mutations above. Without it the battery
+        # would gain four cases all pulling the same way and no case proving the
+        # new key is judged only where it matters — `needs:` is ordinary and
+        # common, and a gate that reds on it anywhere in the file would be
+        # over-reaching into every job it does not judge.
+        (
+            "an unrelated JOB given `needs:`",
+            wf.replace("  installer-tests:\n",
+                       "  installer-tests:\n    needs: [no-bash-policy]\n", 1),
+        ),
     ]
 
 
@@ -789,27 +913,61 @@ def self_test(cmd: str, wf: str) -> None:
     step = f"run: scripts/ci/backend-rust {victim}"
     macos_at = wf.index("  build-and-test-macos:")
 
-    cases: list[tuple[str, str, str]] = [
-        ("function defined but absent from PHASES", cmd.replace(f"  {victim}\n)", ")"), wf),
-        ("PHASES entry with no function", re.sub(rf"{fn}\(\) \{{.*?\n\}}\n", "", cmd, flags=re.S), wf),
-        ("workflow invokes a non-member", cmd, wf.replace(step, "run: scripts/ci/backend-rust ghost-phase", 1)),
-        ("phase missing from one job only", cmd, wf[:macos_at] + wf[macos_at:].replace(f"        {step}\n", "", 1)),
-        ("duplicate entry in PHASES", cmd.replace(f"  {victim}\n)", f"  {victim}\n  {victim}\n)"), wf),
-        ("invocation present only in a comment", cmd, wf.replace(f"        {step}", f"        run: /bin/true\n        # {step}", 1)),
-        ("the gate's own step replaced by an echo", cmd, wf.replace(SELF, "echo neutered")),
+    cases: list[tuple[str, str, str, str]] = [
+        ("function defined but absent from PHASES", cmd.replace(f"  {victim}\n)", ")"), wf, R_ORPHAN),
+        ("PHASES entry with no function", re.sub(rf"{fn}\(\) \{{.*?\n\}}\n", "", cmd, flags=re.S), wf, R_UNDEFINED),
+        ("workflow invokes a non-member", cmd, wf.replace(step, "run: scripts/ci/backend-rust ghost-phase", 1), R_NONMEMBER),
+        ("phase missing from one job only", cmd, wf[:macos_at] + wf[macos_at:].replace(f"        {step}\n", "", 1), R_MISSING),
+        ("duplicate entry in PHASES", cmd.replace(f"  {victim}\n)", f"  {victim}\n  {victim}\n)"), wf, R_DUP_REG),
+        ("invocation present only in a comment", cmd, wf.replace(f"        {step}", f"        run: /bin/true\n        # {step}", 1), R_MISSING),
+        ("the gate's own step replaced by an echo", cmd, wf.replace(SELF, "echo neutered"), R_SELF_TEST),
     ]
-    cases += [(label, cmd, mw) for label, mw in fail_open_cases(wf, victim, step)]
+    cases += [(label, cmd, mw, want) for label, mw, want in fail_open_cases(wf, victim, step)]
 
-    for label, mc, mw in cases:
+    n_caught = n_refused = 0
+    for label, mc, mw, want in cases:
         if mc == cmd and mw == wf:
             raise SystemExit(f"SELF-TEST INVALID: mutation '{label}' changed nothing")
-        errs, _ = evaluate(mc, mw)
-        if not errs:
+
+        # A case that must make the parser REFUSE, rather than report.
+        if want.startswith(MALFORMED):
+            needle = want[len(MALFORMED):]
+            try:
+                evaluate(mc, mw)
+            except Malformed as e:
+                if needle not in str(e):
+                    raise SystemExit(
+                        f"SELF-TEST FAILED: '{label}' raised Malformed but not for "
+                        f"the expected reason. wanted {needle!r}, got {str(e)!r}"
+                    )
+                print(f"  self-test  refused: {label}  [{needle}]")
+                n_refused += 1
+                continue
             raise SystemExit(
-                f"SELF-TEST FAILED: '{label}' was not detected. The gate does not "
-                "discriminate; its green verdict would mean nothing."
+                f"SELF-TEST FAILED: '{label}' did not raise Malformed. The parser "
+                "accepted a document shape it cannot model."
             )
-        print(f"  self-test  caught: {label}")
+
+        errs, _ = evaluate(mc, mw)
+        # THE REASON IS PART OF THE ASSERTION, not something read afterwards.
+        # "errs is non-empty" accepts a red produced by any side effect of the
+        # edit, so a case can pass while testing something other than its label.
+        # The count tripwire is stripped first because it rides along on nearly
+        # every genuine failure and would satisfy a naive check on its own.
+        substantive = [e for e in errs if TRIPWIRE_MARK not in e]
+        if not substantive:
+            raise SystemExit(
+                f"SELF-TEST FAILED: '{label}' produced no substantive error "
+                f"(only the count tripwire, if anything): {errs}. A mutation red "
+                "solely by the tripwire says nothing about the defect it models."
+            )
+        if not any(want in e for e in substantive):
+            raise SystemExit(
+                f"SELF-TEST FAILED: '{label}' was caught for the WRONG REASON. "
+                f"expected an error containing {want!r}, got {substantive}"
+            )
+        print(f"  self-test  caught: {label}  [{want}]")
+        n_caught += 1
 
     for label, mw in universe_controls(wf):
         if mw == wf:
@@ -830,8 +988,13 @@ def self_test(cmd: str, wf: str) -> None:
     errs, _ = evaluate(cmd, wf)
     if errs:
         raise SystemExit(f"SELF-TEST FAILED: the unmutated tree is red: {errs}")
-    print(f"  self-test  {len(cases)} mutations caught, "
-          f"{len(universe_controls(wf))} controls left unjudged, clean tree green")
+    # The summary must decompose the way the log above does. An earlier version
+    # printed "30 mutations caught" while the lines it summarised read 29
+    # `caught` and 1 `refused` — a total that contradicts its own detail, and the
+    # kind of number that gets quoted onward without the log beside it.
+    print(f"  self-test  {n_caught} mutations caught, {n_refused} malformed "
+          f"document refused, {len(universe_controls(wf))} controls left "
+          f"unjudged, clean tree green")
 
     runtime_self_test(cmd)
 
