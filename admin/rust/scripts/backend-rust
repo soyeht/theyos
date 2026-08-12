@@ -481,11 +481,23 @@ main() {
     --check-root)
       # Print the RESOLVED root and prove it is the repository, by looking for a
       # marker only the real root has. Exists so the wiring gate can test this by
-      # VALUE — running the script and comparing to `git rev-parse --show-toplevel`
-      # — instead of counting `../` in the source. A textual check would have to
-      # know this file's depth, which is exactly the fact that changes when the
-      # file moves, so it would agree with whatever the file says and confirm
-      # nothing.
+      # VALUE — running this script from a temporary directory and comparing the
+      # printed path against the root the CHECKER derives from its own location
+      # (`Path(__file__).resolve().parents[2]`), which is an independent path
+      # arithmetic in a different file at a different depth. No git command is
+      # involved on either side.
+      #
+      # An earlier version of this comment credited a git plumbing command as
+      # the comparator. It never was one; review caught the description, not a
+      # defect in the mechanism. The command is not named here so that a search
+      # for it does not match this retraction — a comment naming the wrong
+      # authority is worse than none, because it tells the next reader to trust
+      # a check that is not running.
+      #
+      # Textual verification is impossible here in principle: a grep would have
+      # to know this file's depth, which is exactly the fact that changes when
+      # the file moves, so it would agree with whatever the file says and
+      # confirm nothing.
       if [ ! -d "$REPO_ROOT/.git" ] && [ ! -f "$REPO_ROOT/.git" ]; then
         printf 'REPO_ROOT does not look like a repository root: %s\n' "$REPO_ROOT" >&2
         return 1

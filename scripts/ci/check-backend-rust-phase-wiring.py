@@ -127,6 +127,65 @@ STEP_DISQUALIFYING = ("if", "continue-on-error", "shell")
 CONTRACT_JOB = "backend-rust-command-contract"
 JOB_KEY_ALLOWLIST = frozenset({"name", "runs-on", "timeout-minutes"})
 
+# THE ALLOW-LIST WAS STILL ON THE WRONG AXIS, ONE LEVEL DOWN.
+#
+# Naming the permitted keys says nothing about their VALUES, and a value can stop
+# a job as thoroughly as an extra key. Measured in review: setting the contract
+# job's `runs-on` to `[self-hosted, theyos-runner-that-does-not-exist]` — valid
+# GitHub grammar, since a label array requires a runner satisfying every label —
+# means the job is never dispatched, while this gate returned no errors at all.
+# The instrument can be switched off by editing a key it already permits.
+#
+# So the contract is POSITIVE on both axes: these keys must be PRESENT, and each
+# must carry the exact value this job is supposed to carry.
+#
+# The contract is EXACT and PER JOB, not a global set of admitted values. A
+# global set would let the Linux job claim macOS's runner, or either job take the
+# contract job's 5-minute budget, and every one of those is a real change to what
+# CI proves while the gate stayed quiet.
+#
+# All three keys are load-bearing, which is why all three are pinned — but the
+# reason `name` matters is NOT the same for all three jobs, and saying so
+# uniformly would be false:
+#
+#   name              on build-and-test-linux and build-and-test-macos it is the
+#                     CHECK CONTEXT branch protection requires, so a rename
+#                     silently removes a context that was supposed to be required.
+#                     On backend-rust-command-contract it is NOT protected — that
+#                     job is deliberately outside main's required set — so the pin
+#                     holds the published identity the body, the logs and this
+#                     gate all name, and claims no protection it does not have.
+#   runs-on           decides whether the job is dispatched at all
+#   timeout-minutes   is the budget; shrink it and the phases stop finishing
+#
+# The parser stores raw strings, so the comparison is exact string equality.
+JOB_CONTRACT = {
+    "build-and-test-linux": {
+        "name": "Build & Test (Rust / Linux)",
+        "runs-on": "ubuntu-latest",
+        "timeout-minutes": "75",
+    },
+    "build-and-test-macos": {
+        "name": "Build & Test (Rust / macOS)",
+        "runs-on": "macos-15",
+        "timeout-minutes": "75",
+    },
+    CONTRACT_JOB: {
+        "name": "Backend Rust command contract",
+        "runs-on": "ubuntu-latest",
+        "timeout-minutes": "5",
+    },
+}
+REQUIRED_JOB_KEYS = ("name", "runs-on", "timeout-minutes")
+
+# The self-referential limit, stated honestly rather than overclaimed. A value —
+# or an `if:` — on the CONTRACT JOB itself can prevent this checker from running,
+# and a check that does not run reports nothing. The earlier text claimed only
+# deleting the whole job could silence it; that was too narrow. The backstop for
+# this class is branch protection and review of the workflow diff, not this file,
+# and `Backend Rust command contract` is deliberately not among main's required
+# contexts — so its absence does not block a merge on its own.
+
 
 class Malformed(SystemExit):
     """Raised instead of guessing. Every branch here is a deliberate refusal."""
@@ -421,6 +480,34 @@ def assert_command_location(wf: str, cmd_path: Path) -> list[str]:
             "namespace that P28 governs. It lives in admin/rust/scripts/ "
             "deliberately; moving it back needs a policy decision, not an edit."
         )
+
+    # THE RETIRED PATH MUST NOT EXIST ON DISK — checked by stat, not by config.
+    #
+    # The previous version asked only whether the CONFIGURED command sat under
+    # `scripts/`, which is a question about this file's constant. Review planted
+    # a byte-identical 100755 copy at the retired path while leaving the
+    # canonical one in place, and this gate returned rc=0: the copy is invisible
+    # to `no-bash-policy` too, because it has no `.sh` extension. So the body's
+    # claim that the gate fails "if the executable reappears" was false as
+    # written — a resurrected copy is exactly the case it was supposed to catch.
+    #
+    # The promise here is deliberately NARROW and verifiable: this one retired
+    # path must not exist. A namespace-wide claim would need a defined universe
+    # and a real sweep, and an unverifiable wide promise is what produced this
+    # finding in the first place.
+    # os.path.lexists, NOT .exists(): a dangling symlink at the retired path is
+    # a real reappearance and `.exists()` follows the link and reports False.
+    # Measured before this line existed — a broken symlink there left the gate
+    # green. The promise is "this path must not exist", and a name in the
+    # directory exists whether or not its target does.
+    resurrected = REPO_ROOT / RETIRED_PATH
+    if os.path.lexists(resurrected):
+        errs.append(
+            f"{RETIRED_PATH} exists on disk. The dispatcher was moved out of the "
+            "repository-root `scripts/` namespace for P28; a copy left or "
+            "recreated there is undetected by the policy check (no `.sh` "
+            "extension) and re-creates exactly the condition review blocked."
+        )
     # The COMMAND ITSELF is on this list, and it was the surface I missed. My
     # first sweep covered only the files I had edited — workflow and the two
     # checkers — and reported "0 residual references" while the moved script
@@ -486,6 +573,29 @@ def judged_jobs() -> tuple[str, ...]:
     return JOBS + (CONTRACT_JOB,)
 
 
+def why_pinned(job: str, key: str) -> str:
+    """Why THIS key on THIS job is pinned — never a claim that is false elsewhere.
+
+    A single sentence covering all three jobs would have to say `name` is the
+    context branch protection requires, and that is untrue of the contract job,
+    which this gate itself documents as outside main's required set. A diagnosis
+    that overstates its own authority teaches the reader to discount it.
+    """
+    if key == "runs-on":
+        return ("`runs-on` decides whether the job is dispatched at all; a label "
+                "set no runner satisfies means it never starts while its steps "
+                "still read as unconditional.")
+    if key == "timeout-minutes":
+        return ("`timeout-minutes` is the budget this job's phases need; too "
+                "small and they stop finishing.")
+    if job == CONTRACT_JOB:
+        return ("`name` is this job's published identity — the body, the logs "
+                "and this gate all refer to it. It is NOT among main's required "
+                "contexts, so the pin protects recognisability, not enforcement.")
+    return ("`name` is the CHECK CONTEXT branch protection requires for this "
+            "job; renaming it silently removes a required context.")
+
+
 def assert_job_keys(jobs: dict) -> list[str]:
     """Every top-level key on a judged job must be on the allow-list.
 
@@ -501,7 +611,8 @@ def assert_job_keys(jobs: dict) -> list[str]:
     """
     errs = []
     for name in judged_jobs():
-        unknown = sorted(set(jobs[name]["attrs"]) - JOB_KEY_ALLOWLIST)
+        attrs = jobs[name]["attrs"]
+        unknown = sorted(set(attrs) - JOB_KEY_ALLOWLIST)
         if unknown:
             errs.append(
                 f"{name}: unknown top-level key(s) {unknown} — a judged job may "
@@ -510,6 +621,23 @@ def assert_job_keys(jobs: dict) -> list[str]:
                 "job running while every step still reads as unconditional. Add "
                 "it to JOB_KEY_ALLOWLIST deliberately, with teeth."
             )
+        missing = [k for k in REQUIRED_JOB_KEYS if k not in attrs]
+        if missing:
+            errs.append(
+                f"{name}: missing required key(s) {missing} — the contract is "
+                "positive; a judged job must carry these, not merely avoid "
+                "carrying others."
+            )
+        want = JOB_CONTRACT[name]
+        for key in REQUIRED_JOB_KEYS:
+            if key not in attrs:
+                continue                       # already reported as missing
+            if attrs[key] != want[key]:
+                errs.append(
+                    f"{name}: {key} is {attrs[key]!r}, expected {want[key]!r}. "
+                    f"{why_pinned(name, key)} Changing it is a review decision, "
+                    "not an edit."
+                )
     return errs
 
 
@@ -789,6 +917,9 @@ R_DUP_REG = "PHASES contains duplicates"
 R_SELF_TEST = "`--self-test` invocation"
 R_LIVE = "load-bearing live invocation"
 R_UNKNOWN_KEY = "unknown top-level key"   # the allow-list, now the job boundary
+R_MISSING_KEY = "missing required key"    # the positive half of the same contract
+R_JOB_VALUE = "expected"                  # a pinned key carrying the wrong value
+R_RESURRECTED = "exists on disk"          # the retired path, checked by stat
 MALFORMED = "MALFORMED:"             # prefix: the case must RAISE, not return
 
 
@@ -898,6 +1029,46 @@ def fail_open_cases(wf: str, victim: str, step: str) -> list[tuple[str, str]]:
         # review event even when benign. If this case ever stops being red, the
         # allow-list has been widened without anyone deciding to widen it.
         ("`permissions:` — LEGITIMATE, and red by design", job_attr("    permissions:\n      contents: read\n"), R_UNKNOWN_KEY),
+        # --- an ALLOWED key whose VALUE stops the job ------------------------
+        #
+        # The allow-list named keys and said nothing about values. Review set the
+        # contract job's `runs-on` to a label array no runner satisfies — valid
+        # GitHub grammar — and the job is never dispatched while this gate
+        # reported nothing. The instrument could be switched off by editing a key
+        # it already permits, which is the same axis error one level down.
+    ]
+
+    # --- NINE cases: every pinned key, on every judged job --------------------
+    #
+    # Three keys x three jobs, each mutated on its own, because a global "admitted
+    # values" set would let one job take another's runner or budget and stay
+    # green. Each case must name the job, the key and the value.
+    #
+    # `name` is in here for a reason that DIFFERS by job, which is why the
+    # diagnosis comes from `why_pinned` rather than a single sentence: on the two
+    # Rust jobs it is the required check context, and on the contract job it is
+    # the published identity of a job that is deliberately not required.
+    # `timeout-minutes` is in here because a budget too small is a job that
+    # cannot finish its phases.
+    for _job, _want in JOB_CONTRACT.items():
+        _blk_start = wf.index(f"  {_job}:")
+        _blk_end = wf.index("    steps:", _blk_start)
+        _blk = wf[_blk_start:_blk_end]
+        for _key, _bad in (("name", "Renamed Job"),
+                           ("runs-on", "[self-hosted, theyos-runner-that-does-not-exist]"),
+                           ("timeout-minutes", "1")):
+            _line = f"    {_key}: {_want[_key]}\n"
+            assert _line in _blk, (_job, _key)
+            _mut = wf[:_blk_start] + _blk.replace(_line, f"    {_key}: {_bad}\n", 1) + wf[_blk_end:]
+            cases.append((f"{_job}: {_key} changed to {_bad[:34]!r}", _mut, R_JOB_VALUE))
+
+    cases += [
+        # --- the POSITIVE half: a required key removed ------------------------
+        (
+            "judged job missing a required key (`timeout-minutes`)",
+            wf.replace("    timeout-minutes: 5\n", "", 1),
+            R_MISSING_KEY,
+        ),
         # --- the document model itself ---------------------------------------
         (
             "a second `steps:` section in one job",
@@ -1037,6 +1208,71 @@ def universe_controls(wf: str) -> list[tuple[str, str]]:
     ]
 
 
+def assert_retired_path_absent(cmd: str, wf: str) -> None:
+    """Plant a real copy AND a dangling symlink; require the gate to see both.
+
+    FILESYSTEM mutants, not text ones, because the defect they model is a name
+    existing in a directory. Two forms because they fail different predicates:
+
+        a regular 100755 copy    caught by `.exists()` and by `lexists`
+        a DANGLING symlink       `.exists()` follows the link and returns False
+
+    The second is why this guard uses `os.path.lexists`. Measured before the
+    change: a broken symlink at the retired path left the gate green, and the
+    promise is "this path must not exist" — a name in a directory exists whether
+    or not its target does.
+
+    Restores in a `finally` and asserts the clean state afterwards, so a failure
+    cannot leave the working tree dirty for the next reader.
+    """
+    import os
+    import shutil
+
+    resurrected = REPO_ROOT / RETIRED_PATH
+    if os.path.lexists(resurrected):
+        raise SystemExit(
+            f"SELF-TEST INVALID: {RETIRED_PATH} already exists before a mutant "
+            "is planted; the tree is not in the state these cases assume."
+        )
+    created_dir = not resurrected.parent.exists()
+    resurrected.parent.mkdir(parents=True, exist_ok=True)
+
+    def _cleanup() -> None:
+        if os.path.lexists(resurrected):
+            os.unlink(resurrected)
+        if created_dir:
+            try:
+                resurrected.parent.rmdir()
+            except OSError:
+                pass
+
+    for label, plant in (
+        ("a regular 100755 copy", lambda: (shutil.copy2(COMMAND, resurrected),
+                                           os.chmod(resurrected, 0o755))),
+        ("a DANGLING symlink", lambda: os.symlink("/nonexistent/backend-rust",
+                                                  resurrected)),
+    ):
+        try:
+            plant()
+            errs, _ = evaluate(cmd, wf)
+            if not any(R_RESURRECTED in e for e in errs):
+                raise SystemExit(
+                    f"SELF-TEST FAILED: {label} at {RETIRED_PATH} did not turn "
+                    "the gate red. The claim that it fails when the executable "
+                    "reappears would be false for that form."
+                )
+            print(f"  self-test  filesystem: {label} at the retired path is caught")
+        finally:
+            _cleanup()
+
+    errs, _ = evaluate(cmd, wf)
+    if errs:
+        raise SystemExit(
+            f"SELF-TEST INVALID: the tree did not come back clean after the "
+            f"filesystem mutants: {errs}"
+        )
+
+
 def assert_pin_is_deliberate(cmd: str, wf: str, victim: str, step: str) -> None:
     """A phase count that legitimately GROWS must be red — and red saying so.
 
@@ -1164,6 +1400,7 @@ def self_test(cmd: str, wf: str) -> None:
             )
         print(f"  self-test  not judged: {label}")
 
+    assert_retired_path_absent(cmd, wf)
     assert_pin_is_deliberate(cmd, wf, victim, step)
 
     errs, _ = evaluate(cmd, wf)
