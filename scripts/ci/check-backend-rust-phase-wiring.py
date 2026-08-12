@@ -76,7 +76,178 @@ JOBS = ("build-and-test-linux", "build-and-test-macos")
 EXPECTED_COMMON = 11
 SELF = "scripts/ci/check-backend-rust-phase-wiring.py"
 
-INVOCATION = re.compile(r"(?:^|\s)scripts/ci/backend-rust\s+([a-z0-9][a-z0-9-]*)\s*$")
+PHASE_CALL = re.compile(r"^scripts/ci/backend-rust ([a-z0-9][a-z0-9-]*)$")
+SELF_TEST_CMD = f"python3 {SELF} --self-test"
+LIVE_CMD = f"python3 {SELF}"
+
+# Attributes that make a step or job stop being an unconditional, load-bearing
+# invocation. `shell` is here with the other two because changing the shell
+# changes how a failure propagates, which is the property being asserted.
+DISQUALIFYING = ("if", "continue-on-error", "shell")
+
+
+class Malformed(SystemExit):
+    """Raised instead of guessing. Every branch here is a deliberate refusal."""
+
+
+def parse_workflow(text: str) -> tuple[dict, str | None]:
+    """A narrow, section-aware scan of the subset this gate needs.
+
+    Deliberately NOT PyYAML. No script in this repo imports yaml and no CI step
+    installs it; `scripts/check_consumption_coverage.py` states the reason for
+    the same choice — "A minimal indent-aware scan is used on purpose: it has no
+    YAML dependency". A gate that needs an implicitly-present module is a new
+    way to fail, and it fails asymmetrically: green under whichever interpreter
+    CI happens to use, broken for anyone following the repo convention.
+
+    Returns `({job: {attrs, defaults_shell, steps: [step, ...]}}, wf_shell)`.
+
+    SECTION STATE IS THE POINT, and the negative control is live in this very
+    file rather than invented: `on.push.branches` contains `- main` at indent 6,
+    byte-identical to `- name: Checkout` at indent 6. A depth-only scan
+    materialises the trigger list as a step. Steps are therefore collected only
+    inside `jobs -> <job> -> steps`.
+
+    Fails closed — raises rather than guessing — on tabs, unexpected
+    indentation, YAML aliases or merge keys, and duplicated relevant keys.
+    """
+    if "\t" in text:
+        raise Malformed("workflow contains a tab; indentation cannot be trusted")
+
+    jobs: dict[str, dict] = {}
+    wf_shell: str | None = None
+    section = None          # None | "jobs" | "defaults"
+    job = None
+    in_steps = False
+    step: dict | None = None
+    lines = text.split("\n")
+
+    def close_step() -> None:
+        nonlocal step
+        if step is not None:
+            jobs[job]["steps"].append(step)
+            step = None
+
+    for raw in lines:
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        indent = len(raw) - len(raw.lstrip(" "))
+        body = raw.strip()
+        # YAML alias/merge syntax only. An earlier version tested for a bare `*`
+        # and refused `- "admin/rust/**"`, a path glob in the trigger list — the
+        # right instinct (fail closed) aimed at the wrong token. An alias is `*`
+        # or `&` introducing an identifier in VALUE position, never a `*` inside
+        # a quoted string.
+        if (
+            body.startswith("<<:")
+            or re.match(r"^- [*&]\w", body)
+            or re.search(r":\s+[*&]\w", body)
+        ):
+            raise Malformed(f"alias or merge key is not supported: {body!r}")
+
+        if indent == 0:
+            close_step()
+            job, in_steps = None, False
+            section = "jobs" if body == "jobs:" else ("defaults" if body == "defaults:" else None)
+            continue
+
+        if section == "defaults" and indent in (2, 4) and body.startswith("shell:"):
+            wf_shell = body.split(":", 1)[1].strip()
+            continue
+
+        if section != "jobs":
+            continue
+
+        if indent == 2 and body.endswith(":") and not body.startswith("- "):
+            close_step()
+            job = body[:-1]
+            jobs[job] = {"attrs": {}, "defaults_shell": None, "steps": []}
+            in_steps = False
+            continue
+
+        if job is None:
+            continue
+
+        if indent == 4:
+            close_step()
+            in_steps = body == "steps:"
+            if not in_steps and ":" in body:
+                key, _, val = body.partition(":")
+                key = key.strip()
+                if key in jobs[job]["attrs"]:
+                    raise Malformed(f"job {job}: duplicated key {key!r}")
+                jobs[job]["attrs"][key] = val.strip()
+            continue
+
+        if not in_steps:
+            # job-level defaults.run.shell lives under `defaults:` at indent 4,
+            # so its children arrive here.
+            if body.startswith("shell:"):
+                jobs[job]["defaults_shell"] = body.split(":", 1)[1].strip()
+            continue
+
+        if indent == 6 and body.startswith("- "):
+            close_step()
+            step = {}
+            body = body[2:]
+            indent = 8  # fall through and record this first key
+        elif indent > 8:
+            # Nested content of a step key — `with:`, `env:` and their children.
+            # Skipped rather than refused: this is ordinary YAML, and none of the
+            # keys this gate cares about (`run`, `if`, `continue-on-error`,
+            # `shell`, `uses`) can live at that depth, so ignoring it drops
+            # nothing. Refusing it here was the first version's error: fail-closed
+            # is for shapes the parser cannot interpret, not for shapes it simply
+            # has no use for.
+            continue
+        elif indent != 8:
+            raise Malformed(
+                f"job {job}: unexpected indentation {indent} inside steps: {body!r}"
+            )
+
+        if step is None:
+            raise Malformed(f"job {job}: step attribute outside a step: {body!r}")
+
+        key, sep, val = body.partition(":")
+        if not sep:
+            continue  # a continuation line of a block scalar
+        key, val = key.strip(), val.strip()
+        if key in ("name", "run", "uses", "if", "continue-on-error", "shell"):
+            if key in step:
+                raise Malformed(f"job {job}: duplicated step key {key!r}")
+            step[key] = val
+            if key == "run":
+                step["run_is_block"] = val.startswith("|") or val.startswith(">")
+
+    close_step()
+    return jobs, wf_shell
+
+
+def load_bearing(job: dict, step: dict, wf_shell: str | None) -> bool:
+    """Does this step run unconditionally, with its status as the step's status?
+
+    Anything conditional, advisory, or run under a shell whose failure
+    propagation differs is refused. The refusal is deliberate: a legitimate
+    condition should require a change here, visible in review, rather than
+    silently satisfying the contract.
+    """
+    if wf_shell is not None or job["defaults_shell"] is not None:
+        return False
+    if any(a in job["attrs"] for a in DISQUALIFYING):
+        return False
+    return not any(a in step for a in DISQUALIFYING)
+
+
+def command_of(step: dict) -> str | None:
+    """The step's command, only if it is a one-line `run:` scalar.
+
+    A block scalar returns None: a candidate command must be exactly the
+    invocation, so no wrapper, prefix, pipeline, `;`, `||` or `&` can ride along.
+    `uses:` is not `run:` and can never satisfy this contract.
+    """
+    if "run" not in step or step.get("run_is_block"):
+        return None
+    return step["run"] or None
 
 
 def registry(text: str) -> list[str]:
@@ -90,74 +261,67 @@ def functions(text: str) -> list[str]:
     return [m.replace("_", "-") for m in re.findall(r"^phase_(\w+)\(\)", text, re.M)]
 
 
-def job_block(workflow: str, job: str) -> str:
-    start = re.search(rf"^  {re.escape(job)}:$", workflow, re.M)
-    if not start:
-        raise SystemExit(f"job {job} not found — this gate's subject moved")
-    rest = workflow[start.end() :]
-    nxt = re.search(r"^  [A-Za-z0-9_-]+:$", rest, re.M)
-    return rest[: nxt.start()] if nxt else rest
-
-
-def run_scalars(block: str) -> list[str]:
-    """Every executable line of every `run:` in a job. Comments excluded."""
-    out: list[str] = []
-    lines = block.split("\n")
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        if line.strip().startswith("#"):
-            i += 1
-            continue
-        inline = re.match(r"^\s+run: (?![|>])(.+)$", line)
-        if inline:
-            out.append(inline.group(1).strip())
-            i += 1
-            continue
-        opened = re.match(r"^(\s+)run: [|>]", line)
-        if not opened:
-            i += 1
-            continue
-        indent = len(opened.group(1))
-        i += 1
-        while i < len(lines):
-            body = lines[i]
-            if body.strip() and (len(body) - len(body.lstrip())) <= indent:
-                break
-            stripped = body.strip()
-            if stripped and not stripped.startswith("#"):
-                out.append(stripped)
-            i += 1
-    return out
-
-
-def invoked(block: str) -> list[str]:
+def invoked(job: dict, wf_shell: str | None) -> list[str]:
+    """Phases this job actually runs: exact one-line commands on load-bearing steps."""
     out = []
-    for cmd in run_scalars(block):
-        hit = INVOCATION.search(cmd)
+    for step in job["steps"]:
+        cmd = command_of(step)
+        if cmd is None or not load_bearing(job, step, wf_shell):
+            continue
+        hit = PHASE_CALL.match(cmd)
         if hit:
             out.append(hit.group(1))
     return out
+
+
+def gate_steps(jobs: dict, wf_shell: str | None) -> tuple[int, int]:
+    """Count load-bearing, exactly-matching self-test and live invocations."""
+    self_n = live_n = 0
+    for job in jobs.values():
+        for step in job["steps"]:
+            cmd = command_of(step)
+            if cmd is None or not load_bearing(job, step, wf_shell):
+                continue
+            if cmd == SELF_TEST_CMD:
+                self_n += 1
+            elif cmd == LIVE_CMD:
+                live_n += 1
+    return self_n, live_n
 
 
 def duplicates(names: list[str]) -> list[str]:
     return sorted({n for n in names if names.count(n) > 1})
 
 
-def assert_wired(workflow: str) -> list[str]:
-    """Some active step must invoke this script."""
-    for job in re.findall(r"^  ([A-Za-z0-9_-]+):$", workflow, re.M):
-        if any(SELF in cmd for cmd in run_scalars(job_block(workflow, job))):
-            return []
-    return [
-        f"no active workflow step invokes {SELF} — an orphaned gate never fires, "
-        "and replacing its step with an echo is the cheapest way to neuter it"
-    ]
+def assert_wired(jobs: dict, wf_shell: str | None) -> list[str]:
+    """Exactly one load-bearing self-test step and exactly one live step.
+
+    A gate nothing runs is not a gate, and the cheapest ways to neuter one are to
+    delete its step, condition it away, mark it advisory, wrap the command so its
+    status is discarded, or duplicate it so a green copy hides a red one. Each is
+    a different edit and all of them land here as a count that is not 1.
+    """
+    self_n, live_n = gate_steps(jobs, wf_shell)
+    errs = []
+    if self_n != 1:
+        errs.append(
+            f"expected exactly 1 load-bearing `--self-test` invocation, found "
+            f"{self_n} — an orphaned or advisory gate never fires"
+        )
+    if live_n != 1:
+        errs.append(
+            f"expected exactly 1 load-bearing live invocation, found {live_n}"
+        )
+    return errs
 
 
 def evaluate(cmd: str, wf: str) -> tuple[list[str], dict[str, int]]:
     reg, fns = registry(cmd), functions(cmd)
-    per_job = {j: invoked(job_block(wf, j)) for j in JOBS}
+    jobs, wf_shell = parse_workflow(wf)
+    for name in JOBS:
+        if name not in jobs:
+            raise Malformed(f"job {name} not found — this gate's subject moved")
+    per_job = {j: invoked(jobs[j], wf_shell) for j in JOBS}
     errs: list[str] = []
 
     for label, names in (("PHASES", reg), ("phase_* functions", fns), *per_job.items()):
@@ -178,22 +342,41 @@ def evaluate(cmd: str, wf: str) -> tuple[list[str], dict[str, int]]:
         if jset - rset:
             errs.append(f"{job} invokes non-members: {sorted(jset - rset)} — exits 2")
         if rset - jset:
-            errs.append(f"{job} never invokes: {sorted(rset - jset)} — registered, unrun")
+            errs.append(
+                f"{job} never invokes: {sorted(rset - jset)} — registered but not "
+                "run by a load-bearing, exactly-matching step"
+            )
 
     common = set.intersection(*(set(v) for v in per_job.values()))
     if len(common) != EXPECTED_COMMON:
+        # This is a TRIPWIRE, not a defect detector, and the message has to say
+        # so. Measured: it can only fire alone when the registry, the functions
+        # and both jobs already AGREE — any disagreement trips one of the set
+        # comparisons above first. So the one case where this is the sole error
+        # is a phase count that legitimately changed.
+        #
+        # It is kept because 11 is an agreed number rather than an emergent one:
+        # `Quarantine probe (issue #470)` is deliberately NOT a phase, pinned
+        # inline by a contract test, and promoting it would be a decision. But a
+        # pin whose message reads like a coverage hole sends the next person
+        # hunting for a missing invocation that does not exist, so the message
+        # names both readings and points at the constant to change.
         errs.append(
             f"the jobs share {len(common)} phases, expected {EXPECTED_COMMON}: "
-            f"{sorted(common)}"
+            f"{sorted(common)}. Either a phase stopped being invoked by both "
+            f"jobs, or the phase count legitimately changed — if the latter, "
+            f"EXPECTED_COMMON in {SELF} is the number to update, deliberately."
         )
 
-    errs += assert_wired(wf)
+    errs += assert_wired(jobs, wf_shell)
     counts = {"PHASES": len(reg), "functions": len(fns)}
     counts.update({j: len(v) for j, v in per_job.items()})
     return errs, counts
 
 
-def harness(cmd: str, phases: list[str], extra: str = "") -> str:
+def harness(
+    cmd: str, phases: list[str], extra: str = "", bodies: dict[str, str] | None = None
+) -> str:
     """The real header and the real dispatcher, with toy phases spliced in.
 
     Faithfulness is the entire point and it rests on this splice: everything
@@ -205,12 +388,17 @@ def harness(cmd: str, phases: list[str], extra: str = "") -> str:
     keep passing while the shipped code rotted.
 
     Toy phases rather than the real ones because the real bodies invoke cargo.
+    `bodies` supplies a multi-command body for a phase; the single-command
+    default cannot express the defect the runtime cases below exist to catch,
+    since masking only shows up when a phase has a command AFTER the failing one.
     """
     head = cmd[: cmd.index("PHASES=(")]
     tail = cmd[cmd.index("usage() {") :]
+    bodies = bodies or {}
     body = "PHASES=(\n" + "".join(f"  {p}\n" for p in phases) + ")\n\n"
     for p in dict.fromkeys(phases):
-        body += f'phase_{p.replace("-", "_")}() {{ echo "RAN-{p}"; }}\n'
+        inner = bodies.get(p, f'echo "RAN-{p}"')
+        body += f'phase_{p.replace("-", "_")}() {{ {inner}; }}\n'
     return head + body + extra + "\n" + tail
 
 
@@ -228,6 +416,36 @@ def run_harness(text: str, arg: str) -> tuple[int, str]:
         return p.returncode, p.stdout + p.stderr
     finally:
         os.unlink(path)
+
+
+def assert_mid_body_fails_loudly(cmd: str) -> None:
+    """A phase failing part-way through its body must abort and report failure.
+
+    Kept as its own function so the negative control can re-run these exact
+    assertions against a crippled dispatcher and require them to raise. The
+    single-command cases cannot express this defect at all: masking is only
+    observable when a command FOLLOWS the failing one, hence the three-command
+    fixture. Material exposure in the shipped pipeline — `phase_excluded_members`
+    runs three cargo invocations in sequence, so a failing first run can be
+    masked by a later one passing.
+    """
+    mid = {"mid": "echo BEFORE; false; echo AFTER", "after": "echo NEXT"}
+    fixture = harness(cmd, ["mid", "after"], bodies=mid)
+
+    rc, out = run_harness(fixture, "mid")
+    if rc == 0 or "AFTER" in out or "mid: ok" in out or "BEFORE" not in out:
+        raise SystemExit(
+            f"RUNTIME SELF-TEST FAILED: a phase failing mid-body did not fail "
+            f"loudly (rc={rc}, reached AFTER={'AFTER' in out}, reported "
+            f"ok={'mid: ok' in out}). A later command masks an earlier failure."
+        )
+
+    rc, out = run_harness(fixture, "all")
+    if rc == 0 or "AFTER" in out or "NEXT" in out or "BEFORE" not in out:
+        raise SystemExit(
+            f"RUNTIME SELF-TEST FAILED: `all` continued past a phase that failed "
+            f"mid-body (rc={rc}, AFTER={'AFTER' in out}, NEXT={'NEXT' in out})"
+        )
 
 
 def runtime_self_test(cmd: str) -> None:
@@ -281,6 +499,57 @@ def runtime_self_test(cmd: str) -> None:
         )
     print("  self-test  runtime: `all` runs each phase once, in registry order")
 
+    assert_mid_body_fails_loudly(cmd)
+    print("  self-test  runtime: mid-body failure aborts the phase, rc preserved")
+    print("  self-test  runtime: `all` stops at a mid-body failure")
+
+    green = harness(
+        cmd, ["one", "two"], bodies={"one": "echo G1; echo G2; echo G3"}
+    )
+    rc, out = run_harness(green, "all")
+    if rc != 0 or [out.count(f"G{i}") for i in (1, 2, 3)] != [1, 1, 1] or out.count("RAN-two") != 1:
+        raise SystemExit(
+            f"RUNTIME SELF-TEST FAILED: the multi-command green control did not "
+            f"run every command exactly once (rc={rc})"
+        )
+    print("  self-test  runtime: multi-command green control runs everything once")
+
+    rc, out = run_harness(harness(cmd, ["lastfail"], bodies={"lastfail": "echo L1; false"}), "lastfail")
+    if rc == 0 or "L1" not in out:
+        raise SystemExit(
+            f"RUNTIME SELF-TEST FAILED: a failing LAST command did not propagate "
+            f"(rc={rc})"
+        )
+    print("  self-test  runtime: a failing last command still propagates")
+
+    # NEGATIVE CONTROL, stated as the property that matters: with the old
+    # pattern restored, THE SELF-TEST MUST TERMINATE RED. Not "the mutant
+    # masks" — that is a fact about the mutant. What has to hold is that these
+    # assertions detect it, so the exact checks run above are re-run against the
+    # crippled dispatcher and are required to raise.
+    broken = cmd.replace(
+        '  set +e\n  ( set -Eeuo pipefail; cd "$REPO_ROOT"; "$fn" )\n  rc=$?\n  set -e',
+        '  ( cd "$REPO_ROOT" && "$fn" ) || rc=$?',
+    )
+    if broken == cmd:
+        raise SystemExit(
+            "RUNTIME SELF-TEST INVALID: cannot locate the errexit-safe dispatch "
+            "block, so the regression it fixes cannot be simulated"
+        )
+    try:
+        assert_mid_body_fails_loudly(broken)
+    except SystemExit:
+        print(
+            "  self-test  runtime: negative control — restoring `( ... ) || rc=$?` "
+            "makes this self-test RED"
+        )
+    else:
+        raise SystemExit(
+            "RUNTIME SELF-TEST INVALID: with `( ... ) || rc=$?` restored the "
+            "mid-body assertions still passed. They do not detect the masking, "
+            "so their green says nothing about the shipped dispatcher."
+        )
+
     # NEGATIVE CONTROL on the runtime cases themselves. Strip the membership
     # test out of the copy under test; the orphan case MUST start passing. If it
     # does not, these cases are not bound to the shipped dispatcher — they would
@@ -304,8 +573,212 @@ def runtime_self_test(cmd: str) -> None:
     print("  self-test  runtime: negative control — removing the check reopens it")
 
 
+def fail_open_cases(wf: str, victim: str, step: str) -> list[tuple[str, str]]:
+    """Every way a step can be in the file and still not gate anything.
+
+    In all of them the text `scripts/ci/backend-rust <victim>` remains plainly
+    visible in the job: a reviewer skimming the diff sees the invocation, and any
+    grep over the job body finds it. What changes is whether the step runs
+    unconditionally and whether its exit status becomes the step's status.
+
+    This is the population that made the FIRST version of this parser useless. It
+    asked "could this command execute?" — to which every entry below answers yes
+    — instead of "does it execute unconditionally, with load-bearing status?".
+    Thirteen of these were found by review, not by me, and they were found in a
+    parser I had already called done.
+
+    `if: always()` is the sharpest of them and is here deliberately: it does not
+    stop the step running, it detaches the step from the failure chain. A form
+    that still executes is the one that survives an eyeball check.
+    """
+    line = f"        {step}\n"
+    if wf.count(line) != 2:
+        raise SystemExit(
+            f"SELF-TEST INVALID: expected the {victim} step in exactly 2 jobs, "
+            f"found {wf.count(line)}"
+        )
+
+    def phase_step(replacement: str) -> str:
+        """Mutate the FIRST occurrence only — the Linux job."""
+        return wf.replace(line, replacement, 1)
+
+    def attr(a: str) -> str:
+        return phase_step(f"        {a}\n{line}")
+
+    def suffix(s: str) -> str:
+        return phase_step(f"        {step}{s}\n")
+
+    linux = "  build-and-test-linux:\n"
+    cases = [
+        # --- the step is present but conditional or advisory -----------------
+        ("step conditional (`if: always()` — it still RUNS)", attr("if: always()")),
+        ("step advisory (`continue-on-error: true`)", attr("continue-on-error: true")),
+        ("step under a custom shell", attr("shell: bash")),
+        # --- the command runs but its status is discarded --------------------
+        ("status discarded by `|| true`", suffix(" || true")),
+        ("status replaced by a following `;` command", suffix("; true")),
+        ("status taken by the last stage of a pipeline", suffix(" | tee /dev/null")),
+        ("backgrounded with `&` — the step waits for nothing", suffix(" &")),
+        # --- the command is not the command ----------------------------------
+        ("wrapped in `echo`, so it only prints", phase_step(line.replace("run: ", "run: echo "))),
+        (
+            "moved into a block scalar, which can hide a wrapper",
+            phase_step(f"        run: |\n          scripts/ci/backend-rust {victim}\n"),
+        ),
+        ("`uses:` a composite action instead of `run:`", phase_step(f"        uses: ./.github/actions/{victim}\n")),
+        # --- the whole job stops being load-bearing --------------------------
+        ("job conditional (`if:` on build-and-test-linux)", wf.replace(linux, linux + "    if: always()\n", 1)),
+        ("job advisory (`continue-on-error:` on the job)", wf.replace(linux, linux + "    continue-on-error: true\n", 1)),
+        (
+            "job-level `defaults.run.shell`",
+            wf.replace(linux, linux + "    defaults:\n      run:\n        shell: bash\n", 1),
+        ),
+        # --- the whole WORKFLOW stops being load-bearing ---------------------
+        (
+            "workflow-level `defaults.run.shell`",
+            wf.replace("\njobs:\n", "\ndefaults:\n  run:\n    shell: bash\njobs:\n", 1),
+        ),
+    ]
+
+    # The gate's own two steps. Removal and duplication are separate edits and
+    # both are counted, because a second green copy hides a red original just as
+    # effectively as deleting it.
+    #
+    # NOTE, and it is a live trap rather than a hypothetical: LIVE_CMD is a
+    # PREFIX of SELF_TEST_CMD. Matching must include the trailing newline or
+    # "remove the live step" silently removes the self-test step instead, and the
+    # case would pass for the wrong reason.
+    for name, cmdline in (("self-test", SELF_TEST_CMD), ("live", LIVE_CMD)):
+        gate_line = f"        run: {cmdline}\n"
+        if wf.count(gate_line) != 1:
+            raise SystemExit(
+                f"SELF-TEST INVALID: expected exactly 1 {name} step, found "
+                f"{wf.count(gate_line)}"
+            )
+        cases.append((f"the gate's own {name} step deleted", wf.replace(gate_line, "", 1)))
+        cases.append(
+            (
+                f"the gate's own {name} step duplicated",
+                wf.replace(
+                    gate_line,
+                    gate_line + f"      - name: {name} (copy)\n" + gate_line,
+                    1,
+                ),
+            )
+        )
+
+    return cases
+
+
+def universe_controls(wf: str) -> list[tuple[str, str]]:
+    """Shapes this gate must NOT judge. Each one must stay GREEN.
+
+    Without these the fail-open battery above proves far less than it appears
+    to. A checker that simply reds on any edit to the workflow catches all
+    fourteen mutations and is worthless — the battery alone cannot tell a
+    discriminating gate from an indiscriminate one. These controls are what make
+    the reds mean something.
+
+    They are also the practical failure mode: a gate that reds on unrelated
+    edits gets marked `continue-on-error` by the next person it blocks, and then
+    it is decoration.
+
+    `set -o pipefail` in some other step is the adjudicated example. It does not
+    belong to this gate's population — this gate does not audit shell strictness
+    anywhere except in the exactly-matching steps it counts — so it must not be
+    judged here.
+    """
+    anchor = "      - name: Clippy (deny warnings)\n"
+    if wf.count(anchor) != 2:
+        raise SystemExit(
+            f"SELF-TEST INVALID: expected 2 anchors for control insertion, "
+            f"found {wf.count(anchor)}"
+        )
+
+    def insert(block: str) -> str:
+        """Add an unrelated step to the Linux job, before the first anchor."""
+        return wf.replace(anchor, block + anchor, 1)
+
+    return [
+        (
+            "an unrelated step running a pipeline under `set -o pipefail`",
+            insert(
+                "      - name: Unrelated pipeline (universe control)\n"
+                "        run: |\n"
+                "          set -o pipefail\n"
+                "          echo x | cat\n"
+            ),
+        ),
+        (
+            "an unrelated step marked advisory",
+            insert(
+                "      - name: Unrelated advisory step (universe control)\n"
+                "        continue-on-error: true\n"
+                "        run: echo advisory\n"
+            ),
+        ),
+        (
+            "an unrelated step under a custom shell",
+            insert(
+                "      - name: Unrelated shell step (universe control)\n"
+                "        shell: bash\n"
+                "        run: echo other-shell\n"
+            ),
+        ),
+        (
+            "an unrelated JOB made conditional",
+            wf.replace("  installer-tests:\n", "  installer-tests:\n    if: always()\n", 1),
+        ),
+    ]
+
+
+def assert_pin_is_deliberate(cmd: str, wf: str, victim: str, step: str) -> None:
+    """A phase count that legitimately GROWS must be red — and red saying so.
+
+    A third category, and it belongs to neither block above: this is not a defect
+    the gate catches, nor an unrelated edit the gate ignores. It is a tripwire
+    firing on a tree that is entirely correct.
+
+    Measured before it was written: with a 12th phase added properly — in PHASES,
+    with a function, invoked by a load-bearing exact step in both jobs — every set
+    comparison agrees and `EXPECTED_COMMON` is the ONLY error. So the constant
+    cannot detect a defect; it can only announce that an agreed number moved.
+
+    Asserted here so that behaviour is on the record as a decision rather than
+    discovered as a surprise, and so the message keeps naming the constant. A pin
+    is a number nobody re-evaluates; the least it can do is say it is a pin.
+    """
+    fn = f"phase_{victim.replace('-', '_')}"
+    cmd12 = cmd.replace(f"  {victim}\n)", f"  {victim}\n  new-phase\n)")
+    cmd12 = cmd12.replace(f"{fn}() {{", f"phase_new_phase() {{ echo new; }}\n\n{fn}() {{", 1)
+    wf12 = wf.replace(
+        f"        {step}\n",
+        f"        {step}\n      - name: New phase\n"
+        f"        run: scripts/ci/backend-rust new-phase\n",
+    )
+    if cmd12 == cmd or wf12 == wf:
+        raise SystemExit(
+            "SELF-TEST INVALID: could not construct a correct 12-phase tree, so "
+            "the tripwire's behaviour on legitimate growth is unproven"
+        )
+
+    errs, counts = evaluate(cmd12, wf12)
+    if set(counts.values()) != {EXPECTED_COMMON + 1}:
+        raise SystemExit(
+            f"SELF-TEST INVALID: the grown tree is not internally consistent, so "
+            f"any error it produces proves nothing: {counts}"
+        )
+    if len(errs) != 1 or "EXPECTED_COMMON" not in errs[0]:
+        raise SystemExit(
+            "SELF-TEST FAILED: a correctly added phase must trip exactly the "
+            f"count tripwire and name the constant to change. Got: {errs}"
+        )
+    print("  self-test  tripwire: a correctly added phase is red BY DESIGN, "
+          "and the message names the constant")
+
+
 def self_test(cmd: str, wf: str) -> None:
-    """Every mutation below must be caught. If one is not, refuse to report.
+    """Every mutation below must be caught, every control must stay green.
 
     A three-set comparison that has never been observed to fail is
     indistinguishable from one that returns success unconditionally, and this
@@ -325,6 +798,7 @@ def self_test(cmd: str, wf: str) -> None:
         ("invocation present only in a comment", cmd, wf.replace(f"        {step}", f"        run: /bin/true\n        # {step}", 1)),
         ("the gate's own step replaced by an echo", cmd, wf.replace(SELF, "echo neutered")),
     ]
+    cases += [(label, cmd, mw) for label, mw in fail_open_cases(wf, victim, step)]
 
     for label, mc, mw in cases:
         if mc == cmd and mw == wf:
@@ -337,10 +811,27 @@ def self_test(cmd: str, wf: str) -> None:
             )
         print(f"  self-test  caught: {label}")
 
+    for label, mw in universe_controls(wf):
+        if mw == wf:
+            raise SystemExit(
+                f"SELF-TEST INVALID: control '{label}' changed nothing, so its "
+                "green proves nothing about the gate's reach"
+            )
+        errs, _ = evaluate(cmd, mw)
+        if errs:
+            raise SystemExit(
+                f"SELF-TEST FAILED: control '{label}' was judged and went red: "
+                f"{errs}. This gate is reaching outside its population."
+            )
+        print(f"  self-test  not judged: {label}")
+
+    assert_pin_is_deliberate(cmd, wf, victim, step)
+
     errs, _ = evaluate(cmd, wf)
     if errs:
         raise SystemExit(f"SELF-TEST FAILED: the unmutated tree is red: {errs}")
-    print("  self-test  clean tree stays green")
+    print(f"  self-test  {len(cases)} mutations caught, "
+          f"{len(universe_controls(wf))} controls left unjudged, clean tree green")
 
     runtime_self_test(cmd)
 

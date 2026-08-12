@@ -481,16 +481,23 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+      - name: Phase wiring gate compiles
+        # Its own step because the two below must each be a single-line `run:`
+        # equal to exactly the invocation the gate looks for. Setup sharing a
+        # block scalar with the self-test would make neither of them countable:
+        # a block scalar can hide a wrapper, a `||`, or a second command whose
+        # status replaces the first, so the gate refuses to treat one as proof
+        # that it ran.
+        run: python3 -m py_compile scripts/ci/check-backend-rust-phase-wiring.py
       - name: Phase wiring gate self-test
-        # First, because a three-set comparison that has never been observed to
-        # fail is indistinguishable from one that returns success
+        # Before the live check, because a comparison that has never been
+        # observed to fail is indistinguishable from one that returns success
         # unconditionally. This mutates the pair in memory — a function dropped
         # from PHASES, an entry with no function, an invocation demoted to a
-        # comment, this gate's own step replaced by an echo — and requires each
-        # to be caught before any real verdict is allowed to print.
-        run: |
-          python3 -m py_compile scripts/ci/check-backend-rust-phase-wiring.py
-          python3 scripts/ci/check-backend-rust-phase-wiring.py --self-test
+        # comment, this gate's own step replaced by an echo, a phase failing
+        # part-way through its body — and requires each to be caught before any
+        # real verdict is allowed to print.
+        run: python3 scripts/ci/check-backend-rust-phase-wiring.py --self-test
       - name: Phase wiring gate (live)
         # PHASES must equal the phase_* functions must equal the phases each Rust
         # job actually invokes, per job and without duplicates. `backend-rust all`

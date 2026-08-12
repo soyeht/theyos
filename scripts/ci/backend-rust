@@ -381,19 +381,47 @@ run_phase() {
 
   local started=$SECONDS
   local rc=0
-  # Subshell: see "Each phase runs in a subshell" above. `cd` and `export`
-  # inside a phase must not reach the next one, exactly as between two steps.
+
+  # THE SUBSHELL MUST RUN AS A SIMPLE COMMAND, and the errexit toggle around it
+  # is the whole reason this is not written the obvious way.
   #
-  # `|| rc=$?` and not a bare call: under `set -e` a failing subshell exits the
-  # script immediately, so the status line below would never print on the only
-  # run where anyone wants it. Capturing here keeps the abort (the `return`
-  # still propagates, and a failing phase still stops `all`) while letting the
-  # phase say how long it took before it goes.
+  # An earlier version read `( cd "$REPO_ROOT" && "$fn" ) || rc=$?`. In bash,
+  # errexit is DISABLED for any command that is an operand of `&&`/`||`, and the
+  # suppression is inherited by the subshell — so every command inside the phase
+  # ran with `set -e` off. Measured:
+  #
+  #   set -Eeuo pipefail
+  #   ( cd /tmp && { false; echo AFTER; } ) || rc=$?
+  #   -> prints AFTER, rc=0
+  #
+  # A phase body with more than one command therefore continued past a failure
+  # and exited with the LAST command's status. `excluded-members` runs three
+  # cargo invocations: a failing Noise interop run — the exact thing
+  # THEYOS_REQUIRE_NOISE_INTEROP exists to turn into a failure — was masked by
+  # the control-model tests passing afterwards.
+  #
+  # It was also a REGRESSION against the workflow this was extracted from.
+  # GitHub runs a `run: |` block under `bash -e`, so the same body aborted on
+  # the first failure there:
+  #
+  #   bash -e step.sh   (false; echo AFTER)   -> rc=1, AFTER never printed
+  #
+  # The equivalence checker could not see this: it proves the TEXT survived the
+  # move, and this defect is in the harness that runs the text.
+  #
+  # So: turn errexit off in the parent only long enough to capture the status,
+  # and turn it back ON inside the subshell before anything runs. `cd` is
+  # sequenced with `;` rather than `&&` for the same reason — under errexit a
+  # failing `cd` aborts the subshell on its own, and `&&` would reintroduce the
+  # suppression this comment exists to prevent.
   #
   # No `::group::` markers on purpose. One phase per step means the step IS the
   # group; wrapping the body in another one would leave every CI step collapsed
   # behind an extra click, which is visibility lost for nothing.
-  ( cd "$REPO_ROOT" && "$fn" ) || rc=$?
+  set +e
+  ( set -Eeuo pipefail; cd "$REPO_ROOT"; "$fn" )
+  rc=$?
+  set -e
 
   if ((rc == 0)); then
     printf '%s: ok in %ss\n' "$phase" "$((SECONDS - started))"
