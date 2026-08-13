@@ -119,11 +119,18 @@ def depfile_inputs(target: Path, repo_root: Path = ROOT) -> set[str]:
 
 def run_compile(emit_inputs: bool) -> int:
     target = fresh_target()
+    env = os.environ.copy()
+    # Feature-surface only asks Cargo whether each configuration compiles. Its
+    # temporary targets are deleted before the next phase, so DWARF has no
+    # consumer here; omit it without changing debug assertions or the
+    # consumption-coverage derivation that shares this script.
+    if not emit_inputs:
+        env["CARGO_PROFILE_DEV_DEBUG"] = "0"
     try:
         for row in matrix():
             stream = sys.stderr if emit_inputs else sys.stdout
             print(f"::group::consumption matrix {row.name}", file=stream)
-            subprocess.run(command(row), cwd=RUST, check=True)
+            subprocess.run(command(row), cwd=RUST, env=env, check=True)
             print("::endgroup::", file=stream)
         if emit_inputs:
             print(json.dumps(sorted(depfile_inputs(target))))
