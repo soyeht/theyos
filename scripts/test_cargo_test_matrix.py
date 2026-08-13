@@ -22,6 +22,13 @@ SPEC.loader.exec_module(matrix)
 class FeatureSurfaceDebugInfoTests(unittest.TestCase):
     def test_feature_surface_disables_debug_info_for_cargo(self) -> None:
         captured: list[dict[str, str]] = []
+        created: list[Path] = []
+        real_fresh_target = matrix.fresh_target
+
+        def record_fresh_target() -> Path:
+            target = real_fresh_target()
+            created.append(target)
+            return target
 
         def fake_run(*_args: object, **kwargs: object) -> None:
             env = kwargs["env"]
@@ -29,13 +36,14 @@ class FeatureSurfaceDebugInfoTests(unittest.TestCase):
             captured.append(env)
 
         with (
+            patch.object(matrix, "fresh_target", side_effect=record_fresh_target),
             patch.object(matrix, "matrix", return_value=[matrix.Row("workspace", None)]),
             patch.object(matrix.subprocess, "run", side_effect=fake_run),
             patch.dict(os.environ, {"CARGO_PROFILE_DEV_DEBUG": "2"}, clear=True),
         ):
             self.assertEqual(matrix.run_compile(False), 0)
 
-        target = Path(captured[0]["CARGO_TARGET_DIR"])
+        target = created[0]
         self.assertEqual(captured[0]["CARGO_PROFILE_DEV_DEBUG"], "0")
         self.assertEqual(captured[0]["CARGO_TARGET_DIR"], str(target))
         self.assertEqual(captured[0]["CLAWS_CATALOG_JSON"], str(target / "claws-catalog.json"))
@@ -43,6 +51,13 @@ class FeatureSurfaceDebugInfoTests(unittest.TestCase):
 
     def test_derive_does_not_override_debug_info(self) -> None:
         captured: list[dict[str, str]] = []
+        created: list[Path] = []
+        real_fresh_target = matrix.fresh_target
+
+        def record_fresh_target() -> Path:
+            target = real_fresh_target()
+            created.append(target)
+            return target
 
         def fake_run(*_args: object, **kwargs: object) -> None:
             env = kwargs["env"]
@@ -50,6 +65,7 @@ class FeatureSurfaceDebugInfoTests(unittest.TestCase):
             captured.append(env)
 
         with (
+            patch.object(matrix, "fresh_target", side_effect=record_fresh_target),
             patch.object(matrix, "matrix", return_value=[matrix.Row("workspace", None)]),
             patch.object(matrix.subprocess, "run", side_effect=fake_run),
             patch.object(matrix, "depfile_inputs", return_value=set()),
@@ -57,7 +73,7 @@ class FeatureSurfaceDebugInfoTests(unittest.TestCase):
         ):
             self.assertEqual(matrix.run_compile(True), 0)
 
-        target = Path(captured[0]["CARGO_TARGET_DIR"])
+        target = created[0]
         self.assertEqual(captured[0]["CARGO_PROFILE_DEV_DEBUG"], "2")
         self.assertEqual(captured[0]["CARGO_TARGET_DIR"], str(target))
         self.assertEqual(captured[0]["CLAWS_CATALOG_JSON"], str(target / "claws-catalog.json"))
