@@ -26,6 +26,7 @@ class FeatureSurfaceDebugInfoTests(unittest.TestCase):
         captured: list[dict[str, str]] = []
 
         def fake_fresh_target() -> Path:
+            os.environ.setdefault("CLAWS_CATALOG_JSON", str(target / "claws-catalog.json"))
             os.environ["CARGO_TARGET_DIR"] = str(target)
             return target
 
@@ -44,12 +45,14 @@ class FeatureSurfaceDebugInfoTests(unittest.TestCase):
 
         self.assertEqual(captured[0]["CARGO_PROFILE_DEV_DEBUG"], "0")
         self.assertEqual(captured[0]["CARGO_TARGET_DIR"], str(target))
+        self.assertEqual(captured[0]["CLAWS_CATALOG_JSON"], str(target / "claws-catalog.json"))
 
     def test_derive_does_not_override_debug_info(self) -> None:
         target = Path(tempfile.mkdtemp())
         captured: list[dict[str, str]] = []
 
         def fake_fresh_target() -> Path:
+            os.environ.setdefault("CLAWS_CATALOG_JSON", str(target / "claws-catalog.json"))
             os.environ["CARGO_TARGET_DIR"] = str(target)
             return target
 
@@ -69,6 +72,7 @@ class FeatureSurfaceDebugInfoTests(unittest.TestCase):
 
         self.assertEqual(captured[0]["CARGO_PROFILE_DEV_DEBUG"], "2")
         self.assertEqual(captured[0]["CARGO_TARGET_DIR"], str(target))
+        self.assertEqual(captured[0]["CLAWS_CATALOG_JSON"], str(target / "claws-catalog.json"))
 
 
 if __name__ == "__main__":
