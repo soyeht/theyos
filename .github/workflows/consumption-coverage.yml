@@ -59,10 +59,12 @@ jobs:
         continue-on-error: true
         run: uv run scripts/check_consumption_coverage.py --derive
 
-      - name: Gate self-tests
+      - name: Matrix and coverage self-tests
         id: selftest
         continue-on-error: true
-        run: uv run scripts/test_check_consumption_coverage.py
+        run: |
+          uv run scripts/test_cargo_test_matrix.py
+          uv run scripts/test_check_consumption_coverage.py
 
       - name: Summary
         if: always()
@@ -71,7 +73,7 @@ jobs:
             echo "| gate | outcome |"
             echo "|---|---|"
             echo "| consumption coverage | ${{ steps.coverage.outcome }} |"
-            echo "| coverage self-tests | ${{ steps.selftest.outcome }} |"
+            echo "| matrix and coverage self-tests | ${{ steps.selftest.outcome }} |"
             echo ""
             echo "This job is NOT a required check, so a red here reports rather than blocks."
             echo "RED = a consumed file the backend paths do not cover (false-green class)."

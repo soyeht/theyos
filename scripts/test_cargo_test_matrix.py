@@ -25,13 +25,17 @@ class FeatureSurfaceDebugInfoTests(unittest.TestCase):
         target = Path(tempfile.mkdtemp())
         captured: list[dict[str, str]] = []
 
+        def fake_fresh_target() -> Path:
+            os.environ["CARGO_TARGET_DIR"] = str(target)
+            return target
+
         def fake_run(*_args: object, **kwargs: object) -> None:
             env = kwargs["env"]
             assert isinstance(env, dict)
             captured.append(env)
 
         with (
-            patch.object(matrix, "fresh_target", return_value=target),
+            patch.object(matrix, "fresh_target", side_effect=fake_fresh_target),
             patch.object(matrix, "matrix", return_value=[matrix.Row("workspace", None)]),
             patch.object(matrix.subprocess, "run", side_effect=fake_run),
             patch.dict(os.environ, {"CARGO_PROFILE_DEV_DEBUG": "2"}),
@@ -39,10 +43,15 @@ class FeatureSurfaceDebugInfoTests(unittest.TestCase):
             self.assertEqual(matrix.run_compile(False), 0)
 
         self.assertEqual(captured[0]["CARGO_PROFILE_DEV_DEBUG"], "0")
+        self.assertEqual(captured[0]["CARGO_TARGET_DIR"], str(target))
 
     def test_derive_does_not_override_debug_info(self) -> None:
         target = Path(tempfile.mkdtemp())
         captured: list[dict[str, str]] = []
+
+        def fake_fresh_target() -> Path:
+            os.environ["CARGO_TARGET_DIR"] = str(target)
+            return target
 
         def fake_run(*_args: object, **kwargs: object) -> None:
             env = kwargs["env"]
@@ -50,7 +59,7 @@ class FeatureSurfaceDebugInfoTests(unittest.TestCase):
             captured.append(env)
 
         with (
-            patch.object(matrix, "fresh_target", return_value=target),
+            patch.object(matrix, "fresh_target", side_effect=fake_fresh_target),
             patch.object(matrix, "matrix", return_value=[matrix.Row("workspace", None)]),
             patch.object(matrix.subprocess, "run", side_effect=fake_run),
             patch.object(matrix, "depfile_inputs", return_value=set()),
@@ -59,6 +68,7 @@ class FeatureSurfaceDebugInfoTests(unittest.TestCase):
             self.assertEqual(matrix.run_compile(True), 0)
 
         self.assertEqual(captured[0]["CARGO_PROFILE_DEV_DEBUG"], "2")
+        self.assertEqual(captured[0]["CARGO_TARGET_DIR"], str(target))
 
 
 if __name__ == "__main__":
