@@ -10,11 +10,11 @@ pessoal e não entram em documento versionado.
 
 ---
 
-## A decisão que gerou esta versão (medida 2026-08-11 @ `a10107d2`)
+## A decisão que gerou esta versão (medida 2026-08-12 @ `883775b7`)
 
 <!-- doc-freshness-anchor
-measured: 2026-08-11
-sha: a10107d2ed1e0a3ee58175f01e358f4cbc5db1bd
+measured: 2026-08-12
+sha: 883775b7bfdc6cf7cd27771aabefa42fe03b6e91
 paths:
   - admin/rust/mesh-session-core-rs/**
   - admin/rust/mesh-session-control-model-rs/**
@@ -22,6 +22,7 @@ paths:
   - admin/rust/t1-iptunnel-dev-runner-rs/**
   - admin/rust/nat-probe-rs/**
   - admin/rust/scripts/graph-gate/**
+  - admin/rust/scripts/backend-rust
   - scripts/noise-conformance-peer.py
   - .github/workflows/backend-ci.yml
 -->
@@ -316,13 +317,17 @@ dois modos.
 > é refusável por `THEYOS_REQUIRE_NOISE_INTEROP`, e essa escotilha existe para o
 > laptop sem `uv`, não para o CI.
 >
-> **Exigido no CI, nos dois runners.** `THEYOS_REQUIRE_NOISE_INTEROP=1` está no
-> step que roda os workspace members excluídos, e o `uv` é instalado **antes**
-> dele. A ordem é carga estrutural, não arrumação: com a ordem anterior o step
-> tomava o ramo "sem uv" e publicava verde sem provar nada. Medido nos três
-> modos — peer presente com `REQUIRE` passa; peer ausente com `REQUIRE` falha
-> (exit 101); peer ausente sem `REQUIRE` pula, porque a escotilha existe para o
-> laptop sem `uv` e não para o CI.
+> **Exigido no CI, nos dois runners.** `THEYOS_REQUIRE_NOISE_INTEROP=1` é
+> exportado dentro de `phase_excluded_members` em
+> `admin/rust/scripts/backend-rust`, o despachante partilhado que a pipeline
+> Rust passou a usar; os dois runners invocam essa fase com
+> `admin/rust/scripts/backend-rust excluded-members`, e em cada um deles o `uv`
+> é instalado **antes** dessa invocação. A declaração é única e partilhada, em
+> vez de uma cópia por runner. A ordem é carga estrutural, não arrumação: com a
+> ordem anterior o step tomava o ramo "sem uv" e publicava verde sem provar
+> nada. Medido nos três modos — peer presente com `REQUIRE` passa; peer ausente
+> com `REQUIRE` falha (exit 101); peer ausente sem `REQUIRE` pula, porque a
+> escotilha existe para o laptop sem `uv` e não para o CI.
 >
 > A evidência é **positiva e nominal**, não ausência de aviso: o log de cada
 > runner carrega `interop peer: noiseprotocol=0.3.1`, nomeando a implementação
