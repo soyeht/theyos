@@ -26,7 +26,11 @@ adversarial test are added.
 
 GitHub adapters are pinned to `github.com/soyeht/theyos`. Caller-supplied
 `--repo` and inherited `GH_REPO`/`GH_HOST` cannot redirect a validated payload
-to another destination.
+to another destination. An explicit pull-request or issue target must be a
+strict positive decimal identifier in that repository; absolute URLs,
+`owner/repository#number` selectors, refs, branch names, zero, and leading-zero
+forms fail before execution. The dedicated iOS adapters below are the only
+cross-repository exceptions.
 
 `git push` is intentionally not an adapter: its externally visible text is
 the history already authored, not stdin. Create every commit message through

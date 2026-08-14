@@ -22,7 +22,10 @@ adds the stdin-reading body/message flag. Unsupported writers are check-only
 until a reviewed adapter is added. ``git push`` is intentionally outside the
 execution grammar because its published text is existing history, not stdin;
 commit messages are guarded when they are created. General GitHub prose
-adapters are intentionally pinned to ``github.com/soyeht/theyos``. The separate
+adapters are intentionally pinned to ``github.com/soyeht/theyos``. Their only
+permitted explicit issue or pull-request target is a strict positive decimal
+identifier in that repository; URLs, owner/repository selectors, refs, and
+branch names are rejected before execution. The separate
 ``governed-release`` family is hardcoded to
 ``github.com/soyeht/soyeht-ios`` and cannot redirect at runtime. The dedicated
 ``governed-ios-pr-create`` adapter can create only the draft consumer PR from
@@ -286,6 +289,17 @@ GH_COMMANDS: dict[tuple[str, str], tuple[int, int, frozenset[str], frozenset[str
     ),
 }
 
+LOCAL_GITHUB_TARGET_COMMANDS = frozenset(
+    {
+        ("issue", "comment"),
+        ("issue", "edit"),
+        ("pr", "comment"),
+        ("pr", "edit"),
+        ("pr", "review"),
+    }
+)
+LOCAL_GITHUB_NUMBER_PATTERN = re.compile(r"[1-9][0-9]*")
+
 
 def _parse_closed_flags(
     arguments: Sequence[str],
@@ -346,6 +360,13 @@ def prepare_command(command: Sequence[str]) -> list[str]:
     if not minimum <= len(positional) <= maximum:
         raise UnsafeCommand(
             f"gh {key[0]} {key[1]} expects {minimum}..{maximum} positional targets"
+        )
+    if key in LOCAL_GITHUB_TARGET_COMMANDS and any(
+        LOCAL_GITHUB_NUMBER_PATTERN.fullmatch(target) is None for target in positional
+    ):
+        raise UnsafeCommand(
+            f"gh {key[0]} {key[1]} accepts only positive decimal "
+            "targets in soyeht/theyos"
         )
     if key in {("issue", "create"), ("pr", "create")} and "--title" not in seen:
         raise UnsafeCommand(f"gh {key[0]} create requires an explicit --title")

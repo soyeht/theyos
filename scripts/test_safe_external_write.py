@@ -240,6 +240,80 @@ class ExecutionBoundaryTests(unittest.TestCase):
                 with self.assertRaises(guard.UnsafeCommand):
                     guard.prepare_command(command)
 
+    def test_general_github_writers_accept_only_same_repo_decimal_targets(self) -> None:
+        cases = (
+            ["gh", "pr", "edit", "16", "--title", "safe"],
+            ["gh", "pr", "review", "16", "--approve"],
+            ["gh", "pr", "comment", "16"],
+            ["gh", "issue", "edit", "16", "--title", "safe"],
+            ["gh", "issue", "comment", "16"],
+        )
+        for command in cases:
+            with self.subTest(command=command):
+                prepared = guard.prepare_command(command)
+                self.assertIn("16", prepared)
+                self.assertEqual(["--body-file", "-"], prepared[-2:])
+
+    def test_general_github_writers_reject_cross_repo_and_ref_targets(self) -> None:
+        command_prefixes = (
+            (["gh", "pr", "edit"], ["--title", "safe"]),
+            (["gh", "pr", "review"], ["--approve"]),
+            (["gh", "pr", "comment"], []),
+            (["gh", "issue", "edit"], ["--title", "safe"]),
+            (["gh", "issue", "comment"], []),
+        )
+        targets = (
+            "https://github.com/soyeht/soyeht-ios/pull/16",
+            "soyeht/soyeht-ios#16",
+            "refs/pull/16/head",
+            "ci/governed-macos-release",
+            "016",
+            "0",
+        )
+        for prefix, suffix in command_prefixes:
+            for target in targets:
+                with self.subTest(command=prefix, target=target):
+                    with self.assertRaises(guard.UnsafeCommand):
+                        guard.prepare_command([*prefix, target, *suffix])
+
+    def test_cross_repo_targets_fail_before_any_mutation(self) -> None:
+        commands = (
+            [
+                "gh",
+                "pr",
+                "edit",
+                "https://github.com/soyeht/soyeht-ios/pull/16",
+                "--title",
+                "safe",
+            ],
+            [
+                "gh",
+                "pr",
+                "review",
+                "https://github.com/soyeht/soyeht-ios/pull/16",
+                "--approve",
+            ],
+            ["gh", "pr", "comment", "soyeht/soyeht-ios#16"],
+            [
+                "gh",
+                "issue",
+                "edit",
+                "https://github.com/soyeht/soyeht-ios/issues/16",
+                "--title",
+                "safe",
+            ],
+            ["gh", "issue", "comment", "soyeht/soyeht-ios#16"],
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                with (
+                    mock.patch.object(guard.sys, "stdin", self._stdin(b"safe body")),
+                    mock.patch.object(guard.subprocess, "run") as run,
+                ):
+                    code = guard.main(["--stdin", "--", *command])
+                self.assertEqual(2, code)
+                run.assert_not_called()
+
     def test_github_destination_overrides_inherited_environment(self) -> None:
         with mock.patch.dict(
             guard.os.environ,
