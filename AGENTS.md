@@ -56,8 +56,11 @@ The adapter pins the reviewed consumer execution quartet byte-for-byte: the
 build-only release workflow, the required `build` workflow, its phase
 dispatcher, and the dedicated release-contract checker. Change any of those
 four files by updating and landing this adapter contract first, then re-anchor
-the consumer. Land changes in this order: first the adapter and its tests in
-`theyos`; then re-anchor and land the `soyeht-ios` workflow/docs consumer.
+the consumer. A pin-only follow-up must change only these four digests, their
+exact-value tests, and this narrow ordering policy; it must not broaden adapter
+grammar or mutations. Land changes in this order: first the adapter pins and
+tests in `theyos`; then re-anchor and land the byte-identical `soyeht-ios`
+workflow/docs consumer.
 There is no direct `git tag`, `git push`, `gh release`, clobber, or
 missing-guard fallback.
 

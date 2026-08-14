@@ -82,10 +82,10 @@ RELEASE_TAG_PREFIX = "refs/tags/mac-v"
 RELEASE_PROJECT_FILE = "TerminalApp/Soyeht.xcodeproj/project.pbxproj"
 RELEASE_WORKFLOW_FILE = ".github/workflows/macos-release.yml"
 RELEASE_EXECUTION_CONTRACT_SHA256 = {
-    ".github/workflows/macos-release.yml": "a5c968eaa7556f3194cb1a0ff86e5cade5e15185417b4b57863652cde0a4f512",
+    ".github/workflows/macos-release.yml": "522a852c2601b431266fd7de3718daaa028cbf45a5dfbc22d69a0cb52802bd3b",
     ".github/workflows/xcode.yml": "7fedc9ebe251950479eead626e3fb89d880077d51c68b8df4aaf7f383602d486",
     "scripts/ci/test-ios": "6359805f5fa0bb9c435cd20b6e1eafb6747c4d4baa730b142502e39c61bffb7e",
-    "scripts/ci/check-governed-macos-release.py": "8751007bfea037d92b36480ac21144c3e4abda9c4421cf0ba69596c56b837452",
+    "scripts/ci/check-governed-macos-release.py": "61458cb8b6c093558d7cec8af7f793f142038489e8d00d5fe4857f8a81ea73a3",
 }
 RELEASE_CONTRACT_MARKER = b"# governed-release-contract: theyos-safe-external-write-v1"
 RELEASE_REQUIRED_BUILD_MARKER = b"# governed-release-required-build: scripts/ci/check-governed-macos-release.py"
