@@ -1,0 +1,29 @@
+{
+  "about": "M1a(a) deterministic Noise XX vectors. Generated from this tree by mesh-session-core-rs/tests/m1a_deterministic_vectors.rs and reproduced byte for byte by an independent implementation (noiseprotocol, via scripts/noise-vectors-peer.py). The test re-derives the transcript and compares this file field by field under an EXHAUSTIVE key set with duplicate keys rejected, so a wire change, a renamed field or a dropped field goes red here instead of being skipped by a lookup that simply does not find it. Each pin is checked against its real source rather than against a copy of itself: the pattern against production, snow_version against this crate's Cargo.lock, and both plaintexts against the test's constants.",
+  "provenance": "Derived from the code and pins in this tree, reviewed, then frozen. NOT copied from any earlier tree: a corpus whose provenance is old literals proves the old tree, not this one.",
+  "authority_status": "synthetic-test-only-non-authoritative",
+  "scope": "cross-language-handshake-witness",
+
+  "pattern": "Noise_XX_25519_ChaChaPoly_BLAKE2s",
+  "peer_noise_version": "0.3.1",
+  "snow_version": "0.10.0",
+
+  "keys_are_test_only": "Fixed TEST keys, deliberately recognisable. They exist only in the test target and in this file. docs/mesh-plan.md forbids adding a fixed-key seam to the mesh-session production surface or flow. What is mechanized is narrower than that prohibition: no_literal_seam_reference_outside_the_allowlisted_mention checks that the identifier appears under mesh-session-core-rs/src exactly once, byte-for-byte, in the single allowlisted TEXTUAL occurrence (a doc-comment in this object, though the check proves neither its lexical category nor its position). It is textual only -- it does not parse, expand macros, or reason about reachability. The claim is scoped to mesh-session: other crates and other protocols are outside it.",
+  "initiator_static": "1111111111111111111111111111111111111111111111111111111111111111",
+  "initiator_ephemeral": "2222222222222222222222222222222222222222222222222222222222222222",
+  "responder_static": "3333333333333333333333333333333333333333333333333333333333333333",
+  "responder_ephemeral": "4444444444444444444444444444444444444444444444444444444444444444",
+
+  "record_i2r_plaintext": "m1a-i2r",
+  "record_r2i_plaintext": "m1a-r2i",
+
+  "prologue": "736f796568742f6d6573682d73657373696f6e2f763101",
+  "flight1": "0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20",
+  "flight2": "ff2ee45601ec1b67310c7790404585ae697331eee1c1f8cf2419731c1fff3e6b34844ab378b06d2634652a1eb7d2b6c67c2082af188b41dd5e7da57cf64439f310afbf8d3252bbd6ca7e07b9e35d626cf270658df9076a636f72d48e04a8d7ca",
+  "flight3": "75537efbe989fb8406a0dcce52dbec0f832fd70f3c37a8f6efb0d8b74afcc1a5c00f9fee643461421bc9478f11426f4cede1deeecd83517969a3bcb9e30390aa",
+  "handshake_hash": "13919acbf987beb024a3bc6334a0a8dced036a48c7eb2340c5d007f7f21daaef",
+  "record_i2r": "180f7b0a2c6a6122ca2c804c1f95528414baf336fcfc3e",
+  "record_r2i": "e4ea8ff72a025a0c23a67c83be9245906e5aa8e0bf43c3",
+
+  "negatives": "Refused by BOTH implementations, asserted by stable error category rather than incidental message text: bitflip (one bit of flight 2's AEAD tag), replay (flight 1 where flight 2 belongs), reorder (flight 3 where flight 2 belongs), prologue (a responder under a different prologue). The prologue negative is asserted at flight 2, not flight 1: XX's first message carries no authenticated material, so a diverging prologue is invisible there and becomes detectable only at the first AEAD tag over the handshake hash."
+}
