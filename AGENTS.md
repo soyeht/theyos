@@ -26,12 +26,65 @@ adversarial test are added.
 
 GitHub adapters are pinned to `github.com/soyeht/theyos`. Caller-supplied
 `--repo` and inherited `GH_REPO`/`GH_HOST` cannot redirect a validated payload
-to another destination.
+to another destination. An explicit pull-request or issue target must be a
+strict positive decimal identifier in that repository; absolute URLs,
+`owner/repository#number` selectors, refs, branch names, zero, and leading-zero
+forms fail before execution. The dedicated iOS adapters below are the only
+cross-repository exceptions.
 
 `git push` is intentionally not an adapter: its externally visible text is
 the history already authored, not stdin. Create every commit message through
 the guarded `git commit` adapter, then push without adding new prose. Custom
 merge, tag, release, or e-mail text needs its own reviewed adapter first.
+
+### Governed Soyeht macOS release objects
+
+The `governed-release` adapter family is pinned separately to
+`github.com/soyeht/soyeht-ios`; it does not relax the existing destination for
+issue, pull-request, review, or commit adapters. It accepts only the complete
+`refs/tags/mac-v<version>` ref and full commit/main OIDs. Its five operations
+create one object at a time and then read that object back: annotated tag
+object, tag ref, draft release, one asset upload, and release publication.
+The tag message is fixed to `Soyeht <version>` and every later phase remains
+bound to the original tag-object OID.
+
+This family is **not usable for publication** until the corresponding
+`soyeht-ios` consumer change is present in the target commit. The adapter must
+fail closed when that workflow contract is absent, when the tag or release
+already exists, or when any target, version, asset, digest, or readback differs.
+The adapter pins the reviewed consumer execution quartet byte-for-byte: the
+build-only release workflow, the required `build` workflow, its phase
+dispatcher, and the dedicated release-contract checker. Change any of those
+four files by updating and landing this adapter contract first, then re-anchor
+the consumer. Land changes in this order: first the adapter and its tests in
+`theyos`; then re-anchor and land the `soyeht-ios` workflow/docs consumer.
+There is no direct `git tag`, `git push`, `gh release`, clobber, or
+missing-guard fallback.
+
+The consumer's required `build` context validates the release docs and both
+matching agent-instruction blocks. That checker is versioned in the same head:
+simultaneously removing the checker and its invocation can only be made
+mechanically red by a trusted-base workflow or repository protection. Neither
+external protection nor permanence against an administrator is claimed by
+this adapter; its fail-closed boundary is the exact four-blob execution pin.
+
+The only cross-repository pull-request writer is the separate
+`governed-ios-pr-create` adapter. It can create exactly one draft PR in
+`soyeht/soyeht-ios`, from `ci/governed-macos-release` to `main`, after proving
+the remote branch is at the supplied full OID and no PR already exists. It must
+read back the open draft with byte-exact title/body and exact head/base. It has
+no edit, ready, review, merge, repository-selector, or fallback operation. This
+adapter exists only to stage the consumer change after the `theyos` adapter PR
+lands; it does not make the release family usable before that consumer is in
+`soyeht-ios` main.
+
+The separate `governed-ios-pr-body-update` adapter can update only the body of
+that same fixed consumer PR number 16 while it is OPEN+DRAFT at the expected
+full head OID. The repository, PR number, title, base, and head are hardcoded;
+the old body digest and size are mandatory preconditions, and one body-only
+PATCH is followed by byte-exact readback. It cannot change a title, create a
+second mutation, or ready, review, merge, or redirect the PR. A post-mutation
+readback failure is RED and has no automatic rollback.
 
 Soyeht pane handles are internal routing identifiers. Never place them in an
 external payload. Write `agent-khai` or `internal agent Khai`, without an
