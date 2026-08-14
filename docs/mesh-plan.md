@@ -10,11 +10,11 @@ pessoal e não entram em documento versionado.
 
 ---
 
-## A decisão que gerou esta versão (medida 2026-08-12 @ `883775b7`)
+## A decisão que gerou esta versão (medida 2026-08-14 @ `57b1634c`)
 
 <!-- doc-freshness-anchor
-measured: 2026-08-12
-sha: 883775b7bfdc6cf7cd27771aabefa42fe03b6e91
+measured: 2026-08-14
+sha: 57b1634ce325511f9affae636533a247478797b3
 paths:
   - admin/rust/mesh-session-core-rs/**
   - admin/rust/mesh-session-control-model-rs/**
@@ -306,7 +306,11 @@ linguagem, sem compartilhar crypto nem estado com o `snow`.
 hash**; e as negativas (bit flip, replay, reorder, prologue trocado) falham nos
 dois modos.
 
-> **Estado (2026-08-10): M1a ABERTO.** Fechou-se a metade (b), e só ela.
+> **Estado (2026-08-13): M1a ABERTO. A metade (a) está entregue.** As duas
+> metades estão versionadas e exigidas no mesmo gate de CI, mas o "Pronto
+> quando" acima exige que as negativas falhem nos **dois modos** — o
+> determinístico e o ao vivo — e o modo ao vivo não as tem. Falta essa
+> cobertura, e só ela. **M1b continua aberto.**
 >
 > **(b) feito e exigido em automação.** O interop ao vivo está versionado
 > como teste do core: `snow` ↔ `noiseprotocol`, prologue e framing reais, cada
@@ -336,11 +340,50 @@ dois modos.
 > bem-sucedido produz log byte-idêntico ao de um handshake real. Por isso o
 > `--nocapture` naquele comando é evidência, e removê-lo cega o gate.
 >
-> **(a) não começou.** Vetores determinísticos em harness isolado, e as
-> negativas (bit flip, replay, reorder, prologue trocado) nos dois modos. Sem
-> isso o "Pronto quando" acima não está satisfeito, e nenhuma prova de (b) o
-> substitui: uma implementação que concorda com a nossa não demonstra que ela
-> recusa o que deve recusar.
+> **(a) feito, no mesmo gate.** Os vetores determinísticos vivem num alvo
+> `tests/` que o Cargo só constrói sob `cargo test`, com as chaves fixas
+> contidas ali. O transcript — prologue, os 3 flights XX, hash de handshake e o
+> primeiro record em cada sentido — está **congelado** em
+> `admin/contracts/mesh-session/v1/m1a_noise_vectors_v1.json`, e o teste
+> regenera-o e confere campo a campo sob conjunto de chaves **exaustivo**: um
+> campo acrescentado, renomeado ou removido falha, em vez de ser saltado por uma
+> busca que simplesmente não o encontra. Chave duplicada é recusada em vez de
+> resolvida por último-ganha. O comparando é o mesmo pin da metade (b) —
+> `noiseprotocol==0.3.1` — pela mesma razão que ali.
+>
+> Três testes sustentam o "Pronto quando" acima:
+> `an_independent_implementation_reproduces_the_vectors` reproduz o transcript
+> byte-a-byte numa segunda implementação;
+> `our_own_implementation_refuses_every_negative` e
+> `the_independent_implementation_refuses_every_negative` exigem que bit flip,
+> replay, reorder e prologue trocado falhem nas duas **implementações** — uma
+> implementação que concorda com a nossa não demonstra que recusa o que deve
+> recusar. Isso cobre as negativas **dentro do modo determinístico**, e não as
+> estende ao outro modo.
+>
+> A proibição do seam de chave fixa tem um teste que a mecaniza EM PARTE, e a
+> parte está nomeada:
+> `no_literal_seam_reference_outside_the_allowlisted_mention` verifica que o
+> identificador aparece sob `mesh-session-core-rs/src` exatamente UMA vez,
+> byte a byte, na única ocorrência TEXTUAL permitida — que neste objeto calha
+> ser um doc-comment, embora a verificação não prove nem a categoria léxica nem
+> a posição. É uma verificação
+> **textual**: não analisa sintaxe, não expande macros e não raciocina sobre
+> alcançabilidade — indireção por macro definida fora de `src/` não deixa
+> ocorrência literal e não é vista. A proibição escrita acima é mais larga do
+> que o que este teste prova. O harness chega ao seam pelo método upstream do
+> `snow`, a partir de um `Builder` construído no próprio ficheiro de teste.
+>
+> **O que falta para fechar o M1a**, e é um requisito só: as negativas — bit
+> flip, replay, reorder, prologue trocado — no modo AO VIVO. A metade (b)
+> existe e está exigida em automação; o que ela não tem é cobertura negativa.
+> `scripts/noise-conformance-peer.py` não expõe modo negativo e a suíte de
+> `src/noise.rs` não exercita bit flip, replay nem reorder. Acrescentá-las é
+> trabalho próprio, não um apêndice deste commit.
+>
+> **Limite.** Isto entrega a metade (a) e nada mais. O M1a continua aberto pela
+> lacuna acima, e o M1b — vetores de wire e autorização cross-language,
+> Rust↔Swift — continua aberto e não tem objeto neste commit.
 
 ## M1b — Wire e autorização cross-language
 
