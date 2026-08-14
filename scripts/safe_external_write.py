@@ -28,6 +28,9 @@ adapters are intentionally pinned to ``github.com/soyeht/theyos``. The separate
 ``governed-ios-pr-create`` adapter can create only the draft consumer PR from
 ``ci/governed-macos-release`` into ``soyeht/soyeht-ios:main``. It cannot edit,
 ready, review, or merge a PR and does not add a general destination selector.
+The companion ``governed-ios-pr-body-update`` adapter can change only the body
+of that same consumer PR number 16 while it remains open and draft; every
+other field is a hardcoded readback invariant.
 Any further repository or operation requires an explicit code change and
 review.
 """
@@ -70,11 +73,19 @@ RELEASE_GITHUB_REPO = "soyeht/soyeht-ios"
 IOS_PR_BASE = "main"
 IOS_PR_HEAD = "ci/governed-macos-release"
 IOS_PR_HEAD_OWNER = "soyeht"
+IOS_PR_NUMBER = 16
+IOS_PR_TITLE = "ci(macos): make release workflow build-only and governed"
 RELEASE_TAG_PREFIX = "refs/tags/mac-v"
 RELEASE_PROJECT_FILE = "TerminalApp/Soyeht.xcodeproj/project.pbxproj"
 RELEASE_WORKFLOW_FILE = ".github/workflows/macos-release.yml"
-RELEASE_WORKFLOW_SHA256 = "c513b00f3a0b17d86dfabb55e4955ad70a35f0dc2a37c78b01d9fd1657afbb1c"
+RELEASE_EXECUTION_CONTRACT_SHA256 = {
+    ".github/workflows/macos-release.yml": "a5c968eaa7556f3194cb1a0ff86e5cade5e15185417b4b57863652cde0a4f512",
+    ".github/workflows/xcode.yml": "7fedc9ebe251950479eead626e3fb89d880077d51c68b8df4aaf7f383602d486",
+    "scripts/ci/test-ios": "6359805f5fa0bb9c435cd20b6e1eafb6747c4d4baa730b142502e39c61bffb7e",
+    "scripts/ci/check-governed-macos-release.py": "8751007bfea037d92b36480ac21144c3e4abda9c4421cf0ba69596c56b837452",
+}
 RELEASE_CONTRACT_MARKER = b"# governed-release-contract: theyos-safe-external-write-v1"
+RELEASE_REQUIRED_BUILD_MARKER = b"# governed-release-required-build: scripts/ci/check-governed-macos-release.py"
 RELEASE_CONTRACT_REQUIRED_ACTIVE_LINES = (
     b"      expected_ref:",
     b"      expected_oid:",
@@ -531,6 +542,14 @@ class IOSDraftPRExpectation:
 
 
 @dataclass(frozen=True)
+class IOSDraftPRBodyUpdateExpectation:
+    expected_head_oid: str
+    expected_old_body_sha256: str
+    expected_old_body_size: int
+    body: str
+
+
+@dataclass(frozen=True)
 class AssetExpectation:
     name: str
     size: int
@@ -703,15 +722,24 @@ def _assert_common_release_state(api: GitHubAPI, common: ReleaseCommon) -> None:
             f"the requested version {common.version!r}"
         )
 
-    workflow_bytes = _read_repository_file(
-        api,
-        RELEASE_WORKFLOW_FILE,
-        common.target_oid,
-        "governed release workflow",
-    )
+    execution_contract = {
+        path: _read_repository_file(
+            api,
+            path,
+            common.target_oid,
+            f"governed release execution contract {path}",
+        )
+        for path in RELEASE_EXECUTION_CONTRACT_SHA256
+    }
+    workflow_bytes = execution_contract[RELEASE_WORKFLOW_FILE]
     if workflow_bytes.count(RELEASE_CONTRACT_MARKER) != 1:
         raise ReleaseGuardError(
             "the governed iOS workflow contract is absent or duplicated; "
+            "consumer PR B must be in the target commit"
+        )
+    if workflow_bytes.count(RELEASE_REQUIRED_BUILD_MARKER) != 1:
+        raise ReleaseGuardError(
+            "the governed iOS required-build contract is absent or duplicated; "
             "consumer PR B must be in the target commit"
         )
     active_lines = tuple(
@@ -734,9 +762,15 @@ def _assert_common_release_state(api: GitHubAPI, common: ReleaseCommon) -> None:
             "governed iOS workflow contract mismatch: "
             f"missing={missing_contract!r}, forbidden={forbidden_contract!r}"
         )
-    if hashlib.sha256(workflow_bytes).hexdigest() != RELEASE_WORKFLOW_SHA256:
+    mismatched_bytes = [
+        path
+        for path, expected_sha256 in RELEASE_EXECUTION_CONTRACT_SHA256.items()
+        if hashlib.sha256(execution_contract[path]).hexdigest() != expected_sha256
+    ]
+    if mismatched_bytes:
         raise ReleaseGuardError(
-            "governed iOS workflow bytes do not match the reviewed consumer contract"
+            "governed iOS execution-contract bytes do not match the reviewed "
+            f"consumer quartet: {mismatched_bytes!r}"
         )
 
     ambiguous_branch = api.read_optional(
@@ -945,6 +979,46 @@ def _parse_ios_pr_create_arguments(arguments: Sequence[str]) -> tuple[str, str]:
     return _full_oid(values["--expected-head-oid"], "expected PR head OID"), title
 
 
+def _parse_ios_pr_body_update_arguments(
+    arguments: Sequence[str],
+) -> tuple[str, str, int]:
+    allowed = frozenset(
+        {
+            "--expected-head-oid",
+            "--expected-old-body-sha256",
+            "--expected-old-body-size",
+        }
+    )
+    values: dict[str, str] = {}
+    index = 0
+    while index < len(arguments):
+        flag = arguments[index]
+        if flag not in allowed:
+            raise UnsafeCommand(f"unsupported governed iOS PR body argument: {flag}")
+        if flag in values:
+            raise UnsafeCommand(f"duplicate governed iOS PR body argument: {flag}")
+        if index + 1 >= len(arguments) or arguments[index + 1].startswith("--"):
+            raise UnsafeCommand(f"missing value for governed iOS PR body argument: {flag}")
+        values[flag] = arguments[index + 1]
+        index += 2
+    missing = sorted(allowed - values.keys())
+    if missing:
+        raise UnsafeCommand(
+            "missing governed iOS PR body arguments: " + ", ".join(missing)
+        )
+    digest = values["--expected-old-body-sha256"]
+    if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise ReleaseGuardError("expected old PR body SHA-256 must be 64 lowercase hex digits")
+    size_text = values["--expected-old-body-size"]
+    if re.fullmatch(r"[1-9][0-9]*", size_text) is None:
+        raise ReleaseGuardError("expected old PR body size must be a positive decimal integer")
+    return (
+        _full_oid(values["--expected-head-oid"], "expected PR head OID"),
+        digest,
+        int(size_text),
+    )
+
+
 def _assert_ios_pr_head(
     api: GitHubAPI,
     expected_head_oid: str,
@@ -1046,6 +1120,104 @@ def execute_governed_ios_pr_create(
                 "head_oid": expectation.expected_head_oid,
                 "operation": "governed-ios-pr-create",
                 "pr_number": number,
+                "repository": RELEASE_GITHUB_REPO,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    return 0
+
+
+def _assert_ios_pr_body_update_readback(
+    readback: Mapping[str, Any],
+    expectation: IOSDraftPRBodyUpdateExpectation,
+    expected_body: str,
+) -> None:
+    head = _expect_mapping(readback.get("head"), "governed iOS PR body readback head")
+    base = _expect_mapping(readback.get("base"), "governed iOS PR body readback base")
+    head_repo = _expect_mapping(head.get("repo"), "governed iOS PR body head repository")
+    base_repo = _expect_mapping(base.get("repo"), "governed iOS PR body base repository")
+    if (
+        readback.get("number") != IOS_PR_NUMBER
+        or readback.get("state") != "open"
+        or readback.get("draft") is not True
+        or readback.get("title") != IOS_PR_TITLE
+        or readback.get("body") != expected_body
+        or head.get("ref") != IOS_PR_HEAD
+        or head.get("sha") != expectation.expected_head_oid
+        or head_repo.get("full_name") != RELEASE_GITHUB_REPO
+        or base.get("ref") != IOS_PR_BASE
+        or base_repo.get("full_name") != RELEASE_GITHUB_REPO
+    ):
+        raise ReleaseGuardError("governed iOS draft PR body readback mismatch")
+
+
+def execute_governed_ios_pr_body_update(
+    arguments: Sequence[str],
+    payload: str,
+    *,
+    api: GitHubAPI | None = None,
+) -> int:
+    """Update only the fixed iOS consumer draft PR body and read it back."""
+    expected_head_oid, old_digest, old_size = _parse_ios_pr_body_update_arguments(
+        arguments
+    )
+    if not payload:
+        raise ReleaseGuardError("governed iOS PR body must not be empty")
+    if find_mentions(payload):
+        raise ReleaseGuardError("governed iOS PR body failed the outbound writer check")
+    expectation = IOSDraftPRBodyUpdateExpectation(
+        expected_head_oid=expected_head_oid,
+        expected_old_body_sha256=old_digest,
+        expected_old_body_size=old_size,
+        body=payload,
+    )
+    client = api or GitHubAPI()
+    _assert_ios_pr_head(client, expectation.expected_head_oid)
+    before = _expect_mapping(
+        client.read(f"repos/{RELEASE_GITHUB_REPO}/pulls/{IOS_PR_NUMBER}"),
+        "governed iOS PR body preflight",
+    )
+    old_body = before.get("body")
+    if not isinstance(old_body, str):
+        raise ReleaseGuardError("governed iOS PR old body is not text")
+    _assert_ios_pr_body_update_readback(before, expectation, old_body)
+    old_bytes = old_body.encode("utf-8")
+    if (
+        len(old_bytes) != expectation.expected_old_body_size
+        or hashlib.sha256(old_bytes).hexdigest()
+        != expectation.expected_old_body_sha256
+    ):
+        raise ReleaseGuardError("governed iOS PR old body bytes do not match expectation")
+    if old_body == expectation.body:
+        raise ReleaseGuardError("governed iOS PR body update must change the body")
+
+    client.mutate_json(
+        "PATCH",
+        f"repos/{RELEASE_GITHUB_REPO}/pulls/{IOS_PR_NUMBER}",
+        {"body": expectation.body},
+    )
+
+    _assert_ios_pr_head(client, expectation.expected_head_oid)
+    after = _expect_mapping(
+        client.read(f"repos/{RELEASE_GITHUB_REPO}/pulls/{IOS_PR_NUMBER}"),
+        "governed iOS PR body readback",
+    )
+    _assert_ios_pr_body_update_readback(after, expectation, expectation.body)
+    print(
+        json.dumps(
+            {
+                "base": IOS_PR_BASE,
+                "body_sha256": hashlib.sha256(
+                    expectation.body.encode("utf-8")
+                ).hexdigest(),
+                "body_size": len(expectation.body.encode("utf-8")),
+                "draft": True,
+                "head": IOS_PR_HEAD,
+                "head_oid": expectation.expected_head_oid,
+                "operation": "governed-ios-pr-body-update",
+                "pr_number": IOS_PR_NUMBER,
                 "repository": RELEASE_GITHUB_REPO,
             },
             sort_keys=True,
@@ -1356,6 +1528,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if command[:1] == ["governed-ios-pr-create"]:
         try:
             return execute_governed_ios_pr_create(command[1:], payload)
+        except (UnsafeCommand, ReleaseGuardError, GitHubAPIError) as error:
+            print(f"BLOCKED: {error}", file=sys.stderr)
+            return 2
+
+    if command[:1] == ["governed-ios-pr-body-update"]:
+        try:
+            return execute_governed_ios_pr_body_update(command[1:], payload)
         except (UnsafeCommand, ReleaseGuardError, GitHubAPIError) as error:
             print(f"BLOCKED: {error}", file=sys.stderr)
             return 2

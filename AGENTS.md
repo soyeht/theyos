@@ -48,11 +48,21 @@ This family is **not usable for publication** until the corresponding
 `soyeht-ios` consumer change is present in the target commit. The adapter must
 fail closed when that workflow contract is absent, when the tag or release
 already exists, or when any target, version, asset, digest, or readback differs.
-The adapter pins the reviewed consumer workflow bytes; change that workflow by
-updating and landing this adapter contract first, then re-anchor the consumer.
-Land changes in this order: first the adapter and its tests in `theyos`; then
-re-anchor and land the `soyeht-ios` workflow/docs consumer. There is no direct
-`git tag`, `git push`, `gh release`, clobber, or missing-guard fallback.
+The adapter pins the reviewed consumer execution quartet byte-for-byte: the
+build-only release workflow, the required `build` workflow, its phase
+dispatcher, and the dedicated release-contract checker. Change any of those
+four files by updating and landing this adapter contract first, then re-anchor
+the consumer. Land changes in this order: first the adapter and its tests in
+`theyos`; then re-anchor and land the `soyeht-ios` workflow/docs consumer.
+There is no direct `git tag`, `git push`, `gh release`, clobber, or
+missing-guard fallback.
+
+The consumer's required `build` context validates the release docs and both
+matching agent-instruction blocks. That checker is versioned in the same head:
+simultaneously removing the checker and its invocation can only be made
+mechanically red by a trusted-base workflow or repository protection. Neither
+external protection nor permanence against an administrator is claimed by
+this adapter; its fail-closed boundary is the exact four-blob execution pin.
 
 The only cross-repository pull-request writer is the separate
 `governed-ios-pr-create` adapter. It can create exactly one draft PR in
@@ -63,6 +73,14 @@ no edit, ready, review, merge, repository-selector, or fallback operation. This
 adapter exists only to stage the consumer change after the `theyos` adapter PR
 lands; it does not make the release family usable before that consumer is in
 `soyeht-ios` main.
+
+The separate `governed-ios-pr-body-update` adapter can update only the body of
+that same fixed consumer PR number 16 while it is OPEN+DRAFT at the expected
+full head OID. The repository, PR number, title, base, and head are hardcoded;
+the old body digest and size are mandatory preconditions, and one body-only
+PATCH is followed by byte-exact readback. It cannot change a title, create a
+second mutation, or ready, review, merge, or redirect the PR. A post-mutation
+readback failure is RED and has no automatic rollback.
 
 Soyeht pane handles are internal routing identifiers. Never place them in an
 external payload. Write `agent-khai` or `internal agent Khai`, without an

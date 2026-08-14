@@ -47,6 +47,7 @@ class FakeReleaseAPI:
         self.workflow = b"\n".join(
             (
                 guard.RELEASE_CONTRACT_MARKER,
+                guard.RELEASE_REQUIRED_BUILD_MARKER,
                 b"      expected_ref:",
                 b"      expected_oid:",
                 b"  contents: read",
@@ -54,6 +55,11 @@ class FakeReleaseAPI:
                 b"          if-no-files-found: error",
             )
         )
+        self.execution_contract = {
+            path: f"reviewed bytes for {path}\n".encode("utf-8")
+            for path in guard.RELEASE_EXECUTION_CONTRACT_SHA256
+            if path != guard.RELEASE_WORKFLOW_FILE
+        }
         self.tag_objects: dict[str, dict[str, Any]] = {}
         self.tags: dict[str, str] = {}
         self.releases: dict[int, dict[str, Any]] = {}
@@ -171,8 +177,15 @@ class FakeReleaseAPI:
                 "encoding": "base64",
                 "content": encoded,
             }
-        if f"/contents/{guard.RELEASE_WORKFLOW_FILE}?ref={TARGET}" in endpoint:
-            encoded = base64.b64encode(self.workflow).decode("ascii")
+        for path in guard.RELEASE_EXECUTION_CONTRACT_SHA256:
+            if f"/contents/{path}?ref={TARGET}" not in endpoint:
+                continue
+            payload = (
+                self.workflow
+                if path == guard.RELEASE_WORKFLOW_FILE
+                else self.execution_contract[path]
+            )
+            encoded = base64.b64encode(payload).decode("ascii")
             if self.linewrap_contents:
                 encoded = "\n".join(encoded[index : index + 20] for index in range(0, len(encoded), 20))
             return {
@@ -524,6 +537,287 @@ class GovernedIOSPRCreateTests(unittest.TestCase):
         )
 
 
+class FakeIOSPRBodyUpdateAPI:
+    def __init__(self) -> None:
+        self.head_oid = TARGET
+        self.post_mutation_head_oid: str | None = None
+        self.head_type = "commit"
+        self.head_ref = f"refs/heads/{guard.IOS_PR_HEAD}"
+        self.body = "Old governed body\n"
+        self.state = "open"
+        self.draft = True
+        self.number: Any = guard.IOS_PR_NUMBER
+        self.title = guard.IOS_PR_TITLE
+        self.pr_head_ref = guard.IOS_PR_HEAD
+        self.pr_head_oid = TARGET
+        self.pr_head_repo = guard.RELEASE_GITHUB_REPO
+        self.pr_base_ref = guard.IOS_PR_BASE
+        self.pr_base_repo = guard.RELEASE_GITHUB_REPO
+        self.readback_patch: dict[str, Any] | None = None
+        self.mutations: list[tuple[str, str, dict[str, Any]]] = []
+
+    def _assert_repo(self, endpoint: str) -> None:
+        if not endpoint.startswith(f"repos/{guard.RELEASE_GITHUB_REPO}/"):
+            raise AssertionError(f"un-pinned iOS PR endpoint: {endpoint}")
+
+    def _pr(self) -> dict[str, Any]:
+        value = {
+            "number": self.number,
+            "state": self.state,
+            "draft": self.draft,
+            "title": self.title,
+            "body": self.body,
+            "head": {
+                "ref": self.pr_head_ref,
+                "sha": self.pr_head_oid,
+                "repo": {"full_name": self.pr_head_repo},
+            },
+            "base": {
+                "ref": self.pr_base_ref,
+                "repo": {"full_name": self.pr_base_repo},
+            },
+        }
+        if self.mutations and self.readback_patch is not None:
+            for key, replacement in self.readback_patch.items():
+                if key == "head.repo.full_name":
+                    value["head"]["repo"]["full_name"] = replacement
+                elif key == "base.repo.full_name":
+                    value["base"]["repo"]["full_name"] = replacement
+                elif key.startswith("head."):
+                    value["head"][key.removeprefix("head.")] = replacement
+                elif key.startswith("base."):
+                    value["base"][key.removeprefix("base.")] = replacement
+                else:
+                    value[key] = replacement
+        return value
+
+    def read(self, endpoint: str) -> Any:
+        self._assert_repo(endpoint)
+        if endpoint.endswith(f"/git/ref/heads/{guard.IOS_PR_HEAD}"):
+            oid = (
+                self.post_mutation_head_oid
+                if self.mutations and self.post_mutation_head_oid is not None
+                else self.head_oid
+            )
+            return {
+                "ref": self.head_ref,
+                "object": {"type": self.head_type, "sha": oid},
+            }
+        if endpoint.endswith(f"/pulls/{guard.IOS_PR_NUMBER}"):
+            return copy.deepcopy(self._pr())
+        raise AssertionError(f"unexpected iOS PR body read: {endpoint}")
+
+    def mutate_json(
+        self, method: str, endpoint: str, payload: Mapping[str, Any]
+    ) -> Any:
+        self._assert_repo(endpoint)
+        stored = dict(payload)
+        self.mutations.append((method, endpoint, stored))
+        if (
+            method != "PATCH"
+            or endpoint
+            != f"repos/{guard.RELEASE_GITHUB_REPO}/pulls/{guard.IOS_PR_NUMBER}"
+            or set(stored) != {"body"}
+        ):
+            raise AssertionError(f"unexpected iOS PR body mutation: {method} {endpoint}")
+        self.body = stored["body"]
+        return self._pr()
+
+
+class GovernedIOSPRBodyUpdateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.api = FakeIOSPRBodyUpdateAPI()
+        self.new_body = "New governed body\n"
+
+    def arguments(self, api: FakeIOSPRBodyUpdateAPI | None = None) -> list[str]:
+        source = api or self.api
+        old_bytes = source.body.encode("utf-8")
+        return [
+            "--expected-head-oid",
+            TARGET,
+            "--expected-old-body-sha256",
+            hashlib.sha256(old_bytes).hexdigest(),
+            "--expected-old-body-size",
+            str(len(old_bytes)),
+        ]
+
+    def execute(self) -> int:
+        return guard.execute_governed_ios_pr_body_update(
+            self.arguments(), self.new_body, api=self.api
+        )
+
+    def test_success_is_one_body_only_patch_with_exact_readback(self) -> None:
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(0, self.execute())
+        self.assertEqual(
+            [
+                (
+                    "PATCH",
+                    f"repos/{guard.RELEASE_GITHUB_REPO}/pulls/{guard.IOS_PR_NUMBER}",
+                    {"body": self.new_body},
+                )
+            ],
+            self.api.mutations,
+        )
+        receipt = json.loads(stdout.getvalue())
+        self.assertEqual("governed-ios-pr-body-update", receipt["operation"])
+        self.assertEqual(guard.IOS_PR_NUMBER, receipt["pr_number"])
+        self.assertEqual(TARGET, receipt["head_oid"])
+        self.assertEqual(
+            hashlib.sha256(self.new_body.encode()).hexdigest(),
+            receipt["body_sha256"],
+        )
+
+    def test_destination_identity_and_other_operations_are_not_in_grammar(self) -> None:
+        for flag in (
+            "--repo",
+            "--host",
+            "--dest",
+            "--number",
+            "--base",
+            "--head",
+            "--title",
+            "--force",
+            "--admin",
+            "--ready",
+            "--review",
+            "--merge",
+        ):
+            with self.subTest(flag=flag), self.assertRaises(guard.UnsafeCommand):
+                guard.execute_governed_ios_pr_body_update(
+                    [*self.arguments(), flag, "attacker/value"],
+                    self.new_body,
+                    api=self.api,
+                )
+        self.assertEqual([], self.api.mutations)
+
+    def test_argument_shape_and_payload_fail_closed_before_mutation(self) -> None:
+        valid = self.arguments()
+        cases = (
+            [],
+            valid[:-2],
+            [*valid, "--expected-head-oid", TARGET],
+            [*valid[:1], "a" * 39, *valid[2:]],
+            [*valid[:3], "A" * 64, *valid[4:]],
+            [*valid[:5], "0"],
+            [*valid[:5], "01"],
+        )
+        for arguments in cases:
+            with self.subTest(arguments=arguments), self.assertRaises(
+                (guard.UnsafeCommand, guard.ReleaseGuardError)
+            ):
+                guard.execute_governed_ios_pr_body_update(
+                    arguments, self.new_body, api=self.api
+                )
+        unsafe_mention = "unsafe " + chr(64) + "person body\n"
+        for body in ("", unsafe_mention, self.api.body):
+            with self.subTest(body=body), self.assertRaises(guard.ReleaseGuardError):
+                guard.execute_governed_ios_pr_body_update(
+                    self.arguments(), body, api=self.api
+                )
+        self.assertEqual([], self.api.mutations)
+
+    def test_remote_ref_and_every_pr_precondition_are_load_bearing(self) -> None:
+        mutations = (
+            lambda api: setattr(api, "head_ref", "refs/heads/other"),
+            lambda api: setattr(api, "head_type", "tag"),
+            lambda api: setattr(api, "head_oid", WRONG),
+            lambda api: setattr(api, "number", 17),
+            lambda api: setattr(api, "state", "closed"),
+            lambda api: setattr(api, "draft", False),
+            lambda api: setattr(api, "title", "changed"),
+            lambda api: setattr(api, "pr_head_ref", "other"),
+            lambda api: setattr(api, "pr_head_oid", WRONG),
+            lambda api: setattr(api, "pr_head_repo", "other/repo"),
+            lambda api: setattr(api, "pr_base_ref", "other"),
+            lambda api: setattr(api, "pr_base_repo", "other/repo"),
+        )
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                self.api = FakeIOSPRBodyUpdateAPI()
+                arguments = self.arguments(self.api)
+                mutate(self.api)
+                with self.assertRaises(guard.ReleaseGuardError):
+                    guard.execute_governed_ios_pr_body_update(
+                        arguments, self.new_body, api=self.api
+                    )
+                self.assertEqual([], self.api.mutations)
+
+    def test_old_body_hash_and_size_are_independent_preconditions(self) -> None:
+        valid = self.arguments()
+        cases = (
+            [*valid[:3], "0" * 64, *valid[4:]],
+            [*valid[:5], str(len(self.api.body.encode()) + 1)],
+        )
+        for arguments in cases:
+            with self.subTest(arguments=arguments), self.assertRaisesRegex(
+                guard.ReleaseGuardError, "old body bytes"
+            ):
+                guard.execute_governed_ios_pr_body_update(
+                    arguments, self.new_body, api=self.api
+                )
+        self.assertEqual([], self.api.mutations)
+
+    def test_post_mutation_ref_and_every_readback_field_are_red_after_one_patch(self) -> None:
+        patches = (
+            {"number": 17},
+            {"state": "closed"},
+            {"draft": False},
+            {"title": "changed"},
+            {"body": "changed\n"},
+            {"head.ref": "other"},
+            {"head.sha": WRONG},
+            {"head.repo.full_name": "other/repo"},
+            {"base.ref": "other"},
+            {"base.repo.full_name": "other/repo"},
+        )
+        for patch in patches:
+            with self.subTest(patch=patch):
+                self.api = FakeIOSPRBodyUpdateAPI()
+                self.api.readback_patch = patch
+                with self.assertRaisesRegex(guard.ReleaseGuardError, "readback"):
+                    self.execute()
+                self.assertEqual(1, len(self.api.mutations))
+        self.api = FakeIOSPRBodyUpdateAPI()
+        self.api.post_mutation_head_oid = WRONG
+        with self.assertRaisesRegex(guard.ReleaseGuardError, "remote branch"):
+            self.execute()
+        self.assertEqual(1, len(self.api.mutations))
+
+    def test_reuse_cannot_create_a_second_mutation(self) -> None:
+        arguments = self.arguments()
+        self.assertEqual(
+            0,
+            guard.execute_governed_ios_pr_body_update(
+                arguments, self.new_body, api=self.api
+            ),
+        )
+        with self.assertRaises(guard.ReleaseGuardError):
+            guard.execute_governed_ios_pr_body_update(
+                arguments, "Third governed body\n", api=self.api
+            )
+        self.assertEqual(1, len(self.api.mutations))
+
+    def test_main_routes_exact_validated_body_to_dedicated_adapter(self) -> None:
+        arguments = self.arguments()
+        stdin = mock.Mock()
+        stdin.buffer.read.return_value = self.new_body.encode("utf-8")
+        with (
+            mock.patch.object(guard.sys, "stdin", stdin),
+            mock.patch.object(
+                guard,
+                "execute_governed_ios_pr_body_update",
+                return_value=0,
+            ) as execute,
+        ):
+            code = guard.main(
+                ["--stdin", "--", "governed-ios-pr-body-update", *arguments]
+            )
+        self.assertEqual(0, code)
+        execute.assert_called_once_with(arguments, self.new_body)
+
+
 class GitHubAPIIOSTargetBoundaryTests(unittest.TestCase):
     def test_pr_listing_uses_fixed_host_repo_and_overrides_inherited_destination(self) -> None:
         completed = mock.Mock(returncode=0, stdout=b"[[]]", stderr=b"")
@@ -553,12 +847,21 @@ class GitHubAPIIOSTargetBoundaryTests(unittest.TestCase):
 class GovernedReleaseTests(unittest.TestCase):
     def setUp(self) -> None:
         self.api = FakeReleaseAPI()
-        workflow_digest = hashlib.sha256(self.api.workflow).hexdigest()
-        workflow_digest_patch = mock.patch.object(
-            guard, "RELEASE_WORKFLOW_SHA256", workflow_digest
+        execution_contract_digests = {
+            path: hashlib.sha256(
+                self.api.workflow
+                if path == guard.RELEASE_WORKFLOW_FILE
+                else self.api.execution_contract[path]
+            ).hexdigest()
+            for path in guard.RELEASE_EXECUTION_CONTRACT_SHA256
+        }
+        execution_contract_digest_patch = mock.patch.object(
+            guard,
+            "RELEASE_EXECUTION_CONTRACT_SHA256",
+            execution_contract_digests,
         )
-        workflow_digest_patch.start()
-        self.addCleanup(workflow_digest_patch.stop)
+        execution_contract_digest_patch.start()
+        self.addCleanup(execution_contract_digest_patch.stop)
 
     def common(self) -> list[str]:
         return [
@@ -816,6 +1119,10 @@ class GovernedReleaseTests(unittest.TestCase):
         cases = (
             b"      expected_ref:\n      expected_oid:\n  contents: read",
             self.api.workflow.replace(
+                guard.RELEASE_REQUIRED_BUILD_MARKER,
+                b"# required-build marker removed",
+            ),
+            self.api.workflow.replace(
                 b"        uses: actions/upload-artifact@v4",
                 b"        # uses: actions/upload-artifact@v4",
             ),
@@ -829,6 +1136,18 @@ class GovernedReleaseTests(unittest.TestCase):
             with self.subTest(workflow=workflow):
                 self.api = FakeReleaseAPI()
                 self.api.workflow = workflow
+                self.assert_blocked_before_mutation(
+                    "tag-object-create", payload=TAG_MESSAGE
+                )
+
+    def test_each_execution_contract_blob_drift_is_red_before_mutation(self) -> None:
+        for path in guard.RELEASE_EXECUTION_CONTRACT_SHA256:
+            with self.subTest(path=path):
+                self.api = FakeReleaseAPI()
+                if path == guard.RELEASE_WORKFLOW_FILE:
+                    self.api.workflow += b"\n# drift"
+                else:
+                    self.api.execution_contract[path] += b"# drift\n"
                 self.assert_blocked_before_mutation(
                     "tag-object-create", payload=TAG_MESSAGE
                 )
