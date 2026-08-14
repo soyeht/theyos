@@ -269,5 +269,23 @@ class ExecutionBoundaryTests(unittest.TestCase):
         self.assertIn("khai", stderr.getvalue())
 
 
+def load_tests(
+    loader: unittest.TestLoader,
+    tests: unittest.TestSuite,
+    pattern: str | None,
+) -> unittest.TestSuite:
+    """Run the dedicated governed-release adversarial suite in the CI entrypoint."""
+    release_tests_path = Path(__file__).with_name("test_safe_external_release.py")
+    release_spec = importlib.util.spec_from_file_location(
+        "test_safe_external_release", release_tests_path
+    )
+    assert release_spec is not None and release_spec.loader is not None
+    release_tests = importlib.util.module_from_spec(release_spec)
+    sys.modules[release_spec.name] = release_tests
+    release_spec.loader.exec_module(release_tests)
+    tests.addTests(loader.loadTestsFromModule(release_tests))
+    return tests
+
+
 if __name__ == "__main__":
     unittest.main()

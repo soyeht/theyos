@@ -21,21 +21,33 @@ validation race. Executed commands use a closed grammar: the wrapper itself
 adds the stdin-reading body/message flag. Unsupported writers are check-only
 until a reviewed adapter is added. ``git push`` is intentionally outside the
 execution grammar because its published text is existing history, not stdin;
-commit messages are guarded when they are created. GitHub adapters are
-intentionally pinned to ``github.com/soyeht/theyos``; another repository
-requires an explicit code change and review rather than a runtime override.
+commit messages are guarded when they are created. General GitHub prose
+adapters are intentionally pinned to ``github.com/soyeht/theyos``. The separate
+``governed-release`` family is hardcoded to
+``github.com/soyeht/soyeht-ios`` and cannot redirect at runtime. The dedicated
+``governed-ios-pr-create`` adapter can create only the draft consumer PR from
+``ci/governed-macos-release`` into ``soyeht/soyeht-ios:main``. It cannot edit,
+ready, review, or merge a PR and does not add a general destination selector.
+Any further repository or operation requires an explicit code change and
+review.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
+import http.client
+import json
 import os
 import re
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Mapping, Sequence
+from urllib.parse import quote
 
 
 # GitHub mention syntax, deliberately fail-closed.  The preceding-character
@@ -54,6 +66,36 @@ ENTITY_MENTION_PATTERN = re.compile(
 )
 SAFE_GITHUB_HOST = "github.com"
 SAFE_GITHUB_REPO = "soyeht/theyos"
+RELEASE_GITHUB_REPO = "soyeht/soyeht-ios"
+IOS_PR_BASE = "main"
+IOS_PR_HEAD = "ci/governed-macos-release"
+IOS_PR_HEAD_OWNER = "soyeht"
+RELEASE_TAG_PREFIX = "refs/tags/mac-v"
+RELEASE_PROJECT_FILE = "TerminalApp/Soyeht.xcodeproj/project.pbxproj"
+RELEASE_WORKFLOW_FILE = ".github/workflows/macos-release.yml"
+RELEASE_WORKFLOW_SHA256 = "c513b00f3a0b17d86dfabb55e4955ad70a35f0dc2a37c78b01d9fd1657afbb1c"
+RELEASE_CONTRACT_MARKER = b"# governed-release-contract: theyos-safe-external-write-v1"
+RELEASE_CONTRACT_REQUIRED_ACTIVE_LINES = (
+    b"      expected_ref:",
+    b"      expected_oid:",
+    b"  contents: read",
+    b"        uses: actions/upload-artifact@v4",
+    b"          if-no-files-found: error",
+)
+RELEASE_CONTRACT_FORBIDDEN = (
+    b"gh release",
+    b"git tag",
+    b"git push",
+    b"--clobber",
+)
+RELEASE_ASSET_NAMES = frozenset({"Soyeht.dmg", "appcast.xml"})
+FULL_OID_PATTERN = re.compile(r"[0-9a-f]{40}")
+VERSION_PATTERN = re.compile(
+    r"[0-9]+(?:\.[0-9]+){1,2}(?:[.-][0-9A-Za-z]+)?"
+)
+MARKETING_VERSION_PATTERN = re.compile(
+    rb"\bMARKETING_VERSION\s*=\s*([^;\r\n]+)\s*;"
+)
 
 
 @dataclass(frozen=True)
@@ -65,6 +107,10 @@ class Mention:
 
 class UnsafeCommand(ValueError):
     """Raised when a child command can source outbound text outside stdin."""
+
+
+class ReleaseGuardError(ValueError):
+    """Raised when a governed release precondition or readback fails."""
 
 
 def find_mentions(payload: str, allowed: frozenset[str] = frozenset()) -> tuple[Mention, ...]:
@@ -309,6 +355,948 @@ def child_environment(command: Sequence[str]) -> dict[str, str] | None:
     return environment
 
 
+class GitHubAPIError(RuntimeError):
+    """A failed, non-interactive GitHub API request."""
+
+    def __init__(self, command: Sequence[str], returncode: int, stderr: str) -> None:
+        super().__init__(
+            f"GitHub API request failed with exit {returncode}: "
+            f"{' '.join(command[:6])}: {stderr.strip()}"
+        )
+        self.returncode = returncode
+        self.stderr = stderr
+
+    @property
+    def is_not_found(self) -> bool:
+        return "HTTP 404" in self.stderr
+
+
+class GitHubAPI:
+    """Minimal API client pinned to the governed iOS repository."""
+
+    def _request(
+        self,
+        method: str,
+        endpoint: str,
+        *,
+        body: bytes | None = None,
+        headers: Sequence[str] = (),
+        paginate: bool = False,
+    ) -> Any:
+        command = [
+            "gh",
+            "api",
+            "--hostname",
+            SAFE_GITHUB_HOST,
+            "--method",
+            method,
+            "--header",
+            "Accept: application/vnd.github+json",
+            "--header",
+            "X-GitHub-Api-Version: 2022-11-28",
+        ]
+        for header in headers:
+            command.extend(["--header", header])
+        if paginate:
+            command.extend(["--paginate", "--slurp"])
+        command.append(endpoint)
+        if body is not None:
+            command.extend(["--input", "-"])
+
+        environment = os.environ.copy()
+        environment["GH_HOST"] = SAFE_GITHUB_HOST
+        environment["GH_REPO"] = RELEASE_GITHUB_REPO
+        completed = subprocess.run(
+            command,
+            input=body,
+            capture_output=True,
+            check=False,
+            env=environment,
+        )
+        if completed.returncode:
+            raise GitHubAPIError(
+                command,
+                completed.returncode,
+                completed.stderr.decode("utf-8", errors="replace"),
+            )
+        try:
+            return json.loads(completed.stdout)
+        except json.JSONDecodeError as error:
+            raise ReleaseGuardError(
+                f"GitHub API returned non-JSON success for {method} {endpoint}"
+            ) from error
+
+    def read(self, endpoint: str) -> Any:
+        return self._request("GET", endpoint)
+
+    def read_optional(self, endpoint: str) -> Any | None:
+        try:
+            return self.read(endpoint)
+        except GitHubAPIError as error:
+            if error.is_not_found:
+                return None
+            raise
+
+    def read_pages(self, endpoint: str) -> list[Any]:
+        pages = self._request("GET", endpoint, paginate=True)
+        if not isinstance(pages, list):
+            raise ReleaseGuardError("paginated GitHub response is not a list")
+        flattened: list[Any] = []
+        for page in pages:
+            if not isinstance(page, list):
+                raise ReleaseGuardError("paginated GitHub page is not a list")
+            flattened.extend(page)
+        return flattened
+
+    def mutate_json(self, method: str, endpoint: str, payload: Mapping[str, Any]) -> Any:
+        body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return self._request(
+            method,
+            endpoint,
+            body=body,
+            headers=("Content-Type: application/json",),
+        )
+
+    def upload_asset(
+        self,
+        release_id: int,
+        name: str,
+        payload: bytes,
+        upload_url: str,
+    ) -> Any:
+        expected_template = (
+            f"https://uploads.github.com/repos/{RELEASE_GITHUB_REPO}/releases/"
+            f"{release_id}/assets{{?name,label}}"
+        )
+        if upload_url != expected_template:
+            raise ReleaseGuardError("release upload URL readback mismatch")
+        token_result = subprocess.run(
+            ["gh", "auth", "token", "--hostname", SAFE_GITHUB_HOST],
+            capture_output=True,
+            check=False,
+        )
+        if token_result.returncode:
+            raise ReleaseGuardError("cannot obtain GitHub authentication for asset upload")
+        token = token_result.stdout.decode("utf-8").strip()
+        if not token:
+            raise ReleaseGuardError("GitHub authentication token is empty")
+        endpoint = (
+            f"/repos/{RELEASE_GITHUB_REPO}/releases/{release_id}/assets"
+            f"?name={quote(name, safe='')}"
+        )
+        connection = http.client.HTTPSConnection("uploads.github.com", timeout=900)
+        try:
+            connection.request(
+                "POST",
+                endpoint,
+                body=payload,
+                headers={
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/octet-stream",
+                "X-GitHub-Api-Version": "2022-11-28",
+                },
+            )
+            response = connection.getresponse()
+            response_bytes = response.read()
+            if response.status < 200 or response.status >= 300:
+                raise ReleaseGuardError(
+                    f"GitHub asset upload failed with HTTP {response.status}"
+                )
+        except (OSError, http.client.HTTPException) as error:
+            raise ReleaseGuardError("GitHub asset upload failed before readback") from error
+        finally:
+            connection.close()
+            token = ""
+        try:
+            return json.loads(response_bytes)
+        except json.JSONDecodeError as error:
+            raise ReleaseGuardError("asset upload returned non-JSON success") from error
+
+
+@dataclass(frozen=True)
+class ReleaseCommon:
+    tag_ref: str
+    tag: str
+    version: str
+    target_oid: str
+    expected_main: str
+
+
+@dataclass(frozen=True)
+class IOSDraftPRExpectation:
+    expected_head_oid: str
+    title: str
+    body: str
+
+
+@dataclass(frozen=True)
+class AssetExpectation:
+    name: str
+    size: int
+    sha256: str
+
+
+RELEASE_OPERATION_FLAGS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
+    # (required single-value flags beyond the common set, repeatable flags)
+    "tag-object-create": (frozenset(), frozenset()),
+    "tag-ref-create": (frozenset({"--tag-object-oid"}), frozenset()),
+    "release-draft-create": (
+        frozenset({"--title", "--tag-object-oid"}),
+        frozenset(),
+    ),
+    "asset-upload": (
+        frozenset(
+            {
+                "--release-id",
+                "--tag-object-oid",
+                "--asset-name",
+                "--asset-path",
+                "--asset-sha256",
+                "--asset-size",
+            }
+        ),
+        frozenset(),
+    ),
+    "release-publish": (
+        frozenset({"--release-id", "--tag-object-oid"}),
+        frozenset({"--asset"}),
+    ),
+}
+RELEASE_COMMON_FLAGS = frozenset(
+    {"--tag-ref", "--version", "--target-oid", "--expected-main"}
+)
+
+
+def _parse_release_arguments(arguments: Sequence[str]) -> tuple[str, dict[str, list[str]]]:
+    if not arguments:
+        raise UnsafeCommand("governed-release requires an operation")
+    operation = arguments[0]
+    grammar = RELEASE_OPERATION_FLAGS.get(operation)
+    if grammar is None:
+        raise UnsafeCommand(f"unsupported governed-release operation: {operation}")
+    required_extra, repeatable = grammar
+    allowed = RELEASE_COMMON_FLAGS | required_extra | repeatable
+    values: dict[str, list[str]] = {}
+    index = 1
+    while index < len(arguments):
+        flag = arguments[index]
+        if flag not in allowed:
+            raise UnsafeCommand(f"unsupported governed-release argument: {flag}")
+        if index + 1 >= len(arguments) or arguments[index + 1].startswith("--"):
+            raise UnsafeCommand(f"missing value for governed-release argument: {flag}")
+        if flag not in repeatable and flag in values:
+            raise UnsafeCommand(f"duplicate governed-release argument: {flag}")
+        values.setdefault(flag, []).append(arguments[index + 1])
+        index += 2
+
+    required = RELEASE_COMMON_FLAGS | required_extra
+    missing = sorted(flag for flag in required if flag not in values)
+    if missing:
+        raise UnsafeCommand(
+            "missing governed-release arguments: " + ", ".join(missing)
+        )
+    if operation == "release-publish" and len(values.get("--asset", [])) != 2:
+        raise UnsafeCommand("release-publish requires exactly two --asset values")
+    return operation, values
+
+
+def _single(values: Mapping[str, list[str]], flag: str) -> str:
+    candidates = values.get(flag, [])
+    if len(candidates) != 1:
+        raise UnsafeCommand(f"governed-release requires exactly one {flag}")
+    return candidates[0]
+
+
+def _full_oid(value: str, label: str) -> str:
+    if FULL_OID_PATTERN.fullmatch(value) is None:
+        raise ReleaseGuardError(f"{label} must be a lowercase, full 40-hex OID")
+    return value
+
+
+def _release_common(values: Mapping[str, list[str]]) -> ReleaseCommon:
+    version = _single(values, "--version")
+    if VERSION_PATTERN.fullmatch(version) is None:
+        raise ReleaseGuardError("release version has invalid grammar")
+    tag_ref = _single(values, "--tag-ref")
+    expected_tag_ref = f"{RELEASE_TAG_PREFIX}{version}"
+    if tag_ref != expected_tag_ref:
+        raise ReleaseGuardError(
+            f"tag ref must be the complete expected ref {expected_tag_ref!r}"
+        )
+    return ReleaseCommon(
+        tag_ref=tag_ref,
+        tag=tag_ref.removeprefix("refs/tags/"),
+        version=version,
+        target_oid=_full_oid(_single(values, "--target-oid"), "target OID"),
+        expected_main=_full_oid(_single(values, "--expected-main"), "expected main"),
+    )
+
+
+def _expect_mapping(value: Any, label: str) -> Mapping[str, Any]:
+    if not isinstance(value, dict):
+        raise ReleaseGuardError(f"{label} is not a JSON object")
+    return value
+
+
+def _read_repository_file(
+    api: GitHubAPI,
+    path: str,
+    oid: str,
+    label: str,
+) -> bytes:
+    value = _expect_mapping(
+        api.read(f"repos/{RELEASE_GITHUB_REPO}/contents/{path}?ref={oid}"),
+        label,
+    )
+    if value.get("type") != "file" or value.get("encoding") != "base64":
+        raise ReleaseGuardError(f"{label} is not a base64 file")
+    try:
+        encoded = re.sub(r"\s+", "", str(value.get("content", "")))
+        return base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError) as error:
+        raise ReleaseGuardError(f"{label} has invalid base64") from error
+
+
+def _assert_common_release_state(api: GitHubAPI, common: ReleaseCommon) -> None:
+    main_ref = _expect_mapping(
+        api.read(f"repos/{RELEASE_GITHUB_REPO}/git/ref/heads/main"),
+        "main ref",
+    )
+    main_object = _expect_mapping(main_ref.get("object"), "main ref object")
+    if main_object.get("type") != "commit" or main_object.get("sha") != common.expected_main:
+        raise ReleaseGuardError("origin/main drifted from the expected full OID")
+
+    commit = _expect_mapping(
+        api.read(f"repos/{RELEASE_GITHUB_REPO}/commits/{common.target_oid}"),
+        "target commit",
+    )
+    if commit.get("sha") != common.target_oid:
+        raise ReleaseGuardError("target commit readback does not match the requested OID")
+
+    comparison = _expect_mapping(
+        api.read(
+            f"repos/{RELEASE_GITHUB_REPO}/compare/"
+            f"{common.target_oid}...{common.expected_main}"
+        ),
+        "target/main comparison",
+    )
+    merge_base = _expect_mapping(comparison.get("merge_base_commit"), "merge base")
+    if comparison.get("status") not in {"ahead", "identical"}:
+        raise ReleaseGuardError("target OID is not already merged into origin/main")
+    if merge_base.get("sha") != common.target_oid:
+        raise ReleaseGuardError("target OID is not the merge base of origin/main")
+
+    project_bytes = _read_repository_file(
+        api,
+        RELEASE_PROJECT_FILE,
+        common.target_oid,
+        "project version source",
+    )
+    versions = {
+        match.group(1).decode("utf-8").strip()
+        for match in MARKETING_VERSION_PATTERN.finditer(project_bytes)
+    }
+    if versions != {common.version}:
+        raise ReleaseGuardError(
+            f"declared MARKETING_VERSION set {sorted(versions)!r} does not equal "
+            f"the requested version {common.version!r}"
+        )
+
+    workflow_bytes = _read_repository_file(
+        api,
+        RELEASE_WORKFLOW_FILE,
+        common.target_oid,
+        "governed release workflow",
+    )
+    if workflow_bytes.count(RELEASE_CONTRACT_MARKER) != 1:
+        raise ReleaseGuardError(
+            "the governed iOS workflow contract is absent or duplicated; "
+            "consumer PR B must be in the target commit"
+        )
+    active_lines = tuple(
+        line.rstrip()
+        for line in workflow_bytes.splitlines()
+        if not line.lstrip().startswith(b"#")
+    )
+    missing_contract = [
+        line.decode("ascii", errors="replace")
+        for line in RELEASE_CONTRACT_REQUIRED_ACTIVE_LINES
+        if line not in active_lines
+    ]
+    forbidden_contract = [
+        token.decode("ascii", errors="replace")
+        for token in RELEASE_CONTRACT_FORBIDDEN
+        if any(token.lower() in line.lower() for line in active_lines)
+    ]
+    if missing_contract or forbidden_contract:
+        raise ReleaseGuardError(
+            "governed iOS workflow contract mismatch: "
+            f"missing={missing_contract!r}, forbidden={forbidden_contract!r}"
+        )
+    if hashlib.sha256(workflow_bytes).hexdigest() != RELEASE_WORKFLOW_SHA256:
+        raise ReleaseGuardError(
+            "governed iOS workflow bytes do not match the reviewed consumer contract"
+        )
+
+    ambiguous_branch = api.read_optional(
+        f"repos/{RELEASE_GITHUB_REPO}/git/ref/heads/{common.tag}"
+    )
+    if ambiguous_branch is not None:
+        raise ReleaseGuardError("a branch exists with the release tag's short name")
+
+
+def _assert_release_absent(api: GitHubAPI, common: ReleaseCommon) -> None:
+    if api.read_optional(
+        f"repos/{RELEASE_GITHUB_REPO}/releases/tags/{common.tag}"
+    ) is not None:
+        raise ReleaseGuardError("release tag is already associated with a release")
+    releases = api.read_pages(f"repos/{RELEASE_GITHUB_REPO}/releases?per_page=100")
+    for release in releases:
+        if isinstance(release, dict) and release.get("tag_name") == common.tag:
+            raise ReleaseGuardError("release tag is already used by a draft or release")
+
+
+def _assert_tag_absent(api: GitHubAPI, common: ReleaseCommon) -> None:
+    if api.read_optional(
+        f"repos/{RELEASE_GITHUB_REPO}/git/ref/tags/{common.tag}"
+    ) is not None:
+        raise ReleaseGuardError("release tag ref already exists")
+    _assert_release_absent(api, common)
+
+
+def _expected_tag_message(common: ReleaseCommon) -> str:
+    return f"Soyeht {common.version}\n"
+
+
+def _read_tag(
+    api: GitHubAPI,
+    common: ReleaseCommon,
+    expected_tag_object_oid: str,
+) -> tuple[str, Mapping[str, Any]]:
+    tag_ref = _expect_mapping(
+        api.read(f"repos/{RELEASE_GITHUB_REPO}/git/ref/tags/{common.tag}"),
+        "tag ref",
+    )
+    if tag_ref.get("ref") != common.tag_ref:
+        raise ReleaseGuardError("tag ref readback name mismatch")
+    ref_object = _expect_mapping(tag_ref.get("object"), "tag ref object")
+    if ref_object.get("type") != "tag":
+        raise ReleaseGuardError("release ref is not an annotated tag object")
+    tag_object_oid = _full_oid(str(ref_object.get("sha", "")), "tag object OID")
+    if tag_object_oid != expected_tag_object_oid:
+        raise ReleaseGuardError("release ref drifted to a different tag object")
+    tag_object = _expect_mapping(
+        api.read(f"repos/{RELEASE_GITHUB_REPO}/git/tags/{tag_object_oid}"),
+        "tag object",
+    )
+    target = _expect_mapping(tag_object.get("object"), "tag target")
+    if tag_object.get("tag") != common.tag:
+        raise ReleaseGuardError("tag object name mismatch")
+    if tag_object.get("message") != _expected_tag_message(common):
+        raise ReleaseGuardError("tag object message is not the fixed governed message")
+    if target.get("type") != "commit" or target.get("sha") != common.target_oid:
+        raise ReleaseGuardError("tag object does not point directly to the expected commit")
+    return tag_object_oid, tag_object
+
+
+def _read_release(
+    api: GitHubAPI,
+    common: ReleaseCommon,
+    release_id: int,
+    tag_object_oid: str,
+) -> Mapping[str, Any]:
+    release = _expect_mapping(
+        api.read(f"repos/{RELEASE_GITHUB_REPO}/releases/{release_id}"),
+        "release",
+    )
+    if release.get("id") != release_id:
+        raise ReleaseGuardError("release ID readback mismatch")
+    if release.get("tag_name") != common.tag:
+        raise ReleaseGuardError("release tag readback mismatch")
+    # GitHub documents target_commitish as material only when the named tag does
+    # not already exist. This flow creates the annotated ref first, so bind the
+    # release through the authoritative ref -> tag object -> commit chain below.
+    _read_tag(api, common, tag_object_oid)
+    return release
+
+
+def _release_id(value: str) -> int:
+    if not value.isascii() or not value.isdigit() or int(value) <= 0:
+        raise ReleaseGuardError("release ID must be a positive decimal integer")
+    return int(value)
+
+
+def _asset_expectation(value: str) -> AssetExpectation:
+    pieces = value.split(":")
+    if len(pieces) != 3:
+        raise ReleaseGuardError("asset expectation must be NAME:SIZE:SHA256")
+    name, size_text, digest = pieces
+    if name not in RELEASE_ASSET_NAMES:
+        raise ReleaseGuardError(f"unexpected release asset name: {name!r}")
+    if not size_text.isascii() or not size_text.isdigit() or int(size_text) <= 0:
+        raise ReleaseGuardError("asset size must be a positive decimal integer")
+    if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise ReleaseGuardError("asset SHA-256 must be 64 lowercase hex characters")
+    return AssetExpectation(name=name, size=int(size_text), sha256=digest)
+
+
+def _remote_assets(release: Mapping[str, Any]) -> dict[str, AssetExpectation]:
+    assets = release.get("assets")
+    if not isinstance(assets, list):
+        raise ReleaseGuardError("release assets readback is not a list")
+    result: dict[str, AssetExpectation] = {}
+    for asset_value in assets:
+        asset = _expect_mapping(asset_value, "release asset")
+        name = str(asset.get("name", ""))
+        if name in result:
+            raise ReleaseGuardError(f"duplicate remote asset name: {name!r}")
+        digest_text = str(asset.get("digest", ""))
+        if not digest_text.startswith("sha256:"):
+            raise ReleaseGuardError(f"remote asset {name!r} lacks a SHA-256 digest")
+        if asset.get("state") != "uploaded":
+            raise ReleaseGuardError(f"remote asset {name!r} is not fully uploaded")
+        size = asset.get("size")
+        if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+            raise ReleaseGuardError(f"remote asset {name!r} has invalid size")
+        result[name] = AssetExpectation(
+            name=name,
+            size=size,
+            sha256=digest_text.removeprefix("sha256:"),
+        )
+    return result
+
+
+def _read_asset_bytes(path_text: str, expectation: AssetExpectation) -> bytes:
+    asset_path = Path(path_text)
+    if not asset_path.is_absolute():
+        raise ReleaseGuardError("asset path must be absolute")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(asset_path, flags)
+    except OSError as error:
+        raise ReleaseGuardError(f"cannot open release asset safely: {error}") from error
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ReleaseGuardError("release asset is not a regular file")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    ) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ):
+        raise ReleaseGuardError("release asset changed while it was being read")
+    payload = b"".join(chunks)
+    if len(payload) != expectation.size:
+        raise ReleaseGuardError("release asset size does not match the expected size")
+    if hashlib.sha256(payload).hexdigest() != expectation.sha256:
+        raise ReleaseGuardError("release asset digest does not match the expected SHA-256")
+    return payload
+
+
+def _emit_release_receipt(operation: str, **fields: Any) -> None:
+    receipt = {
+        "operation": operation,
+        "repository": RELEASE_GITHUB_REPO,
+        **fields,
+    }
+    print(json.dumps(receipt, sort_keys=True, separators=(",", ":")))
+
+
+def _parse_ios_pr_create_arguments(arguments: Sequence[str]) -> tuple[str, str]:
+    allowed = frozenset({"--expected-head-oid", "--title"})
+    values: dict[str, str] = {}
+    index = 0
+    while index < len(arguments):
+        flag = arguments[index]
+        if flag not in allowed:
+            raise UnsafeCommand(f"unsupported governed iOS PR argument: {flag}")
+        if flag in values:
+            raise UnsafeCommand(f"duplicate governed iOS PR argument: {flag}")
+        if index + 1 >= len(arguments) or arguments[index + 1].startswith("--"):
+            raise UnsafeCommand(f"missing value for governed iOS PR argument: {flag}")
+        values[flag] = arguments[index + 1]
+        index += 2
+    missing = sorted(allowed - values.keys())
+    if missing:
+        raise UnsafeCommand(
+            "missing governed iOS PR arguments: " + ", ".join(missing)
+        )
+    title = values["--title"]
+    if not title or "\n" in title or "\r" in title:
+        raise ReleaseGuardError("governed iOS PR title must be one nonempty line")
+    return _full_oid(values["--expected-head-oid"], "expected PR head OID"), title
+
+
+def _assert_ios_pr_head(
+    api: GitHubAPI,
+    expected_head_oid: str,
+) -> None:
+    branch_ref = _expect_mapping(
+        api.read(f"repos/{RELEASE_GITHUB_REPO}/git/ref/heads/{IOS_PR_HEAD}"),
+        "governed iOS PR head ref",
+    )
+    branch_object = _expect_mapping(
+        branch_ref.get("object"), "governed iOS PR head object"
+    )
+    if (
+        branch_ref.get("ref") != f"refs/heads/{IOS_PR_HEAD}"
+        or branch_object.get("type") != "commit"
+        or branch_object.get("sha") != expected_head_oid
+    ):
+        raise ReleaseGuardError(
+            "governed iOS PR remote branch does not equal the expected full OID"
+        )
+
+
+def _assert_ios_pr_absent(api: GitHubAPI) -> None:
+    head = quote(f"{IOS_PR_HEAD_OWNER}:{IOS_PR_HEAD}", safe="")
+    matches = api.read_pages(
+        f"repos/{RELEASE_GITHUB_REPO}/pulls?state=all&head={head}"
+        f"&base={IOS_PR_BASE}&per_page=100"
+    )
+    if matches:
+        raise ReleaseGuardError(
+            "a pull request already exists for the governed iOS consumer branch"
+        )
+
+
+def execute_governed_ios_pr_create(
+    arguments: Sequence[str],
+    payload: str,
+    *,
+    api: GitHubAPI | None = None,
+) -> int:
+    """Create exactly the fixed iOS consumer draft PR and read it back."""
+    expected_head_oid, title = _parse_ios_pr_create_arguments(arguments)
+    if not payload:
+        raise ReleaseGuardError("governed iOS PR body must not be empty")
+    expectation = IOSDraftPRExpectation(
+        expected_head_oid=expected_head_oid,
+        title=title,
+        body=payload,
+    )
+    client = api or GitHubAPI()
+    _assert_ios_pr_head(client, expectation.expected_head_oid)
+    _assert_ios_pr_absent(client)
+    created = _expect_mapping(
+        client.mutate_json(
+            "POST",
+            f"repos/{RELEASE_GITHUB_REPO}/pulls",
+            {
+                "base": IOS_PR_BASE,
+                "body": expectation.body,
+                "draft": True,
+                "head": f"{IOS_PR_HEAD_OWNER}:{IOS_PR_HEAD}",
+                "title": expectation.title,
+            },
+        ),
+        "created governed iOS PR",
+    )
+    number = created.get("number")
+    if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+        raise ReleaseGuardError("created governed iOS PR has invalid number")
+
+    # Recheck the remote ref after the single mutation before accepting the PR.
+    _assert_ios_pr_head(client, expectation.expected_head_oid)
+    readback = _expect_mapping(
+        client.read(f"repos/{RELEASE_GITHUB_REPO}/pulls/{number}"),
+        "governed iOS PR readback",
+    )
+    head = _expect_mapping(readback.get("head"), "governed iOS PR readback head")
+    base = _expect_mapping(readback.get("base"), "governed iOS PR readback base")
+    head_repo = _expect_mapping(head.get("repo"), "governed iOS PR head repository")
+    base_repo = _expect_mapping(base.get("repo"), "governed iOS PR base repository")
+    if (
+        readback.get("number") != number
+        or readback.get("state") != "open"
+        or readback.get("draft") is not True
+        or readback.get("title") != expectation.title
+        or readback.get("body") != expectation.body
+        or head.get("ref") != IOS_PR_HEAD
+        or head.get("sha") != expectation.expected_head_oid
+        or head_repo.get("full_name") != RELEASE_GITHUB_REPO
+        or base.get("ref") != IOS_PR_BASE
+        or base_repo.get("full_name") != RELEASE_GITHUB_REPO
+    ):
+        raise ReleaseGuardError("governed iOS draft PR readback mismatch")
+    print(
+        json.dumps(
+            {
+                "base": IOS_PR_BASE,
+                "draft": True,
+                "head": IOS_PR_HEAD,
+                "head_oid": expectation.expected_head_oid,
+                "operation": "governed-ios-pr-create",
+                "pr_number": number,
+                "repository": RELEASE_GITHUB_REPO,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    return 0
+
+
+def execute_governed_release(
+    arguments: Sequence[str],
+    payload: str,
+    *,
+    api: GitHubAPI | None = None,
+) -> int:
+    """Execute exactly one governed iOS tag/release mutation and read it back."""
+    operation, values = _parse_release_arguments(arguments)
+    common = _release_common(values)
+    tag_object_oid_argument = (
+        None
+        if operation == "tag-object-create"
+        else _full_oid(_single(values, "--tag-object-oid"), "tag object OID")
+    )
+    client = api or GitHubAPI()
+    _assert_common_release_state(client, common)
+
+    if operation == "tag-object-create":
+        if payload != _expected_tag_message(common):
+            raise ReleaseGuardError("annotated tag message must equal the fixed governed message")
+        _assert_tag_absent(client, common)
+        created = _expect_mapping(
+            client.mutate_json(
+                "POST",
+                f"repos/{RELEASE_GITHUB_REPO}/git/tags",
+                {
+                    "tag": common.tag,
+                    "message": payload,
+                    "object": common.target_oid,
+                    "type": "commit",
+                },
+            ),
+            "created tag object",
+        )
+        tag_object_oid = _full_oid(str(created.get("sha", "")), "created tag object OID")
+        readback = _expect_mapping(
+            client.read(f"repos/{RELEASE_GITHUB_REPO}/git/tags/{tag_object_oid}"),
+            "created tag object readback",
+        )
+        target = _expect_mapping(readback.get("object"), "created tag target")
+        if (
+            readback.get("tag") != common.tag
+            or readback.get("message") != payload
+            or target.get("type") != "commit"
+            or target.get("sha") != common.target_oid
+        ):
+            raise ReleaseGuardError("created tag object readback mismatch")
+        _assert_common_release_state(client, common)
+        _assert_tag_absent(client, common)
+        _emit_release_receipt(
+            operation,
+            tag_ref=common.tag_ref,
+            tag_object_oid=tag_object_oid,
+            target_oid=common.target_oid,
+        )
+        return 0
+
+    if operation not in {"tag-ref-create", "release-draft-create"} and payload:
+        raise ReleaseGuardError(f"{operation} requires empty stdin")
+
+    if operation == "tag-ref-create":
+        if payload != _expected_tag_message(common):
+            raise ReleaseGuardError("tag-ref-create requires the fixed governed tag message")
+        assert tag_object_oid_argument is not None
+        tag_object_oid = tag_object_oid_argument
+        _assert_tag_absent(client, common)
+        tag_object = _expect_mapping(
+            client.read(f"repos/{RELEASE_GITHUB_REPO}/git/tags/{tag_object_oid}"),
+            "tag object",
+        )
+        target = _expect_mapping(tag_object.get("object"), "tag object target")
+        if (
+            tag_object.get("tag") != common.tag
+            or tag_object.get("message") != payload
+            or target.get("type") != "commit"
+            or target.get("sha") != common.target_oid
+        ):
+            raise ReleaseGuardError("tag object is not the expected annotated commit tag")
+        client.mutate_json(
+            "POST",
+            f"repos/{RELEASE_GITHUB_REPO}/git/refs",
+            {"ref": common.tag_ref, "sha": tag_object_oid},
+        )
+        _assert_common_release_state(client, common)
+        read_oid, _ = _read_tag(client, common, tag_object_oid)
+        if read_oid != tag_object_oid:
+            raise ReleaseGuardError("created tag ref points to a different tag object")
+        _assert_release_absent(client, common)
+        _emit_release_receipt(
+            operation,
+            tag_ref=common.tag_ref,
+            tag_object_oid=tag_object_oid,
+            target_oid=common.target_oid,
+        )
+        return 0
+
+    assert tag_object_oid_argument is not None
+    _read_tag(client, common, tag_object_oid_argument)
+
+    if operation == "release-draft-create":
+        if not payload:
+            raise ReleaseGuardError("release body must not be empty")
+        title = _single(values, "--title")
+        if not title:
+            raise ReleaseGuardError("release title must not be empty")
+        _assert_release_absent(client, common)
+        created = _expect_mapping(
+            client.mutate_json(
+                "POST",
+                f"repos/{RELEASE_GITHUB_REPO}/releases",
+                {
+                    "tag_name": common.tag,
+                    "target_commitish": common.target_oid,
+                    "name": title,
+                    "body": payload,
+                    "draft": True,
+                    "prerelease": False,
+                    "generate_release_notes": False,
+                    "make_latest": "false",
+                },
+            ),
+            "created draft release",
+        )
+        release_id = created.get("id")
+        if not isinstance(release_id, int) or isinstance(release_id, bool) or release_id <= 0:
+            raise ReleaseGuardError("created release has invalid ID")
+        _assert_common_release_state(client, common)
+        release = _read_release(
+            client, common, release_id, tag_object_oid_argument
+        )
+        if (
+            release.get("draft") is not True
+            or release.get("prerelease") is not False
+            or release.get("name") != title
+            or release.get("body") != payload
+            or _remote_assets(release)
+        ):
+            raise ReleaseGuardError("draft release readback mismatch")
+        _emit_release_receipt(
+            operation,
+            release_id=release_id,
+            tag_ref=common.tag_ref,
+            target_oid=common.target_oid,
+        )
+        return 0
+
+    release_id = _release_id(_single(values, "--release-id"))
+    release = _read_release(client, common, release_id, tag_object_oid_argument)
+    if release.get("draft") is not True:
+        raise ReleaseGuardError("asset and publish operations require a draft release")
+
+    if operation == "asset-upload":
+        expectation = _asset_expectation(
+            f"{_single(values, '--asset-name')}:"
+            f"{_single(values, '--asset-size')}:"
+            f"{_single(values, '--asset-sha256')}"
+        )
+        remote_before = _remote_assets(release)
+        if expectation.name in remote_before:
+            raise ReleaseGuardError("release asset name is already in use")
+        asset_bytes = _read_asset_bytes(_single(values, "--asset-path"), expectation)
+        upload_url = release.get("upload_url")
+        if not isinstance(upload_url, str):
+            raise ReleaseGuardError("draft release lacks an upload URL")
+        created = _expect_mapping(
+            client.upload_asset(
+                release_id,
+                expectation.name,
+                asset_bytes,
+                upload_url,
+            ),
+            "uploaded asset",
+        )
+        asset_id = created.get("id")
+        if not isinstance(asset_id, int) or isinstance(asset_id, bool) or asset_id <= 0:
+            raise ReleaseGuardError("uploaded asset has invalid ID")
+        _assert_common_release_state(client, common)
+        readback = _expect_mapping(
+            client.read(f"repos/{RELEASE_GITHUB_REPO}/releases/assets/{asset_id}"),
+            "uploaded asset readback",
+        )
+        expected_digest = f"sha256:{expectation.sha256}"
+        if (
+            readback.get("name") != expectation.name
+            or readback.get("size") != expectation.size
+            or readback.get("digest") != expected_digest
+            or readback.get("state") != "uploaded"
+        ):
+            raise ReleaseGuardError("uploaded asset readback mismatch")
+        release_after = _read_release(
+            client, common, release_id, tag_object_oid_argument
+        )
+        expected_after = {**remote_before, expectation.name: expectation}
+        if _remote_assets(release_after) != expected_after:
+            raise ReleaseGuardError("release asset-set readback mismatch after upload")
+        _emit_release_receipt(
+            operation,
+            asset_id=asset_id,
+            asset_name=expectation.name,
+            asset_sha256=expectation.sha256,
+            asset_size=expectation.size,
+            release_id=release_id,
+        )
+        return 0
+
+    if operation == "release-publish":
+        expected_assets: dict[str, AssetExpectation] = {}
+        for value in values.get("--asset", []):
+            expectation = _asset_expectation(value)
+            if expectation.name in expected_assets:
+                raise ReleaseGuardError("duplicate expected asset name")
+            expected_assets[expectation.name] = expectation
+        if frozenset(expected_assets) != RELEASE_ASSET_NAMES:
+            raise ReleaseGuardError("publish requires the exact governed asset-name set")
+        if _remote_assets(release) != expected_assets:
+            raise ReleaseGuardError("draft release assets do not match the publish manifest")
+        client.mutate_json(
+            "PATCH",
+            f"repos/{RELEASE_GITHUB_REPO}/releases/{release_id}",
+            {"draft": False, "make_latest": "true"},
+        )
+        _assert_common_release_state(client, common)
+        published = _read_release(
+            client, common, release_id, tag_object_oid_argument
+        )
+        if published.get("draft") is not False:
+            raise ReleaseGuardError("release publish readback is still draft")
+        if published.get("prerelease") is not False:
+            raise ReleaseGuardError("release publish readback is unexpectedly prerelease")
+        if _remote_assets(published) != expected_assets:
+            raise ReleaseGuardError("published release assets changed during publish")
+        _emit_release_receipt(
+            operation,
+            release_id=release_id,
+            tag_ref=common.tag_ref,
+            target_oid=common.target_oid,
+        )
+        return 0
+
+    raise AssertionError(f"unhandled governed release operation: {operation}")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     payload, forwarded_stdin = _read_payload(args)
@@ -356,6 +1344,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+
+
+    if command[:1] == ["governed-release"]:
+        try:
+            return execute_governed_release(command[1:], payload)
+        except (UnsafeCommand, ReleaseGuardError, GitHubAPIError) as error:
+            print(f"BLOCKED: {error}", file=sys.stderr)
+            return 2
+
+    if command[:1] == ["governed-ios-pr-create"]:
+        try:
+            return execute_governed_ios_pr_create(command[1:], payload)
+        except (UnsafeCommand, ReleaseGuardError, GitHubAPIError) as error:
+            print(f"BLOCKED: {error}", file=sys.stderr)
+            return 2
 
     try:
         prepared_command = prepare_command(command)

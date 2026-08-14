@@ -33,6 +33,37 @@ the history already authored, not stdin. Create every commit message through
 the guarded `git commit` adapter, then push without adding new prose. Custom
 merge, tag, release, or e-mail text needs its own reviewed adapter first.
 
+### Governed Soyeht macOS release objects
+
+The `governed-release` adapter family is pinned separately to
+`github.com/soyeht/soyeht-ios`; it does not relax the existing destination for
+issue, pull-request, review, or commit adapters. It accepts only the complete
+`refs/tags/mac-v<version>` ref and full commit/main OIDs. Its five operations
+create one object at a time and then read that object back: annotated tag
+object, tag ref, draft release, one asset upload, and release publication.
+The tag message is fixed to `Soyeht <version>` and every later phase remains
+bound to the original tag-object OID.
+
+This family is **not usable for publication** until the corresponding
+`soyeht-ios` consumer change is present in the target commit. The adapter must
+fail closed when that workflow contract is absent, when the tag or release
+already exists, or when any target, version, asset, digest, or readback differs.
+The adapter pins the reviewed consumer workflow bytes; change that workflow by
+updating and landing this adapter contract first, then re-anchor the consumer.
+Land changes in this order: first the adapter and its tests in `theyos`; then
+re-anchor and land the `soyeht-ios` workflow/docs consumer. There is no direct
+`git tag`, `git push`, `gh release`, clobber, or missing-guard fallback.
+
+The only cross-repository pull-request writer is the separate
+`governed-ios-pr-create` adapter. It can create exactly one draft PR in
+`soyeht/soyeht-ios`, from `ci/governed-macos-release` to `main`, after proving
+the remote branch is at the supplied full OID and no PR already exists. It must
+read back the open draft with byte-exact title/body and exact head/base. It has
+no edit, ready, review, merge, repository-selector, or fallback operation. This
+adapter exists only to stage the consumer change after the `theyos` adapter PR
+lands; it does not make the release family usable before that consumer is in
+`soyeht-ios` main.
+
 Soyeht pane handles are internal routing identifiers. Never place them in an
 external payload. Write `agent-khai` or `internal agent Khai`, without an
 at-sign. HTML entities that render as an at-sign are also prohibited because
