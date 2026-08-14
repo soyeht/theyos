@@ -132,8 +132,8 @@ lint and compile phases CI runs: tier 1 is clippy plus the workspace build, tier
 2 is the feature matrix. It issues only `cargo check` and `cargo test --no-run`,
 so no test executes, no process is spawned and no port is bound. The caches are
 persistent, which is where the speed comes from — measured on a 20-core Mac, tier
-2 took 499s cold and 85s warm, against 1222s for the same phase on the runner.
-The cache reaches about 24 GB; `--clean` drops it.
+2 took 499s cold and 85-94s warm across two runs, against 1222s for the same
+phase on the runner. The cache reaches about 24 GB; `--clean` drops it.
 
 **Running the test phases belongs in a disposable VM, never on a developer or
 shared host.** These tests spawn processes, bind ports and exec shells — one

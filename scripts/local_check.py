@@ -16,8 +16,13 @@ already sitting at.
 Tier 2 is not redundant. `cargo build --workspace` compiles one configuration; the matrix
 compiles every one CI promises to cover, and a broken feature combination is invisible to
 tier 1 by construction. The persistent cache is where the speed comes from: measured on a
-20-core Mac at 2 workers, 499s cold and 85s warm, against 1222s for the same phase on the
-runner. The cache reaches about 24 GB; `--clean` drops it.
+20-core Mac at 2 workers, 499s cold and 85-94s warm across two runs, against 1222s for the
+same phase on the runner. The cache reaches about 24 GB; `--clean` drops it.
+
+The ways this tool could claim green without having compiled anything — an empty matrix, a
+row that could not be run, a derivation that failed, a changed worker count silently
+discarding the cache — are held by `scripts/test_local_check.py`, which stubs the matrix
+and needs no toolchain. Each of those guards was mutated and the battery went red.
 
 THIS IS NOT THE GATE, AND GREEN HERE IS NOT GREEN ON CI. CI builds from a fresh target
 directory, on a different OS, and then runs the tests this script never runs. Treat a red
@@ -78,15 +83,34 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 BACKEND_RUST = ROOT / "admin" / "rust" / "scripts" / "backend-rust"
 CACHE = Path(os.path.expanduser("~/.cache/theyos-local-check"))
-
-sys.path.insert(0, str(ROOT / "scripts"))
-import cargo_test_matrix as ctm  # noqa: E402  (path must be set first)
+WORKERS_STAMP = CACHE / "workers"
 
 GREEN, RED, DIM, BOLD, OFF = "\033[32m", "\033[31m", "\033[2m", "\033[1m", "\033[0m"
 if not sys.stdout.isatty():
     GREEN = RED = DIM = BOLD = OFF = ""
 
 TIER1_PHASES = ("clippy-workspace", "clippy-datapath", "build")
+
+
+def load_matrix_module():
+    """Import `cargo_test_matrix` lazily, and say something useful when it cannot.
+
+    It needs `tomllib`, which is Python 3.11+. Importing at module scope made
+    `--clean` and `--help` fail on an older interpreter for no reason, and turned a
+    solvable version problem into a traceback. This is not hypothetical: a macOS guest
+    whose `python3` was the system 3.9 failed exactly here.
+    """
+    sys.path.insert(0, str(ROOT / "scripts"))
+    try:
+        import cargo_test_matrix as ctm
+    except ModuleNotFoundError as exc:
+        if exc.name == "tomllib":
+            print(f"{RED}tier 2 needs Python 3.11 or newer for tomllib{OFF}; this "
+                  f"interpreter is {sys.version.split()[0]}.\n"
+                  f"  Tier 1 does not: try `--tier1`, or run this under a newer python3.")
+            return None
+        raise
+    return ctm
 
 
 def tier1() -> int:
@@ -111,7 +135,7 @@ def tier1() -> int:
     return 1 if failed else 0
 
 
-def tier2(workers: int, jobs: int) -> int:
+def tier2(ctm, workers: int, jobs: int) -> int:
     try:
         rows = list(ctm.matrix())
     except Exception as exc:  # cargo metadata failing is a real, common case
@@ -123,28 +147,52 @@ def tier2(workers: int, jobs: int) -> int:
         print(f"{RED}the matrix derived zero rows — refusing to call that a pass{OFF}")
         return 2
 
-    warm = all((CACHE / f"t{i}").is_dir() for i in range(workers))
+    # A CHANGED WORKER COUNT SILENTLY THROWS THE CACHE AWAY. Row i lives in dir
+    # `i % workers`, so changing workers moves most rows to a directory that has never
+    # compiled them. Without this notice the run just looks inexplicably slow, and the
+    # docstring's promise that the assignment "keeps things warm" reads as a lie — it
+    # holds only for a fixed worker count.
+    previous = None
+    if WORKERS_STAMP.exists():
+        previous = WORKERS_STAMP.read_text().strip() or None
+    changed = previous is not None and previous != str(workers)
+
+    warm = (not changed) and all((CACHE / f"t{i}").is_dir() for i in range(workers))
     print(f"{BOLD}tier 2 — feature surface{OFF}  {len(rows)} rows · "
           f"{workers} workers x -j {jobs} · "
           f"{'warm' if warm else 'cold (first run builds everything)'}")
+    if changed:
+        print(f"{DIM}  worker count changed {previous} -> {workers}: rows move between "
+              f"directories, so this run is cold and the old dirs stay on disk "
+              f"(--clean drops them){OFF}")
+    WORKERS_STAMP.write_text(str(workers))
     print(f"{DIM}  caches in {CACHE}, separate from admin/rust/target on purpose{OFF}")
 
     results: list[dict | None] = [None] * len(rows)
 
     def run(i: int) -> None:
+        # NOTHING ESCAPES THIS FUNCTION. `pool.map` re-raises the first exception at
+        # iteration, so a single row that threw — a missing cargo, an unreadable target
+        # dir — used to abort the whole pass and discard the twenty-five results that had
+        # already been paid for. A row that could not run is a FAILED row, reported beside
+        # the others, not the end of the run.
         row = rows[i]
-        target = CACHE / f"t{i % workers}"
-        target.mkdir(parents=True, exist_ok=True)
-        env = dict(os.environ)
-        env["CARGO_TARGET_DIR"] = str(target)
-        env["CARGO_PROFILE_DEV_DEBUG"] = "0"
-        env.setdefault("CLAWS_CATALOG_JSON", str(target / "claws-catalog.json"))
-        cmd = [*ctm.command(row), "-j", str(jobs)]
         t0 = time.time()
-        proc = subprocess.run(cmd, cwd=str(ctm.RUST), env=env,
-                              capture_output=True, text=True)
-        results[i] = {"name": row.name, "rc": proc.returncode,
-                      "secs": time.time() - t0, "out": proc.stdout + proc.stderr}
+        try:
+            target = CACHE / f"t{i % workers}"
+            target.mkdir(parents=True, exist_ok=True)
+            env = dict(os.environ)
+            env["CARGO_TARGET_DIR"] = str(target)
+            env["CARGO_PROFILE_DEV_DEBUG"] = "0"
+            env.setdefault("CLAWS_CATALOG_JSON", str(target / "claws-catalog.json"))
+            cmd = [*ctm.command(row), "-j", str(jobs)]
+            proc = subprocess.run(cmd, cwd=str(ctm.RUST), env=env,
+                                  capture_output=True, text=True)
+            rc, out = proc.returncode, proc.stdout + proc.stderr
+        except Exception as exc:  # noqa: BLE001 — the row's verdict must survive it
+            rc, out = -1, f"error: this row could not be run: {exc!r}"
+        results[i] = {"name": row.name, "rc": rc,
+                      "secs": time.time() - t0, "out": out}
 
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -207,12 +255,14 @@ def main() -> int:
     CACHE.mkdir(parents=True, exist_ok=True)
 
     if args.tier2:
-        return tier2(workers, jobs)
+        ctm = load_matrix_module()
+        return 2 if ctm is None else tier2(ctm, workers, jobs)
     rc = tier1()
     if args.tier1 or rc != 0:
         return rc
     print()
-    return tier2(workers, jobs)
+    ctm = load_matrix_module()
+    return 2 if ctm is None else tier2(ctm, workers, jobs)
 
 
 if __name__ == "__main__":

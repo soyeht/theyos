@@ -99,7 +99,8 @@ jobs:
           rc=0
           for t in scripts/test_check_cross_repo_pin_freshness.py \
                    scripts/test_check_plan_doc_freshness.py \
-                   scripts/test_check_branch_hygiene.py; do
+                   scripts/test_check_branch_hygiene.py \
+                   scripts/test_local_check.py; do
             echo "::group::${t}"
             uv run "${t}" || rc=1
             echo "::endgroup::"
