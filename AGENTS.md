@@ -121,3 +121,29 @@ pasted diff prefixes. It deliberately fails closed on ambiguous strings such
 as scoped package paths and rare e-mail local-parts. Do not weaken the regular
 expression to make such input pass; rewrite the text without an at-sign or use
 an explicitly authorized allowlist entry.
+
+## Checking before you push
+
+Backend CI answers in about 43 minutes. There are two routes and they are not
+interchangeable.
+
+**Compiling is safe on any machine.** `python3 scripts/local_check.py` runs the
+lint and compile phases CI runs: tier 1 is clippy plus the workspace build, tier
+2 is the feature matrix. It issues only `cargo check` and `cargo test --no-run`,
+so no test executes, no process is spawned and no port is bound. The caches are
+persistent, which is where the speed comes from — measured on a 20-core Mac, tier
+2 took 499s cold and 85s warm, against 1222s for the same phase on the runner.
+The cache reaches about 24 GB; `--clean` drops it.
+
+**Running the test phases belongs in a disposable VM, never on a developer or
+shared host.** These tests spawn processes, bind ports and exec shells — one
+`core-rs` test hangs on `exec bash -l -i`, and a cleanup on a shared host has
+already stopped a production service once.
+
+Green locally is not green on CI: the runner builds from a fresh target
+directory, on a different OS, and then runs the tests. Treat a red here as
+certain and a green as encouraging.
+
+`admin/rust/scripts/backend-rust --list` is the canonical phase list. Nothing
+local re-implements those commands, and new tooling must not either — a second
+copy drifts, and the drift stays invisible until CI disagrees.
