@@ -1546,13 +1546,13 @@ class TheyosV0126TagGit:
             raise TheyosTagGuardError("git repository root is empty")
         return Path(text).resolve()
 
-    def origin_url(self, *, push: bool) -> str:
+    def origin_urls(self, *, push: bool) -> tuple[str, ...]:
         arguments = ["remote", "get-url"]
         if push:
             arguments.append("--push")
-        arguments.append("origin")
+        arguments.extend(["--all", "origin"])
         _, output = self.output(arguments)
-        return output.decode("utf-8", errors="strict").strip()
+        return tuple(output.decode("utf-8", errors="strict").splitlines())
 
     def config_values(self, key: str) -> tuple[str, ...]:
         returncode, output = self.output(
@@ -1798,10 +1798,15 @@ def _assert_theyos_v0126_preconditions(
     target_oid: str,
     expected_main: str,
 ) -> None:
-    if git.origin_url(push=False) != THEYOS_REPOSITORY_URL:
-        raise TheyosTagGuardError("origin fetch URL is not the canonical theyos URL")
-    if git.origin_url(push=True) != THEYOS_REPOSITORY_URL:
-        raise TheyosTagGuardError("origin push URL is not the canonical theyos URL")
+    canonical_origin = (THEYOS_REPOSITORY_URL,)
+    if git.origin_urls(push=False) != canonical_origin:
+        raise TheyosTagGuardError(
+            "origin must have exactly one canonical theyos fetch URL"
+        )
+    if git.origin_urls(push=True) != canonical_origin:
+        raise TheyosTagGuardError(
+            "origin must have exactly one canonical theyos push URL"
+        )
     for key in (
         "remote.origin.push",
         "remote.origin.receivepack",

@@ -871,8 +871,8 @@ class FakeTheyosTagAPI:
 class FakeTheyosTagGit:
     def __init__(self, api: FakeTheyosTagAPI) -> None:
         self.api = api
-        self.fetch_url = guard.THEYOS_REPOSITORY_URL
-        self.push_url = guard.THEYOS_REPOSITORY_URL
+        self.fetch_urls = (guard.THEYOS_REPOSITORY_URL,)
+        self.push_urls = (guard.THEYOS_REPOSITORY_URL,)
         self.head = THEYOS_TAG_TARGET
         self.origin_main = THEYOS_TAG_TARGET
         self.remote_main = THEYOS_TAG_TARGET
@@ -922,8 +922,8 @@ class FakeTheyosTagGit:
     def repository_root(self) -> Path:
         return Path("/repo")
 
-    def origin_url(self, *, push: bool) -> str:
-        return self.push_url if push else self.fetch_url
+    def origin_urls(self, *, push: bool) -> tuple[str, ...]:
+        return self.push_urls if push else self.fetch_urls
 
     def config_values(self, key: str) -> tuple[str, ...]:
         return self.config.get(key, ())
@@ -1295,6 +1295,104 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                 ).stdout.splitlines()
                 self.assertEqual([guard.THEYOS_TAG_REF], remote_tags)
 
+    def test_real_preflight_rejects_multiple_origin_urls_before_mutation(self) -> None:
+        for url_mode in ("fetch", "push"):
+            with self.subTest(url_mode=url_mode), tempfile.TemporaryDirectory() as root:
+                root_path = Path(root)
+                repository = root_path / "repository"
+                extra_remote = root_path / "extra-remote.git"
+                subprocess.run(
+                    ["git", "init", "--bare", str(extra_remote)],
+                    check=True,
+                    capture_output=True,
+                )
+                subprocess.run(
+                    ["git", "init", str(repository)],
+                    check=True,
+                    capture_output=True,
+                )
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(repository),
+                        "remote",
+                        "add",
+                        "origin",
+                        guard.THEYOS_REPOSITORY_URL,
+                    ],
+                    check=True,
+                )
+                if url_mode == "fetch":
+                    subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(repository),
+                            "config",
+                            "--add",
+                            "remote.origin.url",
+                            str(extra_remote),
+                        ],
+                        check=True,
+                    )
+                    expected_error = "exactly one canonical theyos fetch URL"
+                else:
+                    for push_url in (guard.THEYOS_REPOSITORY_URL, str(extra_remote)):
+                        subprocess.run(
+                            [
+                                "git",
+                                "-C",
+                                str(repository),
+                                "remote",
+                                "set-url",
+                                "--add",
+                                "--push",
+                                "origin",
+                                push_url,
+                            ],
+                            check=True,
+                        )
+                    expected_error = "exactly one canonical theyos push URL"
+
+                with contextlib.chdir(repository), self.assertRaisesRegex(
+                    guard.TheyosTagGuardError, expected_error
+                ):
+                    guard._assert_theyos_v0126_preconditions(
+                        guard.TheyosV0126TagGit(),
+                        FakeTheyosTagAPI(),
+                        THEYOS_TAG_TARGET,
+                        THEYOS_TAG_TARGET,
+                    )
+
+                local_tag = subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(repository),
+                        "show-ref",
+                        "--verify",
+                        guard.THEYOS_TAG_REF,
+                    ],
+                    check=False,
+                    capture_output=True,
+                )
+                self.assertNotEqual(0, local_tag.returncode)
+                remote_tags = subprocess.run(
+                    [
+                        "git",
+                        "--git-dir",
+                        str(extra_remote),
+                        "for-each-ref",
+                        "--format=%(refname)",
+                        "refs/tags",
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.splitlines()
+                self.assertEqual([], remote_tags)
+
     def test_argument_payload_and_target_shape_fail_before_mutation(self) -> None:
         malformed = (
             [],
@@ -1346,8 +1444,26 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
 
     def test_each_moving_precondition_fails_before_mutation(self) -> None:
         mutations = (
-            lambda: setattr(self.git, "fetch_url", "https://example.invalid/theyos.git"),
-            lambda: setattr(self.git, "push_url", "ssh://example.invalid/theyos.git"),
+            lambda: setattr(
+                self.git,
+                "fetch_urls",
+                ("https://example.invalid/theyos.git",),
+            ),
+            lambda: setattr(
+                self.git,
+                "push_urls",
+                ("ssh://example.invalid/theyos.git",),
+            ),
+            lambda: setattr(
+                self.git,
+                "fetch_urls",
+                (guard.THEYOS_REPOSITORY_URL, "https://example.invalid/theyos.git"),
+            ),
+            lambda: setattr(
+                self.git,
+                "push_urls",
+                (guard.THEYOS_REPOSITORY_URL, "ssh://example.invalid/theyos.git"),
+            ),
             lambda: setattr(self.git, "head", "4" * 40),
             lambda: setattr(self.git, "origin_main", "4" * 40),
             lambda: setattr(self.git, "remote_main", "4" * 40),
