@@ -15,6 +15,7 @@ import copy
 import hashlib
 import io
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -1151,13 +1152,16 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                 THEYOS_TAG_TARGET,
                 guard.THEYOS_TAG_MESSAGE.encode("utf-8"),
             )
-        run.assert_called_once_with(
+        run.assert_called_once()
+        self.assertEqual(
             [
                 "git",
                 "-c",
                 "core.hooksPath=/dev/null",
                 "-c",
                 "core.fsmonitor=false",
+                "-c",
+                "core.attributesFile=/dev/null",
                 "tag",
                 "--annotate",
                 "--no-sign",
@@ -1166,10 +1170,15 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                 guard.THEYOS_TAG,
                 THEYOS_TAG_TARGET,
             ],
-            input=guard.THEYOS_TAG_MESSAGE.encode("utf-8"),
-            capture_output=True,
-            check=False,
+            run.call_args.args[0],
         )
+        self.assertEqual(
+            guard.THEYOS_TAG_MESSAGE.encode("utf-8"),
+            run.call_args.kwargs["input"],
+        )
+        self.assertTrue(run.call_args.kwargs["capture_output"])
+        self.assertFalse(run.call_args.kwargs["check"])
+        self.assertEqual("1", run.call_args.kwargs["env"]["GIT_ATTR_NOSYSTEM"])
 
     def test_real_git_boundary_disables_executable_fsmonitor(self) -> None:
         for guarded in (False, True):
@@ -1290,6 +1299,355 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                 else:
                     self.assertTrue(marker.exists())
                     self.assertEqual(["refs/tags/unrelated"], remote_tags)
+
+    def test_real_raw_clean_never_executes_attribute_filters(self) -> None:
+        for attribute_source in ("info", "tracked", "global", "system"):
+            for driver in ("clean", "process"):
+                for guarded in (False, True):
+                    with (
+                        self.subTest(
+                            attribute_source=attribute_source,
+                            driver=driver,
+                            guarded=guarded,
+                        ),
+                        tempfile.TemporaryDirectory() as root,
+                    ):
+                        root_path = Path(root)
+                        remote = root_path / "remote.git"
+                        repository = root_path / "repository"
+                        home = root_path / "home"
+                        home.mkdir()
+                        environment = dict(os.environ)
+                        environment["HOME"] = str(home)
+                        environment["XDG_CONFIG_HOME"] = str(home / "xdg")
+                        subprocess.run(
+                            ["git", "init", "--bare", str(remote)],
+                            check=True,
+                            capture_output=True,
+                            env=environment,
+                        )
+                        subprocess.run(
+                            ["git", "init", str(repository)],
+                            check=True,
+                            capture_output=True,
+                            env=environment,
+                        )
+                        for key, value in (
+                            ("user.name", "Release Test"),
+                            ("user.email", "release@example.invalid"),
+                        ):
+                            subprocess.run(
+                                ["git", "-C", str(repository), "config", key, value],
+                                check=True,
+                                env=environment,
+                            )
+                        tracked = repository / "tracked.txt"
+                        tracked.write_text("reviewed bytes\n", encoding="utf-8")
+                        if attribute_source == "tracked":
+                            (repository / ".gitattributes").write_text(
+                                "tracked.txt filter=side-effect\n",
+                                encoding="utf-8",
+                            )
+                        add_paths = ["tracked.txt"]
+                        if attribute_source == "tracked":
+                            add_paths.append(".gitattributes")
+                        subprocess.run(
+                            ["git", "-C", str(repository), "add", *add_paths],
+                            check=True,
+                            env=environment,
+                        )
+                        subprocess.run(
+                            ["git", "-C", str(repository), "commit", "-m", "fixture"],
+                            check=True,
+                            capture_output=True,
+                            env=environment,
+                        )
+                        target = subprocess.run(
+                            ["git", "-C", str(repository), "rev-parse", "HEAD"],
+                            check=True,
+                            capture_output=True,
+                            text=True,
+                            env=environment,
+                        ).stdout.strip()
+                        subprocess.run(
+                            ["git", "-C", str(repository), "tag", "unrelated", target],
+                            check=True,
+                            env=environment,
+                        )
+                        subprocess.run(
+                            [
+                                "git",
+                                "-C",
+                                str(repository),
+                                "remote",
+                                "add",
+                                "origin",
+                                str(remote),
+                            ],
+                            check=True,
+                            env=environment,
+                        )
+                        attributes = root_path / f"{attribute_source}.attributes"
+                        attributes.write_text(
+                            "tracked.txt filter=side-effect\n",
+                            encoding="utf-8",
+                        )
+                        if attribute_source == "info":
+                            (repository / ".git" / "info" / "attributes").write_bytes(
+                                attributes.read_bytes()
+                            )
+                        elif attribute_source == "global":
+                            subprocess.run(
+                                [
+                                    "git",
+                                    "config",
+                                    "--global",
+                                    "core.attributesFile",
+                                    str(attributes),
+                                ],
+                                check=True,
+                                env=environment,
+                            )
+                        elif attribute_source == "system":
+                            system_config = root_path / "system.gitconfig"
+                            system_config.write_text(
+                                "[core]\n"
+                                f"\tattributesFile = {attributes}\n",
+                                encoding="utf-8",
+                            )
+                            environment["GIT_CONFIG_SYSTEM"] = str(system_config)
+
+                        marker = root_path / f"{driver}-filter-executed"
+                        filter_program = root_path / f"{driver}-filter"
+                        filter_program.write_text(
+                            "#!/bin/sh\n"
+                            f": > {marker}\n"
+                            "git push --no-verify origin "
+                            "refs/tags/unrelated:refs/tags/unrelated "
+                            ">/dev/null 2>&1\n"
+                            + ("cat\n" if driver == "clean" else "exit 1\n"),
+                            encoding="utf-8",
+                        )
+                        filter_program.chmod(0o700)
+                        subprocess.run(
+                            [
+                                "git",
+                                "-C",
+                                str(repository),
+                                "config",
+                                f"filter.side-effect.{driver}",
+                                str(filter_program),
+                            ],
+                            check=True,
+                            env=environment,
+                        )
+                        if driver == "process":
+                            subprocess.run(
+                                [
+                                    "git",
+                                    "-C",
+                                    str(repository),
+                                    "config",
+                                    "filter.side-effect.required",
+                                    "true",
+                                ],
+                                check=True,
+                                env=environment,
+                            )
+                        os.utime(tracked, None)
+
+                        if guarded:
+                            with (
+                                mock.patch.dict(
+                                    guard.os.environ, environment, clear=True
+                                ),
+                                contextlib.chdir(repository),
+                            ):
+                                self.assertTrue(guard.TheyosV0126TagGit().clean())
+                        else:
+                            subprocess.run(
+                                [
+                                    "git",
+                                    "-C",
+                                    str(repository),
+                                    "status",
+                                    "--porcelain=v1",
+                                    "--untracked-files=all",
+                                ],
+                                check=False,
+                                capture_output=True,
+                                env=environment,
+                            )
+
+                        remote_tags = subprocess.run(
+                            [
+                                "git",
+                                "--git-dir",
+                                str(remote),
+                                "for-each-ref",
+                                "--format=%(refname)",
+                                "refs/tags",
+                            ],
+                            check=True,
+                            capture_output=True,
+                            text=True,
+                            env=environment,
+                        ).stdout.splitlines()
+                        if guarded:
+                            self.assertFalse(marker.exists())
+                            self.assertEqual([], remote_tags)
+                        else:
+                            self.assertTrue(marker.exists())
+                            self.assertEqual(["refs/tags/unrelated"], remote_tags)
+
+    def test_real_raw_clean_distinguishes_worktree_and_index_drift(self) -> None:
+        cases = (
+            "clean",
+            "modified",
+            "deleted",
+            "mode-changed",
+            "untracked",
+            "staged",
+            "worktree-symlink",
+            "unmerged",
+        )
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as root:
+                repository = Path(root) / "repository"
+                subprocess.run(
+                    ["git", "init", str(repository)],
+                    check=True,
+                    capture_output=True,
+                )
+                for key, value in (
+                    ("user.name", "Release Test"),
+                    ("user.email", "release@example.invalid"),
+                ):
+                    subprocess.run(
+                        ["git", "-C", str(repository), "config", key, value],
+                        check=True,
+                    )
+                tracked = repository / "tracked.txt"
+                tracked.write_text("reviewed bytes\n", encoding="utf-8")
+                (repository / ".gitignore").write_text(
+                    "ignored.txt\n", encoding="utf-8"
+                )
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(repository),
+                        "add",
+                        "tracked.txt",
+                        ".gitignore",
+                    ],
+                    check=True,
+                )
+                subprocess.run(
+                    ["git", "-C", str(repository), "commit", "-m", "fixture"],
+                    check=True,
+                    capture_output=True,
+                )
+                (repository / "ignored.txt").write_text(
+                    "ignored bytes\n", encoding="utf-8"
+                )
+                expected = case == "clean"
+                raises = False
+                if case == "modified":
+                    tracked.write_text("changed bytes\n", encoding="utf-8")
+                elif case == "deleted":
+                    tracked.unlink()
+                elif case == "mode-changed":
+                    tracked.chmod(0o755)
+                elif case == "untracked":
+                    (repository / "visible.txt").write_text(
+                        "untracked\n", encoding="utf-8"
+                    )
+                elif case == "staged":
+                    tracked.write_text("staged bytes\n", encoding="utf-8")
+                    subprocess.run(
+                        ["git", "-C", str(repository), "add", "tracked.txt"],
+                        check=True,
+                    )
+                elif case == "worktree-symlink":
+                    tracked.unlink()
+                    tracked.symlink_to("ignored.txt")
+                elif case == "unmerged":
+                    oid = subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(repository),
+                            "rev-parse",
+                            "HEAD:tracked.txt",
+                        ],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    ).stdout.strip()
+                    subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(repository),
+                            "update-index",
+                            "--force-remove",
+                            "tracked.txt",
+                        ],
+                        check=True,
+                    )
+                    subprocess.run(
+                        ["git", "-C", str(repository), "update-index", "--index-info"],
+                        input=(
+                            f"100644 {oid} 1\ttracked.txt\n"
+                            f"100644 {oid} 2\ttracked.txt\n"
+                            f"100644 {oid} 3\ttracked.txt\n"
+                        ),
+                        text=True,
+                        check=True,
+                    )
+                    raises = True
+                with contextlib.chdir(repository):
+                    if raises:
+                        with self.assertRaises(guard.TheyosTagGuardError):
+                            guard.TheyosV0126TagGit().clean()
+                    else:
+                        self.assertEqual(
+                            expected,
+                            guard.TheyosV0126TagGit().clean(),
+                        )
+
+    def test_real_raw_clean_rejects_tracked_symlink_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            repository = Path(root) / "repository"
+            subprocess.run(
+                ["git", "init", str(repository)],
+                check=True,
+                capture_output=True,
+            )
+            for key, value in (
+                ("user.name", "Release Test"),
+                ("user.email", "release@example.invalid"),
+            ):
+                subprocess.run(
+                    ["git", "-C", str(repository), "config", key, value],
+                    check=True,
+                )
+            (repository / "target.txt").write_text("target\n", encoding="utf-8")
+            (repository / "tracked-link").symlink_to("target.txt")
+            subprocess.run(
+                ["git", "-C", str(repository), "add", "tracked-link"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repository), "commit", "-m", "fixture"],
+                check=True,
+                capture_output=True,
+            )
+            with contextlib.chdir(repository), self.assertRaises(
+                guard.TheyosTagGuardError
+            ):
+                guard.TheyosV0126TagGit().clean()
 
     def test_real_create_bypasses_reference_transaction_hooks(self) -> None:
         for hook_mode in ("standard", "configured"):
@@ -1518,13 +1876,16 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
             guard.subprocess, "run", return_value=completed
         ) as run:
             repository.push_tag()
-        run.assert_called_once_with(
+        run.assert_called_once()
+        self.assertEqual(
             [
                 "git",
                 "-c",
                 "core.hooksPath=/dev/null",
                 "-c",
                 "core.fsmonitor=false",
+                "-c",
+                "core.attributesFile=/dev/null",
                 "-c",
                 "push.followTags=false",
                 "-c",
@@ -1537,10 +1898,12 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                 "origin",
                 f"{guard.THEYOS_TAG_REF}:{guard.THEYOS_TAG_REF}",
             ],
-            input=None,
-            capture_output=True,
-            check=False,
+            run.call_args.args[0],
         )
+        self.assertIsNone(run.call_args.kwargs["input"])
+        self.assertTrue(run.call_args.kwargs["capture_output"])
+        self.assertFalse(run.call_args.kwargs["check"])
+        self.assertEqual("1", run.call_args.kwargs["env"]["GIT_ATTR_NOSYSTEM"])
 
     def test_real_push_bypasses_standard_and_configured_pre_push_hooks(self) -> None:
         for hook_mode in ("standard", "configured"):

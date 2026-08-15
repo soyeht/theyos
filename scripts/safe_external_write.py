@@ -1521,13 +1521,18 @@ class TheyosV0126TagGit:
             "core.hooksPath=/dev/null",
             "-c",
             "core.fsmonitor=false",
+            "-c",
+            "core.attributesFile=/dev/null",
             *arguments,
         ]
+        environment = dict(os.environ)
+        environment["GIT_ATTR_NOSYSTEM"] = "1"
         completed = subprocess.run(
             command,
             input=input_bytes,
             capture_output=True,
             check=False,
+            env=environment,
         )
         if completed.returncode not in allowed_returncodes:
             stderr = completed.stderr.decode("utf-8", errors="replace").strip()
@@ -1582,11 +1587,190 @@ class TheyosV0126TagGit:
         _, output = self.output(["cat-file", "-t", oid])
         return output.decode("ascii", errors="strict").strip()
 
-    def clean(self) -> bool:
+    @staticmethod
+    def _split_zero_records(output: bytes) -> tuple[bytes, ...]:
+        if not output:
+            return ()
+        if not output.endswith(b"\0"):
+            raise TheyosTagGuardError("raw Git record stream lacks terminal NUL")
+        return tuple(output[:-1].split(b"\0"))
+
+    def _head_tree_entries(self) -> dict[bytes, tuple[str, str]]:
         _, output = self.output(
-            ["status", "--porcelain=v1", "--untracked-files=all"]
+            ["ls-tree", "-r", "-z", "--full-tree", "HEAD"]
         )
-        return output == b""
+        entries: dict[bytes, tuple[str, str]] = {}
+        for record in self._split_zero_records(output):
+            metadata, separator, path = record.partition(b"\t")
+            fields = metadata.split(b" ")
+            if separator != b"\t" or len(fields) != 3 or not path:
+                raise TheyosTagGuardError("HEAD tree record is malformed")
+            mode_bytes, object_type, oid_bytes = fields
+            try:
+                mode = mode_bytes.decode("ascii", errors="strict")
+                oid = oid_bytes.decode("ascii", errors="strict")
+            except UnicodeDecodeError as error:
+                raise TheyosTagGuardError(
+                    "HEAD tree metadata is not ASCII"
+                ) from error
+            if (
+                mode not in {"100644", "100755"}
+                or object_type != b"blob"
+                or FULL_OID_PATTERN.fullmatch(oid) is None
+                or path in entries
+            ):
+                raise TheyosTagGuardError(
+                    "HEAD tree contains an unsupported or duplicate entry"
+                )
+            entries[path] = (mode, oid)
+        return entries
+
+    def _index_entries(self) -> dict[bytes, tuple[str, str]]:
+        _, output = self.output(["ls-files", "--stage", "-z"])
+        entries: dict[bytes, tuple[str, str]] = {}
+        for record in self._split_zero_records(output):
+            metadata, separator, path = record.partition(b"\t")
+            fields = metadata.split(b" ")
+            if separator != b"\t" or len(fields) != 3 or not path:
+                raise TheyosTagGuardError("index record is malformed")
+            mode_bytes, oid_bytes, stage = fields
+            try:
+                mode = mode_bytes.decode("ascii", errors="strict")
+                oid = oid_bytes.decode("ascii", errors="strict")
+            except UnicodeDecodeError as error:
+                raise TheyosTagGuardError(
+                    "index metadata is not ASCII"
+                ) from error
+            if (
+                stage != b"0"
+                or mode not in {"100644", "100755"}
+                or FULL_OID_PATTERN.fullmatch(oid) is None
+                or path in entries
+            ):
+                raise TheyosTagGuardError(
+                    "index contains an unmerged, unsupported, or duplicate entry"
+                )
+            entries[path] = (mode, oid)
+        return entries
+
+    def _blob_bytes(self, oids: Sequence[str]) -> dict[str, bytes]:
+        ordered = tuple(sorted(set(oids)))
+        if not ordered:
+            return {}
+        completed = self._run(
+            ["cat-file", "--batch"],
+            input_bytes=("\n".join(ordered) + "\n").encode("ascii"),
+        )
+        output = completed.stdout
+        position = 0
+        blobs: dict[str, bytes] = {}
+        for expected_oid in ordered:
+            header_end = output.find(b"\n", position)
+            if header_end < 0:
+                raise TheyosTagGuardError("cat-file batch header is missing")
+            fields = output[position:header_end].split(b" ")
+            if len(fields) != 3:
+                raise TheyosTagGuardError("cat-file batch header is malformed")
+            oid_bytes, object_type, size_bytes = fields
+            try:
+                oid = oid_bytes.decode("ascii", errors="strict")
+                size = int(size_bytes.decode("ascii", errors="strict"))
+            except (UnicodeDecodeError, ValueError) as error:
+                raise TheyosTagGuardError(
+                    "cat-file batch metadata is invalid"
+                ) from error
+            content_start = header_end + 1
+            content_end = content_start + size
+            if (
+                oid != expected_oid
+                or object_type != b"blob"
+                or size < 0
+                or content_end >= len(output)
+                or output[content_end:content_end + 1] != b"\n"
+            ):
+                raise TheyosTagGuardError("cat-file batch readback mismatch")
+            blobs[oid] = output[content_start:content_end]
+            position = content_end + 1
+        if position != len(output):
+            raise TheyosTagGuardError("cat-file batch has trailing bytes")
+        return blobs
+
+    @staticmethod
+    def _read_worktree_file(root: Path, raw_path: bytes) -> tuple[str, bytes] | None:
+        if (
+            not raw_path
+            or raw_path.startswith(b"/")
+            or any(part in {b"", b".", b".."} for part in raw_path.split(b"/"))
+        ):
+            raise TheyosTagGuardError("tracked path is not a safe relative path")
+        path = root.joinpath(*[os.fsdecode(part) for part in raw_path.split(b"/")])
+        current = root
+        try:
+            for part in path.relative_to(root).parts[:-1]:
+                current /= part
+                parent_stat = os.lstat(current)
+                if stat.S_ISLNK(parent_stat.st_mode) or not stat.S_ISDIR(
+                    parent_stat.st_mode
+                ):
+                    return None
+            before = os.lstat(path)
+        except FileNotFoundError:
+            return None
+        if (
+            stat.S_ISLNK(before.st_mode)
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX)
+        ):
+            return None
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags)
+        except (FileNotFoundError, OSError):
+            return None
+        try:
+            opened = os.fstat(descriptor)
+            with os.fdopen(descriptor, "rb", closefd=False) as stream:
+                content = stream.read()
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        stable_fields = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        if any(
+            getattr(before, field) != getattr(opened, field)
+            or getattr(opened, field) != getattr(after, field)
+            for field in stable_fields
+        ):
+            return None
+        mode = "100755" if opened.st_mode & stat.S_IXUSR else "100644"
+        return mode, content
+
+    def clean(self) -> bool:
+        head_entries = self._head_tree_entries()
+        index_entries = self._index_entries()
+        if head_entries != index_entries:
+            return False
+        _, untracked = self.output(
+            ["ls-files", "--others", "--exclude-standard", "-z"]
+        )
+        if self._split_zero_records(untracked):
+            return False
+        blobs = self._blob_bytes([oid for _, oid in index_entries.values()])
+        root = self.repository_root()
+        for path, (expected_mode, oid) in index_entries.items():
+            worktree_entry = self._read_worktree_file(root, path)
+            if worktree_entry is None:
+                return False
+            actual_mode, content = worktree_entry
+            if actual_mode != expected_mode or content != blobs[oid]:
+                return False
+        return True
 
     def read_repository_file(self, relative_path: str) -> bytes:
         root = self.repository_root()
