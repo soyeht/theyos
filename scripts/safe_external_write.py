@@ -1790,13 +1790,28 @@ class TheyosV0126TagGit:
         return path.read_bytes()
 
     def local_ref(self, ref: str) -> str | None:
-        returncode, output = self.output(
-            ["show-ref", "--verify", "--hash", ref],
+        completed = self._run(
+            ["rev-parse", "--verify", "--quiet", "--end-of-options", ref],
             allowed_returncodes=frozenset({0, 1}),
         )
-        if returncode == 1:
+        if completed.stderr:
+            raise TheyosTagGuardError("local ref lookup wrote to stderr")
+        if completed.returncode == 1:
+            if completed.stdout:
+                raise TheyosTagGuardError(
+                    "absent local ref lookup returned unexpected output"
+                )
             return None
-        return output.decode("ascii", errors="strict").strip()
+        output = completed.stdout
+        if len(output) != 41 or output[-1:] != b"\n":
+            raise TheyosTagGuardError("local ref lookup output is malformed")
+        try:
+            oid = output[:-1].decode("ascii", errors="strict")
+        except UnicodeDecodeError as error:
+            raise TheyosTagGuardError("local ref OID is not ASCII") from error
+        if FULL_OID_PATTERN.fullmatch(oid) is None:
+            raise TheyosTagGuardError("local ref OID is not a full object ID")
+        return oid
 
     def remote_refs(self, refs: Sequence[str]) -> dict[str, str]:
         _, output = self.output(["ls-remote", "origin", *refs])

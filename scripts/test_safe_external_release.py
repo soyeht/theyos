@@ -1740,6 +1740,234 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                         self.assertTrue(boundary.clean())
                 self.assertEqual(not guarded, marker.exists())
 
+    def test_real_local_ref_distinguishes_absence_branch_and_annotated_tag(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            repository = Path(root) / "repository"
+            subprocess.run(
+                ["git", "init", str(repository)], check=True, capture_output=True
+            )
+            for key, value in (
+                ("user.name", "Release Test"),
+                ("user.email", "release@example.invalid"),
+            ):
+                subprocess.run(
+                    ["git", "-C", str(repository), "config", key, value], check=True
+                )
+            tracked = repository / "tracked.txt"
+            tracked.write_text("reviewed bytes\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "-C", str(repository), "add", "tracked.txt"], check=True
+            )
+            subprocess.run(
+                ["git", "-C", str(repository), "commit", "-m", "fixture"],
+                check=True,
+                capture_output=True,
+            )
+            commit_oid = subprocess.run(
+                ["git", "-C", str(repository), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            branch_ref = "refs/heads/v0.1.26"
+            tag_ref = guard.THEYOS_TAG_REF
+            boundary = guard.TheyosV0126TagGit()
+            with contextlib.chdir(repository):
+                self.assertIsNone(boundary.local_ref(branch_ref))
+                self.assertIsNone(boundary.local_ref(tag_ref))
+                subprocess.run(
+                    ["git", "branch", guard.THEYOS_TAG, commit_oid], check=True
+                )
+                self.assertEqual(commit_oid, boundary.local_ref(branch_ref))
+                subprocess.run(
+                    [
+                        "git",
+                        "tag",
+                        "--annotate",
+                        "--no-sign",
+                        "--cleanup=verbatim",
+                        "--message",
+                        guard.THEYOS_TAG_MESSAGE.rstrip("\n"),
+                        guard.THEYOS_TAG,
+                        commit_oid,
+                    ],
+                    check=True,
+                )
+                tag_object_oid = subprocess.run(
+                    ["git", "rev-parse", tag_ref],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                self.assertNotEqual(commit_oid, tag_object_oid)
+                self.assertEqual(tag_object_oid, boundary.local_ref(tag_ref))
+
+    def test_local_ref_requires_exact_returncode_output_and_stderr(self) -> None:
+        cases = (
+            (0, b"1" * 40 + b"\n", b"", "1" * 40),
+            (1, b"", b"", None),
+            (0, b"", b"", guard.TheyosTagGuardError),
+            (0, b"1" * 40, b"", guard.TheyosTagGuardError),
+            (0, b"1" * 40 + b"\nextra\n", b"", guard.TheyosTagGuardError),
+            (0, b"z" * 40 + b"\n", b"", guard.TheyosTagGuardError),
+            (1, b"unexpected\n", b"", guard.TheyosTagGuardError),
+            (1, b"", b"warning\n", guard.TheyosTagGuardError),
+        )
+        for returncode, stdout, stderr, expected in cases:
+            with self.subTest(
+                returncode=returncode, stdout=stdout, stderr=stderr
+            ):
+                completed = subprocess.CompletedProcess(
+                    args=[], returncode=returncode, stdout=stdout, stderr=stderr
+                )
+                boundary = guard.TheyosV0126TagGit()
+                with mock.patch.object(boundary, "_run", return_value=completed) as run:
+                    if isinstance(expected, type) and issubclass(expected, Exception):
+                        with self.assertRaises(expected):
+                            boundary.local_ref(guard.THEYOS_TAG_REF)
+                    else:
+                        self.assertEqual(expected, boundary.local_ref(guard.THEYOS_TAG_REF))
+                run.assert_called_once_with(
+                    [
+                        "rev-parse",
+                        "--verify",
+                        "--quiet",
+                        "--end-of-options",
+                        guard.THEYOS_TAG_REF,
+                    ],
+                    allowed_returncodes=frozenset({0, 1}),
+                )
+
+    def test_real_local_refs_gate_create_and_push_states(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            repository = Path(root) / "repository"
+            subprocess.run(
+                ["git", "init", str(repository)], check=True, capture_output=True
+            )
+            for key, value in (
+                ("user.name", "Release Test"),
+                ("user.email", "release@example.invalid"),
+            ):
+                subprocess.run(
+                    ["git", "-C", str(repository), "config", key, value], check=True
+                )
+            tracked = repository / "tracked.txt"
+            tracked.write_text("reviewed bytes\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "-C", str(repository), "add", "tracked.txt"], check=True
+            )
+            subprocess.run(
+                ["git", "-C", str(repository), "commit", "-m", "fixture"],
+                check=True,
+                capture_output=True,
+            )
+            target_oid = subprocess.run(
+                ["git", "-C", str(repository), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+            api = FakeTheyosTagAPI()
+            api.main_oid = target_oid
+            real = guard.TheyosV0126TagGit()
+
+            class HybridGit(FakeTheyosTagGit):
+                def __init__(self) -> None:
+                    super().__init__(api)
+                    self.head = target_oid
+                    self.origin_main = target_oid
+                    self.remote_main = target_oid
+
+                def local_ref(self, ref: str) -> str | None:
+                    return real.local_ref(ref)
+
+                def object_type(self, oid: str) -> str:
+                    return real.object_type(oid)
+
+                def tag_object_bytes(self, tag_object_oid: str) -> bytes:
+                    return real.tag_object_bytes(tag_object_oid)
+
+                def create_tag(self, target: str, message: bytes) -> None:
+                    self.mutations.append(("tag", (guard.THEYOS_TAG, target)))
+                    real.create_tag(target, message)
+
+                def push_tag(self) -> None:
+                    self.mutations.append(("push", (guard.THEYOS_TAG_REF,)))
+                    tag_object_oid = real.local_ref(guard.THEYOS_TAG_REF)
+                    assert tag_object_oid is not None
+                    self.remote[guard.THEYOS_TAG_REF] = tag_object_oid
+                    self.remote[f"{guard.THEYOS_TAG_REF}^{{}}"] = target_oid
+                    api.add_tag(tag_object_oid, target_oid)
+
+            arguments = [
+                "create",
+                "--target-oid",
+                target_oid,
+                "--expected-main",
+                target_oid,
+            ]
+            with contextlib.chdir(repository):
+                create_git = HybridGit()
+                self.assertEqual(
+                    0,
+                    guard.execute_governed_theyos_v0126_tag(
+                        arguments,
+                        guard.THEYOS_TAG_MESSAGE,
+                        git=create_git,
+                        api=api,
+                    ),
+                )
+                self.assertEqual(1, len(create_git.mutations))
+
+                subprocess.run(
+                    ["git", "branch", guard.THEYOS_TAG, target_oid], check=True
+                )
+                blocked_create = HybridGit()
+                with self.assertRaisesRegex(
+                    guard.TheyosTagGuardError,
+                    "local branch makes the tag name ambiguous",
+                ):
+                    guard.execute_governed_theyos_v0126_tag(
+                        arguments,
+                        guard.THEYOS_TAG_MESSAGE,
+                        git=blocked_create,
+                        api=FakeTheyosTagAPI(),
+                    )
+                self.assertEqual([], blocked_create.mutations)
+                subprocess.run(
+                    ["git", "branch", "--delete", guard.THEYOS_TAG], check=True
+                )
+
+                push_api = FakeTheyosTagAPI()
+                push_api.main_oid = target_oid
+                api = push_api
+                push_git = HybridGit()
+                push_arguments = ["push", *arguments[1:]]
+                self.assertEqual(
+                    0,
+                    guard.execute_governed_theyos_v0126_tag(
+                        push_arguments, "", git=push_git, api=push_api
+                    ),
+                )
+                self.assertEqual(1, len(push_git.mutations))
+
+                subprocess.run(
+                    ["git", "branch", guard.THEYOS_TAG, target_oid], check=True
+                )
+                blocked_api = FakeTheyosTagAPI()
+                blocked_api.main_oid = target_oid
+                api = blocked_api
+                blocked_push = HybridGit()
+                with self.assertRaisesRegex(
+                    guard.TheyosTagGuardError,
+                    "local branch makes the tag name ambiguous",
+                ):
+                    guard.execute_governed_theyos_v0126_tag(
+                        push_arguments, "", git=blocked_push, api=blocked_api
+                    )
+                self.assertEqual([], blocked_push.mutations)
+
     def test_real_raw_clean_distinguishes_worktree_and_index_drift(self) -> None:
         cases = (
             "clean",
