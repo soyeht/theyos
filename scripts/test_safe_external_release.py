@@ -844,6 +844,23 @@ class GitHubAPIIOSTargetBoundaryTests(unittest.TestCase):
         self.assertEqual("soyeht/soyeht-ios", environment["GH_REPO"])
 
 
+class GovernedReleasePinTests(unittest.TestCase):
+    def test_corrected_dispatch_transport_consumer_quartet_is_exact(self) -> None:
+        self.assertEqual(
+            {
+                ".github/workflows/macos-release.yml":
+                    "522a852c2601b431266fd7de3718daaa028cbf45a5dfbc22d69a0cb52802bd3b",
+                ".github/workflows/xcode.yml":
+                    "7fedc9ebe251950479eead626e3fb89d880077d51c68b8df4aaf7f383602d486",
+                "scripts/ci/test-ios":
+                    "6359805f5fa0bb9c435cd20b6e1eafb6747c4d4baa730b142502e39c61bffb7e",
+                "scripts/ci/check-governed-macos-release.py":
+                    "61458cb8b6c093558d7cec8af7f793f142038489e8d00d5fe4857f8a81ea73a3",
+            },
+            guard.RELEASE_EXECUTION_CONTRACT_SHA256,
+        )
+
+
 class GovernedReleaseTests(unittest.TestCase):
     def setUp(self) -> None:
         self.api = FakeReleaseAPI()
