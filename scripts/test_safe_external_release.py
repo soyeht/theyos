@@ -1055,6 +1055,8 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
         run.assert_called_once_with(
             [
                 "git",
+                "-c",
+                "core.hooksPath=/dev/null",
                 "tag",
                 "--annotate",
                 "--no-sign",
@@ -1067,6 +1069,171 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
             capture_output=True,
             check=False,
         )
+
+    def test_real_create_bypasses_reference_transaction_hooks(self) -> None:
+        for hook_mode in ("standard", "configured"):
+            for guarded in (False, True):
+                with (
+                    self.subTest(hook_mode=hook_mode, guarded=guarded),
+                    tempfile.TemporaryDirectory() as root,
+                ):
+                    root_path = Path(root)
+                    remote = root_path / "remote.git"
+                    repository = root_path / "repository"
+                    subprocess.run(
+                        ["git", "init", "--bare", str(remote)],
+                        check=True,
+                        capture_output=True,
+                    )
+                    subprocess.run(
+                        ["git", "init", str(repository)],
+                        check=True,
+                        capture_output=True,
+                    )
+                    for key, value in (
+                        ("user.name", "Release Test"),
+                        ("user.email", "release@example.invalid"),
+                    ):
+                        subprocess.run(
+                            ["git", "-C", str(repository), "config", key, value],
+                            check=True,
+                        )
+                    tracked = repository / "tracked.txt"
+                    tracked.write_text("reviewed bytes\n", encoding="utf-8")
+                    subprocess.run(
+                        ["git", "-C", str(repository), "add", "tracked.txt"],
+                        check=True,
+                    )
+                    subprocess.run(
+                        ["git", "-C", str(repository), "commit", "-m", "fixture"],
+                        check=True,
+                        capture_output=True,
+                    )
+                    subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(repository),
+                            "remote",
+                            "add",
+                            "origin",
+                            str(remote),
+                        ],
+                        check=True,
+                    )
+                    target = subprocess.run(
+                        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    ).stdout.strip()
+                    subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(repository),
+                            "tag",
+                            "--annotate",
+                            "--no-sign",
+                            "--cleanup=verbatim",
+                            "--file=-",
+                            "unrelated",
+                            target,
+                        ],
+                        input=b"unrelated tag\n",
+                        check=True,
+                    )
+
+                    marker = repository / "reference-transaction-executed"
+                    if hook_mode == "standard":
+                        hook = repository / ".git" / "hooks" / "reference-transaction"
+                    else:
+                        hooks = root_path / "configured-hooks"
+                        hooks.mkdir()
+                        hook = hooks / "reference-transaction"
+                        subprocess.run(
+                            [
+                                "git",
+                                "-C",
+                                str(repository),
+                                "config",
+                                "core.hooksPath",
+                                str(hooks),
+                            ],
+                            check=True,
+                        )
+                    hook.write_text(
+                        "#!/bin/sh\n"
+                        "if test \"$1\" = prepared; then\n"
+                        f"  : > {marker}\n"
+                        "  git push --no-verify origin "
+                        "refs/tags/unrelated:refs/tags/unrelated\n"
+                        "fi\n",
+                        encoding="utf-8",
+                    )
+                    hook.chmod(0o700)
+
+                    if guarded:
+                        with contextlib.chdir(repository):
+                            guard.TheyosV0126TagGit().create_tag(
+                                target,
+                                guard.THEYOS_TAG_MESSAGE.encode("utf-8"),
+                            )
+                    else:
+                        subprocess.run(
+                            [
+                                "git",
+                                "-C",
+                                str(repository),
+                                "tag",
+                                "--annotate",
+                                "--no-sign",
+                                "--cleanup=verbatim",
+                                "--file=-",
+                                guard.THEYOS_TAG,
+                                target,
+                            ],
+                            input=guard.THEYOS_TAG_MESSAGE.encode("utf-8"),
+                            check=True,
+                            capture_output=True,
+                        )
+
+                    local_tags = subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(repository),
+                            "for-each-ref",
+                            "--format=%(refname)",
+                            "refs/tags",
+                        ],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    ).stdout.splitlines()
+                    self.assertEqual(
+                        ["refs/tags/unrelated", guard.THEYOS_TAG_REF],
+                        local_tags,
+                    )
+                    remote_tags = subprocess.run(
+                        [
+                            "git",
+                            "--git-dir",
+                            str(remote),
+                            "for-each-ref",
+                            "--format=%(refname)",
+                            "refs/tags",
+                        ],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    ).stdout.splitlines()
+                    if guarded:
+                        self.assertFalse(marker.exists())
+                        self.assertEqual([], remote_tags)
+                    else:
+                        self.assertTrue(marker.exists())
+                        self.assertEqual(["refs/tags/unrelated"], remote_tags)
 
     def test_push_is_one_exact_ref_mutation_and_remote_api_readback(self) -> None:
         self.git.add_local_tag()

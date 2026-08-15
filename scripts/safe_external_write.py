@@ -1622,6 +1622,8 @@ class TheyosV0126TagGit:
     def create_tag(self, target_oid: str, message: bytes) -> None:
         self._run(
             [
+                "-c",
+                "core.hooksPath=/dev/null",
                 "tag",
                 "--annotate",
                 "--no-sign",
