@@ -56,7 +56,8 @@ The adapter pins the reviewed consumer execution quartet byte-for-byte: the
 build-only release workflow, the required `build` workflow, its phase
 dispatcher, and the dedicated release-contract checker. Change any of those
 four files by updating and landing this adapter contract first, then re-anchor
-the consumer. A pin-only follow-up must change only these four digests, their
+the consumer. A pin-only follow-up, including one that corrects the consumer's
+required-secret inventory guard, must change only these four digests, their
 exact-value tests, and this narrow ordering policy; it must not broaden adapter
 grammar or mutations. Land changes in this order: first the adapter pins and
 tests in `theyos`; then re-anchor and land the byte-identical `soyeht-ios`
