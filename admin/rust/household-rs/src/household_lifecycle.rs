@@ -192,6 +192,11 @@ impl HouseholdLifecycleLock {
         kind: LockKind,
         deadline: Option<Instant>,
     ) -> Result<LifecycleGuard, HouseholdLifecycleLockError> {
+        #[cfg(feature = "test-support")]
+        crate::first_owner_test_support::lifecycle_attempt(
+            &self.inner.state_path,
+            kind == LockKind::Exclusive,
+        );
         let file = open_existing_lock(&self.inner.state_dir)?;
         validate_lock_file(&self.inner.state_dir, &file)?;
         if !self.file_matches_expected(&file) || !named_lock_matches(&self.inner.state_dir, &file) {
@@ -206,6 +211,10 @@ impl HouseholdLifecycleLock {
             match result {
                 Ok(()) => break,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    #[cfg(feature = "test-support")]
+                    if crate::first_owner_test_support::fail_on_contention(&self.inner.state_path) {
+                        return Err(HouseholdLifecycleLockError::LockTimeout);
+                    }
                     if deadline.is_some_and(|limit| Instant::now() >= limit) {
                         return Err(HouseholdLifecycleLockError::LockTimeout);
                     }
@@ -225,6 +234,11 @@ impl HouseholdLifecycleLock {
         if kind == LockKind::Shared && guard.teardown_breadcrumb_exists()? {
             return Err(HouseholdLifecycleLockError::RecoveryRequired);
         }
+        #[cfg(feature = "test-support")]
+        crate::first_owner_test_support::lifecycle_success(
+            &self.inner.state_path,
+            kind == LockKind::Exclusive,
+        );
         Ok(guard)
     }
 

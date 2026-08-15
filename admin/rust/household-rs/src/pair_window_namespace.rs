@@ -234,6 +234,7 @@ impl PairWindowNamespaceV2 {
         self.read_named(PAIR_MACHINE_NAME)
     }
 
+    #[cfg(test)]
     pub(crate) fn write_pair_device<T: Serialize>(&self, value: &T) -> Result<(), StorageError> {
         let _guard = self.acquire_current_shared()?;
         self.write_named(PAIR_DEVICE_NAME, value)
@@ -244,6 +245,7 @@ impl PairWindowNamespaceV2 {
         self.write_named(PAIR_MACHINE_NAME, value)
     }
 
+    #[cfg(test)]
     pub(crate) fn delete_pair_device(&self) -> Result<(), StorageError> {
         let _guard = self.acquire_current_shared()?;
         self.delete_named(PAIR_DEVICE_NAME)
@@ -254,6 +256,14 @@ impl PairWindowNamespaceV2 {
         guard: &LifecycleWriteGuard,
     ) -> Result<Option<T>, StorageError> {
         self.validate_write_guard(guard)?;
+        self.read_named(PAIR_DEVICE_NAME)
+    }
+
+    pub(crate) fn read_pair_device_under_shared<T: DeserializeOwned>(
+        &self,
+        guard: &LifecycleReadGuard,
+    ) -> Result<Option<T>, StorageError> {
+        self.validate_read_guard(guard)?;
         self.read_named(PAIR_DEVICE_NAME)
     }
 
@@ -285,6 +295,15 @@ impl PairWindowNamespaceV2 {
         self.write_named(PAIR_DEVICE_NAME, value)
     }
 
+    pub(crate) fn write_pair_device_under_shared<T: Serialize>(
+        &self,
+        value: &T,
+        guard: &LifecycleReadGuard,
+    ) -> Result<(), StorageError> {
+        self.validate_read_guard(guard)?;
+        self.write_named(PAIR_DEVICE_NAME, value)
+    }
+
     pub(crate) fn write_pair_machine_under_lifecycle<T: Serialize>(
         &self,
         value: &T,
@@ -302,7 +321,15 @@ impl PairWindowNamespaceV2 {
         self.delete_named(PAIR_DEVICE_NAME)
     }
 
-    fn acquire_current_shared(&self) -> Result<LifecycleReadGuard, StorageError> {
+    pub(crate) fn delete_pair_device_under_shared(
+        &self,
+        guard: &LifecycleReadGuard,
+    ) -> Result<(), StorageError> {
+        self.validate_read_guard(guard)?;
+        self.delete_named(PAIR_DEVICE_NAME)
+    }
+
+    pub(crate) fn acquire_current_shared(&self) -> Result<LifecycleReadGuard, StorageError> {
         let guard = self
             .inner
             .lifecycle
@@ -318,7 +345,7 @@ impl PairWindowNamespaceV2 {
         Ok(guard)
     }
 
-    fn validate_write_guard(&self, guard: &LifecycleWriteGuard) -> Result<(), StorageError> {
+    fn validate_read_guard(&self, guard: &LifecycleReadGuard) -> Result<(), StorageError> {
         guard
             .verify_state_root(&self.inner.state_path)
             .map_err(|error| lifecycle_storage_error(&self.inner.state_path, error))?;
@@ -330,6 +357,28 @@ impl PairWindowNamespaceV2 {
             return Err(stale_generation_error(&self.inner.state_path));
         }
         Ok(())
+    }
+
+    pub(crate) fn validate_write_guard(
+        &self,
+        guard: &LifecycleWriteGuard,
+    ) -> Result<(), StorageError> {
+        guard
+            .verify_state_root(&self.inner.state_path)
+            .map_err(|error| lifecycle_storage_error(&self.inner.state_path, error))?;
+        if guard
+            .lifecycle_generation()
+            .map_err(|error| lifecycle_storage_error(&self.inner.state_path, error))?
+            != Some(self.inner.generation)
+        {
+            return Err(stale_generation_error(&self.inner.state_path));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn state_path(&self) -> &Path {
+        &self.inner.state_path
     }
 
     fn validate_binding(&self) -> Result<(), StorageError> {
