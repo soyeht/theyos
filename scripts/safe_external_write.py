@@ -34,6 +34,10 @@ ready, review, or merge a PR and does not add a general destination selector.
 The companion ``governed-ios-pr-body-update`` adapter can change only the body
 of that same consumer PR number 16 while it remains open and draft; every
 other field is a hardcoded readback invariant.
+The ``governed-theyos-v0126-tag`` adapter is narrower still: it can author
+the one annotated backend tag ``v0.1.26`` locally, or push only that already
+validated ref. Creation and push are separate invocations, each with one
+mutation and a complete readback.
 Any further repository or operation requires an explicit code change and
 review.
 """
@@ -103,6 +107,13 @@ RELEASE_CONTRACT_FORBIDDEN = (
     b"--clobber",
 )
 RELEASE_ASSET_NAMES = frozenset({"Soyeht.dmg", "appcast.xml"})
+THEYOS_REPOSITORY_URL = "https://github.com/soyeht/theyos.git"
+THEYOS_TAG_VERSION = "0.1.26"
+THEYOS_TAG = f"v{THEYOS_TAG_VERSION}"
+THEYOS_TAG_REF = f"refs/tags/{THEYOS_TAG}"
+THEYOS_TAG_MESSAGE = f"theyos-engine {THEYOS_TAG_VERSION}\n"
+THEYOS_VERSION_FILE = "VERSION"
+THEYOS_CARGO_FILE = "admin/rust/soyeht-rs/Cargo.toml"
 FULL_OID_PATTERN = re.compile(r"[0-9a-f]{40}")
 VERSION_PATTERN = re.compile(
     r"[0-9]+(?:\.[0-9]+){1,2}(?:[.-][0-9A-Za-z]+)?"
@@ -125,6 +136,10 @@ class UnsafeCommand(ValueError):
 
 class ReleaseGuardError(ValueError):
     """Raised when a governed release precondition or readback fails."""
+
+
+class TheyosTagGuardError(ValueError):
+    """Raised when the fixed theyos v0.1.26 tag boundary fails closed."""
 
 
 def find_mentions(payload: str, allowed: frozenset[str] = frozenset()) -> tuple[Mention, ...]:
@@ -1490,6 +1505,419 @@ def execute_governed_release(
     raise AssertionError(f"unhandled governed release operation: {operation}")
 
 
+class TheyosV0126TagGit:
+    """Git boundary for the one governed theyos v0.1.26 annotated tag."""
+
+    def _run(
+        self,
+        arguments: Sequence[str],
+        *,
+        input_bytes: bytes | None = None,
+        allowed_returncodes: frozenset[int] = frozenset({0}),
+    ) -> subprocess.CompletedProcess[bytes]:
+        command = ["git", *arguments]
+        completed = subprocess.run(
+            command,
+            input=input_bytes,
+            capture_output=True,
+            check=False,
+        )
+        if completed.returncode not in allowed_returncodes:
+            stderr = completed.stderr.decode("utf-8", errors="replace").strip()
+            raise TheyosTagGuardError(
+                f"git command failed with exit {completed.returncode}: "
+                f"{' '.join(command[:8])}: {stderr}"
+            )
+        return completed
+
+    def output(
+        self,
+        arguments: Sequence[str],
+        *,
+        allowed_returncodes: frozenset[int] = frozenset({0}),
+    ) -> tuple[int, bytes]:
+        completed = self._run(arguments, allowed_returncodes=allowed_returncodes)
+        return completed.returncode, completed.stdout
+
+    def repository_root(self) -> Path:
+        _, output = self.output(["rev-parse", "--show-toplevel"])
+        text = output.decode("utf-8", errors="strict").strip()
+        if not text:
+            raise TheyosTagGuardError("git repository root is empty")
+        return Path(text).resolve()
+
+    def origin_url(self, *, push: bool) -> str:
+        arguments = ["remote", "get-url"]
+        if push:
+            arguments.append("--push")
+        arguments.append("origin")
+        _, output = self.output(arguments)
+        return output.decode("utf-8", errors="strict").strip()
+
+    def config_values(self, key: str) -> tuple[str, ...]:
+        returncode, output = self.output(
+            ["config", "--get-all", key],
+            allowed_returncodes=frozenset({0, 1}),
+        )
+        if returncode == 1:
+            return ()
+        return tuple(output.decode("utf-8", errors="strict").splitlines())
+
+    def head_oid(self) -> str:
+        _, output = self.output(["rev-parse", "HEAD"])
+        return output.decode("ascii", errors="strict").strip()
+
+    def origin_main_oid(self) -> str:
+        _, output = self.output(["rev-parse", "refs/remotes/origin/main"])
+        return output.decode("ascii", errors="strict").strip()
+
+    def object_type(self, oid: str) -> str:
+        _, output = self.output(["cat-file", "-t", oid])
+        return output.decode("ascii", errors="strict").strip()
+
+    def clean(self) -> bool:
+        _, output = self.output(
+            ["status", "--porcelain=v1", "--untracked-files=all"]
+        )
+        return output == b""
+
+    def read_repository_file(self, relative_path: str) -> bytes:
+        root = self.repository_root()
+        path = (root / relative_path).resolve()
+        try:
+            path.relative_to(root)
+        except ValueError as error:
+            raise TheyosTagGuardError(
+                "version path escapes the repository"
+            ) from error
+        if path.is_symlink() or not path.is_file():
+            raise TheyosTagGuardError(
+                f"required version file is not a regular file: {relative_path}"
+            )
+        return path.read_bytes()
+
+    def local_ref(self, ref: str) -> str | None:
+        returncode, output = self.output(
+            ["show-ref", "--verify", "--hash", ref],
+            allowed_returncodes=frozenset({0, 1}),
+        )
+        if returncode == 1:
+            return None
+        return output.decode("ascii", errors="strict").strip()
+
+    def remote_refs(self, refs: Sequence[str]) -> dict[str, str]:
+        _, output = self.output(["ls-remote", "origin", *refs])
+        found: dict[str, str] = {}
+        for raw_line in output.splitlines():
+            fields = raw_line.decode("ascii", errors="strict").split("\t")
+            if len(fields) != 2 or fields[1] in found:
+                raise TheyosTagGuardError("remote ref readback is malformed or duplicated")
+            found[fields[1]] = fields[0]
+        return found
+
+    def tag_object_bytes(self, tag_object_oid: str) -> bytes:
+        _, output = self.output(["cat-file", "tag", tag_object_oid])
+        return output
+
+    def create_tag(self, target_oid: str, message: bytes) -> None:
+        self._run(
+            [
+                "tag",
+                "--annotate",
+                "--no-sign",
+                "--cleanup=verbatim",
+                "--file=-",
+                THEYOS_TAG,
+                target_oid,
+            ],
+            input_bytes=message,
+        )
+
+    def push_tag(self) -> None:
+        self._run(
+            [
+                "-c",
+                "push.followTags=false",
+                "-c",
+                "push.gpgSign=false",
+                "push",
+                "--no-follow-tags",
+                "--no-signed",
+                "--porcelain",
+                "origin",
+                f"{THEYOS_TAG_REF}:{THEYOS_TAG_REF}",
+            ]
+        )
+
+
+def _parse_theyos_v0126_tag_arguments(
+    arguments: Sequence[str],
+) -> tuple[str, str, str]:
+    if not arguments:
+        raise UnsafeCommand("governed-theyos-v0126-tag requires an operation")
+    operation = arguments[0]
+    if operation not in {"create", "push"}:
+        raise UnsafeCommand(
+            f"unsupported governed-theyos-v0126-tag operation: {operation}"
+        )
+    values: dict[str, str] = {}
+    index = 1
+    while index < len(arguments):
+        flag = arguments[index]
+        if flag not in {"--target-oid", "--expected-main"}:
+            raise UnsafeCommand(
+                f"unsupported governed-theyos-v0126-tag argument: {flag}"
+            )
+        if flag in values:
+            raise UnsafeCommand(
+                f"duplicate governed-theyos-v0126-tag argument: {flag}"
+            )
+        if index + 1 >= len(arguments):
+            raise UnsafeCommand(
+                f"missing value for governed-theyos-v0126-tag argument: {flag}"
+            )
+        values[flag] = arguments[index + 1]
+        index += 2
+    missing = {"--target-oid", "--expected-main"} - values.keys()
+    if missing:
+        raise UnsafeCommand(
+            "missing governed-theyos-v0126-tag arguments: "
+            + ", ".join(sorted(missing))
+        )
+    target_oid = _full_oid(values["--target-oid"], "target OID")
+    expected_main = _full_oid(values["--expected-main"], "expected main OID")
+    if target_oid != expected_main:
+        raise TheyosTagGuardError("tag target and expected main must be identical")
+    return operation, target_oid, expected_main
+
+
+def _cargo_package_version(payload: bytes) -> str:
+    match = re.search(
+        rb"(?ms)^\[package\][ \t]*\r?$.*?^version[ \t]*=[ \t]*\"([^\"\r\n]+)\"[ \t]*\r?$",
+        payload,
+    )
+    if match is None:
+        raise TheyosTagGuardError("canonical Cargo package version is missing")
+    return match.group(1).decode("utf-8", errors="strict")
+
+
+def _tag_object_fields(payload: bytes) -> tuple[dict[bytes, bytes], bytes]:
+    header, separator, message = payload.partition(b"\n\n")
+    if not separator:
+        raise TheyosTagGuardError("annotated tag object has no header/message separator")
+    fields: dict[bytes, bytes] = {}
+    for line in header.splitlines():
+        name, separator, value = line.partition(b" ")
+        if not separator or name in fields:
+            raise TheyosTagGuardError("annotated tag object header is malformed or duplicated")
+        fields[name] = value
+    if set(fields) != {b"object", b"type", b"tag", b"tagger"}:
+        raise TheyosTagGuardError("annotated tag object has unexpected headers")
+    if re.fullmatch(rb".+ <[^<>\r\n]+> [0-9]+ [+-][0-9]{4}", fields[b"tagger"]) is None:
+        raise TheyosTagGuardError("annotated tag object tagger is invalid")
+    return fields, message
+
+
+def _assert_local_tag(
+    git: TheyosV0126TagGit,
+    target_oid: str,
+) -> str:
+    tag_object_oid = git.local_ref(THEYOS_TAG_REF)
+    if tag_object_oid is None:
+        raise TheyosTagGuardError("governed local tag is absent")
+    tag_object_oid = _full_oid(tag_object_oid, "local tag object OID")
+    if git.object_type(tag_object_oid) != "tag":
+        raise TheyosTagGuardError("governed local tag is lightweight")
+    fields, message = _tag_object_fields(git.tag_object_bytes(tag_object_oid))
+    if (
+        fields[b"object"].decode("ascii", errors="strict") != target_oid
+        or fields[b"type"] != b"commit"
+        or fields[b"tag"].decode("utf-8", errors="strict") != THEYOS_TAG
+        or message != THEYOS_TAG_MESSAGE.encode("utf-8")
+    ):
+        raise TheyosTagGuardError("governed local annotated tag readback mismatch")
+    return tag_object_oid
+
+
+def _assert_theyos_tag_api_absent(api: GitHubAPI) -> None:
+    if api.read_optional(
+        f"repos/{SAFE_GITHUB_REPO}/git/ref/tags/{THEYOS_TAG}"
+    ) is not None:
+        raise TheyosTagGuardError("governed tag already exists in the GitHub API")
+
+
+def _assert_theyos_main_api(api: GitHubAPI, expected_main: str) -> None:
+    value = _expect_mapping(
+        api.read(f"repos/{SAFE_GITHUB_REPO}/git/ref/heads/main"),
+        "theyos main ref",
+    )
+    target = _expect_mapping(value.get("object"), "theyos main target")
+    if (
+        value.get("ref") != "refs/heads/main"
+        or target.get("type") != "commit"
+        or target.get("sha") != expected_main
+    ):
+        raise TheyosTagGuardError("GitHub API main ref drifted")
+
+
+def _assert_theyos_tag_api_readback(
+    api: GitHubAPI,
+    tag_object_oid: str,
+    target_oid: str,
+) -> None:
+    value = _expect_mapping(
+        api.read(f"repos/{SAFE_GITHUB_REPO}/git/ref/tags/{THEYOS_TAG}"),
+        "theyos tag ref",
+    )
+    target = _expect_mapping(value.get("object"), "theyos tag ref target")
+    if (
+        value.get("ref") != THEYOS_TAG_REF
+        or target.get("type") != "tag"
+        or target.get("sha") != tag_object_oid
+    ):
+        raise TheyosTagGuardError("GitHub API tag ref readback mismatch")
+    tag_object = _expect_mapping(
+        api.read(f"repos/{SAFE_GITHUB_REPO}/git/tags/{tag_object_oid}"),
+        "theyos tag object",
+    )
+    peeled = _expect_mapping(tag_object.get("object"), "theyos tag object target")
+    if (
+        tag_object.get("sha") != tag_object_oid
+        or tag_object.get("tag") != THEYOS_TAG
+        or tag_object.get("message") != THEYOS_TAG_MESSAGE
+        or peeled.get("type") != "commit"
+        or peeled.get("sha") != target_oid
+    ):
+        raise TheyosTagGuardError("GitHub API annotated tag readback mismatch")
+
+
+def _assert_theyos_v0126_preconditions(
+    git: TheyosV0126TagGit,
+    api: GitHubAPI,
+    target_oid: str,
+    expected_main: str,
+) -> None:
+    if git.origin_url(push=False) != THEYOS_REPOSITORY_URL:
+        raise TheyosTagGuardError("origin fetch URL is not the canonical theyos URL")
+    if git.origin_url(push=True) != THEYOS_REPOSITORY_URL:
+        raise TheyosTagGuardError("origin push URL is not the canonical theyos URL")
+    for key in (
+        "remote.origin.push",
+        "remote.origin.receivepack",
+        "push.pushOption",
+        "remote.origin.mirror",
+    ):
+        if git.config_values(key):
+            raise TheyosTagGuardError(f"unsafe Git configuration is set: {key}")
+    if git.head_oid() != target_oid:
+        raise TheyosTagGuardError("HEAD does not equal the governed tag target")
+    if git.origin_main_oid() != expected_main:
+        raise TheyosTagGuardError("origin/main does not equal expected main")
+    if git.object_type(target_oid) != "commit":
+        raise TheyosTagGuardError("governed tag target is not a commit")
+    if not git.clean():
+        raise TheyosTagGuardError("worktree is not clean")
+    if git.read_repository_file(THEYOS_VERSION_FILE) != (
+        THEYOS_TAG_VERSION + "\n"
+    ).encode("utf-8"):
+        raise TheyosTagGuardError("VERSION is not exactly the governed version")
+    cargo_version = _cargo_package_version(
+        git.read_repository_file(THEYOS_CARGO_FILE)
+    )
+    if cargo_version != THEYOS_TAG_VERSION:
+        raise TheyosTagGuardError("canonical Cargo version is not the governed version")
+
+    refs = git.remote_refs(
+        (
+            "refs/heads/main",
+            f"refs/heads/{THEYOS_TAG}",
+            THEYOS_TAG_REF,
+            f"{THEYOS_TAG_REF}^{{}}",
+        )
+    )
+    if refs.get("refs/heads/main") != expected_main:
+        raise TheyosTagGuardError("remote main does not equal expected main")
+    if f"refs/heads/{THEYOS_TAG}" in refs:
+        raise TheyosTagGuardError("remote branch makes the tag name ambiguous")
+    if git.local_ref(f"refs/heads/{THEYOS_TAG}") is not None:
+        raise TheyosTagGuardError("local branch makes the tag name ambiguous")
+    _assert_theyos_main_api(api, expected_main)
+
+
+def execute_governed_theyos_v0126_tag(
+    arguments: Sequence[str],
+    payload: str,
+    *,
+    git: TheyosV0126TagGit | None = None,
+    api: GitHubAPI | None = None,
+) -> int:
+    """Create locally or push the one fixed annotated theyos v0.1.26 tag."""
+    operation, target_oid, expected_main = _parse_theyos_v0126_tag_arguments(
+        arguments
+    )
+    repository = git or TheyosV0126TagGit()
+    client = api or GitHubAPI()
+    _assert_theyos_v0126_preconditions(
+        repository, client, target_oid, expected_main
+    )
+
+    remote_refs = repository.remote_refs(
+        (THEYOS_TAG_REF, f"{THEYOS_TAG_REF}^{{}}")
+    )
+    if remote_refs:
+        raise TheyosTagGuardError("governed tag already exists remotely")
+    _assert_theyos_tag_api_absent(client)
+
+    if operation == "create":
+        if payload != THEYOS_TAG_MESSAGE:
+            raise TheyosTagGuardError(
+                "annotated tag message must equal the fixed governed message"
+            )
+        if repository.local_ref(THEYOS_TAG_REF) is not None:
+            raise TheyosTagGuardError("governed local tag already exists")
+        repository.create_tag(target_oid, payload.encode("utf-8"))
+        tag_object_oid = _assert_local_tag(repository, target_oid)
+    else:
+        if payload:
+            raise TheyosTagGuardError("tag push accepts no payload")
+        tag_object_oid = _assert_local_tag(repository, target_oid)
+        # Re-read every moving precondition immediately before the sole push.
+        _assert_theyos_v0126_preconditions(
+            repository, client, target_oid, expected_main
+        )
+        if repository.remote_refs(
+            (THEYOS_TAG_REF, f"{THEYOS_TAG_REF}^{{}}")
+        ):
+            raise TheyosTagGuardError("governed tag appeared before push")
+        _assert_theyos_tag_api_absent(client)
+        repository.push_tag()
+        remote_refs = repository.remote_refs(
+            (THEYOS_TAG_REF, f"{THEYOS_TAG_REF}^{{}}")
+        )
+        if remote_refs != {
+            THEYOS_TAG_REF: tag_object_oid,
+            f"{THEYOS_TAG_REF}^{{}}": target_oid,
+        }:
+            raise TheyosTagGuardError("remote tag ref or peeled target mismatch")
+        _assert_theyos_tag_api_readback(
+            client, tag_object_oid, target_oid
+        )
+
+    print(
+        json.dumps(
+            {
+                "operation": f"governed-theyos-v0126-tag-{operation}",
+                "tag_ref": THEYOS_TAG_REF,
+                "tag_object_oid": tag_object_oid,
+                "target_oid": target_oid,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     payload, forwarded_stdin = _read_payload(args)
@@ -1557,6 +1985,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             return execute_governed_ios_pr_body_update(command[1:], payload)
         except (UnsafeCommand, ReleaseGuardError, GitHubAPIError) as error:
+            print(f"BLOCKED: {error}", file=sys.stderr)
+            return 2
+
+    if command[:1] == ["governed-theyos-v0126-tag"]:
+        try:
+            return execute_governed_theyos_v0126_tag(command[1:], payload)
+        except (
+            UnsafeCommand,
+            ReleaseGuardError,
+            TheyosTagGuardError,
+            GitHubAPIError,
+        ) as error:
             print(f"BLOCKED: {error}", file=sys.stderr)
             return 2
 

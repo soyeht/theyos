@@ -90,6 +90,25 @@ PATCH is followed by byte-exact readback. It cannot change a title, create a
 second mutation, or ready, review, merge, or redirect the PR. A post-mutation
 readback failure is RED and has no automatic rollback.
 
+### Governed theyos v0.1.26 tag
+
+The dedicated `governed-theyos-v0126-tag` adapter is the only authorized
+writer for the annotated backend tag `refs/tags/v0.1.26`. It is hardcoded to
+the canonical `soyeht/theyos` origin, version, ref, and exact message
+`theyos-engine v0.1.26\n`. The caller supplies only the full target and
+expected-main OIDs, which must be identical to each other, `HEAD`,
+`origin/main`, the remote main ref, and the GitHub API main ref.
+
+Tag authorship and push are separate one-mutation operations. Authorship uses
+annotated, unsigned, verbatim-message semantics and reads back the local tag
+object, tagger, target, and exact message. Push sends one explicit refspec with
+force, follow-tags, and Git push signing disabled, then reads back both the
+remote tag object and peeled commit through Git and the GitHub API. Wrong
+origin or push URL, dirty worktree, version drift, a branch/tag ambiguity,
+an existing local or remote tag, unsafe push configuration, or any readback
+mismatch is RED. A post-mutation mismatch has no automatic cleanup or retry.
+Do not run raw `git tag` or a tag push as a fallback.
+
 Soyeht pane handles are internal routing identifiers. Never place them in an
 external payload. Write `agent-khai` or `internal agent Khai`, without an
 at-sign. HTML entities that render as an at-sign are also prohibited because

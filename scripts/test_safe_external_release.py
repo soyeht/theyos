@@ -818,6 +818,487 @@ class GovernedIOSPRBodyUpdateTests(unittest.TestCase):
         execute.assert_called_once_with(arguments, self.new_body)
 
 
+THEYOS_TAG_TARGET = "5" * 40
+THEYOS_TAG_OBJECT = "6" * 40
+
+
+class FakeTheyosTagAPI:
+    def __init__(self) -> None:
+        self.main_oid = THEYOS_TAG_TARGET
+        self.tag_object_oid: str | None = None
+        self.tag_target = THEYOS_TAG_TARGET
+        self.tag_message = guard.THEYOS_TAG_MESSAGE
+        self.tag_type = "tag"
+
+    def add_tag(self, tag_object_oid: str, target_oid: str) -> None:
+        self.tag_object_oid = tag_object_oid
+        self.tag_target = target_oid
+
+    def read_optional(self, endpoint: str) -> Any | None:
+        if endpoint.endswith(f"/git/ref/tags/{guard.THEYOS_TAG}"):
+            return self.read(endpoint) if self.tag_object_oid is not None else None
+        raise AssertionError(f"unexpected optional read: {endpoint}")
+
+    def read(self, endpoint: str) -> Any:
+        if endpoint.endswith("/git/ref/heads/main"):
+            return {
+                "ref": "refs/heads/main",
+                "object": {"type": "commit", "sha": self.main_oid},
+            }
+        if endpoint.endswith(f"/git/ref/tags/{guard.THEYOS_TAG}"):
+            if self.tag_object_oid is None:
+                raise AssertionError("tag API read before tag exists")
+            return {
+                "ref": guard.THEYOS_TAG_REF,
+                "object": {
+                    "type": self.tag_type,
+                    "sha": self.tag_object_oid,
+                },
+            }
+        if "/git/tags/" in endpoint:
+            if self.tag_object_oid is None:
+                raise AssertionError("tag object API read before tag exists")
+            return {
+                "sha": self.tag_object_oid,
+                "tag": guard.THEYOS_TAG,
+                "message": self.tag_message,
+                "object": {"type": "commit", "sha": self.tag_target},
+            }
+        raise AssertionError(f"unexpected read: {endpoint}")
+
+
+class FakeTheyosTagGit:
+    def __init__(self, api: FakeTheyosTagAPI) -> None:
+        self.api = api
+        self.fetch_url = guard.THEYOS_REPOSITORY_URL
+        self.push_url = guard.THEYOS_REPOSITORY_URL
+        self.head = THEYOS_TAG_TARGET
+        self.origin_main = THEYOS_TAG_TARGET
+        self.remote_main = THEYOS_TAG_TARGET
+        self.clean_state = True
+        self.object_types = {THEYOS_TAG_TARGET: "commit"}
+        self.files = {
+            guard.THEYOS_VERSION_FILE:
+                (guard.THEYOS_TAG_VERSION + "\n").encode("utf-8"),
+            guard.THEYOS_CARGO_FILE:
+                (
+                    "[package]\nname = \"soyeht\"\n"
+                    f"version = \"{guard.THEYOS_TAG_VERSION}\"\n"
+                ).encode("utf-8"),
+        }
+        self.config: dict[str, tuple[str, ...]] = {}
+        self.local_refs: dict[str, str] = {}
+        self.remote: dict[str, str] = {"refs/heads/main": THEYOS_TAG_TARGET}
+        self.tag_objects: dict[str, bytes] = {}
+        self.mutations: list[tuple[str, tuple[str, ...]]] = []
+        self.created_tag_object = THEYOS_TAG_OBJECT
+        self.create_readback_override: bytes | None = None
+        self.push_remote_override: dict[str, str] | None = None
+
+    @staticmethod
+    def tag_bytes(target: str = THEYOS_TAG_TARGET) -> bytes:
+        return (
+            f"object {target}\n"
+            "type commit\n"
+            f"tag {guard.THEYOS_TAG}\n"
+            "tagger Release Agent <release@example.invalid> 1770000000 +0000\n"
+            "\n"
+            f"{guard.THEYOS_TAG_MESSAGE}"
+        ).encode("utf-8")
+
+    def add_local_tag(
+        self,
+        *,
+        object_type: str = "tag",
+        target: str = THEYOS_TAG_TARGET,
+    ) -> None:
+        oid = THEYOS_TAG_OBJECT if object_type == "tag" else target
+        self.local_refs[guard.THEYOS_TAG_REF] = oid
+        self.object_types[oid] = object_type
+        if object_type == "tag":
+            self.tag_objects[oid] = self.tag_bytes(target)
+
+    def repository_root(self) -> Path:
+        return Path("/repo")
+
+    def origin_url(self, *, push: bool) -> str:
+        return self.push_url if push else self.fetch_url
+
+    def config_values(self, key: str) -> tuple[str, ...]:
+        return self.config.get(key, ())
+
+    def head_oid(self) -> str:
+        return self.head
+
+    def origin_main_oid(self) -> str:
+        return self.origin_main
+
+    def object_type(self, oid: str) -> str:
+        return self.object_types.get(oid, "missing")
+
+    def clean(self) -> bool:
+        return self.clean_state
+
+    def read_repository_file(self, relative_path: str) -> bytes:
+        return self.files[relative_path]
+
+    def local_ref(self, ref: str) -> str | None:
+        return self.local_refs.get(ref)
+
+    def remote_refs(self, refs: list[str] | tuple[str, ...]) -> dict[str, str]:
+        if self.push_remote_override is not None and self.mutations:
+            return {
+                ref: oid
+                for ref, oid in self.push_remote_override.items()
+                if ref in refs
+            }
+        values = dict(self.remote)
+        values["refs/heads/main"] = self.remote_main
+        return {ref: oid for ref, oid in values.items() if ref in refs}
+
+    def tag_object_bytes(self, tag_object_oid: str) -> bytes:
+        if self.create_readback_override is not None and self.mutations:
+            return self.create_readback_override
+        return self.tag_objects[tag_object_oid]
+
+    def create_tag(self, target_oid: str, message: bytes) -> None:
+        self.mutations.append(("tag", (guard.THEYOS_TAG, target_oid)))
+        self.local_refs[guard.THEYOS_TAG_REF] = self.created_tag_object
+        self.object_types[self.created_tag_object] = "tag"
+        self.tag_objects[self.created_tag_object] = self.tag_bytes(target_oid)
+        self.assert_message = message
+
+    def push_tag(self) -> None:
+        self.mutations.append(("push", (guard.THEYOS_TAG_REF,)))
+        tag_object_oid = self.local_refs[guard.THEYOS_TAG_REF]
+        self.remote[guard.THEYOS_TAG_REF] = tag_object_oid
+        self.remote[f"{guard.THEYOS_TAG_REF}^{{}}"] = THEYOS_TAG_TARGET
+        self.api.add_tag(tag_object_oid, THEYOS_TAG_TARGET)
+
+
+class GovernedTheyosV0126TagTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.api = FakeTheyosTagAPI()
+        self.git = FakeTheyosTagGit(self.api)
+
+    def arguments(self, operation: str) -> list[str]:
+        return [
+            operation,
+            "--target-oid",
+            THEYOS_TAG_TARGET,
+            "--expected-main",
+            THEYOS_TAG_TARGET,
+        ]
+
+    def execute(self, operation: str, payload: str) -> int:
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            result = guard.execute_governed_theyos_v0126_tag(
+                self.arguments(operation),
+                payload,
+                git=self.git,
+                api=self.api,
+            )
+        self.assertIn(
+            f'"operation":"governed-theyos-v0126-tag-{operation}"',
+            stdout.getvalue(),
+        )
+        return result
+
+    def assert_blocked_before_mutation(
+        self,
+        operation: str,
+        payload: str,
+    ) -> None:
+        with self.assertRaises(
+            (
+                guard.UnsafeCommand,
+                guard.ReleaseGuardError,
+                guard.TheyosTagGuardError,
+            )
+        ):
+            guard.execute_governed_theyos_v0126_tag(
+                self.arguments(operation),
+                payload,
+                git=self.git,
+                api=self.api,
+            )
+        self.assertEqual([], self.git.mutations)
+
+    def test_create_is_one_local_mutation_and_exact_tag_readback(self) -> None:
+        self.assertEqual(0, self.execute("create", guard.THEYOS_TAG_MESSAGE))
+        self.assertEqual(
+            [("tag", (guard.THEYOS_TAG, THEYOS_TAG_TARGET))],
+            self.git.mutations,
+        )
+        self.assertEqual(
+            guard.THEYOS_TAG_MESSAGE.encode("utf-8"),
+            self.git.assert_message,
+        )
+        self.assertEqual(
+            THEYOS_TAG_OBJECT,
+            self.git.local_refs[guard.THEYOS_TAG_REF],
+        )
+        self.assertIsNone(self.api.tag_object_oid)
+
+    def test_create_command_neutralizes_signing_and_cleanup_configuration(self) -> None:
+        completed = mock.Mock(returncode=0, stdout=b"", stderr=b"")
+        repository = guard.TheyosV0126TagGit()
+        with mock.patch.object(
+            guard.subprocess, "run", return_value=completed
+        ) as run:
+            repository.create_tag(
+                THEYOS_TAG_TARGET,
+                guard.THEYOS_TAG_MESSAGE.encode("utf-8"),
+            )
+        run.assert_called_once_with(
+            [
+                "git",
+                "tag",
+                "--annotate",
+                "--no-sign",
+                "--cleanup=verbatim",
+                "--file=-",
+                guard.THEYOS_TAG,
+                THEYOS_TAG_TARGET,
+            ],
+            input=guard.THEYOS_TAG_MESSAGE.encode("utf-8"),
+            capture_output=True,
+            check=False,
+        )
+
+    def test_push_is_one_exact_ref_mutation_and_remote_api_readback(self) -> None:
+        self.git.add_local_tag()
+        self.git.config["tag.gpgSign"] = ("true",)
+        self.git.config["push.gpgSign"] = ("if-asked",)
+        self.git.config["push.followTags"] = ("true",)
+        self.assertEqual(0, self.execute("push", ""))
+        self.assertEqual(
+            [("push", (guard.THEYOS_TAG_REF,))],
+            self.git.mutations,
+        )
+        self.assertEqual(THEYOS_TAG_OBJECT, self.api.tag_object_oid)
+        self.assertEqual(
+            {
+                "refs/heads/main": THEYOS_TAG_TARGET,
+                guard.THEYOS_TAG_REF: THEYOS_TAG_OBJECT,
+                f"{guard.THEYOS_TAG_REF}^{{}}": THEYOS_TAG_TARGET,
+            },
+            self.git.remote,
+        )
+
+    def test_push_command_neutralizes_follow_tags_and_push_signing(self) -> None:
+        completed = mock.Mock(returncode=0, stdout=b"", stderr=b"")
+        repository = guard.TheyosV0126TagGit()
+        with mock.patch.object(
+            guard.subprocess, "run", return_value=completed
+        ) as run:
+            repository.push_tag()
+        run.assert_called_once_with(
+            [
+                "git",
+                "-c",
+                "push.followTags=false",
+                "-c",
+                "push.gpgSign=false",
+                "push",
+                "--no-follow-tags",
+                "--no-signed",
+                "--porcelain",
+                "origin",
+                f"{guard.THEYOS_TAG_REF}:{guard.THEYOS_TAG_REF}",
+            ],
+            input=None,
+            capture_output=True,
+            check=False,
+        )
+
+    def test_argument_payload_and_target_shape_fail_before_mutation(self) -> None:
+        malformed = (
+            [],
+            ["delete"],
+            ["create", "--target-oid", THEYOS_TAG_TARGET],
+            [
+                "create",
+                "--target-oid",
+                THEYOS_TAG_TARGET,
+                "--expected-main",
+                "4" * 40,
+            ],
+            [
+                "create",
+                "--target-oid",
+                "short",
+                "--expected-main",
+                "short",
+            ],
+            [
+                "create",
+                "--target-oid",
+                THEYOS_TAG_TARGET,
+                "--expected-main",
+                THEYOS_TAG_TARGET,
+                "--repo",
+                "other/repo",
+            ],
+        )
+        for arguments in malformed:
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(
+                    (
+                        guard.UnsafeCommand,
+                        guard.ReleaseGuardError,
+                        guard.TheyosTagGuardError,
+                    )
+                ):
+                    guard.execute_governed_theyos_v0126_tag(
+                        arguments,
+                        guard.THEYOS_TAG_MESSAGE,
+                        git=self.git,
+                        api=self.api,
+                    )
+                self.assertEqual([], self.git.mutations)
+        self.assert_blocked_before_mutation("create", "wrong message\n")
+        self.git.add_local_tag()
+        self.assert_blocked_before_mutation("push", "unexpected payload")
+
+    def test_each_moving_precondition_fails_before_mutation(self) -> None:
+        mutations = (
+            lambda: setattr(self.git, "fetch_url", "https://example.invalid/theyos.git"),
+            lambda: setattr(self.git, "push_url", "ssh://example.invalid/theyos.git"),
+            lambda: setattr(self.git, "head", "4" * 40),
+            lambda: setattr(self.git, "origin_main", "4" * 40),
+            lambda: setattr(self.git, "remote_main", "4" * 40),
+            lambda: setattr(self.git, "clean_state", False),
+            lambda: self.git.object_types.__setitem__(THEYOS_TAG_TARGET, "tree"),
+            lambda: self.git.files.__setitem__(
+                guard.THEYOS_VERSION_FILE, b"0.1.25\n"
+            ),
+            lambda: self.git.files.__setitem__(
+                guard.THEYOS_CARGO_FILE,
+                b"[package]\nversion = \"0.1.25\"\n",
+            ),
+            lambda: self.git.config.__setitem__(
+                "remote.origin.push", ("refs/heads/main",)
+            ),
+            lambda: self.git.local_refs.__setitem__(
+                f"refs/heads/{guard.THEYOS_TAG}", "4" * 40
+            ),
+            lambda: self.git.remote.__setitem__(
+                f"refs/heads/{guard.THEYOS_TAG}", "4" * 40
+            ),
+            lambda: setattr(self.api, "main_oid", "4" * 40),
+        )
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                self.setUp()
+                mutate()
+                self.assert_blocked_before_mutation(
+                    "create", guard.THEYOS_TAG_MESSAGE
+                )
+
+    def test_existing_local_or_remote_lightweight_or_annotated_tag_is_red(self) -> None:
+        for location, object_type in (
+            ("local", "commit"),
+            ("local", "tag"),
+            ("remote", "commit"),
+            ("remote", "tag"),
+        ):
+            with self.subTest(location=location, object_type=object_type):
+                self.setUp()
+                oid = (
+                    THEYOS_TAG_OBJECT if object_type == "tag"
+                    else THEYOS_TAG_TARGET
+                )
+                if location == "local":
+                    self.git.local_refs[guard.THEYOS_TAG_REF] = oid
+                    self.git.object_types[oid] = object_type
+                else:
+                    self.git.remote[guard.THEYOS_TAG_REF] = oid
+                self.assert_blocked_before_mutation(
+                    "create", guard.THEYOS_TAG_MESSAGE
+                )
+
+    def test_api_only_existing_tag_is_red_before_mutation(self) -> None:
+        self.api.add_tag(THEYOS_TAG_OBJECT, THEYOS_TAG_TARGET)
+        self.assert_blocked_before_mutation(
+            "create", guard.THEYOS_TAG_MESSAGE
+        )
+
+    def test_push_requires_the_exact_local_annotated_tag_before_mutation(self) -> None:
+        for mode in ("missing", "lightweight", "wrong-target", "wrong-message", "bad-tagger"):
+            with self.subTest(mode=mode):
+                self.setUp()
+                if mode == "lightweight":
+                    self.git.add_local_tag(object_type="commit")
+                elif mode != "missing":
+                    self.git.add_local_tag()
+                    if mode == "wrong-target":
+                        self.git.tag_objects[THEYOS_TAG_OBJECT] = self.git.tag_bytes("4" * 40)
+                    elif mode == "wrong-message":
+                        self.git.tag_objects[THEYOS_TAG_OBJECT] = self.git.tag_bytes().replace(
+                            guard.THEYOS_TAG_MESSAGE.encode("utf-8"),
+                            b"wrong message\n",
+                        )
+                    elif mode == "bad-tagger":
+                        self.git.tag_objects[THEYOS_TAG_OBJECT] = self.git.tag_bytes().replace(
+                            b"Release Agent <release@example.invalid> 1770000000 +0000",
+                            b"missing-identity",
+                        )
+                self.assert_blocked_before_mutation("push", "")
+
+    def test_create_post_mutation_readback_mismatch_is_red_without_cleanup(self) -> None:
+        self.git.create_readback_override = self.git.tag_bytes("4" * 40)
+        with self.assertRaises(guard.TheyosTagGuardError):
+            guard.execute_governed_theyos_v0126_tag(
+                self.arguments("create"),
+                guard.THEYOS_TAG_MESSAGE,
+                git=self.git,
+                api=self.api,
+            )
+        self.assertEqual(1, len(self.git.mutations))
+        self.assertIn(guard.THEYOS_TAG_REF, self.git.local_refs)
+
+    def test_push_post_mutation_ref_or_api_mismatch_is_red_once(self) -> None:
+        for mode in ("remote", "api"):
+            with self.subTest(mode=mode):
+                self.setUp()
+                self.git.add_local_tag()
+                if mode == "remote":
+                    self.git.push_remote_override = {
+                        guard.THEYOS_TAG_REF: "4" * 40,
+                        f"{guard.THEYOS_TAG_REF}^{{}}": THEYOS_TAG_TARGET,
+                    }
+                else:
+                    self.api.tag_type = "commit"
+                with self.assertRaises(guard.TheyosTagGuardError):
+                    guard.execute_governed_theyos_v0126_tag(
+                        self.arguments("push"),
+                        "",
+                        git=self.git,
+                        api=self.api,
+                    )
+                self.assertEqual(1, len(self.git.mutations))
+
+    def test_main_routes_exact_payload_and_arguments_to_the_dedicated_adapter(self) -> None:
+        arguments = self.arguments("create")
+        stdin = mock.Mock()
+        stdin.buffer.read.return_value = guard.THEYOS_TAG_MESSAGE.encode("utf-8")
+        with (
+            mock.patch.object(guard.sys, "stdin", stdin),
+            mock.patch.object(
+                guard,
+                "execute_governed_theyos_v0126_tag",
+                return_value=0,
+            ) as execute,
+        ):
+            code = guard.main(
+                ["--stdin", "--", "governed-theyos-v0126-tag", *arguments]
+            )
+        self.assertEqual(0, code)
+        execute.assert_called_once_with(arguments, guard.THEYOS_TAG_MESSAGE)
+
+
 class GitHubAPIIOSTargetBoundaryTests(unittest.TestCase):
     def test_pr_listing_uses_fixed_host_repo_and_overrides_inherited_destination(self) -> None:
         completed = mock.Mock(returncode=0, stdout=b"[[]]", stderr=b"")
