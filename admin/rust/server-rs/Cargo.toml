@@ -1,6 +1,6 @@
 [package]
 name    = "server-rs"
-version = "0.1.25"
+version = "0.1.26"
 edition.workspace = true
 rust-version.workspace = true
 build   = "build.rs"
@@ -150,6 +150,7 @@ security-framework-sys = { workspace = true }
 
 [dev-dependencies]
 axum-test    = { version = "17", features = ["ws"] }
+household-rs = { workspace = true, features = ["test-support"] }
 serde_json   = { workspace = true }
 p256         = { workspace = true }
 tokio        = { workspace = true }

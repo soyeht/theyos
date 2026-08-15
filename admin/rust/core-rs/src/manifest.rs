@@ -577,18 +577,217 @@ mod tests {
     }
 
     #[test]
-    fn root_version_matches_workspace_crate_version() {
-        let root_version_path =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../VERSION");
-        let root_version = std::fs::read_to_string(&root_version_path)
-            .unwrap_or_else(|err| panic!("failed to read {root_version_path:?}: {err}"));
+    fn release_version_surface_matches_root_and_lock() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let release_packages = release_version_surface(&repo_root, INDEPENDENT_VERSION_PACKAGES)
+            .unwrap_or_else(|err| panic!("release version consistency failed: {err}"));
 
-        assert_eq!(
-            root_version.trim(),
-            env!("CARGO_PKG_VERSION"),
-            "repo root VERSION must stay aligned with the workspace crates \
-             because release tooling and humans use it as metadata"
+        assert!(
+            !release_packages.is_empty(),
+            "the derived release-versioned package surface must not be empty"
         );
+        assert!(
+            release_packages.iter().any(|name| name == "core-rs"),
+            "core-rs must remain on the release-versioned train"
+        );
+    }
+
+    /// Workspace members on independent `0.1.0` development tracks. The
+    /// release-versioned surface is derived as the complement of this policy
+    /// set, so a newly-added member cannot silently escape the release train.
+    const INDEPENDENT_VERSION_PACKAGES: &[&str] = &[
+        "claw-share-bridge-rs",
+        "device-key-rs",
+        "friend-cli-rs",
+        "household-rs",
+        "keystore-rs",
+        "llm-proxy-rs",
+        "m1-household-mesh-smoke-rs",
+        "mesh-session-runtime-rs",
+        "nat-probe-rs",
+        "nostr-relay-rs",
+        "t1-iptunnel-dev-runner-rs",
+        "theyos-engine-build-rs",
+        "tunnel-wire-rs",
+    ];
+
+    fn release_version_surface(
+        repo_root: &std::path::Path,
+        independent_packages: &[&str],
+    ) -> Result<Vec<String>, String> {
+        let root_version = std::fs::read_to_string(repo_root.join("VERSION"))
+            .map_err(|err| format!("read VERSION: {err}"))?;
+        let root_version = root_version.trim();
+        semver::Version::parse(root_version)
+            .map_err(|err| format!("VERSION is not semantic: {err}"))?;
+
+        let rust_root = repo_root.join("admin/rust");
+        let workspace: toml::Value = std::fs::read_to_string(rust_root.join("Cargo.toml"))
+            .map_err(|err| format!("read workspace manifest: {err}"))?
+            .parse()
+            .map_err(|err| format!("parse workspace manifest: {err}"))?;
+        let members = workspace
+            .get("workspace")
+            .and_then(|value| value.get("members"))
+            .and_then(toml::Value::as_array)
+            .ok_or("workspace.members is not an array")?;
+
+        let lock: toml::Value = std::fs::read_to_string(rust_root.join("Cargo.lock"))
+            .map_err(|err| format!("read Cargo.lock: {err}"))?
+            .parse()
+            .map_err(|err| format!("parse Cargo.lock: {err}"))?;
+        let lock_packages = lock
+            .get("package")
+            .and_then(toml::Value::as_array)
+            .ok_or("Cargo.lock package list is not an array")?;
+
+        let mut seen_independent = std::collections::BTreeSet::new();
+        let mut release_packages = Vec::new();
+        for member in members {
+            let member = member
+                .as_str()
+                .ok_or("workspace member path is not a string")?;
+            let manifest_path = rust_root.join(member).join("Cargo.toml");
+            let manifest: toml::Value = std::fs::read_to_string(&manifest_path)
+                .map_err(|err| format!("read {manifest_path:?}: {err}"))?
+                .parse()
+                .map_err(|err| format!("parse {manifest_path:?}: {err}"))?;
+            let package = manifest
+                .get("package")
+                .and_then(toml::Value::as_table)
+                .ok_or_else(|| format!("{manifest_path:?} has no package table"))?;
+            let name = package
+                .get("name")
+                .and_then(toml::Value::as_str)
+                .ok_or_else(|| format!("{manifest_path:?} has no package name"))?;
+            let version = package
+                .get("version")
+                .and_then(toml::Value::as_str)
+                .ok_or_else(|| format!("{manifest_path:?} has no package version"))?;
+
+            let expected = if independent_packages.contains(&name) {
+                seen_independent.insert(name.to_owned());
+                "0.1.0"
+            } else {
+                release_packages.push(name.to_owned());
+                root_version
+            };
+            if version != expected {
+                return Err(format!(
+                    "workspace package {name} has version {version}, expected {expected}"
+                ));
+            }
+
+            let matching_lock_versions: Vec<_> = lock_packages
+                .iter()
+                .filter_map(toml::Value::as_table)
+                .filter(|entry| entry.get("source").is_none())
+                .filter(|entry| entry.get("name").and_then(toml::Value::as_str) == Some(name))
+                .filter_map(|entry| entry.get("version").and_then(toml::Value::as_str))
+                .collect();
+            if matching_lock_versions != [version] {
+                return Err(format!(
+                    "local Cargo.lock entry for {name} is {matching_lock_versions:?}, expected exactly [{version:?}]"
+                ));
+            }
+        }
+
+        let expected_independent: std::collections::BTreeSet<_> =
+            independent_packages.iter().copied().collect();
+        let seen_independent: std::collections::BTreeSet<_> =
+            seen_independent.iter().map(String::as_str).collect();
+        if seen_independent != expected_independent {
+            return Err(format!(
+                "independent-version policy does not close over workspace members: expected {expected_independent:?}, saw {seen_independent:?}"
+            ));
+        }
+
+        release_packages.sort();
+        Ok(release_packages)
+    }
+
+    fn version_fixture() -> tempfile::TempDir {
+        let root = tempfile::tempdir().expect("fixture root");
+        std::fs::create_dir_all(root.path().join("admin/rust/server-rs"))
+            .expect("release member directory");
+        std::fs::create_dir_all(root.path().join("admin/rust/household-rs"))
+            .expect("independent member directory");
+        std::fs::write(root.path().join("VERSION"), "0.1.26\n").expect("fixture VERSION");
+        std::fs::write(
+            root.path().join("admin/rust/Cargo.toml"),
+            "[workspace]\nmembers = [\"server-rs\", \"household-rs\"]\n",
+        )
+        .expect("fixture workspace");
+        std::fs::write(
+            root.path().join("admin/rust/server-rs/Cargo.toml"),
+            "[package]\nname = \"server-rs\"\nversion = \"0.1.26\"\n",
+        )
+        .expect("fixture release manifest");
+        std::fs::write(
+            root.path().join("admin/rust/household-rs/Cargo.toml"),
+            "[package]\nname = \"household-rs\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("fixture independent manifest");
+        std::fs::write(
+            root.path().join("admin/rust/Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"server-rs\"\nversion = \"0.1.26\"\n\n[[package]]\nname = \"household-rs\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("fixture lock");
+        root
+    }
+
+    #[test]
+    fn release_version_surface_accepts_derived_train() {
+        let fixture = version_fixture();
+        let packages = release_version_surface(fixture.path(), &["household-rs"])
+            .expect("coherent fixture must pass");
+        assert_eq!(packages, ["server-rs"]);
+    }
+
+    #[test]
+    fn release_version_surface_rejects_manifest_drift() {
+        let fixture = version_fixture();
+        std::fs::write(
+            fixture.path().join("admin/rust/server-rs/Cargo.toml"),
+            "[package]\nname = \"server-rs\"\nversion = \"0.1.25\"\n",
+        )
+        .expect("mutate release manifest");
+        let error = release_version_surface(fixture.path(), &["household-rs"])
+            .expect_err("drift must fail");
+        assert!(error.contains("server-rs has version 0.1.25, expected 0.1.26"));
+    }
+
+    #[test]
+    fn release_version_surface_rejects_lock_drift() {
+        let fixture = version_fixture();
+        std::fs::write(
+            fixture.path().join("admin/rust/Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"server-rs\"\nversion = \"0.1.25\"\n\n[[package]]\nname = \"household-rs\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("mutate lock");
+        let error = release_version_surface(fixture.path(), &["household-rs"])
+            .expect_err("lock drift must fail");
+        assert!(error.contains("local Cargo.lock entry for server-rs"));
+    }
+
+    #[test]
+    fn release_version_surface_rejects_unclassified_new_member() {
+        let fixture = version_fixture();
+        std::fs::create_dir_all(fixture.path().join("admin/rust/new-tool"))
+            .expect("new member directory");
+        std::fs::write(
+            fixture.path().join("admin/rust/Cargo.toml"),
+            "[workspace]\nmembers = [\"server-rs\", \"household-rs\", \"new-tool\"]\n",
+        )
+        .expect("mutate workspace");
+        std::fs::write(
+            fixture.path().join("admin/rust/new-tool/Cargo.toml"),
+            "[package]\nname = \"new-tool\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("new member manifest");
+        let error = release_version_surface(fixture.path(), &["household-rs"])
+            .expect_err("new member must fail");
+        assert!(error.contains("new-tool has version 0.1.0, expected 0.1.26"));
     }
 
     // ─── P-46: tier model tests ─────────────────────────────────────────

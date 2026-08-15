@@ -43,6 +43,7 @@ use household_rs::ids::{HouseholdId, MachineId, derive_household_id};
 use household_rs::keys::{P256PublicKey, P256Signature, verify_signature};
 use household_rs::pair_device::PairDeviceWindow;
 use household_rs::pair_machine::PairMachineWindow;
+use household_rs::pair_window_namespace::PairWindowNamespaceV2;
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use tokio::sync::RwLock;
@@ -2748,41 +2749,45 @@ pub async fn post_initialize(
     };
     let policy = KeyBackingPolicy::from_env();
     let t_keygen = Instant::now();
-    let (loaded, m_cert_fp, lifecycle_guard) = match tokio::task::spawn_blocking(move || {
-        let (guard, _) = acquire_recovered_lifecycle_exclusive(&state_dir)?;
-        let loaded = bootstrap_or_load_under_lifecycle(&guard, &state_dir, opts, policy)
-            .map_err(|error| lifecycle_io("bootstrap identity under lifecycle", error))?;
-        let m_cert_fp = household_rs::machine_cert::fingerprint(&loaded.cert)
-            .map_err(|error| lifecycle_io("fingerprint bootstrap machine cert", error))?;
-        bootstrap_state::persist(&state_dir, BootstrapState::NamedAwaitingPair)
-            .map_err(|error| lifecycle_io("persist named-awaiting-pair", error))?;
-        guard
-            .sync_state_root()
-            .map_err(|error| lifecycle_io("fsync named-awaiting-pair state", error))?;
-        Ok::<_, io::Error>((loaded, m_cert_fp, guard))
-    })
-    .await
-    {
-        Ok(Ok(result)) => result,
-        Ok(Err(e)) => {
-            tracing::error!(stage = "bootstrap.initialize_failed", error = %e);
-            return cbor_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                BootstrapErrorCode::KeygenFailed.as_str(),
-                None,
-                None,
-            );
-        }
-        Err(e) => {
-            tracing::error!(stage = "bootstrap.initialize_task_failed", error = %e);
-            return cbor_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                BootstrapErrorCode::KeygenFailed.as_str(),
-                None,
-                None,
-            );
-        }
-    };
+    let (loaded, m_cert_fp, lifecycle_guard, pair_device_namespace) =
+        match tokio::task::spawn_blocking(move || {
+            let (guard, _) = acquire_recovered_lifecycle_exclusive(&state_dir)?;
+            let loaded = bootstrap_or_load_under_lifecycle(&guard, &state_dir, opts, policy)
+                .map_err(|error| lifecycle_io("bootstrap identity under lifecycle", error))?;
+            let m_cert_fp = household_rs::machine_cert::fingerprint(&loaded.cert)
+                .map_err(|error| lifecycle_io("fingerprint bootstrap machine cert", error))?;
+            bootstrap_state::persist(&state_dir, BootstrapState::NamedAwaitingPair)
+                .map_err(|error| lifecycle_io("persist named-awaiting-pair", error))?;
+            guard
+                .sync_state_root()
+                .map_err(|error| lifecycle_io("fsync named-awaiting-pair state", error))?;
+            let pair_device_namespace =
+                PairWindowNamespaceV2::current_under_lifecycle(state_dir.clone(), &guard)
+                    .map_err(|error| lifecycle_io("bind installed pair-device namespace", error))?;
+            Ok::<_, io::Error>((loaded, m_cert_fp, guard, pair_device_namespace))
+        })
+        .await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(e)) => {
+                tracing::error!(stage = "bootstrap.initialize_failed", error = %e);
+                return cbor_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    BootstrapErrorCode::KeygenFailed.as_str(),
+                    None,
+                    None,
+                );
+            }
+            Err(e) => {
+                tracing::error!(stage = "bootstrap.initialize_task_failed", error = %e);
+                return cbor_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    BootstrapErrorCode::KeygenFailed.as_str(),
+                    None,
+                    None,
+                );
+            }
+        };
     // u128→u64 truncation impossible in practice (u64 covers ~585 millennia).
     #[allow(clippy::cast_possible_truncation)]
     let keygen_ms = t_keygen.elapsed().as_millis() as u64;
@@ -2793,7 +2798,25 @@ pub async fn post_initialize(
     let name_persisted = loaded.record.name.clone();
     let machine_id = loaded.cert.m_id.to_string();
 
-    // 5. Publish the already-durable state in memory while lifecycle-exclusive
+    // 5. Rebind the already-shared pair window to the generation installed by
+    // bootstrap_or_load. The daemon constructed this Arc before initialize,
+    // when the prior generation was current; replacing the Arc would leave
+    // mounted routes and the snapshot watcher on stale authority.
+    if let Err(error) = state
+        .pair_device_window
+        .rebind_namespace_under_lifecycle(pair_device_namespace, &lifecycle_guard)
+        .await
+    {
+        tracing::error!(stage = "bootstrap.pair_window_rebind_failed", error = %error);
+        return cbor_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            BootstrapErrorCode::KeygenFailed.as_str(),
+            None,
+            None,
+        );
+    }
+
+    // 6. Publish the already-durable state in memory while lifecycle-exclusive
     // is still live. A competing process cannot teardown or install between
     // the on-disk identity/state transaction and this publication.
     {
@@ -2801,13 +2824,13 @@ pub async fn post_initialize(
         *bs = BootstrapState::NamedAwaitingPair;
     }
 
-    // 6. Update HouseholdState in memory.
+    // 7. Update HouseholdState in memory.
     state
         .household
         .set_loaded(SharedHouseholdIdentity::new(loaded))
         .await;
 
-    // 7. Mint pair-device window and build QR URI.
+    // 8. Mint pair-device window and build QR URI.
     //
     // Both inputs are resolved before minting: a QR we could not pin is not
     // worth opening a window for, and opening one anyway would leave a token
@@ -2816,7 +2839,7 @@ pub async fn post_initialize(
         Ok(pub_key) => {
             match state
                 .pair_device_window
-                .mint_token(Duration::from_secs(300), None)
+                .mint_token_under_lifecycle(Duration::from_secs(300), None, &lifecycle_guard)
                 .await
             {
                 Ok(token) => token.to_uri_with_host_and_name(
@@ -2966,6 +2989,10 @@ fn platform_model_string() -> Option<String> {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[path = "handlers_bootstrap_first_owner_tests.rs"]
+mod first_owner_tests;
+
+#[cfg(test)]
 mod m_cert_fp_ordering_guard {
     /// Body of a top-level `pub async fn <name>(` up to the next column-zero
     /// `}`. Both producers are column-zero items, so this bounds them exactly
@@ -3023,10 +3050,13 @@ mod m_cert_fp_ordering_guard {
     fn fingerprint_is_resolved_before_any_window_is_minted() {
         let source = include_str!("handlers_bootstrap.rs");
 
-        for name in ["post_pair_device_reissue", "post_initialize"] {
+        for (name, mint_call) in [
+            ("post_pair_device_reissue", "mint_token("),
+            ("post_initialize", "mint_token_under_lifecycle("),
+        ] {
             let body = fn_body(source, name);
             let fp = unique_offset(&body, "machine_cert::fingerprint(", name);
-            let mint = unique_offset(&body, "mint_token(", name);
+            let mint = unique_offset(&body, mint_call, name);
             assert!(
                 fp < mint,
                 "{name}: fingerprint must be resolved before mint_token, \
@@ -3063,7 +3093,7 @@ mod m_cert_fp_ordering_guard {
     fn post_initialize_holds_lifecycle_through_pair_window_persistence() {
         let source = include_str!("handlers_bootstrap.rs");
         let body = fn_body(source, "post_initialize");
-        let mint = unique_offset(&body, "mint_token(", "post_initialize");
+        let mint = unique_offset(&body, "mint_token_under_lifecycle(", "post_initialize");
         let uri = unique_offset(&body, "token.to_uri_with_host_and_name(", "post_initialize");
         let release = unique_offset(&body, "drop(lifecycle_guard);", "post_initialize");
         assert!(

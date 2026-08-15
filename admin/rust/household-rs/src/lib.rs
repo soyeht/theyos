@@ -60,6 +60,8 @@ pub mod device_cert;
 pub mod emoji_code;
 pub mod error;
 pub mod fingerprint;
+#[cfg(feature = "test-support")]
+pub mod first_owner_test_support;
 pub mod household_install_transaction;
 pub mod household_lifecycle;
 pub mod household_mesh_log;
