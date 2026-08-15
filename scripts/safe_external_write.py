@@ -1643,6 +1643,7 @@ class TheyosV0126TagGit:
                 "push",
                 "--no-follow-tags",
                 "--no-signed",
+                "--no-verify",
                 "--porcelain",
                 "origin",
                 f"{THEYOS_TAG_REF}:{THEYOS_TAG_REF}",
