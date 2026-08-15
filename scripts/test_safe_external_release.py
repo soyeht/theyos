@@ -1026,6 +1026,64 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
             )
         self.assertEqual([], self.git.mutations)
 
+    @staticmethod
+    def precondition_drift_cases() -> tuple[
+        tuple[str, Any], ...
+    ]:
+        wrong_fetch = "https://example.invalid/theyos.git"
+        wrong_push = "ssh://example.invalid/theyos.git"
+        return (
+            ("fetch URL", lambda git, api: setattr(
+                git, "fetch_urls", (wrong_fetch,)
+            )),
+            ("push URL", lambda git, api: setattr(
+                git, "push_urls", (wrong_push,)
+            )),
+            ("multiple fetch URLs", lambda git, api: setattr(
+                git,
+                "fetch_urls",
+                (guard.THEYOS_REPOSITORY_URL, wrong_fetch),
+            )),
+            ("multiple push URLs", lambda git, api: setattr(
+                git,
+                "push_urls",
+                (guard.THEYOS_REPOSITORY_URL, wrong_push),
+            )),
+            ("HEAD", lambda git, api: setattr(git, "head", WRONG)),
+            ("origin/main", lambda git, api: setattr(git, "origin_main", WRONG)),
+            ("remote main", lambda git, api: setattr(git, "remote_main", WRONG)),
+            ("dirty worktree", lambda git, api: setattr(git, "clean_state", False)),
+            ("target object type", lambda git, api: git.object_types.__setitem__(
+                THEYOS_TAG_TARGET, "tree"
+            )),
+            ("VERSION", lambda git, api: git.files.__setitem__(
+                guard.THEYOS_VERSION_FILE, b"0.1.25\n"
+            )),
+            ("Cargo version", lambda git, api: git.files.__setitem__(
+                guard.THEYOS_CARGO_FILE,
+                b"[package]\nversion = \"0.1.25\"\n",
+            )),
+            ("remote.origin.push", lambda git, api: git.config.__setitem__(
+                "remote.origin.push", ("refs/heads/main",)
+            )),
+            ("remote.origin.receivepack", lambda git, api: git.config.__setitem__(
+                "remote.origin.receivepack", ("unsafe",)
+            )),
+            ("push.pushOption", lambda git, api: git.config.__setitem__(
+                "push.pushOption", ("unsafe",)
+            )),
+            ("remote.origin.mirror", lambda git, api: git.config.__setitem__(
+                "remote.origin.mirror", ("true",)
+            )),
+            ("local branch", lambda git, api: git.local_refs.__setitem__(
+                f"refs/heads/{guard.THEYOS_TAG}", WRONG
+            )),
+            ("remote branch", lambda git, api: git.remote.__setitem__(
+                f"refs/heads/{guard.THEYOS_TAG}", WRONG
+            )),
+            ("API main", lambda git, api: setattr(api, "main_oid", WRONG)),
+        )
+
     def test_create_is_one_local_mutation_and_exact_tag_readback(self) -> None:
         self.assertEqual(0, self.execute("create", guard.THEYOS_TAG_MESSAGE))
         self.assertEqual(
@@ -1043,14 +1101,10 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
         self.assertIsNone(self.api.tag_object_oid)
 
     def test_create_blocks_moving_state_drift_after_one_mutation(self) -> None:
-        drift_cases = (
+        drift_cases = self.precondition_drift_cases() + (
             ("local tag", lambda git, api: git.local_refs.__setitem__(
                 guard.THEYOS_TAG_REF, THEYOS_TAG_TARGET
             )),
-            ("HEAD", lambda git, api: setattr(git, "head", WRONG)),
-            ("origin/main", lambda git, api: setattr(git, "origin_main", WRONG)),
-            ("remote main", lambda git, api: setattr(git, "remote_main", WRONG)),
-            ("API main", lambda git, api: setattr(api, "main_oid", WRONG)),
             ("remote tag", lambda git, api: git.remote.update({
                 guard.THEYOS_TAG_REF: THEYOS_TAG_OBJECT,
                 f"{guard.THEYOS_TAG_REF}^{{}}": THEYOS_TAG_TARGET,
@@ -1423,14 +1477,10 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
         )
 
     def test_push_blocks_moving_state_drift_after_one_mutation(self) -> None:
-        drift_cases = (
+        drift_cases = self.precondition_drift_cases() + (
             ("local tag", lambda git, api: git.local_refs.__setitem__(
                 guard.THEYOS_TAG_REF, THEYOS_TAG_TARGET
             )),
-            ("HEAD", lambda git, api: setattr(git, "head", WRONG)),
-            ("origin/main", lambda git, api: setattr(git, "origin_main", WRONG)),
-            ("remote main", lambda git, api: setattr(git, "remote_main", WRONG)),
-            ("API main", lambda git, api: setattr(api, "main_oid", WRONG)),
         )
         for name, drift in drift_cases:
             with self.subTest(name=name):
@@ -1820,54 +1870,10 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
         self.assert_blocked_before_mutation("push", "unexpected payload")
 
     def test_each_moving_precondition_fails_before_mutation(self) -> None:
-        mutations = (
-            lambda: setattr(
-                self.git,
-                "fetch_urls",
-                ("https://example.invalid/theyos.git",),
-            ),
-            lambda: setattr(
-                self.git,
-                "push_urls",
-                ("ssh://example.invalid/theyos.git",),
-            ),
-            lambda: setattr(
-                self.git,
-                "fetch_urls",
-                (guard.THEYOS_REPOSITORY_URL, "https://example.invalid/theyos.git"),
-            ),
-            lambda: setattr(
-                self.git,
-                "push_urls",
-                (guard.THEYOS_REPOSITORY_URL, "ssh://example.invalid/theyos.git"),
-            ),
-            lambda: setattr(self.git, "head", "4" * 40),
-            lambda: setattr(self.git, "origin_main", "4" * 40),
-            lambda: setattr(self.git, "remote_main", "4" * 40),
-            lambda: setattr(self.git, "clean_state", False),
-            lambda: self.git.object_types.__setitem__(THEYOS_TAG_TARGET, "tree"),
-            lambda: self.git.files.__setitem__(
-                guard.THEYOS_VERSION_FILE, b"0.1.25\n"
-            ),
-            lambda: self.git.files.__setitem__(
-                guard.THEYOS_CARGO_FILE,
-                b"[package]\nversion = \"0.1.25\"\n",
-            ),
-            lambda: self.git.config.__setitem__(
-                "remote.origin.push", ("refs/heads/main",)
-            ),
-            lambda: self.git.local_refs.__setitem__(
-                f"refs/heads/{guard.THEYOS_TAG}", "4" * 40
-            ),
-            lambda: self.git.remote.__setitem__(
-                f"refs/heads/{guard.THEYOS_TAG}", "4" * 40
-            ),
-            lambda: setattr(self.api, "main_oid", "4" * 40),
-        )
-        for mutate in mutations:
-            with self.subTest(mutate=mutate):
+        for name, mutate in self.precondition_drift_cases():
+            with self.subTest(name=name):
                 self.setUp()
-                mutate()
+                mutate(self.git, self.api)
                 self.assert_blocked_before_mutation(
                     "create", guard.THEYOS_TAG_MESSAGE
                 )

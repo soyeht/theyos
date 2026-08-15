@@ -1768,24 +1768,38 @@ def _assert_theyos_main_api(api: GitHubAPI, expected_main: str) -> None:
         raise TheyosTagGuardError("GitHub API main ref drifted")
 
 
-def _assert_theyos_moving_state_readback(
+def _assert_theyos_destination_namespace(
     git: TheyosV0126TagGit,
     api: GitHubAPI,
-    target_oid: str,
     expected_main: str,
 ) -> None:
-    if git.head_oid() != target_oid:
-        raise TheyosTagGuardError("HEAD drifted during governed tag operation")
+    canonical_origin = (THEYOS_REPOSITORY_URL,)
+    if git.origin_urls(push=False) != canonical_origin:
+        raise TheyosTagGuardError(
+            "origin must have exactly one canonical theyos fetch URL"
+        )
+    if git.origin_urls(push=True) != canonical_origin:
+        raise TheyosTagGuardError(
+            "origin must have exactly one canonical theyos push URL"
+        )
+    for key in (
+        "remote.origin.push",
+        "remote.origin.receivepack",
+        "push.pushOption",
+        "remote.origin.mirror",
+    ):
+        if git.config_values(key):
+            raise TheyosTagGuardError(f"unsafe Git configuration is set: {key}")
     if git.origin_main_oid() != expected_main:
-        raise TheyosTagGuardError(
-            "origin/main drifted during governed tag operation"
-        )
-    if git.remote_refs(("refs/heads/main",)) != {
-        "refs/heads/main": expected_main
-    }:
-        raise TheyosTagGuardError(
-            "remote main drifted during governed tag operation"
-        )
+        raise TheyosTagGuardError("origin/main does not equal expected main")
+    branch_ref = f"refs/heads/{THEYOS_TAG}"
+    refs = git.remote_refs(("refs/heads/main", branch_ref))
+    if refs.get("refs/heads/main") != expected_main:
+        raise TheyosTagGuardError("remote main does not equal expected main")
+    if branch_ref in refs:
+        raise TheyosTagGuardError("remote branch makes the tag name ambiguous")
+    if git.local_ref(branch_ref) is not None:
+        raise TheyosTagGuardError("local branch makes the tag name ambiguous")
     _assert_theyos_main_api(api, expected_main)
 
 
@@ -1826,27 +1840,9 @@ def _assert_theyos_v0126_preconditions(
     target_oid: str,
     expected_main: str,
 ) -> None:
-    canonical_origin = (THEYOS_REPOSITORY_URL,)
-    if git.origin_urls(push=False) != canonical_origin:
-        raise TheyosTagGuardError(
-            "origin must have exactly one canonical theyos fetch URL"
-        )
-    if git.origin_urls(push=True) != canonical_origin:
-        raise TheyosTagGuardError(
-            "origin must have exactly one canonical theyos push URL"
-        )
-    for key in (
-        "remote.origin.push",
-        "remote.origin.receivepack",
-        "push.pushOption",
-        "remote.origin.mirror",
-    ):
-        if git.config_values(key):
-            raise TheyosTagGuardError(f"unsafe Git configuration is set: {key}")
+    _assert_theyos_destination_namespace(git, api, expected_main)
     if git.head_oid() != target_oid:
         raise TheyosTagGuardError("HEAD does not equal the governed tag target")
-    if git.origin_main_oid() != expected_main:
-        raise TheyosTagGuardError("origin/main does not equal expected main")
     if git.object_type(target_oid) != "commit":
         raise TheyosTagGuardError("governed tag target is not a commit")
     if not git.clean():
@@ -1860,22 +1856,6 @@ def _assert_theyos_v0126_preconditions(
     )
     if cargo_version != THEYOS_TAG_VERSION:
         raise TheyosTagGuardError("canonical Cargo version is not the governed version")
-
-    refs = git.remote_refs(
-        (
-            "refs/heads/main",
-            f"refs/heads/{THEYOS_TAG}",
-            THEYOS_TAG_REF,
-            f"{THEYOS_TAG_REF}^{{}}",
-        )
-    )
-    if refs.get("refs/heads/main") != expected_main:
-        raise TheyosTagGuardError("remote main does not equal expected main")
-    if f"refs/heads/{THEYOS_TAG}" in refs:
-        raise TheyosTagGuardError("remote branch makes the tag name ambiguous")
-    if git.local_ref(f"refs/heads/{THEYOS_TAG}") is not None:
-        raise TheyosTagGuardError("local branch makes the tag name ambiguous")
-    _assert_theyos_main_api(api, expected_main)
 
 
 def execute_governed_theyos_v0126_tag(
@@ -1916,7 +1896,7 @@ def execute_governed_theyos_v0126_tag(
         ):
             raise TheyosTagGuardError("governed tag appeared during creation")
         _assert_theyos_tag_api_absent(client)
-        _assert_theyos_moving_state_readback(
+        _assert_theyos_v0126_preconditions(
             repository, client, target_oid, expected_main
         )
     else:
@@ -1946,7 +1926,7 @@ def execute_governed_theyos_v0126_tag(
         _assert_theyos_tag_api_readback(
             client, tag_object_oid, target_oid
         )
-        _assert_theyos_moving_state_readback(
+        _assert_theyos_v0126_preconditions(
             repository, client, target_oid, expected_main
         )
 
