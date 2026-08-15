@@ -1042,6 +1042,51 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
         )
         self.assertIsNone(self.api.tag_object_oid)
 
+    def test_create_blocks_moving_state_drift_after_one_mutation(self) -> None:
+        drift_cases = (
+            ("local tag", lambda git, api: git.local_refs.__setitem__(
+                guard.THEYOS_TAG_REF, THEYOS_TAG_TARGET
+            )),
+            ("HEAD", lambda git, api: setattr(git, "head", WRONG)),
+            ("origin/main", lambda git, api: setattr(git, "origin_main", WRONG)),
+            ("remote main", lambda git, api: setattr(git, "remote_main", WRONG)),
+            ("API main", lambda git, api: setattr(api, "main_oid", WRONG)),
+            ("remote tag", lambda git, api: git.remote.update({
+                guard.THEYOS_TAG_REF: THEYOS_TAG_OBJECT,
+                f"{guard.THEYOS_TAG_REF}^{{}}": THEYOS_TAG_TARGET,
+            })),
+            ("API tag", lambda git, api: api.add_tag(
+                THEYOS_TAG_OBJECT, THEYOS_TAG_TARGET
+            )),
+        )
+        for name, drift in drift_cases:
+            with self.subTest(name=name):
+                api = FakeTheyosTagAPI()
+                repository = FakeTheyosTagGit(api)
+                original_create = repository.create_tag
+
+                def create_then_drift(target_oid: str, message: bytes) -> None:
+                    original_create(target_oid, message)
+                    drift(repository, api)
+
+                repository.create_tag = create_then_drift
+                stdout = io.StringIO()
+                with (
+                    contextlib.redirect_stdout(stdout),
+                    self.assertRaises(guard.TheyosTagGuardError),
+                ):
+                    guard.execute_governed_theyos_v0126_tag(
+                        self.arguments("create"),
+                        guard.THEYOS_TAG_MESSAGE,
+                        git=repository,
+                        api=api,
+                    )
+                self.assertEqual(
+                    [("tag", (guard.THEYOS_TAG, THEYOS_TAG_TARGET))],
+                    repository.mutations,
+                )
+                self.assertEqual("", stdout.getvalue())
+
     def test_create_command_neutralizes_signing_and_cleanup_configuration(self) -> None:
         completed = mock.Mock(returncode=0, stdout=b"", stderr=b"")
         repository = guard.TheyosV0126TagGit()
@@ -1057,6 +1102,8 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                 "git",
                 "-c",
                 "core.hooksPath=/dev/null",
+                "-c",
+                "core.fsmonitor=false",
                 "tag",
                 "--annotate",
                 "--no-sign",
@@ -1069,6 +1116,126 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
             capture_output=True,
             check=False,
         )
+
+    def test_real_git_boundary_disables_executable_fsmonitor(self) -> None:
+        for guarded in (False, True):
+            with (
+                self.subTest(guarded=guarded),
+                tempfile.TemporaryDirectory() as root,
+            ):
+                root_path = Path(root)
+                remote = root_path / "remote.git"
+                repository = root_path / "repository"
+                subprocess.run(
+                    ["git", "init", "--bare", str(remote)],
+                    check=True,
+                    capture_output=True,
+                )
+                subprocess.run(
+                    ["git", "init", str(repository)],
+                    check=True,
+                    capture_output=True,
+                )
+                for key, value in (
+                    ("user.name", "Release Test"),
+                    ("user.email", "release@example.invalid"),
+                ):
+                    subprocess.run(
+                        ["git", "-C", str(repository), "config", key, value],
+                        check=True,
+                    )
+                tracked = repository / "tracked.txt"
+                tracked.write_text("reviewed bytes\n", encoding="utf-8")
+                subprocess.run(
+                    ["git", "-C", str(repository), "add", "tracked.txt"],
+                    check=True,
+                )
+                subprocess.run(
+                    ["git", "-C", str(repository), "commit", "-m", "fixture"],
+                    check=True,
+                    capture_output=True,
+                )
+                target = subprocess.run(
+                    ["git", "-C", str(repository), "rev-parse", "HEAD"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                subprocess.run(
+                    ["git", "-C", str(repository), "tag", "unrelated", target],
+                    check=True,
+                )
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(repository),
+                        "remote",
+                        "add",
+                        "origin",
+                        str(remote),
+                    ],
+                    check=True,
+                )
+                marker = root_path / "fsmonitor-executed"
+                hook = root_path / "fsmonitor-hook"
+                hook.write_text(
+                    "#!/bin/sh\n"
+                    f": > {marker}\n"
+                    "git push --no-verify origin "
+                    "refs/tags/unrelated:refs/tags/unrelated >/dev/null 2>&1\n"
+                    "printf '\\n'\n",
+                    encoding="utf-8",
+                )
+                hook.chmod(0o700)
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(repository),
+                        "config",
+                        "core.fsmonitor",
+                        str(hook),
+                    ],
+                    check=True,
+                )
+
+                if guarded:
+                    with contextlib.chdir(repository):
+                        self.assertTrue(guard.TheyosV0126TagGit().clean())
+                else:
+                    subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(repository),
+                            "status",
+                            "--porcelain=v1",
+                            "--untracked-files=all",
+                        ],
+                        check=True,
+                        capture_output=True,
+                    )
+
+                remote_tags = subprocess.run(
+                    [
+                        "git",
+                        "--git-dir",
+                        str(remote),
+                        "for-each-ref",
+                        "--format=%(refname)",
+                        "refs/tags",
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.splitlines()
+                if guarded:
+                    self.assertFalse(marker.exists())
+                    self.assertEqual([], remote_tags)
+                else:
+                    self.assertTrue(marker.exists())
+                    self.assertEqual(["refs/tags/unrelated"], remote_tags)
 
     def test_real_create_bypasses_reference_transaction_hooks(self) -> None:
         for hook_mode in ("standard", "configured"):
@@ -1255,6 +1422,45 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
             self.git.remote,
         )
 
+    def test_push_blocks_moving_state_drift_after_one_mutation(self) -> None:
+        drift_cases = (
+            ("local tag", lambda git, api: git.local_refs.__setitem__(
+                guard.THEYOS_TAG_REF, THEYOS_TAG_TARGET
+            )),
+            ("HEAD", lambda git, api: setattr(git, "head", WRONG)),
+            ("origin/main", lambda git, api: setattr(git, "origin_main", WRONG)),
+            ("remote main", lambda git, api: setattr(git, "remote_main", WRONG)),
+            ("API main", lambda git, api: setattr(api, "main_oid", WRONG)),
+        )
+        for name, drift in drift_cases:
+            with self.subTest(name=name):
+                api = FakeTheyosTagAPI()
+                repository = FakeTheyosTagGit(api)
+                repository.add_local_tag()
+                original_push = repository.push_tag
+
+                def push_then_drift() -> None:
+                    original_push()
+                    drift(repository, api)
+
+                repository.push_tag = push_then_drift
+                stdout = io.StringIO()
+                with (
+                    contextlib.redirect_stdout(stdout),
+                    self.assertRaises(guard.TheyosTagGuardError),
+                ):
+                    guard.execute_governed_theyos_v0126_tag(
+                        self.arguments("push"),
+                        "",
+                        git=repository,
+                        api=api,
+                    )
+                self.assertEqual(
+                    [("push", (guard.THEYOS_TAG_REF,))],
+                    repository.mutations,
+                )
+                self.assertEqual("", stdout.getvalue())
+
     def test_push_command_is_exact_and_neutralizes_ambient_side_effects(self) -> None:
         completed = mock.Mock(returncode=0, stdout=b"", stderr=b"")
         repository = guard.TheyosV0126TagGit()
@@ -1265,6 +1471,10 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
         run.assert_called_once_with(
             [
                 "git",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "core.fsmonitor=false",
                 "-c",
                 "push.followTags=false",
                 "-c",

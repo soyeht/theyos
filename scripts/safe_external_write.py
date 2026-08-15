@@ -1515,7 +1515,14 @@ class TheyosV0126TagGit:
         input_bytes: bytes | None = None,
         allowed_returncodes: frozenset[int] = frozenset({0}),
     ) -> subprocess.CompletedProcess[bytes]:
-        command = ["git", *arguments]
+        command = [
+            "git",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            *arguments,
+        ]
         completed = subprocess.run(
             command,
             input=input_bytes,
@@ -1622,8 +1629,6 @@ class TheyosV0126TagGit:
     def create_tag(self, target_oid: str, message: bytes) -> None:
         self._run(
             [
-                "-c",
-                "core.hooksPath=/dev/null",
                 "tag",
                 "--annotate",
                 "--no-sign",
@@ -1763,6 +1768,27 @@ def _assert_theyos_main_api(api: GitHubAPI, expected_main: str) -> None:
         raise TheyosTagGuardError("GitHub API main ref drifted")
 
 
+def _assert_theyos_moving_state_readback(
+    git: TheyosV0126TagGit,
+    api: GitHubAPI,
+    target_oid: str,
+    expected_main: str,
+) -> None:
+    if git.head_oid() != target_oid:
+        raise TheyosTagGuardError("HEAD drifted during governed tag operation")
+    if git.origin_main_oid() != expected_main:
+        raise TheyosTagGuardError(
+            "origin/main drifted during governed tag operation"
+        )
+    if git.remote_refs(("refs/heads/main",)) != {
+        "refs/heads/main": expected_main
+    }:
+        raise TheyosTagGuardError(
+            "remote main drifted during governed tag operation"
+        )
+    _assert_theyos_main_api(api, expected_main)
+
+
 def _assert_theyos_tag_api_readback(
     api: GitHubAPI,
     tag_object_oid: str,
@@ -1885,6 +1911,14 @@ def execute_governed_theyos_v0126_tag(
             raise TheyosTagGuardError("governed local tag already exists")
         repository.create_tag(target_oid, payload.encode("utf-8"))
         tag_object_oid = _assert_local_tag(repository, target_oid)
+        if repository.remote_refs(
+            (THEYOS_TAG_REF, f"{THEYOS_TAG_REF}^{{}}")
+        ):
+            raise TheyosTagGuardError("governed tag appeared during creation")
+        _assert_theyos_tag_api_absent(client)
+        _assert_theyos_moving_state_readback(
+            repository, client, target_oid, expected_main
+        )
     else:
         if payload:
             raise TheyosTagGuardError("tag push accepts no payload")
@@ -1899,6 +1933,8 @@ def execute_governed_theyos_v0126_tag(
             raise TheyosTagGuardError("governed tag appeared before push")
         _assert_theyos_tag_api_absent(client)
         repository.push_tag()
+        if _assert_local_tag(repository, target_oid) != tag_object_oid:
+            raise TheyosTagGuardError("local tag object drifted during push")
         remote_refs = repository.remote_refs(
             (THEYOS_TAG_REF, f"{THEYOS_TAG_REF}^{{}}")
         )
@@ -1909,6 +1945,9 @@ def execute_governed_theyos_v0126_tag(
             raise TheyosTagGuardError("remote tag ref or peeled target mismatch")
         _assert_theyos_tag_api_readback(
             client, tag_object_oid, target_oid
+        )
+        _assert_theyos_moving_state_readback(
+            repository, client, target_oid, expected_main
         )
 
     print(
