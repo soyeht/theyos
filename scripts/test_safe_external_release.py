@@ -13,11 +13,13 @@ import base64
 import contextlib
 import copy
 import hashlib
+import http.server
 import io
 import json
 import os
 import subprocess
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from typing import Any, Mapping
@@ -897,6 +899,10 @@ class FakeTheyosTagGit:
         self.create_readback_override: bytes | None = None
         self.push_remote_override: dict[str, str] | None = None
 
+    def assert_runtime(self, operation: str) -> None:
+        if operation not in {"create", "push"}:
+            raise AssertionError(f"unexpected operation: {operation}")
+
     @staticmethod
     def tag_bytes(target: str = THEYOS_TAG_TARGET) -> bytes:
         return (
@@ -1094,7 +1100,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
         base_environment = {
             key: value
             for key, value in guard.os.environ.items()
-            if key not in guard.THEYOS_FORBIDDEN_OBJECT_ENVIRONMENT
+            if not key.startswith("GIT_")
         }
         for operation in ("create", "push"):
             for name, additions in scenarios:
@@ -1115,6 +1121,50 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                         self.assertRaisesRegex(
                             guard.TheyosTagGuardError,
                             "unsafe Git object database environment is present",
+                        ),
+                    ):
+                        guard.execute_governed_theyos_v0126_tag(
+                            self.arguments(operation),
+                            guard.THEYOS_TAG_MESSAGE if operation == "create" else "",
+                            git=repository,
+                            api=api,
+                        )
+                    run.assert_not_called()
+                    self.assertEqual([], repository.mutations)
+                    self.assertEqual("", stdout.getvalue())
+
+    def test_other_inherited_git_environment_is_red_before_git(self) -> None:
+        scenarios = (
+            ("GIT_ASKPASS", "/tmp/askpass"),
+            ("GIT_CONFIG_COUNT", "1"),
+            ("GIT_CONFIG_KEY_0", "credential.helper"),
+            ("GIT_CONFIG_VALUE_0", "!malicious-helper"),
+            ("GIT_DIR", "/tmp/redirected-git-dir"),
+        )
+        base_environment = {
+            key: value
+            for key, value in guard.os.environ.items()
+            if not key.startswith("GIT_")
+        }
+        for operation in ("create", "push"):
+            for key, value in scenarios:
+                with self.subTest(operation=operation, key=key):
+                    api = FakeTheyosTagAPI()
+                    repository = FakeTheyosTagGit(api)
+                    if operation == "push":
+                        repository.add_local_tag()
+                    stdout = io.StringIO()
+                    with (
+                        mock.patch.object(
+                            guard.os,
+                            "environ",
+                            {**base_environment, key: value},
+                        ),
+                        mock.patch.object(guard.subprocess, "run") as run,
+                        contextlib.redirect_stdout(stdout),
+                        self.assertRaisesRegex(
+                            guard.TheyosTagGuardError,
+                            "unsafe inherited Git environment is present",
                         ),
                     ):
                         guard.execute_governed_theyos_v0126_tag(
@@ -1247,7 +1297,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                     environment = {
                         key: value
                         for key, value in guard.os.environ.items()
-                        if key not in guard.THEYOS_FORBIDDEN_OBJECT_ENVIRONMENT
+                        if not key.startswith("GIT_")
                     }
                     environment.update(additions)
                     stdout = io.StringIO()
@@ -1445,13 +1495,15 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
         run.assert_called_once()
         self.assertEqual(
             [
-                "git",
+                guard.THEYOS_GIT_EXECUTABLE,
                 "-c",
                 "core.hooksPath=/dev/null",
                 "-c",
                 "core.fsmonitor=false",
                 "-c",
                 "core.attributesFile=/dev/null",
+                "-c",
+                "core.askPass=/usr/bin/false",
                 "tag",
                 "--annotate",
                 "--no-sign",
@@ -1468,9 +1520,97 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
         )
         self.assertTrue(run.call_args.kwargs["capture_output"])
         self.assertFalse(run.call_args.kwargs["check"])
-        self.assertEqual("1", run.call_args.kwargs["env"]["GIT_ATTR_NOSYSTEM"])
-        self.assertEqual("1", run.call_args.kwargs["env"]["GIT_NO_REPLACE_OBJECTS"])
-        self.assertEqual("1", run.call_args.kwargs["env"]["GIT_NO_LAZY_FETCH"])
+        self.assertEqual(repository._environment(), run.call_args.kwargs["env"])
+
+    def test_runtime_preflight_uses_fixed_gh_version_and_hostname(self) -> None:
+        repository = guard.TheyosV0126TagGit()
+        version = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=f"gh version {guard.THEYOS_GH_VERSION} (fixture)\n".encode(),
+            stderr=b"",
+        )
+        auth = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=b"", stderr=b"authenticated\n"
+        )
+        with (
+            mock.patch.object(guard.Path, "is_file", return_value=True),
+            mock.patch.object(
+                guard.Path,
+                "resolve",
+                return_value=Path(guard.THEYOS_GH_REALPATH),
+            ),
+            mock.patch.object(guard.os, "access", return_value=True),
+            mock.patch.object(
+                guard.subprocess,
+                "run",
+                side_effect=(version, auth),
+            ) as run,
+        ):
+            repository.assert_runtime("push")
+        self.assertEqual(2, run.call_count)
+        self.assertEqual(
+            [guard.THEYOS_GH_EXECUTABLE, "--version"],
+            run.call_args_list[0].args[0],
+        )
+        self.assertEqual(
+            [
+                guard.THEYOS_GH_EXECUTABLE,
+                "auth",
+                "status",
+                "--hostname",
+                guard.SAFE_GITHUB_HOST,
+            ],
+            run.call_args_list[1].args[0],
+        )
+        for call in run.call_args_list:
+            self.assertEqual(repository._environment(), call.kwargs["env"])
+            self.assertTrue(call.kwargs["capture_output"])
+            self.assertFalse(call.kwargs["check"])
+
+    def test_runtime_preflight_rejects_gh_version_or_auth_mismatch(self) -> None:
+        cases = (
+            (
+                "version",
+                (
+                    subprocess.CompletedProcess(
+                        args=[], returncode=0, stdout=b"gh version 0.0.0\n", stderr=b""
+                    ),
+                ),
+                "version mismatch",
+            ),
+            (
+                "auth",
+                (
+                    subprocess.CompletedProcess(
+                        args=[],
+                        returncode=0,
+                        stdout=(
+                            f"gh version {guard.THEYOS_GH_VERSION} (fixture)\n"
+                        ).encode(),
+                        stderr=b"",
+                    ),
+                    subprocess.CompletedProcess(
+                        args=[], returncode=1, stdout=b"", stderr=b"not authenticated"
+                    ),
+                ),
+                "not authenticated",
+            ),
+        )
+        for name, results, expected_error in cases:
+            with (
+                self.subTest(name=name),
+                mock.patch.object(guard.Path, "is_file", return_value=True),
+                mock.patch.object(
+                    guard.Path,
+                    "resolve",
+                    return_value=Path(guard.THEYOS_GH_REALPATH),
+                ),
+                mock.patch.object(guard.os, "access", return_value=True),
+                mock.patch.object(guard.subprocess, "run", side_effect=results),
+                self.assertRaisesRegex(guard.TheyosTagGuardError, expected_error),
+            ):
+                guard.TheyosV0126TagGit().assert_runtime("push")
 
     def test_real_git_boundary_disables_executable_fsmonitor(self) -> None:
         for guarded in (False, True):
@@ -2160,7 +2300,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
             environment = {
                 key: value
                 for key, value in guard.os.environ.items()
-                if key not in guard.THEYOS_FORBIDDEN_OBJECT_ENVIRONMENT
+                if not key.startswith("GIT_")
             }
             with (
                 contextlib.chdir(repository),
@@ -2613,13 +2753,19 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
         run.assert_called_once()
         self.assertEqual(
             [
-                "git",
+                guard.THEYOS_GIT_EXECUTABLE,
                 "-c",
                 "core.hooksPath=/dev/null",
                 "-c",
                 "core.fsmonitor=false",
                 "-c",
                 "core.attributesFile=/dev/null",
+                "-c",
+                "core.askPass=/usr/bin/false",
+                "-c",
+                "credential.helper=",
+                "-c",
+                f"credential.helper={guard.THEYOS_GH_CREDENTIAL_HELPER}",
                 "-c",
                 "push.followTags=false",
                 "-c",
@@ -2637,9 +2783,207 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
         self.assertIsNone(run.call_args.kwargs["input"])
         self.assertTrue(run.call_args.kwargs["capture_output"])
         self.assertFalse(run.call_args.kwargs["check"])
-        self.assertEqual("1", run.call_args.kwargs["env"]["GIT_ATTR_NOSYSTEM"])
-        self.assertEqual("1", run.call_args.kwargs["env"]["GIT_NO_REPLACE_OBJECTS"])
-        self.assertEqual("1", run.call_args.kwargs["env"]["GIT_NO_LAZY_FETCH"])
+        self.assertEqual(repository._environment(), run.call_args.kwargs["env"])
+
+    def test_real_credential_boundary_uses_only_the_fixed_helper(self) -> None:
+        class UnauthorizedHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                self.send_response(401)
+                self.send_header("WWW-Authenticate", 'Basic realm="fixture"')
+                self.end_headers()
+
+            def log_message(self, format: str, *args: object) -> None:
+                del format, args
+
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            repository = root_path / "repository"
+            subprocess.run(
+                ["git", "init", str(repository)], check=True, capture_output=True
+            )
+            for key, value in (
+                ("user.name", "Release Test"),
+                ("user.email", "release@example.invalid"),
+            ):
+                subprocess.run(
+                    ["git", "-C", str(repository), "config", key, value],
+                    check=True,
+                )
+            tracked = repository / "tracked.txt"
+            tracked.write_text("reviewed bytes\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "-C", str(repository), "add", "tracked.txt"], check=True
+            )
+            subprocess.run(
+                ["git", "-C", str(repository), "commit", "-m", "fixture"],
+                check=True,
+                capture_output=True,
+            )
+            target_oid = subprocess.run(
+                ["git", "-C", str(repository), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repository),
+                    "tag",
+                    "--annotate",
+                    "--no-sign",
+                    "--cleanup=verbatim",
+                    "--file=-",
+                    guard.THEYOS_TAG,
+                    target_oid,
+                ],
+                input=guard.THEYOS_TAG_MESSAGE.encode("utf-8"),
+                check=True,
+            )
+
+            approved_marker = root_path / "approved-helper-executed"
+            malicious_marker = root_path / "malicious-helper-executed"
+            askpass_marker = root_path / "askpass-executed"
+            approved_helper = root_path / "approved-helper"
+            malicious_helper = root_path / "malicious-helper"
+            askpass = root_path / "askpass"
+            approved_helper.write_text(
+                "#!/bin/sh\n"
+                f": > {approved_marker}\n"
+                "if test \"$1\" = get; then\n"
+                "  printf 'username=fixture\\npassword=fixture\\n'\n"
+                "fi\n",
+                encoding="utf-8",
+            )
+            malicious_helper.write_text(
+                "#!/bin/sh\n"
+                f": > {malicious_marker}\n"
+                "if test \"$1\" = get; then\n"
+                "  printf 'username=wrong\\npassword=wrong\\n'\n"
+                "fi\n",
+                encoding="utf-8",
+            )
+            askpass.write_text(
+                f"#!/bin/sh\n: > {askpass_marker}\nprintf 'wrong\\n'\n",
+                encoding="utf-8",
+            )
+            for executable in (approved_helper, malicious_helper, askpass):
+                executable.chmod(0o700)
+
+            server = http.server.ThreadingHTTPServer(
+                ("127.0.0.1", 0), UnauthorizedHandler
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                port = server.server_address[1]
+                remote_url = f"http://127.0.0.1:{port}/repository.git"
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(repository),
+                        "remote",
+                        "add",
+                        "origin",
+                        remote_url,
+                    ],
+                    check=True,
+                )
+                helper_command = f"!{malicious_helper}"
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(repository),
+                        "config",
+                        "--add",
+                        "credential.helper",
+                        helper_command,
+                    ],
+                    check=True,
+                )
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(repository),
+                        "config",
+                        "--add",
+                        f"credential.{remote_url}.helper",
+                        helper_command,
+                    ],
+                    check=True,
+                )
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(repository),
+                        "config",
+                        "core.askPass",
+                        str(askpass),
+                    ],
+                    check=True,
+                )
+                weakened = subprocess.run(
+                    [
+                        guard.THEYOS_GIT_EXECUTABLE,
+                        "-c",
+                        "core.hooksPath=/dev/null",
+                        "-c",
+                        "core.fsmonitor=false",
+                        "-c",
+                        "core.attributesFile=/dev/null",
+                        "-c",
+                        "core.askPass=/usr/bin/false",
+                        "push",
+                        "--no-follow-tags",
+                        "--no-signed",
+                        "--no-verify",
+                        "--porcelain",
+                        "origin",
+                        f"{guard.THEYOS_TAG_REF}:{guard.THEYOS_TAG_REF}",
+                    ],
+                    capture_output=True,
+                    check=False,
+                    cwd=repository,
+                    env=guard.TheyosV0126TagGit._environment(),
+                )
+                self.assertNotEqual(0, weakened.returncode)
+                self.assertTrue(malicious_marker.exists())
+                self.assertFalse(approved_marker.exists())
+                malicious_marker.unlink()
+                inherited = dict(guard.os.environ)
+                inherited.update(
+                    {
+                        "GIT_ASKPASS": str(askpass),
+                        "SSH_ASKPASS": str(askpass),
+                        "GIT_CONFIG_COUNT": "1",
+                        "GIT_CONFIG_KEY_0": "credential.helper",
+                        "GIT_CONFIG_VALUE_0": helper_command,
+                    }
+                )
+                with (
+                    contextlib.chdir(repository),
+                    mock.patch.object(guard.os, "environ", inherited),
+                    mock.patch.object(
+                        guard,
+                        "THEYOS_GH_CREDENTIAL_HELPER",
+                        f"!{approved_helper}",
+                    ),
+                    self.assertRaises(guard.TheyosTagGuardError),
+                ):
+                    guard.TheyosV0126TagGit().push_tag()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+            self.assertTrue(approved_marker.exists())
+            self.assertFalse(malicious_marker.exists())
+            self.assertFalse(askpass_marker.exists())
 
     def test_real_push_bypasses_standard_and_configured_pre_push_hooks(self) -> None:
         for hook_mode in ("standard", "configured"):

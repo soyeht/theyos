@@ -50,6 +50,7 @@ import hashlib
 import http.client
 import json
 import os
+import pwd
 import re
 import stat
 import subprocess
@@ -114,9 +115,37 @@ THEYOS_TAG_REF = f"refs/tags/{THEYOS_TAG}"
 THEYOS_TAG_MESSAGE = f"theyos-engine {THEYOS_TAG_VERSION}\n"
 THEYOS_VERSION_FILE = "VERSION"
 THEYOS_CARGO_FILE = "admin/rust/soyeht-rs/Cargo.toml"
+THEYOS_GIT_EXECUTABLE = "/usr/bin/git"
+THEYOS_GH_EXECUTABLE = "/opt/homebrew/bin/gh"
+THEYOS_GH_REALPATH = "/opt/homebrew/Cellar/gh/2.96.0/bin/gh"
+THEYOS_GH_VERSION = "2.96.0"
+THEYOS_GH_CREDENTIAL_HELPER = (
+    f"!{THEYOS_GH_EXECUTABLE} auth git-credential"
+)
 THEYOS_FORBIDDEN_OBJECT_ENVIRONMENT = (
     "GIT_OBJECT_DIRECTORY",
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+)
+THEYOS_FORBIDDEN_GIT_ENVIRONMENT = (
+    "GIT_ASKPASS",
+    "GIT_COMMON_DIR",
+    "GIT_CONFIG",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_NOSYSTEM",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_NAMESPACE",
+    "GIT_PROXY_COMMAND",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_WORK_TREE",
+)
+THEYOS_FORBIDDEN_GIT_ENVIRONMENT_PREFIXES = (
+    "GIT_CONFIG_KEY_",
+    "GIT_CONFIG_VALUE_",
 )
 FULL_OID_PATTERN = re.compile(r"[0-9a-f]{40}")
 VERSION_PATTERN = re.compile(
@@ -1512,6 +1541,65 @@ def execute_governed_release(
 class TheyosV0126TagGit:
     """Git boundary for the one governed theyos v0.1.26 annotated tag."""
 
+    @staticmethod
+    def _environment() -> dict[str, str]:
+        home = pwd.getpwuid(os.getuid()).pw_dir
+        return {
+            "HOME": home,
+            "LC_ALL": "C",
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_NO_LAZY_FETCH": "1",
+            "GIT_ASKPASS": "/usr/bin/false",
+            "SSH_ASKPASS": "/usr/bin/false",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+
+    def assert_runtime(self, operation: str) -> None:
+        git_path = Path(THEYOS_GIT_EXECUTABLE)
+        if not git_path.is_absolute() or not git_path.is_file() or not os.access(
+            git_path, os.X_OK
+        ):
+            raise TheyosTagGuardError("approved absolute Git executable is unavailable")
+        if operation != "push":
+            return
+        gh_path = Path(THEYOS_GH_EXECUTABLE)
+        if not gh_path.is_absolute() or not gh_path.is_file() or not os.access(
+            gh_path, os.X_OK
+        ):
+            raise TheyosTagGuardError("approved absolute gh executable is unavailable")
+        if str(gh_path.resolve(strict=True)) != THEYOS_GH_REALPATH:
+            raise TheyosTagGuardError("approved gh executable realpath mismatch")
+        version = subprocess.run(
+            [THEYOS_GH_EXECUTABLE, "--version"],
+            capture_output=True,
+            check=False,
+            env=self._environment(),
+        )
+        expected_prefix = f"gh version {THEYOS_GH_VERSION} ".encode("ascii")
+        if (
+            version.returncode != 0
+            or not version.stdout.startswith(expected_prefix)
+            or version.stderr
+        ):
+            raise TheyosTagGuardError("approved gh executable version mismatch")
+        auth = subprocess.run(
+            [
+                THEYOS_GH_EXECUTABLE,
+                "auth",
+                "status",
+                "--hostname",
+                SAFE_GITHUB_HOST,
+            ],
+            capture_output=True,
+            check=False,
+            env=self._environment(),
+        )
+        if auth.returncode != 0:
+            raise TheyosTagGuardError("approved gh helper is not authenticated for GitHub")
+
     def _run(
         self,
         arguments: Sequence[str],
@@ -1520,25 +1608,23 @@ class TheyosV0126TagGit:
         allowed_returncodes: frozenset[int] = frozenset({0}),
     ) -> subprocess.CompletedProcess[bytes]:
         command = [
-            "git",
+            THEYOS_GIT_EXECUTABLE,
             "-c",
             "core.hooksPath=/dev/null",
             "-c",
             "core.fsmonitor=false",
             "-c",
             "core.attributesFile=/dev/null",
+            "-c",
+            "core.askPass=/usr/bin/false",
             *arguments,
         ]
-        environment = dict(os.environ)
-        environment["GIT_ATTR_NOSYSTEM"] = "1"
-        environment["GIT_NO_REPLACE_OBJECTS"] = "1"
-        environment["GIT_NO_LAZY_FETCH"] = "1"
         completed = subprocess.run(
             command,
             input=input_bytes,
             capture_output=True,
             check=False,
-            env=environment,
+            env=self._environment(),
         )
         if completed.returncode not in allowed_returncodes:
             stderr = completed.stderr.decode("utf-8", errors="replace").strip()
@@ -1849,6 +1935,10 @@ class TheyosV0126TagGit:
         self._run(
             [
                 "-c",
+                "credential.helper=",
+                "-c",
+                f"credential.helper={THEYOS_GH_CREDENTIAL_HELPER}",
+                "-c",
                 "push.followTags=false",
                 "-c",
                 "push.gpgSign=false",
@@ -1912,6 +2002,17 @@ def _assert_theyos_object_database_environment() -> None:
         raise TheyosTagGuardError(
             "unsafe Git object database environment is present: "
             + ", ".join(present)
+        )
+    other_git_environment = tuple(sorted(
+        key
+        for key in os.environ
+        if key in THEYOS_FORBIDDEN_GIT_ENVIRONMENT
+        or key.startswith(THEYOS_FORBIDDEN_GIT_ENVIRONMENT_PREFIXES)
+    ))
+    if other_git_environment:
+        raise TheyosTagGuardError(
+            "unsafe inherited Git environment is present: "
+            + ", ".join(other_git_environment)
         )
 
 
@@ -2091,6 +2192,7 @@ def execute_governed_theyos_v0126_tag(
     _assert_theyos_object_database_environment()
     repository = git or TheyosV0126TagGit()
     client = api or GitHubAPI()
+    repository.assert_runtime(operation)
     _assert_theyos_v0126_preconditions(
         repository, client, target_oid, expected_main
     )
