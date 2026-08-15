@@ -114,6 +114,10 @@ THEYOS_TAG_REF = f"refs/tags/{THEYOS_TAG}"
 THEYOS_TAG_MESSAGE = f"theyos-engine {THEYOS_TAG_VERSION}\n"
 THEYOS_VERSION_FILE = "VERSION"
 THEYOS_CARGO_FILE = "admin/rust/soyeht-rs/Cargo.toml"
+THEYOS_FORBIDDEN_OBJECT_ENVIRONMENT = (
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+)
 FULL_OID_PATTERN = re.compile(r"[0-9a-f]{40}")
 VERSION_PATTERN = re.compile(
     r"[0-9]+(?:\.[0-9]+){1,2}(?:[.-][0-9A-Za-z]+)?"
@@ -1900,6 +1904,17 @@ def _parse_theyos_v0126_tag_arguments(
     return operation, target_oid, expected_main
 
 
+def _assert_theyos_object_database_environment() -> None:
+    present = tuple(
+        key for key in THEYOS_FORBIDDEN_OBJECT_ENVIRONMENT if key in os.environ
+    )
+    if present:
+        raise TheyosTagGuardError(
+            "unsafe Git object database environment is present: "
+            + ", ".join(present)
+        )
+
+
 def _cargo_package_version(payload: bytes) -> str:
     match = re.search(
         rb"(?ms)^\[package\][ \t]*\r?$.*?^version[ \t]*=[ \t]*\"([^\"\r\n]+)\"[ \t]*\r?$",
@@ -2070,6 +2085,10 @@ def execute_governed_theyos_v0126_tag(
     operation, target_oid, expected_main = _parse_theyos_v0126_tag_arguments(
         arguments
     )
+    # Reject inherited object-database redirection before constructing or
+    # invoking the Git boundary. Presence is unsafe even when the value is
+    # empty because the caller's environment is then ambiguous.
+    _assert_theyos_object_database_environment()
     repository = git or TheyosV0126TagGit()
     client = api or GitHubAPI()
     _assert_theyos_v0126_preconditions(

@@ -1067,6 +1067,256 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
             )
         self.assertEqual([], self.git.mutations)
 
+    def test_object_database_environment_presence_is_red_before_git(self) -> None:
+        scenarios = (
+            ("object empty", {"GIT_OBJECT_DIRECTORY": ""}),
+            ("object path", {"GIT_OBJECT_DIRECTORY": "/tmp/external-objects"}),
+            ("alternate empty", {"GIT_ALTERNATE_OBJECT_DIRECTORIES": ""}),
+            (
+                "alternate path",
+                {"GIT_ALTERNATE_OBJECT_DIRECTORIES": "/tmp/alternate-objects"},
+            ),
+            (
+                "both empty",
+                {
+                    "GIT_OBJECT_DIRECTORY": "",
+                    "GIT_ALTERNATE_OBJECT_DIRECTORIES": "",
+                },
+            ),
+            (
+                "both paths",
+                {
+                    "GIT_OBJECT_DIRECTORY": "/tmp/external-objects",
+                    "GIT_ALTERNATE_OBJECT_DIRECTORIES": "/tmp/alternate-objects",
+                },
+            ),
+        )
+        base_environment = {
+            key: value
+            for key, value in guard.os.environ.items()
+            if key not in guard.THEYOS_FORBIDDEN_OBJECT_ENVIRONMENT
+        }
+        for operation in ("create", "push"):
+            for name, additions in scenarios:
+                with self.subTest(operation=operation, environment=name):
+                    api = FakeTheyosTagAPI()
+                    repository = FakeTheyosTagGit(api)
+                    if operation == "push":
+                        repository.add_local_tag()
+                    stdout = io.StringIO()
+                    with (
+                        mock.patch.object(
+                            guard.os,
+                            "environ",
+                            {**base_environment, **additions},
+                        ),
+                        mock.patch.object(guard.subprocess, "run") as run,
+                        contextlib.redirect_stdout(stdout),
+                        self.assertRaisesRegex(
+                            guard.TheyosTagGuardError,
+                            "unsafe Git object database environment is present",
+                        ),
+                    ):
+                        guard.execute_governed_theyos_v0126_tag(
+                            self.arguments(operation),
+                            guard.THEYOS_TAG_MESSAGE if operation == "create" else "",
+                            git=repository,
+                            api=api,
+                        )
+                    run.assert_not_called()
+                    self.assertEqual([], repository.mutations)
+                    self.assertEqual("", stdout.getvalue())
+
+    def test_real_object_database_redirection_is_red_before_create_or_push(
+        self,
+    ) -> None:
+        scenario_names = (
+            "object empty",
+            "object path",
+            "alternate empty",
+            "alternate path",
+            "both empty",
+            "both paths",
+        )
+        for operation in ("create", "push"):
+            for scenario_name in scenario_names:
+                with (
+                    self.subTest(operation=operation, environment=scenario_name),
+                    tempfile.TemporaryDirectory() as root,
+                ):
+                    root_path = Path(root)
+                    repository = root_path / "repository"
+                    remote = root_path / "remote.git"
+                    external_objects = root_path / "external-objects"
+                    alternate_objects = root_path / "alternate-objects"
+                    external_objects.mkdir()
+                    alternate_objects.mkdir()
+                    subprocess.run(
+                        ["git", "init", str(repository)],
+                        check=True,
+                        capture_output=True,
+                    )
+                    subprocess.run(
+                        ["git", "init", "--bare", str(remote)],
+                        check=True,
+                        capture_output=True,
+                    )
+                    for key, value in (
+                        ("user.name", "Release Test"),
+                        ("user.email", "release@example.invalid"),
+                    ):
+                        subprocess.run(
+                            ["git", "-C", str(repository), "config", key, value],
+                            check=True,
+                        )
+                    tracked = repository / "tracked.txt"
+                    tracked.write_text("reviewed bytes\n", encoding="utf-8")
+                    subprocess.run(
+                        ["git", "-C", str(repository), "add", "tracked.txt"],
+                        check=True,
+                    )
+                    subprocess.run(
+                        ["git", "-C", str(repository), "commit", "-m", "fixture"],
+                        check=True,
+                        capture_output=True,
+                    )
+                    target_oid = subprocess.run(
+                        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    ).stdout.strip()
+                    local_tag_before: str | None = None
+                    if operation == "push":
+                        subprocess.run(
+                            [
+                                "git",
+                                "-C",
+                                str(repository),
+                                "tag",
+                                "--annotate",
+                                "--no-sign",
+                                "--cleanup=verbatim",
+                                "--file=-",
+                                guard.THEYOS_TAG,
+                                target_oid,
+                            ],
+                            input=guard.THEYOS_TAG_MESSAGE.encode("utf-8"),
+                            check=True,
+                        )
+                        local_tag_before = subprocess.run(
+                            [
+                                "git",
+                                "-C",
+                                str(repository),
+                                "rev-parse",
+                                guard.THEYOS_TAG_REF,
+                            ],
+                            check=True,
+                            capture_output=True,
+                            text=True,
+                        ).stdout.strip()
+
+                    additions: dict[str, str]
+                    if scenario_name == "object empty":
+                        additions = {"GIT_OBJECT_DIRECTORY": ""}
+                    elif scenario_name == "object path":
+                        additions = {
+                            "GIT_OBJECT_DIRECTORY": str(external_objects)
+                        }
+                    elif scenario_name == "alternate empty":
+                        additions = {"GIT_ALTERNATE_OBJECT_DIRECTORIES": ""}
+                    elif scenario_name == "alternate path":
+                        additions = {
+                            "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(
+                                alternate_objects
+                            )
+                        }
+                    elif scenario_name == "both empty":
+                        additions = {
+                            "GIT_OBJECT_DIRECTORY": "",
+                            "GIT_ALTERNATE_OBJECT_DIRECTORIES": "",
+                        }
+                    else:
+                        additions = {
+                            "GIT_OBJECT_DIRECTORY": str(external_objects),
+                            "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(
+                                repository / ".git" / "objects"
+                            ),
+                        }
+                    environment = {
+                        key: value
+                        for key, value in guard.os.environ.items()
+                        if key not in guard.THEYOS_FORBIDDEN_OBJECT_ENVIRONMENT
+                    }
+                    environment.update(additions)
+                    stdout = io.StringIO()
+                    arguments = [
+                        operation,
+                        "--target-oid",
+                        target_oid,
+                        "--expected-main",
+                        target_oid,
+                    ]
+                    with (
+                        contextlib.chdir(repository),
+                        mock.patch.object(guard.os, "environ", environment),
+                        mock.patch.object(guard.subprocess, "run") as run,
+                        contextlib.redirect_stdout(stdout),
+                        self.assertRaisesRegex(
+                            guard.TheyosTagGuardError,
+                            "unsafe Git object database environment is present",
+                        ),
+                    ):
+                        guard.execute_governed_theyos_v0126_tag(
+                            arguments,
+                            guard.THEYOS_TAG_MESSAGE if operation == "create" else "",
+                            git=guard.TheyosV0126TagGit(),
+                            api=FakeTheyosTagAPI(),
+                        )
+                    run.assert_not_called()
+                    self.assertEqual("", stdout.getvalue())
+
+                    local_tag_after = subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(repository),
+                            "rev-parse",
+                            "--verify",
+                            "--quiet",
+                            guard.THEYOS_TAG_REF,
+                        ],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if operation == "create":
+                        self.assertEqual(1, local_tag_after.returncode)
+                        self.assertEqual("", local_tag_after.stdout)
+                    else:
+                        self.assertEqual(0, local_tag_after.returncode)
+                        self.assertEqual(
+                            f"{local_tag_before}\n", local_tag_after.stdout
+                        )
+                    remote_tag = subprocess.run(
+                        [
+                            "git",
+                            "--git-dir",
+                            str(remote),
+                            "rev-parse",
+                            "--verify",
+                            "--quiet",
+                            guard.THEYOS_TAG_REF,
+                        ],
+                        check=False,
+                        capture_output=True,
+                    )
+                    self.assertEqual(1, remote_tag.returncode)
+                    self.assertEqual(b"", remote_tag.stdout)
+                    self.assertEqual([], list(external_objects.rglob("*")))
+                    self.assertEqual([], list(alternate_objects.rglob("*")))
+
     @staticmethod
     def precondition_drift_cases() -> tuple[
         tuple[str, Any], ...
@@ -1907,7 +2157,15 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                 "--expected-main",
                 target_oid,
             ]
-            with contextlib.chdir(repository):
+            environment = {
+                key: value
+                for key, value in guard.os.environ.items()
+                if key not in guard.THEYOS_FORBIDDEN_OBJECT_ENVIRONMENT
+            }
+            with (
+                contextlib.chdir(repository),
+                mock.patch.object(guard.os, "environ", environment),
+            ):
                 create_git = HybridGit()
                 self.assertEqual(
                     0,
@@ -1919,6 +2177,10 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                     ),
                 )
                 self.assertEqual(1, len(create_git.mutations))
+                created_tag_object = real.local_ref(guard.THEYOS_TAG_REF)
+                self.assertIsNotNone(created_tag_object)
+                assert created_tag_object is not None
+                self.assertEqual("tag", real.object_type(created_tag_object))
 
                 subprocess.run(
                     ["git", "branch", guard.THEYOS_TAG, target_oid], check=True
@@ -1951,6 +2213,10 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                     ),
                 )
                 self.assertEqual(1, len(push_git.mutations))
+                self.assertEqual(
+                    created_tag_object,
+                    push_api.tag_object_oid,
+                )
 
                 subprocess.run(
                     ["git", "branch", guard.THEYOS_TAG, target_oid], check=True
