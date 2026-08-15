@@ -1527,6 +1527,8 @@ class TheyosV0126TagGit:
         ]
         environment = dict(os.environ)
         environment["GIT_ATTR_NOSYSTEM"] = "1"
+        environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+        environment["GIT_NO_LAZY_FETCH"] = "1"
         completed = subprocess.run(
             command,
             input=input_bytes,

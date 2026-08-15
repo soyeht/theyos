@@ -979,6 +979,46 @@ class FakeTheyosTagGit:
 
 
 class GovernedTheyosV0126TagTests(unittest.TestCase):
+    @staticmethod
+    def weakened_git_run_without_environment_guard(
+        disabled_environment_key: str,
+    ) -> object:
+        def run(
+            arguments: list[str] | tuple[str, ...],
+            *,
+            input_bytes: bytes | None = None,
+            allowed_returncodes: frozenset[int] = frozenset({0}),
+        ) -> subprocess.CompletedProcess[bytes]:
+            command = [
+                "git",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.attributesFile=/dev/null",
+                *arguments,
+            ]
+            environment = dict(os.environ)
+            environment["GIT_ATTR_NOSYSTEM"] = "1"
+            environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+            environment["GIT_NO_LAZY_FETCH"] = "1"
+            environment.pop(disabled_environment_key)
+            completed = subprocess.run(
+                command,
+                input=input_bytes,
+                capture_output=True,
+                check=False,
+                env=environment,
+            )
+            if completed.returncode not in allowed_returncodes:
+                raise guard.TheyosTagGuardError(
+                    f"weakened git command failed: {completed.returncode}"
+                )
+            return completed
+
+        return run
+
     def setUp(self) -> None:
         self.api = FakeTheyosTagAPI()
         self.git = FakeTheyosTagGit(self.api)
@@ -1179,6 +1219,8 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
         self.assertTrue(run.call_args.kwargs["capture_output"])
         self.assertFalse(run.call_args.kwargs["check"])
         self.assertEqual("1", run.call_args.kwargs["env"]["GIT_ATTR_NOSYSTEM"])
+        self.assertEqual("1", run.call_args.kwargs["env"]["GIT_NO_REPLACE_OBJECTS"])
+        self.assertEqual("1", run.call_args.kwargs["env"]["GIT_NO_LAZY_FETCH"])
 
     def test_real_git_boundary_disables_executable_fsmonitor(self) -> None:
         for guarded in (False, True):
@@ -1499,6 +1541,204 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                         else:
                             self.assertTrue(marker.exists())
                             self.assertEqual(["refs/tags/unrelated"], remote_tags)
+
+    def test_real_raw_clean_ignores_blob_and_commit_replacements(self) -> None:
+        for replacement_kind in ("blob", "commit"):
+            with (
+                self.subTest(replacement_kind=replacement_kind),
+                tempfile.TemporaryDirectory() as root,
+            ):
+                repository = Path(root) / "repository"
+                subprocess.run(
+                    ["git", "init", str(repository)],
+                    check=True,
+                    capture_output=True,
+                )
+                for key, value in (
+                    ("user.name", "Release Test"),
+                    ("user.email", "release@example.invalid"),
+                ):
+                    subprocess.run(
+                        ["git", "-C", str(repository), "config", key, value],
+                        check=True,
+                    )
+                tracked = repository / "tracked.txt"
+                tracked.write_text("reviewed bytes\n", encoding="utf-8")
+                subprocess.run(
+                    ["git", "-C", str(repository), "add", "tracked.txt"],
+                    check=True,
+                )
+                subprocess.run(
+                    ["git", "-C", str(repository), "commit", "-m", "original"],
+                    check=True,
+                    capture_output=True,
+                )
+                original_commit = subprocess.run(
+                    ["git", "-C", str(repository), "rev-parse", "HEAD"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                original_blob = subprocess.run(
+                    ["git", "-C", str(repository), "rev-parse", "HEAD:tracked.txt"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                tracked.write_text("replacement bytes\n", encoding="utf-8")
+
+                if replacement_kind == "blob":
+                    replacement_blob = subprocess.run(
+                        ["git", "-C", str(repository), "hash-object", "-w", "--stdin"],
+                        input=tracked.read_bytes(),
+                        check=True,
+                        capture_output=True,
+                    ).stdout.decode("ascii").strip()
+                    subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(repository),
+                            "replace",
+                            original_blob,
+                            replacement_blob,
+                        ],
+                        check=True,
+                    )
+                else:
+                    subprocess.run(
+                        ["git", "-C", str(repository), "add", "tracked.txt"],
+                        check=True,
+                    )
+                    subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(repository),
+                            "commit",
+                            "-m",
+                            "replacement",
+                        ],
+                        check=True,
+                        capture_output=True,
+                    )
+                    replacement_commit = subprocess.run(
+                        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    ).stdout.strip()
+                    subprocess.run(
+                        ["git", "-C", str(repository), "reset", "--soft", original_commit],
+                        check=True,
+                    )
+                    subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(repository),
+                            "replace",
+                            original_commit,
+                            replacement_commit,
+                        ],
+                        check=True,
+                    )
+
+                weakened = guard.TheyosV0126TagGit()
+                weakened._run = self.weakened_git_run_without_environment_guard(
+                    "GIT_NO_REPLACE_OBJECTS"
+                )
+                with contextlib.chdir(repository):
+                    self.assertTrue(weakened.clean())
+                    self.assertFalse(guard.TheyosV0126TagGit().clean())
+
+    def test_real_raw_clean_disables_promisor_lazy_fetch(self) -> None:
+        for guarded in (False, True):
+            with self.subTest(guarded=guarded), tempfile.TemporaryDirectory() as root:
+                root_path = Path(root)
+                source = root_path / "source"
+                remote = root_path / "remote.git"
+                repository = root_path / "repository"
+                subprocess.run(
+                    ["git", "init", str(source)], check=True, capture_output=True
+                )
+                for key, value in (
+                    ("user.name", "Release Test"),
+                    ("user.email", "release@example.invalid"),
+                ):
+                    subprocess.run(
+                        ["git", "-C", str(source), "config", key, value], check=True
+                    )
+                tracked = source / "tracked.txt"
+                tracked.write_text("reviewed bytes\n", encoding="utf-8")
+                subprocess.run(
+                    ["git", "-C", str(source), "add", "tracked.txt"], check=True
+                )
+                subprocess.run(
+                    ["git", "-C", str(source), "commit", "-m", "fixture"],
+                    check=True,
+                    capture_output=True,
+                )
+                subprocess.run(
+                    ["git", "clone", "--bare", str(source), str(remote)],
+                    check=True,
+                    capture_output=True,
+                )
+                subprocess.run(
+                    ["git", "--git-dir", str(remote), "config", "uploadpack.allowFilter", "true"],
+                    check=True,
+                )
+                subprocess.run(
+                    [
+                        "git",
+                        "clone",
+                        "--filter=blob:none",
+                        "--no-checkout",
+                        f"file://{remote}",
+                        str(repository),
+                    ],
+                    check=True,
+                    capture_output=True,
+                )
+                subprocess.run(
+                    ["git", "-C", str(repository), "read-tree", "HEAD"], check=True
+                )
+                (repository / "tracked.txt").write_text(
+                    "reviewed bytes\n", encoding="utf-8"
+                )
+                marker = root_path / "upload-pack-executed"
+                helper = root_path / "upload-pack-helper"
+                helper.write_text(
+                    "#!/bin/sh\n"
+                    f": > {marker}\n"
+                    "exec git-upload-pack \"$@\"\n",
+                    encoding="utf-8",
+                )
+                helper.chmod(0o700)
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(repository),
+                        "config",
+                        "remote.origin.uploadpack",
+                        str(helper),
+                    ],
+                    check=True,
+                )
+
+                boundary = guard.TheyosV0126TagGit()
+                if not guarded:
+                    boundary._run = self.weakened_git_run_without_environment_guard(
+                        "GIT_NO_LAZY_FETCH"
+                    )
+                with contextlib.chdir(repository):
+                    if guarded:
+                        with self.assertRaises(guard.TheyosTagGuardError):
+                            boundary.clean()
+                    else:
+                        self.assertTrue(boundary.clean())
+                self.assertEqual(not guarded, marker.exists())
 
     def test_real_raw_clean_distinguishes_worktree_and_index_drift(self) -> None:
         cases = (
@@ -1904,6 +2144,8 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
         self.assertTrue(run.call_args.kwargs["capture_output"])
         self.assertFalse(run.call_args.kwargs["check"])
         self.assertEqual("1", run.call_args.kwargs["env"]["GIT_ATTR_NOSYSTEM"])
+        self.assertEqual("1", run.call_args.kwargs["env"]["GIT_NO_REPLACE_OBJECTS"])
+        self.assertEqual("1", run.call_args.kwargs["env"]["GIT_NO_LAZY_FETCH"])
 
     def test_real_push_bypasses_standard_and_configured_pre_push_hooks(self) -> None:
         for hook_mode in ("standard", "configured"):
