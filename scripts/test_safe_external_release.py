@@ -3153,29 +3153,85 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
     def test_real_remote_read_succeeds_without_credentials(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             root_path = Path(root)
-            source = root_path / "source"
-            remote = root_path / "remote.git"
-            subprocess.run(["git", "init", str(source)], check=True, capture_output=True)
-            for key, value in (
-                ("user.name", "Release Test"),
-                ("user.email", "release@example.invalid"),
-            ):
-                subprocess.run(
-                    ["git", "-C", str(source), "config", key, value], check=True
+
+            def initialize_fixture(
+                path: Path, *, explicit_main: bool
+            ) -> str:
+                command = [
+                    "git",
+                    "-c",
+                    "init.defaultBranch=master",
+                    "init",
+                ]
+                if explicit_main:
+                    command.append("--initial-branch=main")
+                command.append(str(path))
+                subprocess.run(command, check=True, capture_output=True)
+                for key, value in (
+                    ("user.name", "Release Test"),
+                    ("user.email", "release@example.invalid"),
+                ):
+                    subprocess.run(
+                        ["git", "-C", str(path), "config", key, value],
+                        check=True,
+                    )
+                (path / "tracked.txt").write_text(
+                    "reviewed bytes\n", encoding="utf-8"
                 )
-            (source / "tracked.txt").write_text("reviewed bytes\n", encoding="utf-8")
-            subprocess.run(["git", "-C", str(source), "add", "tracked.txt"], check=True)
+                subprocess.run(
+                    ["git", "-C", str(path), "add", "tracked.txt"],
+                    check=True,
+                )
+                subprocess.run(
+                    ["git", "-C", str(path), "commit", "-m", "fixture"],
+                    check=True,
+                    capture_output=True,
+                )
+                return subprocess.run(
+                    ["git", "-C", str(path), "rev-parse", "HEAD"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+
+            mutant_source = root_path / "mutant-source"
+            mutant_remote = root_path / "mutant-remote.git"
+            initialize_fixture(mutant_source, explicit_main=False)
             subprocess.run(
-                ["git", "-C", str(source), "commit", "-m", "fixture"],
+                ["git", "clone", "--bare", str(mutant_source), str(mutant_remote)],
                 check=True,
                 capture_output=True,
             )
-            target_oid = subprocess.run(
-                ["git", "-C", str(source), "rev-parse", "HEAD"],
+            with (
+                contextlib.chdir(mutant_source),
+                mock.patch.object(
+                    guard, "THEYOS_REPOSITORY_URL", mutant_remote.as_uri()
+                ),
+            ):
+                self.assertEqual(
+                    {},
+                    guard.TheyosV0126TagGit().remote_refs(
+                        ("refs/heads/main",)
+                    ),
+                )
+
+            source = root_path / "source"
+            remote = root_path / "remote.git"
+            target_oid = initialize_fixture(source, explicit_main=True)
+            main_oid = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(source),
+                    "rev-parse",
+                    "--verify",
+                    "refs/heads/main",
+                ],
                 check=True,
                 capture_output=True,
                 text=True,
             ).stdout.strip()
+            self.assertEqual(target_oid, main_oid)
             subprocess.run(
                 ["git", "clone", "--bare", str(source), str(remote)],
                 check=True,
