@@ -18,6 +18,7 @@ import http.server
 import io
 import json
 import os
+import socketserver
 import subprocess
 import tempfile
 import threading
@@ -1664,6 +1665,17 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
     def test_dedicated_api_uses_only_absolute_approved_gh_and_minimal_env(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             root_path = Path(root)
+            gh_config = root_path / ".config" / "gh"
+            gh_config.mkdir(parents=True, mode=0o700)
+            (gh_config / "config.yml").write_text(
+                'version: "1"\nhttp_unix_socket:\n', encoding="utf-8"
+            )
+            (gh_config / "config.yml").chmod(0o600)
+            (gh_config / "hosts.yml").write_text(
+                "github.com:\n  oauth_token: fixture-token\n",
+                encoding="utf-8",
+            )
+            (gh_config / "hosts.yml").chmod(0o600)
             path_bin = root_path / "path-bin"
             path_bin.mkdir()
             path_marker = root_path / "path-marker"
@@ -1679,15 +1691,23 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                 "#!/usr/bin/env python3\n"
                 "import json, os, pathlib, sys\n"
                 f"pathlib.Path({str(approved_marker)!r}).touch()\n"
-                "for key in ('GH_CONFIG_DIR','GH_TOKEN','GITHUB_TOKEN',"
+                "for key in ('GH_TOKEN','GITHUB_TOKEN',"
                 "'HTTPS_PROXY','HTTP_PROXY','ALL_PROXY','SSL_CERT_FILE',"
                 "'SSL_CERT_DIR'):\n"
                 "    assert key not in os.environ, key\n"
-                "if sys.argv[1:] == ['--version']:\n"
+                "if sys.argv[1:4] == ['config','get','http_unix_socket']:\n"
+                "    assert 'GH_CONFIG_DIR' not in os.environ\n"
+                "elif sys.argv[1:] == ['--version']:\n"
+                "    root = pathlib.Path(os.environ['GH_CONFIG_DIR'])\n"
+                f"    assert root != pathlib.Path({str(root_path / 'evil-config')!r})\n"
+                f"    assert (root / 'config.yml').read_bytes() == {guard.THEYOS_GH_SAFE_CONFIG!r}\n"
+                f"    assert (root / 'hosts.yml').resolve() == pathlib.Path({str(gh_config / 'hosts.yml')!r}).resolve()\n"
                 f"    print('gh version {guard.THEYOS_GH_VERSION} (fixture)')\n"
                 "elif sys.argv[1:3] == ['auth','status']:\n"
+                "    assert 'GH_CONFIG_DIR' in os.environ\n"
                 "    pass\n"
                 "elif sys.argv[1] == 'api':\n"
+                "    assert 'GH_CONFIG_DIR' in os.environ\n"
                 "    print(json.dumps({'ref':'refs/heads/main',"
                 f"'object':{{'type':'commit','sha':'{THEYOS_TAG_TARGET}'}}}}))\n"
                 "else:\n"
@@ -1709,6 +1729,11 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
             }
             with (
                 mock.patch.dict(guard.os.environ, inherited, clear=False),
+                mock.patch.object(
+                    guard.pwd,
+                    "getpwuid",
+                    return_value=mock.Mock(pw_dir=str(root_path.resolve())),
+                ),
                 mock.patch.object(
                     guard, "THEYOS_GH_EXECUTABLE", str(approved_gh)
                 ),
@@ -1747,6 +1772,143 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                         git=self.git,
                     )
                 self.assertEqual([], self.git.mutations)
+
+    @unittest.skipUnless(
+        Path(guard.THEYOS_GH_EXECUTABLE).is_file()
+        and Path(guard.THEYOS_GH_EXECUTABLE).resolve()
+        == Path(guard.THEYOS_GH_REALPATH),
+        "approved gh 2.96.0 is unavailable",
+    )
+    def test_real_gh_persistent_unix_socket_is_red_before_tag_operation(self) -> None:
+        class UnixHandler(http.server.BaseHTTPRequestHandler):
+            requests: list[tuple[str, str | None]] = []
+
+            def do_GET(self) -> None:
+                self.requests.append(
+                    (self.path, self.headers.get("Authorization"))
+                )
+                payload = json.dumps(
+                    {
+                        "login": "fixture-user",
+                        "ref": "fixture-from-unix-socket",
+                    }
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, format: str, *args: object) -> None:
+                del format, args
+
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root).resolve()
+            config_root = root_path / ".config" / "gh"
+            config_root.mkdir(parents=True, mode=0o700)
+            socket_path = root_path / "gh.sock"
+            (config_root / "config.yml").write_text(
+                'version: "1"\n'
+                "git_protocol: https\n"
+                f"http_unix_socket: {socket_path}\n",
+                encoding="utf-8",
+            )
+            (config_root / "config.yml").chmod(0o600)
+            (config_root / "hosts.yml").write_text(
+                "github.com:\n"
+                "  oauth_token: fixture-token\n"
+                "  user: fixture-user\n",
+                encoding="utf-8",
+            )
+            (config_root / "hosts.yml").chmod(0o600)
+            server = socketserver.UnixStreamServer(str(socket_path), UnixHandler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                mutant_environment = {
+                    "HOME": str(root_path),
+                    "LC_ALL": "C",
+                    "GH_HOST": guard.SAFE_GITHUB_HOST,
+                    "GH_REPO": guard.SAFE_GITHUB_REPO,
+                }
+                mutant_auth = subprocess.run(
+                    [
+                        guard.THEYOS_GH_EXECUTABLE,
+                        "auth",
+                        "status",
+                        "--hostname",
+                        guard.SAFE_GITHUB_HOST,
+                    ],
+                    capture_output=True,
+                    check=False,
+                    env=mutant_environment,
+                )
+                mutant_api = subprocess.run(
+                    [
+                        guard.THEYOS_GH_EXECUTABLE,
+                        "api",
+                        "--hostname",
+                        guard.SAFE_GITHUB_HOST,
+                        f"repos/{guard.SAFE_GITHUB_REPO}/git/ref/heads/main",
+                    ],
+                    capture_output=True,
+                    check=False,
+                    env=mutant_environment,
+                )
+                self.assertEqual(0, mutant_auth.returncode)
+                self.assertEqual(0, mutant_api.returncode)
+                self.assertEqual(2, len(UnixHandler.requests))
+                self.assertTrue(
+                    all(authorization for _, authorization in UnixHandler.requests)
+                )
+                UnixHandler.requests.clear()
+
+                with mock.patch.object(
+                    guard.pwd,
+                    "getpwuid",
+                    return_value=mock.Mock(pw_dir=str(root_path)),
+                ):
+                    for operation in ("create", "push"):
+                        with self.subTest(operation=operation):
+                            self.setUp()
+                            if operation == "push":
+                                self.git.add_local_tag()
+                            stdout = io.StringIO()
+                            with (
+                                contextlib.redirect_stdout(stdout),
+                                self.assertRaisesRegex(
+                                    guard.TheyosTagGuardError,
+                                    "persistent gh transport routing",
+                                ),
+                            ):
+                                guard.execute_governed_theyos_v0126_tag(
+                                    self.arguments(operation),
+                                    guard.THEYOS_TAG_MESSAGE
+                                    if operation == "create"
+                                    else "",
+                                    git=self.git,
+                                )
+                            self.assertEqual([], self.git.mutations)
+                            self.assertEqual("", stdout.getvalue())
+                self.assertEqual([], UnixHandler.requests)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+    @unittest.skipUnless(
+        Path(guard.THEYOS_GH_EXECUTABLE).is_file()
+        and Path(guard.THEYOS_GH_EXECUTABLE).resolve()
+        == Path(guard.THEYOS_GH_REALPATH),
+        "approved gh 2.96.0 is unavailable",
+    )
+    def test_real_approved_gh_is_authenticated_through_isolated_config(self) -> None:
+        client = guard.TheyosV0126GitHubAPI()
+        client.assert_runtime()
+        payload = client.read(
+            f"repos/{guard.SAFE_GITHUB_REPO}/git/ref/heads/main"
+        )
+        self.assertEqual("refs/heads/main", payload.get("ref"))
 
     def test_real_git_boundary_disables_executable_fsmonitor(self) -> None:
         for guarded in (False, True):

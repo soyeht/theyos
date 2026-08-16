@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import hashlib
 import http.client
 import json
@@ -55,9 +56,10 @@ import re
 import stat
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 from urllib.parse import quote
 
 
@@ -122,6 +124,7 @@ THEYOS_GH_VERSION = "2.96.0"
 THEYOS_GH_CREDENTIAL_HELPER = (
     f"!{THEYOS_GH_EXECUTABLE} auth git-credential"
 )
+THEYOS_GH_SAFE_CONFIG = b'version: "1"\ngit_protocol: https\n'
 THEYOS_FORBIDDEN_OBJECT_ENVIRONMENT = (
     "GIT_OBJECT_DIRECTORY",
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
@@ -594,17 +597,178 @@ class GitHubAPI:
             raise ReleaseGuardError("asset upload returned non-JSON success") from error
 
 
+@dataclass(frozen=True)
+class _TheyosGHFileSnapshot:
+    device: int
+    inode: int
+    mode: int
+    uid: int
+    gid: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+
+
+def _theyos_gh_home() -> Path:
+    home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    if not home.is_absolute() or home.resolve(strict=True) != home:
+        raise TheyosTagGuardError("canonical gh HOME is not an absolute real directory")
+    return home
+
+
+def _theyos_gh_file_snapshot(
+    path: Path,
+    *,
+    directory: bool,
+    exact_mode: int | None = None,
+) -> _TheyosGHFileSnapshot:
+    try:
+        metadata = os.lstat(path)
+    except OSError as error:
+        raise TheyosTagGuardError("canonical gh configuration path is unavailable") from error
+    expected_kind = stat.S_ISDIR(metadata.st_mode) if directory else stat.S_ISREG(metadata.st_mode)
+    if (
+        not expected_kind
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        or (exact_mode is not None and stat.S_IMODE(metadata.st_mode) != exact_mode)
+    ):
+        raise TheyosTagGuardError("canonical gh configuration ownership or mode mismatch")
+    return _TheyosGHFileSnapshot(
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        mode=metadata.st_mode,
+        uid=metadata.st_uid,
+        gid=metadata.st_gid,
+        size=metadata.st_size,
+        mtime_ns=metadata.st_mtime_ns,
+        ctime_ns=metadata.st_ctime_ns,
+    )
+
+
+def _theyos_gh_store_snapshot() -> tuple[_TheyosGHFileSnapshot, ...]:
+    config_root = _theyos_gh_home() / ".config" / "gh"
+    return (
+        _theyos_gh_file_snapshot(config_root, directory=True),
+        _theyos_gh_file_snapshot(
+            config_root / "config.yml", directory=False, exact_mode=0o600
+        ),
+        _theyos_gh_file_snapshot(
+            config_root / "hosts.yml", directory=False, exact_mode=0o600
+        ),
+    )
+
+
+def _assert_theyos_gh_persistent_routing_is_safe() -> None:
+    before = _theyos_gh_store_snapshot()
+    completed = subprocess.run(
+        [
+            THEYOS_GH_EXECUTABLE,
+            "config",
+            "get",
+            "http_unix_socket",
+            "--host",
+            SAFE_GITHUB_HOST,
+        ],
+        capture_output=True,
+        check=False,
+        env={"HOME": str(_theyos_gh_home()), "LC_ALL": "C"},
+    )
+    after = _theyos_gh_store_snapshot()
+    if before != after:
+        raise TheyosTagGuardError("canonical gh configuration changed during validation")
+    if completed.returncode != 0 or completed.stderr or completed.stdout:
+        raise TheyosTagGuardError("persistent gh transport routing is not empty")
+
+
+def _assert_theyos_isolated_gh_config(
+    root: Path,
+    canonical_hosts: Path,
+) -> None:
+    root_metadata = os.lstat(root)
+    config = root / "config.yml"
+    hosts = root / "hosts.yml"
+    if (
+        not stat.S_ISDIR(root_metadata.st_mode)
+        or stat.S_IMODE(root_metadata.st_mode) != 0o700
+        or root_metadata.st_uid != os.getuid()
+        or set(path.name for path in root.iterdir()) != {"config.yml", "hosts.yml"}
+        or config.read_bytes() != THEYOS_GH_SAFE_CONFIG
+        or stat.S_IMODE(os.lstat(config).st_mode) != 0o600
+        or not hosts.is_symlink()
+        or os.readlink(hosts) != str(canonical_hosts)
+    ):
+        raise TheyosTagGuardError("isolated gh configuration snapshot mismatch")
+
+
+@contextlib.contextmanager
+def _isolated_theyos_gh_environment(
+    base: Mapping[str, str],
+) -> Iterator[dict[str, str]]:
+    home = _theyos_gh_home()
+    canonical_hosts = home / ".config" / "gh" / "hosts.yml"
+    hosts_before = _theyos_gh_file_snapshot(
+        canonical_hosts, directory=False, exact_mode=0o600
+    )
+    with tempfile.TemporaryDirectory(prefix="soyeht-gh-config-") as temporary:
+        root = Path(temporary)
+        os.chmod(root, 0o700)
+        config = root / "config.yml"
+        descriptor = os.open(
+            config,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        try:
+            with os.fdopen(descriptor, "wb", closefd=False) as stream:
+                stream.write(THEYOS_GH_SAFE_CONFIG)
+                stream.flush()
+                os.fsync(stream.fileno())
+        finally:
+            os.close(descriptor)
+        (root / "hosts.yml").symlink_to(canonical_hosts)
+        _assert_theyos_isolated_gh_config(root, canonical_hosts)
+        environment = dict(base)
+        environment["GH_CONFIG_DIR"] = str(root)
+        try:
+            yield environment
+        finally:
+            _assert_theyos_isolated_gh_config(root, canonical_hosts)
+            if hosts_before != _theyos_gh_file_snapshot(
+                canonical_hosts, directory=False, exact_mode=0o600
+            ):
+                raise TheyosTagGuardError(
+                    "canonical gh authentication store changed during use"
+                )
+
+
 class TheyosV0126GitHubAPI(GitHubAPI):
     """Read-only API boundary for the governed theyos v0.1.26 tag."""
 
     @staticmethod
     def _environment() -> dict[str, str]:
         return {
-            "HOME": pwd.getpwuid(os.getuid()).pw_dir,
+            "HOME": str(_theyos_gh_home()),
             "LC_ALL": "C",
             "GH_HOST": SAFE_GITHUB_HOST,
             "GH_REPO": SAFE_GITHUB_REPO,
         }
+
+    def _run(
+        self,
+        command: Sequence[str],
+        *,
+        body: bytes | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        with _isolated_theyos_gh_environment(self._environment()) as environment:
+            return subprocess.run(
+                command,
+                input=body,
+                capture_output=True,
+                check=False,
+                env=environment,
+            )
 
     def assert_runtime(self) -> None:
         gh_path = Path(THEYOS_GH_EXECUTABLE)
@@ -614,11 +778,9 @@ class TheyosV0126GitHubAPI(GitHubAPI):
             raise TheyosTagGuardError("approved absolute gh executable is unavailable")
         if str(gh_path.resolve(strict=True)) != THEYOS_GH_REALPATH:
             raise TheyosTagGuardError("approved gh executable realpath mismatch")
-        version = subprocess.run(
+        _assert_theyos_gh_persistent_routing_is_safe()
+        version = self._run(
             [THEYOS_GH_EXECUTABLE, "--version"],
-            capture_output=True,
-            check=False,
-            env=self._environment(),
         )
         expected_prefix = f"gh version {THEYOS_GH_VERSION} ".encode("ascii")
         if (
@@ -627,7 +789,7 @@ class TheyosV0126GitHubAPI(GitHubAPI):
             or version.stderr
         ):
             raise TheyosTagGuardError("approved gh executable version mismatch")
-        auth = subprocess.run(
+        auth = self._run(
             [
                 THEYOS_GH_EXECUTABLE,
                 "auth",
@@ -635,9 +797,6 @@ class TheyosV0126GitHubAPI(GitHubAPI):
                 "--hostname",
                 SAFE_GITHUB_HOST,
             ],
-            capture_output=True,
-            check=False,
-            env=self._environment(),
         )
         if auth.returncode != 0:
             raise TheyosTagGuardError("approved gh API client is not authenticated")
@@ -670,12 +829,9 @@ class TheyosV0126GitHubAPI(GitHubAPI):
         command.append(endpoint)
         if body is not None:
             command.extend(["--input", "-"])
-        completed = subprocess.run(
+        completed = self._run(
             command,
-            input=body,
-            capture_output=True,
-            check=False,
-            env=self._environment(),
+            body=body,
         )
         if completed.returncode:
             raise GitHubAPIError(
