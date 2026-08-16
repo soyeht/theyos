@@ -34,6 +34,10 @@ ready, review, or merge a PR and does not add a general destination selector.
 The companion ``governed-ios-pr-body-update`` adapter can change only the body
 of that same consumer PR number 16 while it remains open and draft; every
 other field is a hardcoded readback invariant.
+The ``governed-theyos-v0126-tag`` adapter is narrower still: it can author
+the one annotated backend tag ``v0.1.26`` locally, or push only that already
+validated ref. Creation and push are separate invocations, each with one
+mutation and a complete readback.
 Any further repository or operation requires an explicit code change and
 review.
 """
@@ -42,17 +46,20 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import hashlib
 import http.client
 import json
 import os
+import pwd
 import re
 import stat
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 from urllib.parse import quote
 
 
@@ -103,6 +110,46 @@ RELEASE_CONTRACT_FORBIDDEN = (
     b"--clobber",
 )
 RELEASE_ASSET_NAMES = frozenset({"Soyeht.dmg", "appcast.xml"})
+THEYOS_REPOSITORY_URL = "https://github.com/soyeht/theyos.git"
+THEYOS_TAG_VERSION = "0.1.26"
+THEYOS_TAG = f"v{THEYOS_TAG_VERSION}"
+THEYOS_TAG_REF = f"refs/tags/{THEYOS_TAG}"
+THEYOS_TAG_MESSAGE = f"theyos-engine {THEYOS_TAG_VERSION}\n"
+THEYOS_VERSION_FILE = "VERSION"
+THEYOS_CARGO_FILE = "admin/rust/soyeht-rs/Cargo.toml"
+THEYOS_GIT_EXECUTABLE = "/usr/bin/git"
+THEYOS_GH_EXECUTABLE = "/opt/homebrew/bin/gh"
+THEYOS_GH_REALPATH = "/opt/homebrew/Cellar/gh/2.96.0/bin/gh"
+THEYOS_GH_VERSION = "2.96.0"
+THEYOS_GH_CREDENTIAL_HELPER = (
+    f"!{THEYOS_GH_EXECUTABLE} auth git-credential"
+)
+THEYOS_GH_SAFE_CONFIG = b'version: "1"\ngit_protocol: https\n'
+THEYOS_FORBIDDEN_OBJECT_ENVIRONMENT = (
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+)
+THEYOS_FORBIDDEN_GIT_ENVIRONMENT = (
+    "GIT_ASKPASS",
+    "GIT_COMMON_DIR",
+    "GIT_CONFIG",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_NOSYSTEM",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_NAMESPACE",
+    "GIT_PROXY_COMMAND",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_WORK_TREE",
+)
+THEYOS_FORBIDDEN_GIT_ENVIRONMENT_PREFIXES = (
+    "GIT_CONFIG_KEY_",
+    "GIT_CONFIG_VALUE_",
+)
 FULL_OID_PATTERN = re.compile(r"[0-9a-f]{40}")
 VERSION_PATTERN = re.compile(
     r"[0-9]+(?:\.[0-9]+){1,2}(?:[.-][0-9A-Za-z]+)?"
@@ -125,6 +172,10 @@ class UnsafeCommand(ValueError):
 
 class ReleaseGuardError(ValueError):
     """Raised when a governed release precondition or readback fails."""
+
+
+class TheyosTagGuardError(ValueError):
+    """Raised when the fixed theyos v0.1.26 tag boundary fails closed."""
 
 
 def find_mentions(payload: str, allowed: frozenset[str] = frozenset()) -> tuple[Mention, ...]:
@@ -544,6 +595,256 @@ class GitHubAPI:
             return json.loads(response_bytes)
         except json.JSONDecodeError as error:
             raise ReleaseGuardError("asset upload returned non-JSON success") from error
+
+
+@dataclass(frozen=True)
+class _TheyosGHFileSnapshot:
+    device: int
+    inode: int
+    mode: int
+    uid: int
+    gid: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+
+
+def _theyos_gh_home() -> Path:
+    home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    if not home.is_absolute() or home.resolve(strict=True) != home:
+        raise TheyosTagGuardError("canonical gh HOME is not an absolute real directory")
+    return home
+
+
+def _theyos_gh_file_snapshot(
+    path: Path,
+    *,
+    directory: bool,
+    exact_mode: int | None = None,
+) -> _TheyosGHFileSnapshot:
+    try:
+        metadata = os.lstat(path)
+    except OSError as error:
+        raise TheyosTagGuardError("canonical gh configuration path is unavailable") from error
+    expected_kind = stat.S_ISDIR(metadata.st_mode) if directory else stat.S_ISREG(metadata.st_mode)
+    if (
+        not expected_kind
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        or (exact_mode is not None and stat.S_IMODE(metadata.st_mode) != exact_mode)
+    ):
+        raise TheyosTagGuardError("canonical gh configuration ownership or mode mismatch")
+    return _TheyosGHFileSnapshot(
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        mode=metadata.st_mode,
+        uid=metadata.st_uid,
+        gid=metadata.st_gid,
+        size=metadata.st_size,
+        mtime_ns=metadata.st_mtime_ns,
+        ctime_ns=metadata.st_ctime_ns,
+    )
+
+
+def _theyos_gh_store_snapshot() -> tuple[_TheyosGHFileSnapshot, ...]:
+    config_root = _theyos_gh_home() / ".config" / "gh"
+    return (
+        _theyos_gh_file_snapshot(config_root, directory=True),
+        _theyos_gh_file_snapshot(
+            config_root / "config.yml", directory=False, exact_mode=0o600
+        ),
+        _theyos_gh_file_snapshot(
+            config_root / "hosts.yml", directory=False, exact_mode=0o600
+        ),
+    )
+
+
+def _assert_theyos_gh_persistent_routing_is_safe() -> None:
+    before = _theyos_gh_store_snapshot()
+    completed = subprocess.run(
+        [
+            THEYOS_GH_EXECUTABLE,
+            "config",
+            "get",
+            "http_unix_socket",
+            "--host",
+            SAFE_GITHUB_HOST,
+        ],
+        capture_output=True,
+        check=False,
+        env={"HOME": str(_theyos_gh_home()), "LC_ALL": "C"},
+    )
+    after = _theyos_gh_store_snapshot()
+    if before != after:
+        raise TheyosTagGuardError("canonical gh configuration changed during validation")
+    if completed.returncode != 0 or completed.stderr or completed.stdout:
+        raise TheyosTagGuardError("persistent gh transport routing is not empty")
+
+
+def _assert_theyos_isolated_gh_config(
+    root: Path,
+    canonical_hosts: Path,
+) -> None:
+    root_metadata = os.lstat(root)
+    config = root / "config.yml"
+    hosts = root / "hosts.yml"
+    if (
+        not stat.S_ISDIR(root_metadata.st_mode)
+        or stat.S_IMODE(root_metadata.st_mode) != 0o700
+        or root_metadata.st_uid != os.getuid()
+        or set(path.name for path in root.iterdir()) != {"config.yml", "hosts.yml"}
+        or config.read_bytes() != THEYOS_GH_SAFE_CONFIG
+        or stat.S_IMODE(os.lstat(config).st_mode) != 0o600
+        or not hosts.is_symlink()
+        or os.readlink(hosts) != str(canonical_hosts)
+    ):
+        raise TheyosTagGuardError("isolated gh configuration snapshot mismatch")
+
+
+@contextlib.contextmanager
+def _isolated_theyos_gh_environment(
+    base: Mapping[str, str],
+) -> Iterator[dict[str, str]]:
+    home = _theyos_gh_home()
+    canonical_hosts = home / ".config" / "gh" / "hosts.yml"
+    hosts_before = _theyos_gh_file_snapshot(
+        canonical_hosts, directory=False, exact_mode=0o600
+    )
+    with tempfile.TemporaryDirectory(prefix="soyeht-gh-config-") as temporary:
+        root = Path(temporary)
+        os.chmod(root, 0o700)
+        config = root / "config.yml"
+        descriptor = os.open(
+            config,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        try:
+            with os.fdopen(descriptor, "wb", closefd=False) as stream:
+                stream.write(THEYOS_GH_SAFE_CONFIG)
+                stream.flush()
+                os.fsync(stream.fileno())
+        finally:
+            os.close(descriptor)
+        (root / "hosts.yml").symlink_to(canonical_hosts)
+        _assert_theyos_isolated_gh_config(root, canonical_hosts)
+        environment = dict(base)
+        environment["GH_CONFIG_DIR"] = str(root)
+        try:
+            yield environment
+        finally:
+            _assert_theyos_isolated_gh_config(root, canonical_hosts)
+            if hosts_before != _theyos_gh_file_snapshot(
+                canonical_hosts, directory=False, exact_mode=0o600
+            ):
+                raise TheyosTagGuardError(
+                    "canonical gh authentication store changed during use"
+                )
+
+
+class TheyosV0126GitHubAPI(GitHubAPI):
+    """Read-only API boundary for the governed theyos v0.1.26 tag."""
+
+    @staticmethod
+    def _environment() -> dict[str, str]:
+        return {
+            "HOME": str(_theyos_gh_home()),
+            "LC_ALL": "C",
+            "GH_HOST": SAFE_GITHUB_HOST,
+            "GH_REPO": SAFE_GITHUB_REPO,
+        }
+
+    def _run(
+        self,
+        command: Sequence[str],
+        *,
+        body: bytes | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        with _isolated_theyos_gh_environment(self._environment()) as environment:
+            return subprocess.run(
+                command,
+                input=body,
+                capture_output=True,
+                check=False,
+                env=environment,
+            )
+
+    def assert_runtime(self) -> None:
+        gh_path = Path(THEYOS_GH_EXECUTABLE)
+        if not gh_path.is_absolute() or not gh_path.is_file() or not os.access(
+            gh_path, os.X_OK
+        ):
+            raise TheyosTagGuardError("approved absolute gh executable is unavailable")
+        if str(gh_path.resolve(strict=True)) != THEYOS_GH_REALPATH:
+            raise TheyosTagGuardError("approved gh executable realpath mismatch")
+        _assert_theyos_gh_persistent_routing_is_safe()
+        version = self._run(
+            [THEYOS_GH_EXECUTABLE, "--version"],
+        )
+        expected_prefix = f"gh version {THEYOS_GH_VERSION} ".encode("ascii")
+        if (
+            version.returncode != 0
+            or not version.stdout.startswith(expected_prefix)
+            or version.stderr
+        ):
+            raise TheyosTagGuardError("approved gh executable version mismatch")
+        auth = self._run(
+            [
+                THEYOS_GH_EXECUTABLE,
+                "auth",
+                "status",
+                "--hostname",
+                SAFE_GITHUB_HOST,
+            ],
+        )
+        if auth.returncode != 0:
+            raise TheyosTagGuardError("approved gh API client is not authenticated")
+
+    def _request(
+        self,
+        method: str,
+        endpoint: str,
+        *,
+        body: bytes | None = None,
+        headers: Sequence[str] = (),
+        paginate: bool = False,
+    ) -> Any:
+        command = [
+            THEYOS_GH_EXECUTABLE,
+            "api",
+            "--hostname",
+            SAFE_GITHUB_HOST,
+            "--method",
+            method,
+            "--header",
+            "Accept: application/vnd.github+json",
+            "--header",
+            "X-GitHub-Api-Version: 2022-11-28",
+        ]
+        for header in headers:
+            command.extend(["--header", header])
+        if paginate:
+            command.extend(["--paginate", "--slurp"])
+        command.append(endpoint)
+        if body is not None:
+            command.extend(["--input", "-"])
+        completed = self._run(
+            command,
+            body=body,
+        )
+        if completed.returncode:
+            raise GitHubAPIError(
+                command,
+                completed.returncode,
+                completed.stderr.decode("utf-8", errors="replace"),
+            )
+        try:
+            return json.loads(completed.stdout)
+        except json.JSONDecodeError as error:
+            raise TheyosTagGuardError(
+                f"GitHub API returned non-JSON success for {method} {endpoint}"
+            ) from error
 
 
 @dataclass(frozen=True)
@@ -1490,6 +1791,818 @@ def execute_governed_release(
     raise AssertionError(f"unhandled governed release operation: {operation}")
 
 
+class TheyosV0126TagGit:
+    """Git boundary for the one governed theyos v0.1.26 annotated tag."""
+
+    @staticmethod
+    def _environment() -> dict[str, str]:
+        home = pwd.getpwuid(os.getuid()).pw_dir
+        return {
+            "HOME": home,
+            "LC_ALL": "C",
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_NO_LAZY_FETCH": "1",
+            "GIT_ASKPASS": "/usr/bin/false",
+            "SSH_ASKPASS": "/usr/bin/false",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+
+    def assert_runtime(self, operation: str) -> None:
+        git_path = Path(THEYOS_GIT_EXECUTABLE)
+        if not git_path.is_absolute() or not git_path.is_file() or not os.access(
+            git_path, os.X_OK
+        ):
+            raise TheyosTagGuardError("approved absolute Git executable is unavailable")
+        if operation != "push":
+            return
+        gh_path = Path(THEYOS_GH_EXECUTABLE)
+        if not gh_path.is_absolute() or not gh_path.is_file() or not os.access(
+            gh_path, os.X_OK
+        ):
+            raise TheyosTagGuardError("approved absolute gh executable is unavailable")
+        if str(gh_path.resolve(strict=True)) != THEYOS_GH_REALPATH:
+            raise TheyosTagGuardError("approved gh executable realpath mismatch")
+        version = subprocess.run(
+            [THEYOS_GH_EXECUTABLE, "--version"],
+            capture_output=True,
+            check=False,
+            env=self._environment(),
+        )
+        expected_prefix = f"gh version {THEYOS_GH_VERSION} ".encode("ascii")
+        if (
+            version.returncode != 0
+            or not version.stdout.startswith(expected_prefix)
+            or version.stderr
+        ):
+            raise TheyosTagGuardError("approved gh executable version mismatch")
+        auth = subprocess.run(
+            [
+                THEYOS_GH_EXECUTABLE,
+                "auth",
+                "status",
+                "--hostname",
+                SAFE_GITHUB_HOST,
+            ],
+            capture_output=True,
+            check=False,
+            env=self._environment(),
+        )
+        if auth.returncode != 0:
+            raise TheyosTagGuardError("approved gh helper is not authenticated for GitHub")
+
+    def _run(
+        self,
+        arguments: Sequence[str],
+        *,
+        input_bytes: bytes | None = None,
+        allowed_returncodes: frozenset[int] = frozenset({0}),
+    ) -> subprocess.CompletedProcess[bytes]:
+        command = [
+            THEYOS_GIT_EXECUTABLE,
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.attributesFile=/dev/null",
+            "-c",
+            "core.askPass=/usr/bin/false",
+            *arguments,
+        ]
+        completed = subprocess.run(
+            command,
+            input=input_bytes,
+            capture_output=True,
+            check=False,
+            env=self._environment(),
+        )
+        if completed.returncode not in allowed_returncodes:
+            stderr = completed.stderr.decode("utf-8", errors="replace").strip()
+            raise TheyosTagGuardError(
+                f"git command failed with exit {completed.returncode}: "
+                f"{' '.join(command[:8])}: {stderr}"
+            )
+        return completed
+
+    @staticmethod
+    def _remote_configuration(*, authenticated: bool) -> list[str]:
+        configuration = [
+            "-c",
+            "credential.helper=",
+            "-c",
+            f"credential.{THEYOS_REPOSITORY_URL}.helper=",
+            "-c",
+            "http.extraHeader=",
+            "-c",
+            f"http.{THEYOS_REPOSITORY_URL}.extraHeader=",
+            "-c",
+            "http.cookieFile=",
+            "-c",
+            f"http.{THEYOS_REPOSITORY_URL}.cookieFile=",
+            "-c",
+            "http.saveCookies=false",
+            "-c",
+            f"http.{THEYOS_REPOSITORY_URL}.saveCookies=false",
+            "-c",
+            "http.proxy=",
+            "-c",
+            f"http.{THEYOS_REPOSITORY_URL}.proxy=",
+            "-c",
+            "http.sslVerify=true",
+            "-c",
+            f"http.{THEYOS_REPOSITORY_URL}.sslVerify=true",
+            "-c",
+            "http.curloptResolve=",
+            "-c",
+            f"http.{THEYOS_REPOSITORY_URL}.curloptResolve=",
+        ]
+        if authenticated:
+            configuration.extend(
+                [
+                    "-c",
+                    f"credential.helper={THEYOS_GH_CREDENTIAL_HELPER}",
+                ]
+            )
+        return configuration
+
+    def output(
+        self,
+        arguments: Sequence[str],
+        *,
+        allowed_returncodes: frozenset[int] = frozenset({0}),
+    ) -> tuple[int, bytes]:
+        completed = self._run(arguments, allowed_returncodes=allowed_returncodes)
+        return completed.returncode, completed.stdout
+
+    def repository_root(self) -> Path:
+        _, output = self.output(["rev-parse", "--show-toplevel"])
+        text = output.decode("utf-8", errors="strict").strip()
+        if not text:
+            raise TheyosTagGuardError("git repository root is empty")
+        return Path(text).resolve()
+
+    def origin_urls(self, *, push: bool) -> tuple[str, ...]:
+        arguments = ["remote", "get-url"]
+        if push:
+            arguments.append("--push")
+        arguments.extend(["--all", "origin"])
+        _, output = self.output(arguments)
+        return tuple(output.decode("utf-8", errors="strict").splitlines())
+
+    def config_values(self, key: str) -> tuple[str, ...]:
+        returncode, output = self.output(
+            ["config", "--get-all", key],
+            allowed_returncodes=frozenset({0, 1}),
+        )
+        if returncode == 1:
+            return ()
+        return tuple(output.decode("utf-8", errors="strict").splitlines())
+
+    def effective_configuration_keys(self) -> tuple[str, ...]:
+        _, output = self.output(
+            ["config", "--includes", "--null", "--name-only", "--list"]
+        )
+        keys: list[str] = []
+        for raw_key in self._split_zero_records(output):
+            try:
+                key = raw_key.decode("utf-8", errors="strict")
+            except UnicodeDecodeError as error:
+                raise TheyosTagGuardError(
+                    "effective Git configuration key is not UTF-8"
+                ) from error
+            if not key:
+                raise TheyosTagGuardError(
+                    "effective Git configuration key is empty"
+                )
+            keys.append(key)
+        return tuple(keys)
+
+    def head_oid(self) -> str:
+        _, output = self.output(["rev-parse", "HEAD"])
+        return output.decode("ascii", errors="strict").strip()
+
+    def origin_main_oid(self) -> str:
+        _, output = self.output(["rev-parse", "refs/remotes/origin/main"])
+        return output.decode("ascii", errors="strict").strip()
+
+    def object_type(self, oid: str) -> str:
+        _, output = self.output(["cat-file", "-t", oid])
+        return output.decode("ascii", errors="strict").strip()
+
+    @staticmethod
+    def _split_zero_records(output: bytes) -> tuple[bytes, ...]:
+        if not output:
+            return ()
+        if not output.endswith(b"\0"):
+            raise TheyosTagGuardError("raw Git record stream lacks terminal NUL")
+        return tuple(output[:-1].split(b"\0"))
+
+    def _head_tree_entries(self) -> dict[bytes, tuple[str, str]]:
+        _, output = self.output(
+            ["ls-tree", "-r", "-z", "--full-tree", "HEAD"]
+        )
+        entries: dict[bytes, tuple[str, str]] = {}
+        for record in self._split_zero_records(output):
+            metadata, separator, path = record.partition(b"\t")
+            fields = metadata.split(b" ")
+            if separator != b"\t" or len(fields) != 3 or not path:
+                raise TheyosTagGuardError("HEAD tree record is malformed")
+            mode_bytes, object_type, oid_bytes = fields
+            try:
+                mode = mode_bytes.decode("ascii", errors="strict")
+                oid = oid_bytes.decode("ascii", errors="strict")
+            except UnicodeDecodeError as error:
+                raise TheyosTagGuardError(
+                    "HEAD tree metadata is not ASCII"
+                ) from error
+            if (
+                mode not in {"100644", "100755"}
+                or object_type != b"blob"
+                or FULL_OID_PATTERN.fullmatch(oid) is None
+                or path in entries
+            ):
+                raise TheyosTagGuardError(
+                    "HEAD tree contains an unsupported or duplicate entry"
+                )
+            entries[path] = (mode, oid)
+        return entries
+
+    def _index_entries(self) -> dict[bytes, tuple[str, str]]:
+        _, output = self.output(["ls-files", "--stage", "-z"])
+        entries: dict[bytes, tuple[str, str]] = {}
+        for record in self._split_zero_records(output):
+            metadata, separator, path = record.partition(b"\t")
+            fields = metadata.split(b" ")
+            if separator != b"\t" or len(fields) != 3 or not path:
+                raise TheyosTagGuardError("index record is malformed")
+            mode_bytes, oid_bytes, stage = fields
+            try:
+                mode = mode_bytes.decode("ascii", errors="strict")
+                oid = oid_bytes.decode("ascii", errors="strict")
+            except UnicodeDecodeError as error:
+                raise TheyosTagGuardError(
+                    "index metadata is not ASCII"
+                ) from error
+            if (
+                stage != b"0"
+                or mode not in {"100644", "100755"}
+                or FULL_OID_PATTERN.fullmatch(oid) is None
+                or path in entries
+            ):
+                raise TheyosTagGuardError(
+                    "index contains an unmerged, unsupported, or duplicate entry"
+                )
+            entries[path] = (mode, oid)
+        return entries
+
+    def _blob_bytes(self, oids: Sequence[str]) -> dict[str, bytes]:
+        ordered = tuple(sorted(set(oids)))
+        if not ordered:
+            return {}
+        completed = self._run(
+            ["cat-file", "--batch"],
+            input_bytes=("\n".join(ordered) + "\n").encode("ascii"),
+        )
+        output = completed.stdout
+        position = 0
+        blobs: dict[str, bytes] = {}
+        for expected_oid in ordered:
+            header_end = output.find(b"\n", position)
+            if header_end < 0:
+                raise TheyosTagGuardError("cat-file batch header is missing")
+            fields = output[position:header_end].split(b" ")
+            if len(fields) != 3:
+                raise TheyosTagGuardError("cat-file batch header is malformed")
+            oid_bytes, object_type, size_bytes = fields
+            try:
+                oid = oid_bytes.decode("ascii", errors="strict")
+                size = int(size_bytes.decode("ascii", errors="strict"))
+            except (UnicodeDecodeError, ValueError) as error:
+                raise TheyosTagGuardError(
+                    "cat-file batch metadata is invalid"
+                ) from error
+            content_start = header_end + 1
+            content_end = content_start + size
+            if (
+                oid != expected_oid
+                or object_type != b"blob"
+                or size < 0
+                or content_end >= len(output)
+                or output[content_end:content_end + 1] != b"\n"
+            ):
+                raise TheyosTagGuardError("cat-file batch readback mismatch")
+            blobs[oid] = output[content_start:content_end]
+            position = content_end + 1
+        if position != len(output):
+            raise TheyosTagGuardError("cat-file batch has trailing bytes")
+        return blobs
+
+    @staticmethod
+    def _read_worktree_file(root: Path, raw_path: bytes) -> tuple[str, bytes] | None:
+        if (
+            not raw_path
+            or raw_path.startswith(b"/")
+            or any(part in {b"", b".", b".."} for part in raw_path.split(b"/"))
+        ):
+            raise TheyosTagGuardError("tracked path is not a safe relative path")
+        path = root.joinpath(*[os.fsdecode(part) for part in raw_path.split(b"/")])
+        current = root
+        try:
+            for part in path.relative_to(root).parts[:-1]:
+                current /= part
+                parent_stat = os.lstat(current)
+                if stat.S_ISLNK(parent_stat.st_mode) or not stat.S_ISDIR(
+                    parent_stat.st_mode
+                ):
+                    return None
+            before = os.lstat(path)
+        except FileNotFoundError:
+            return None
+        if (
+            stat.S_ISLNK(before.st_mode)
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX)
+        ):
+            return None
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags)
+        except (FileNotFoundError, OSError):
+            return None
+        try:
+            opened = os.fstat(descriptor)
+            with os.fdopen(descriptor, "rb", closefd=False) as stream:
+                content = stream.read()
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        stable_fields = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        if any(
+            getattr(before, field) != getattr(opened, field)
+            or getattr(opened, field) != getattr(after, field)
+            for field in stable_fields
+        ):
+            return None
+        mode = "100755" if opened.st_mode & stat.S_IXUSR else "100644"
+        return mode, content
+
+    def clean(self) -> bool:
+        head_entries = self._head_tree_entries()
+        index_entries = self._index_entries()
+        if head_entries != index_entries:
+            return False
+        _, untracked = self.output(
+            ["ls-files", "--others", "--exclude-standard", "-z"]
+        )
+        if self._split_zero_records(untracked):
+            return False
+        blobs = self._blob_bytes([oid for _, oid in index_entries.values()])
+        root = self.repository_root()
+        for path, (expected_mode, oid) in index_entries.items():
+            worktree_entry = self._read_worktree_file(root, path)
+            if worktree_entry is None:
+                return False
+            actual_mode, content = worktree_entry
+            if actual_mode != expected_mode or content != blobs[oid]:
+                return False
+        return True
+
+    def read_repository_file(self, relative_path: str) -> bytes:
+        root = self.repository_root()
+        path = (root / relative_path).resolve()
+        try:
+            path.relative_to(root)
+        except ValueError as error:
+            raise TheyosTagGuardError(
+                "version path escapes the repository"
+            ) from error
+        if path.is_symlink() or not path.is_file():
+            raise TheyosTagGuardError(
+                f"required version file is not a regular file: {relative_path}"
+            )
+        return path.read_bytes()
+
+    def local_ref(self, ref: str) -> str | None:
+        completed = self._run(
+            ["rev-parse", "--verify", "--quiet", "--end-of-options", ref],
+            allowed_returncodes=frozenset({0, 1}),
+        )
+        if completed.stderr:
+            raise TheyosTagGuardError("local ref lookup wrote to stderr")
+        if completed.returncode == 1:
+            if completed.stdout:
+                raise TheyosTagGuardError(
+                    "absent local ref lookup returned unexpected output"
+                )
+            return None
+        output = completed.stdout
+        if len(output) != 41 or output[-1:] != b"\n":
+            raise TheyosTagGuardError("local ref lookup output is malformed")
+        try:
+            oid = output[:-1].decode("ascii", errors="strict")
+        except UnicodeDecodeError as error:
+            raise TheyosTagGuardError("local ref OID is not ASCII") from error
+        if FULL_OID_PATTERN.fullmatch(oid) is None:
+            raise TheyosTagGuardError("local ref OID is not a full object ID")
+        return oid
+
+    def remote_refs(self, refs: Sequence[str]) -> dict[str, str]:
+        _, output = self.output(
+            [
+                *self._remote_configuration(authenticated=False),
+                "ls-remote",
+                THEYOS_REPOSITORY_URL,
+                *refs,
+            ]
+        )
+        found: dict[str, str] = {}
+        for raw_line in output.splitlines():
+            fields = raw_line.decode("ascii", errors="strict").split("\t")
+            if len(fields) != 2 or fields[1] in found:
+                raise TheyosTagGuardError("remote ref readback is malformed or duplicated")
+            found[fields[1]] = fields[0]
+        return found
+
+    def tag_object_bytes(self, tag_object_oid: str) -> bytes:
+        _, output = self.output(["cat-file", "tag", tag_object_oid])
+        return output
+
+    def create_tag(self, target_oid: str, message: bytes) -> None:
+        self._run(
+            [
+                "tag",
+                "--annotate",
+                "--no-sign",
+                "--cleanup=verbatim",
+                "--file=-",
+                THEYOS_TAG,
+                target_oid,
+            ],
+            input_bytes=message,
+        )
+
+    def push_tag(self) -> None:
+        self._run(
+            [
+                *self._remote_configuration(authenticated=True),
+                "-c",
+                "push.followTags=false",
+                "-c",
+                "push.gpgSign=false",
+                "push",
+                "--no-follow-tags",
+                "--no-signed",
+                "--no-verify",
+                "--porcelain",
+                THEYOS_REPOSITORY_URL,
+                f"{THEYOS_TAG_REF}:{THEYOS_TAG_REF}",
+            ]
+        )
+
+
+def _parse_theyos_v0126_tag_arguments(
+    arguments: Sequence[str],
+) -> tuple[str, str, str]:
+    if not arguments:
+        raise UnsafeCommand("governed-theyos-v0126-tag requires an operation")
+    operation = arguments[0]
+    if operation not in {"create", "push"}:
+        raise UnsafeCommand(
+            f"unsupported governed-theyos-v0126-tag operation: {operation}"
+        )
+    values: dict[str, str] = {}
+    index = 1
+    while index < len(arguments):
+        flag = arguments[index]
+        if flag not in {"--target-oid", "--expected-main"}:
+            raise UnsafeCommand(
+                f"unsupported governed-theyos-v0126-tag argument: {flag}"
+            )
+        if flag in values:
+            raise UnsafeCommand(
+                f"duplicate governed-theyos-v0126-tag argument: {flag}"
+            )
+        if index + 1 >= len(arguments):
+            raise UnsafeCommand(
+                f"missing value for governed-theyos-v0126-tag argument: {flag}"
+            )
+        values[flag] = arguments[index + 1]
+        index += 2
+    missing = {"--target-oid", "--expected-main"} - values.keys()
+    if missing:
+        raise UnsafeCommand(
+            "missing governed-theyos-v0126-tag arguments: "
+            + ", ".join(sorted(missing))
+        )
+    target_oid = _full_oid(values["--target-oid"], "target OID")
+    expected_main = _full_oid(values["--expected-main"], "expected main OID")
+    if target_oid != expected_main:
+        raise TheyosTagGuardError("tag target and expected main must be identical")
+    return operation, target_oid, expected_main
+
+
+def _assert_theyos_object_database_environment() -> None:
+    present = tuple(
+        key for key in THEYOS_FORBIDDEN_OBJECT_ENVIRONMENT if key in os.environ
+    )
+    if present:
+        raise TheyosTagGuardError(
+            "unsafe Git object database environment is present: "
+            + ", ".join(present)
+        )
+    other_git_environment = tuple(sorted(
+        key
+        for key in os.environ
+        if key in THEYOS_FORBIDDEN_GIT_ENVIRONMENT
+        or key.startswith(THEYOS_FORBIDDEN_GIT_ENVIRONMENT_PREFIXES)
+    ))
+    if other_git_environment:
+        raise TheyosTagGuardError(
+            "unsafe inherited Git environment is present: "
+            + ", ".join(other_git_environment)
+        )
+
+
+def _cargo_package_version(payload: bytes) -> str:
+    match = re.search(
+        rb"(?ms)^\[package\][ \t]*\r?$.*?^version[ \t]*=[ \t]*\"([^\"\r\n]+)\"[ \t]*\r?$",
+        payload,
+    )
+    if match is None:
+        raise TheyosTagGuardError("canonical Cargo package version is missing")
+    return match.group(1).decode("utf-8", errors="strict")
+
+
+def _tag_object_fields(payload: bytes) -> tuple[dict[bytes, bytes], bytes]:
+    header, separator, message = payload.partition(b"\n\n")
+    if not separator:
+        raise TheyosTagGuardError("annotated tag object has no header/message separator")
+    fields: dict[bytes, bytes] = {}
+    for line in header.splitlines():
+        name, separator, value = line.partition(b" ")
+        if not separator or name in fields:
+            raise TheyosTagGuardError("annotated tag object header is malformed or duplicated")
+        fields[name] = value
+    if set(fields) != {b"object", b"type", b"tag", b"tagger"}:
+        raise TheyosTagGuardError("annotated tag object has unexpected headers")
+    if re.fullmatch(rb".+ <[^<>\r\n]+> [0-9]+ [+-][0-9]{4}", fields[b"tagger"]) is None:
+        raise TheyosTagGuardError("annotated tag object tagger is invalid")
+    return fields, message
+
+
+def _assert_local_tag(
+    git: TheyosV0126TagGit,
+    target_oid: str,
+) -> str:
+    tag_object_oid = git.local_ref(THEYOS_TAG_REF)
+    if tag_object_oid is None:
+        raise TheyosTagGuardError("governed local tag is absent")
+    tag_object_oid = _full_oid(tag_object_oid, "local tag object OID")
+    if git.object_type(tag_object_oid) != "tag":
+        raise TheyosTagGuardError("governed local tag is lightweight")
+    fields, message = _tag_object_fields(git.tag_object_bytes(tag_object_oid))
+    if (
+        fields[b"object"].decode("ascii", errors="strict") != target_oid
+        or fields[b"type"] != b"commit"
+        or fields[b"tag"].decode("utf-8", errors="strict") != THEYOS_TAG
+        or message != THEYOS_TAG_MESSAGE.encode("utf-8")
+    ):
+        raise TheyosTagGuardError("governed local annotated tag readback mismatch")
+    return tag_object_oid
+
+
+def _assert_theyos_tag_api_absent(api: GitHubAPI) -> None:
+    if api.read_optional(
+        f"repos/{SAFE_GITHUB_REPO}/git/ref/tags/{THEYOS_TAG}"
+    ) is not None:
+        raise TheyosTagGuardError("governed tag already exists in the GitHub API")
+
+
+def _assert_theyos_main_api(api: GitHubAPI, expected_main: str) -> None:
+    value = _expect_mapping(
+        api.read(f"repos/{SAFE_GITHUB_REPO}/git/ref/heads/main"),
+        "theyos main ref",
+    )
+    target = _expect_mapping(value.get("object"), "theyos main target")
+    if (
+        value.get("ref") != "refs/heads/main"
+        or target.get("type") != "commit"
+        or target.get("sha") != expected_main
+    ):
+        raise TheyosTagGuardError("GitHub API main ref drifted")
+
+
+def _assert_theyos_network_configuration(git: TheyosV0126TagGit) -> None:
+    for key in git.effective_configuration_keys():
+        normalized = key.casefold()
+        remote_proxy = (
+            normalized.startswith("remote.")
+            and normalized.endswith(".proxy")
+        )
+        url_rewrite = normalized.startswith("url.") and normalized.endswith(
+            (".insteadof", ".pushinsteadof")
+        )
+        if normalized.startswith("http.") or remote_proxy or url_rewrite:
+            raise TheyosTagGuardError(
+                f"unsafe persistent Git network configuration is set: {key}"
+            )
+
+
+def _assert_theyos_destination_namespace(
+    git: TheyosV0126TagGit,
+    api: GitHubAPI,
+    expected_main: str,
+) -> None:
+    canonical_origin = (THEYOS_REPOSITORY_URL,)
+    if git.origin_urls(push=False) != canonical_origin:
+        raise TheyosTagGuardError(
+            "origin must have exactly one canonical theyos fetch URL"
+        )
+    if git.origin_urls(push=True) != canonical_origin:
+        raise TheyosTagGuardError(
+            "origin must have exactly one canonical theyos push URL"
+        )
+    _assert_theyos_network_configuration(git)
+    for key in (
+        "remote.origin.push",
+        "remote.origin.receivepack",
+        "push.pushOption",
+        "remote.origin.mirror",
+    ):
+        if git.config_values(key):
+            raise TheyosTagGuardError(f"unsafe Git configuration is set: {key}")
+    if git.origin_main_oid() != expected_main:
+        raise TheyosTagGuardError("origin/main does not equal expected main")
+    branch_ref = f"refs/heads/{THEYOS_TAG}"
+    refs = git.remote_refs(("refs/heads/main", branch_ref))
+    if refs.get("refs/heads/main") != expected_main:
+        raise TheyosTagGuardError("remote main does not equal expected main")
+    if branch_ref in refs:
+        raise TheyosTagGuardError("remote branch makes the tag name ambiguous")
+    if git.local_ref(branch_ref) is not None:
+        raise TheyosTagGuardError("local branch makes the tag name ambiguous")
+    _assert_theyos_main_api(api, expected_main)
+
+
+def _assert_theyos_tag_api_readback(
+    api: GitHubAPI,
+    tag_object_oid: str,
+    target_oid: str,
+) -> None:
+    value = _expect_mapping(
+        api.read(f"repos/{SAFE_GITHUB_REPO}/git/ref/tags/{THEYOS_TAG}"),
+        "theyos tag ref",
+    )
+    target = _expect_mapping(value.get("object"), "theyos tag ref target")
+    if (
+        value.get("ref") != THEYOS_TAG_REF
+        or target.get("type") != "tag"
+        or target.get("sha") != tag_object_oid
+    ):
+        raise TheyosTagGuardError("GitHub API tag ref readback mismatch")
+    tag_object = _expect_mapping(
+        api.read(f"repos/{SAFE_GITHUB_REPO}/git/tags/{tag_object_oid}"),
+        "theyos tag object",
+    )
+    peeled = _expect_mapping(tag_object.get("object"), "theyos tag object target")
+    if (
+        tag_object.get("sha") != tag_object_oid
+        or tag_object.get("tag") != THEYOS_TAG
+        or tag_object.get("message") != THEYOS_TAG_MESSAGE
+        or peeled.get("type") != "commit"
+        or peeled.get("sha") != target_oid
+    ):
+        raise TheyosTagGuardError("GitHub API annotated tag readback mismatch")
+
+
+def _assert_theyos_v0126_preconditions(
+    git: TheyosV0126TagGit,
+    api: GitHubAPI,
+    target_oid: str,
+    expected_main: str,
+) -> None:
+    _assert_theyos_destination_namespace(git, api, expected_main)
+    if git.head_oid() != target_oid:
+        raise TheyosTagGuardError("HEAD does not equal the governed tag target")
+    if git.object_type(target_oid) != "commit":
+        raise TheyosTagGuardError("governed tag target is not a commit")
+    if not git.clean():
+        raise TheyosTagGuardError("worktree is not clean")
+    if git.read_repository_file(THEYOS_VERSION_FILE) != (
+        THEYOS_TAG_VERSION + "\n"
+    ).encode("utf-8"):
+        raise TheyosTagGuardError("VERSION is not exactly the governed version")
+    cargo_version = _cargo_package_version(
+        git.read_repository_file(THEYOS_CARGO_FILE)
+    )
+    if cargo_version != THEYOS_TAG_VERSION:
+        raise TheyosTagGuardError("canonical Cargo version is not the governed version")
+
+
+def execute_governed_theyos_v0126_tag(
+    arguments: Sequence[str],
+    payload: str,
+    *,
+    git: TheyosV0126TagGit | None = None,
+    api: GitHubAPI | None = None,
+) -> int:
+    """Create locally or push the one fixed annotated theyos v0.1.26 tag."""
+    operation, target_oid, expected_main = _parse_theyos_v0126_tag_arguments(
+        arguments
+    )
+    # Reject inherited object-database redirection before constructing or
+    # invoking the Git boundary. Presence is unsafe even when the value is
+    # empty because the caller's environment is then ambiguous.
+    _assert_theyos_object_database_environment()
+    repository = git or TheyosV0126TagGit()
+    client = api or TheyosV0126GitHubAPI()
+    if isinstance(client, TheyosV0126GitHubAPI):
+        client.assert_runtime()
+    repository.assert_runtime(operation)
+    _assert_theyos_v0126_preconditions(
+        repository, client, target_oid, expected_main
+    )
+
+    remote_refs = repository.remote_refs(
+        (THEYOS_TAG_REF, f"{THEYOS_TAG_REF}^{{}}")
+    )
+    if remote_refs:
+        raise TheyosTagGuardError("governed tag already exists remotely")
+    _assert_theyos_tag_api_absent(client)
+
+    if operation == "create":
+        if payload != THEYOS_TAG_MESSAGE:
+            raise TheyosTagGuardError(
+                "annotated tag message must equal the fixed governed message"
+            )
+        if repository.local_ref(THEYOS_TAG_REF) is not None:
+            raise TheyosTagGuardError("governed local tag already exists")
+        repository.create_tag(target_oid, payload.encode("utf-8"))
+        tag_object_oid = _assert_local_tag(repository, target_oid)
+        if repository.remote_refs(
+            (THEYOS_TAG_REF, f"{THEYOS_TAG_REF}^{{}}")
+        ):
+            raise TheyosTagGuardError("governed tag appeared during creation")
+        _assert_theyos_tag_api_absent(client)
+        _assert_theyos_v0126_preconditions(
+            repository, client, target_oid, expected_main
+        )
+    else:
+        if payload:
+            raise TheyosTagGuardError("tag push accepts no payload")
+        tag_object_oid = _assert_local_tag(repository, target_oid)
+        # Re-read every moving precondition immediately before the sole push.
+        _assert_theyos_v0126_preconditions(
+            repository, client, target_oid, expected_main
+        )
+        if repository.remote_refs(
+            (THEYOS_TAG_REF, f"{THEYOS_TAG_REF}^{{}}")
+        ):
+            raise TheyosTagGuardError("governed tag appeared before push")
+        _assert_theyos_tag_api_absent(client)
+        repository.push_tag()
+        if _assert_local_tag(repository, target_oid) != tag_object_oid:
+            raise TheyosTagGuardError("local tag object drifted during push")
+        remote_refs = repository.remote_refs(
+            (THEYOS_TAG_REF, f"{THEYOS_TAG_REF}^{{}}")
+        )
+        if remote_refs != {
+            THEYOS_TAG_REF: tag_object_oid,
+            f"{THEYOS_TAG_REF}^{{}}": target_oid,
+        }:
+            raise TheyosTagGuardError("remote tag ref or peeled target mismatch")
+        _assert_theyos_tag_api_readback(
+            client, tag_object_oid, target_oid
+        )
+        _assert_theyos_v0126_preconditions(
+            repository, client, target_oid, expected_main
+        )
+
+    print(
+        json.dumps(
+            {
+                "operation": f"governed-theyos-v0126-tag-{operation}",
+                "tag_ref": THEYOS_TAG_REF,
+                "tag_object_oid": tag_object_oid,
+                "target_oid": target_oid,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     payload, forwarded_stdin = _read_payload(args)
@@ -1557,6 +2670,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             return execute_governed_ios_pr_body_update(command[1:], payload)
         except (UnsafeCommand, ReleaseGuardError, GitHubAPIError) as error:
+            print(f"BLOCKED: {error}", file=sys.stderr)
+            return 2
+
+    if command[:1] == ["governed-theyos-v0126-tag"]:
+        try:
+            return execute_governed_theyos_v0126_tag(command[1:], payload)
+        except (
+            UnsafeCommand,
+            ReleaseGuardError,
+            TheyosTagGuardError,
+            GitHubAPIError,
+        ) as error:
             print(f"BLOCKED: {error}", file=sys.stderr)
             return 2
 
