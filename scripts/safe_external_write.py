@@ -594,6 +594,103 @@ class GitHubAPI:
             raise ReleaseGuardError("asset upload returned non-JSON success") from error
 
 
+class TheyosV0126GitHubAPI(GitHubAPI):
+    """Read-only API boundary for the governed theyos v0.1.26 tag."""
+
+    @staticmethod
+    def _environment() -> dict[str, str]:
+        return {
+            "HOME": pwd.getpwuid(os.getuid()).pw_dir,
+            "LC_ALL": "C",
+            "GH_HOST": SAFE_GITHUB_HOST,
+            "GH_REPO": SAFE_GITHUB_REPO,
+        }
+
+    def assert_runtime(self) -> None:
+        gh_path = Path(THEYOS_GH_EXECUTABLE)
+        if not gh_path.is_absolute() or not gh_path.is_file() or not os.access(
+            gh_path, os.X_OK
+        ):
+            raise TheyosTagGuardError("approved absolute gh executable is unavailable")
+        if str(gh_path.resolve(strict=True)) != THEYOS_GH_REALPATH:
+            raise TheyosTagGuardError("approved gh executable realpath mismatch")
+        version = subprocess.run(
+            [THEYOS_GH_EXECUTABLE, "--version"],
+            capture_output=True,
+            check=False,
+            env=self._environment(),
+        )
+        expected_prefix = f"gh version {THEYOS_GH_VERSION} ".encode("ascii")
+        if (
+            version.returncode != 0
+            or not version.stdout.startswith(expected_prefix)
+            or version.stderr
+        ):
+            raise TheyosTagGuardError("approved gh executable version mismatch")
+        auth = subprocess.run(
+            [
+                THEYOS_GH_EXECUTABLE,
+                "auth",
+                "status",
+                "--hostname",
+                SAFE_GITHUB_HOST,
+            ],
+            capture_output=True,
+            check=False,
+            env=self._environment(),
+        )
+        if auth.returncode != 0:
+            raise TheyosTagGuardError("approved gh API client is not authenticated")
+
+    def _request(
+        self,
+        method: str,
+        endpoint: str,
+        *,
+        body: bytes | None = None,
+        headers: Sequence[str] = (),
+        paginate: bool = False,
+    ) -> Any:
+        command = [
+            THEYOS_GH_EXECUTABLE,
+            "api",
+            "--hostname",
+            SAFE_GITHUB_HOST,
+            "--method",
+            method,
+            "--header",
+            "Accept: application/vnd.github+json",
+            "--header",
+            "X-GitHub-Api-Version: 2022-11-28",
+        ]
+        for header in headers:
+            command.extend(["--header", header])
+        if paginate:
+            command.extend(["--paginate", "--slurp"])
+        command.append(endpoint)
+        if body is not None:
+            command.extend(["--input", "-"])
+        completed = subprocess.run(
+            command,
+            input=body,
+            capture_output=True,
+            check=False,
+            env=self._environment(),
+        )
+        if completed.returncode:
+            raise GitHubAPIError(
+                command,
+                completed.returncode,
+                completed.stderr.decode("utf-8", errors="replace"),
+            )
+        try:
+            return json.loads(completed.stdout)
+        except json.JSONDecodeError as error:
+            raise TheyosTagGuardError(
+                f"GitHub API returned non-JSON success for {method} {endpoint}"
+            ) from error
+
+
 @dataclass(frozen=True)
 class ReleaseCommon:
     tag_ref: str
@@ -2191,7 +2288,9 @@ def execute_governed_theyos_v0126_tag(
     # empty because the caller's environment is then ambiguous.
     _assert_theyos_object_database_environment()
     repository = git or TheyosV0126TagGit()
-    client = api or GitHubAPI()
+    client = api or TheyosV0126GitHubAPI()
+    if isinstance(client, TheyosV0126GitHubAPI):
+        client.assert_runtime()
     repository.assert_runtime(operation)
     _assert_theyos_v0126_preconditions(
         repository, client, target_oid, expected_main

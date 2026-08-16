@@ -838,6 +838,9 @@ class FakeTheyosTagAPI:
         self.tag_object_oid = tag_object_oid
         self.tag_target = target_oid
 
+    def assert_runtime(self) -> None:
+        return None
+
     def read_optional(self, endpoint: str) -> Any | None:
         if endpoint.endswith(f"/git/ref/tags/{guard.THEYOS_TAG}"):
             return self.read(endpoint) if self.tag_object_oid is not None else None
@@ -1611,6 +1614,93 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                 self.assertRaisesRegex(guard.TheyosTagGuardError, expected_error),
             ):
                 guard.TheyosV0126TagGit().assert_runtime("push")
+
+    def test_dedicated_api_uses_only_absolute_approved_gh_and_minimal_env(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            path_bin = root_path / "path-bin"
+            path_bin.mkdir()
+            path_marker = root_path / "path-marker"
+            approved_marker = root_path / "approved-marker"
+            path_gh = path_bin / "gh"
+            path_gh.write_text(
+                f"#!/bin/sh\ntouch {path_marker}\nexit 91\n",
+                encoding="utf-8",
+            )
+            path_gh.chmod(0o755)
+            approved_gh = root_path / "approved-gh"
+            approved_gh.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, pathlib, sys\n"
+                f"pathlib.Path({str(approved_marker)!r}).touch()\n"
+                "for key in ('GH_CONFIG_DIR','GH_TOKEN','GITHUB_TOKEN',"
+                "'HTTPS_PROXY','HTTP_PROXY','ALL_PROXY','SSL_CERT_FILE',"
+                "'SSL_CERT_DIR'):\n"
+                "    assert key not in os.environ, key\n"
+                "if sys.argv[1:] == ['--version']:\n"
+                f"    print('gh version {guard.THEYOS_GH_VERSION} (fixture)')\n"
+                "elif sys.argv[1:3] == ['auth','status']:\n"
+                "    pass\n"
+                "elif sys.argv[1] == 'api':\n"
+                "    print(json.dumps({'ref':'refs/heads/main',"
+                f"'object':{{'type':'commit','sha':'{THEYOS_TAG_TARGET}'}}}}))\n"
+                "else:\n"
+                "    raise SystemExit(92)\n",
+                encoding="utf-8",
+            )
+            approved_gh.chmod(0o755)
+            inherited = {
+                "PATH": f"{path_bin}:/usr/bin:/bin",
+                "GH_CONFIG_DIR": str(root_path / "evil-config"),
+                "GH_HOST": "attacker.invalid",
+                "GH_TOKEN": "fixture-token",
+                "GITHUB_TOKEN": "fixture-token",
+                "HTTPS_PROXY": "http://attacker.invalid",
+                "HTTP_PROXY": "http://attacker.invalid",
+                "ALL_PROXY": "http://attacker.invalid",
+                "SSL_CERT_FILE": str(root_path / "evil-cert"),
+                "SSL_CERT_DIR": str(root_path / "evil-certs"),
+            }
+            with (
+                mock.patch.dict(guard.os.environ, inherited, clear=False),
+                mock.patch.object(
+                    guard, "THEYOS_GH_EXECUTABLE", str(approved_gh)
+                ),
+                mock.patch.object(
+                    guard, "THEYOS_GH_REALPATH", str(approved_gh.resolve())
+                ),
+            ):
+                client = guard.TheyosV0126GitHubAPI()
+                client.assert_runtime()
+                payload = client.read(
+                    f"repos/{guard.SAFE_GITHUB_REPO}/git/ref/heads/main"
+                )
+            self.assertEqual(THEYOS_TAG_TARGET, payload["object"]["sha"])
+            self.assertTrue(approved_marker.exists())
+            self.assertFalse(path_marker.exists())
+
+    def test_dedicated_api_identity_failure_blocks_create_and_push_pre_mutation(self) -> None:
+        for operation in ("create", "push"):
+            with self.subTest(operation=operation):
+                self.setUp()
+                if operation == "push":
+                    self.git.add_local_tag()
+                with (
+                    mock.patch.object(
+                        guard.TheyosV0126GitHubAPI,
+                        "assert_runtime",
+                        side_effect=guard.TheyosTagGuardError("bad API client"),
+                    ),
+                    self.assertRaisesRegex(
+                        guard.TheyosTagGuardError, "bad API client"
+                    ),
+                ):
+                    guard.execute_governed_theyos_v0126_tag(
+                        self.arguments(operation),
+                        guard.THEYOS_TAG_MESSAGE if operation == "create" else "",
+                        git=self.git,
+                    )
+                self.assertEqual([], self.git.mutations)
 
     def test_real_git_boundary_disables_executable_fsmonitor(self) -> None:
         for guarded in (False, True):
