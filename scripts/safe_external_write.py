@@ -1731,6 +1731,39 @@ class TheyosV0126TagGit:
             )
         return completed
 
+    @staticmethod
+    def _remote_configuration(*, authenticated: bool) -> list[str]:
+        configuration = [
+            "-c",
+            "credential.helper=",
+            "-c",
+            f"credential.{THEYOS_REPOSITORY_URL}.helper=",
+            "-c",
+            "http.extraHeader=",
+            "-c",
+            f"http.{THEYOS_REPOSITORY_URL}.extraHeader=",
+            "-c",
+            "http.cookieFile=",
+            "-c",
+            f"http.{THEYOS_REPOSITORY_URL}.cookieFile=",
+            "-c",
+            "http.saveCookies=false",
+            "-c",
+            f"http.{THEYOS_REPOSITORY_URL}.saveCookies=false",
+            "-c",
+            "http.proxy=",
+            "-c",
+            f"http.{THEYOS_REPOSITORY_URL}.proxy=",
+        ]
+        if authenticated:
+            configuration.extend(
+                [
+                    "-c",
+                    f"credential.helper={THEYOS_GH_CREDENTIAL_HELPER}",
+                ]
+            )
+        return configuration
+
     def output(
         self,
         arguments: Sequence[str],
@@ -2001,7 +2034,14 @@ class TheyosV0126TagGit:
         return oid
 
     def remote_refs(self, refs: Sequence[str]) -> dict[str, str]:
-        _, output = self.output(["ls-remote", "origin", *refs])
+        _, output = self.output(
+            [
+                *self._remote_configuration(authenticated=False),
+                "ls-remote",
+                THEYOS_REPOSITORY_URL,
+                *refs,
+            ]
+        )
         found: dict[str, str] = {}
         for raw_line in output.splitlines():
             fields = raw_line.decode("ascii", errors="strict").split("\t")
@@ -2031,10 +2071,7 @@ class TheyosV0126TagGit:
     def push_tag(self) -> None:
         self._run(
             [
-                "-c",
-                "credential.helper=",
-                "-c",
-                f"credential.helper={THEYOS_GH_CREDENTIAL_HELPER}",
+                *self._remote_configuration(authenticated=True),
                 "-c",
                 "push.followTags=false",
                 "-c",

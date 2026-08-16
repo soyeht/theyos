@@ -2855,6 +2855,24 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                 "-c",
                 "credential.helper=",
                 "-c",
+                f"credential.{guard.THEYOS_REPOSITORY_URL}.helper=",
+                "-c",
+                "http.extraHeader=",
+                "-c",
+                f"http.{guard.THEYOS_REPOSITORY_URL}.extraHeader=",
+                "-c",
+                "http.cookieFile=",
+                "-c",
+                f"http.{guard.THEYOS_REPOSITORY_URL}.cookieFile=",
+                "-c",
+                "http.saveCookies=false",
+                "-c",
+                f"http.{guard.THEYOS_REPOSITORY_URL}.saveCookies=false",
+                "-c",
+                "http.proxy=",
+                "-c",
+                f"http.{guard.THEYOS_REPOSITORY_URL}.proxy=",
+                "-c",
                 f"credential.helper={guard.THEYOS_GH_CREDENTIAL_HELPER}",
                 "-c",
                 "push.followTags=false",
@@ -2874,6 +2892,305 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
         self.assertTrue(run.call_args.kwargs["capture_output"])
         self.assertFalse(run.call_args.kwargs["check"])
         self.assertEqual(repository._environment(), run.call_args.kwargs["env"])
+
+    def test_remote_read_command_is_exact_and_anonymous(self) -> None:
+        completed = mock.Mock(
+            returncode=0,
+            stdout=f"{THEYOS_TAG_TARGET}\trefs/heads/main\n".encode("ascii"),
+            stderr=b"",
+        )
+        repository = guard.TheyosV0126TagGit()
+        with mock.patch.object(
+            guard.subprocess, "run", return_value=completed
+        ) as run:
+            refs = repository.remote_refs(("refs/heads/main",))
+        self.assertEqual({"refs/heads/main": THEYOS_TAG_TARGET}, refs)
+        run.assert_called_once()
+        self.assertEqual(
+            [
+                guard.THEYOS_GIT_EXECUTABLE,
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.attributesFile=/dev/null",
+                "-c",
+                "core.askPass=/usr/bin/false",
+                "-c",
+                "credential.helper=",
+                "-c",
+                f"credential.{guard.THEYOS_REPOSITORY_URL}.helper=",
+                "-c",
+                "http.extraHeader=",
+                "-c",
+                f"http.{guard.THEYOS_REPOSITORY_URL}.extraHeader=",
+                "-c",
+                "http.cookieFile=",
+                "-c",
+                f"http.{guard.THEYOS_REPOSITORY_URL}.cookieFile=",
+                "-c",
+                "http.saveCookies=false",
+                "-c",
+                f"http.{guard.THEYOS_REPOSITORY_URL}.saveCookies=false",
+                "-c",
+                "http.proxy=",
+                "-c",
+                f"http.{guard.THEYOS_REPOSITORY_URL}.proxy=",
+                "ls-remote",
+                guard.THEYOS_REPOSITORY_URL,
+                "refs/heads/main",
+            ],
+            run.call_args.args[0],
+        )
+        self.assertEqual(repository._environment(), run.call_args.kwargs["env"])
+
+    def test_real_remote_read_neutralizes_local_credentials_and_headers(self) -> None:
+        class UnauthorizedHandler(http.server.BaseHTTPRequestHandler):
+            authorization_headers: list[str | None] = []
+
+            def do_GET(self) -> None:
+                self.authorization_headers.append(self.headers.get("Authorization"))
+                self.send_response(401)
+                self.send_header("WWW-Authenticate", 'Basic realm="fixture"')
+                self.end_headers()
+
+            def log_message(self, format: str, *args: object) -> None:
+                del format, args
+
+        for helper_scope in ("generic", "url-specific"):
+            with self.subTest(helper_scope=helper_scope), tempfile.TemporaryDirectory() as root:
+                root_path = Path(root)
+                repository = root_path / "repository"
+                side_remote = root_path / "side.git"
+                subprocess.run(
+                    ["git", "init", "--bare", str(side_remote)],
+                    check=True,
+                    capture_output=True,
+                )
+                subprocess.run(
+                    ["git", "init", str(repository)],
+                    check=True,
+                    capture_output=True,
+                )
+                for key, value in (
+                    ("user.name", "Release Test"),
+                    ("user.email", "release@example.invalid"),
+                ):
+                    subprocess.run(
+                        ["git", "-C", str(repository), "config", key, value],
+                        check=True,
+                    )
+                tracked = repository / "tracked.txt"
+                tracked.write_text("reviewed bytes\n", encoding="utf-8")
+                subprocess.run(
+                    ["git", "-C", str(repository), "add", "tracked.txt"],
+                    check=True,
+                )
+                subprocess.run(
+                    ["git", "-C", str(repository), "commit", "-m", "fixture"],
+                    check=True,
+                    capture_output=True,
+                )
+                target_oid = subprocess.run(
+                    ["git", "-C", str(repository), "rev-parse", "HEAD"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                subprocess.run(
+                    ["git", "-C", str(repository), "tag", "unrelated"],
+                    check=True,
+                )
+                marker = root_path / "malicious-helper-executed"
+                helper = root_path / "malicious-helper"
+                helper.write_text(
+                    "#!/bin/sh\n"
+                    f": > {marker}\n"
+                    f"/usr/bin/git push --no-verify {side_remote} "
+                    "refs/tags/unrelated:refs/tags/unrelated >/dev/null 2>&1\n"
+                    "if test \"$1\" = get; then\n"
+                    "  printf 'username=wrong\\npassword=wrong\\n'\n"
+                    "fi\n",
+                    encoding="utf-8",
+                )
+                helper.chmod(0o700)
+
+                server = http.server.ThreadingHTTPServer(
+                    ("127.0.0.1", 0), UnauthorizedHandler
+                )
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    port = server.server_address[1]
+                    remote_url = f"http://127.0.0.1:{port}/repository.git"
+                    helper_key = (
+                        "credential.helper"
+                        if helper_scope == "generic"
+                        else f"credential.{remote_url}.helper"
+                    )
+                    subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(repository),
+                            "config",
+                            "--add",
+                            helper_key,
+                            f"!{helper}",
+                        ],
+                        check=True,
+                    )
+                    subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(repository),
+                            "config",
+                            f"http.{remote_url}.extraHeader",
+                            "Authorization: Basic invalid",
+                        ],
+                        check=True,
+                    )
+                    weakened = subprocess.run(
+                        [
+                            guard.THEYOS_GIT_EXECUTABLE,
+                            "ls-remote",
+                            remote_url,
+                            "refs/heads/main",
+                        ],
+                        capture_output=True,
+                        check=False,
+                        cwd=repository,
+                        env=guard.TheyosV0126TagGit._environment(),
+                    )
+                    self.assertNotEqual(0, weakened.returncode)
+                    self.assertTrue(marker.exists())
+                    side_ref = subprocess.run(
+                        [
+                            "git",
+                            "--git-dir",
+                            str(side_remote),
+                            "rev-parse",
+                            "--verify",
+                            "refs/tags/unrelated",
+                        ],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    ).stdout.strip()
+                    self.assertEqual(target_oid, side_ref)
+
+                    marker.unlink()
+                    subprocess.run(
+                        [
+                            "git",
+                            "--git-dir",
+                            str(side_remote),
+                            "update-ref",
+                            "-d",
+                            "refs/tags/unrelated",
+                        ],
+                        check=True,
+                    )
+                    for operation in ("create", "push"):
+                        with self.subTest(operation=operation):
+                            UnauthorizedHandler.authorization_headers.clear()
+                            api = FakeTheyosTagAPI()
+                            state = FakeTheyosTagGit(api)
+                            state.fetch_urls = (remote_url,)
+                            state.push_urls = (remote_url,)
+                            if operation == "push":
+                                state.add_local_tag()
+                            real_remote = guard.TheyosV0126TagGit()
+                            state.remote_refs = real_remote.remote_refs
+                            stdout = io.StringIO()
+                            with (
+                                contextlib.chdir(repository),
+                                mock.patch.object(
+                                    guard, "THEYOS_REPOSITORY_URL", remote_url
+                                ),
+                                contextlib.redirect_stdout(stdout),
+                                self.assertRaises(guard.TheyosTagGuardError),
+                            ):
+                                guard.execute_governed_theyos_v0126_tag(
+                                    self.arguments(operation),
+                                    "",
+                                    git=state,
+                                    api=api,
+                                )
+                            self.assertEqual([], state.mutations)
+                            self.assertEqual("", stdout.getvalue())
+                            self.assertFalse(marker.exists())
+                            self.assertTrue(
+                                UnauthorizedHandler.authorization_headers
+                            )
+                            self.assertTrue(
+                                all(
+                                    header is None
+                                    for header in UnauthorizedHandler.authorization_headers
+                                )
+                            )
+                            absent = subprocess.run(
+                                [
+                                    "git",
+                                    "--git-dir",
+                                    str(side_remote),
+                                    "rev-parse",
+                                    "--verify",
+                                    "--quiet",
+                                    "refs/tags/unrelated",
+                                ],
+                                capture_output=True,
+                                check=False,
+                            )
+                            self.assertNotEqual(0, absent.returncode)
+                finally:
+                    server.shutdown()
+                    server.server_close()
+                    thread.join(timeout=5)
+
+    def test_real_remote_read_succeeds_without_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            source = root_path / "source"
+            remote = root_path / "remote.git"
+            subprocess.run(["git", "init", str(source)], check=True, capture_output=True)
+            for key, value in (
+                ("user.name", "Release Test"),
+                ("user.email", "release@example.invalid"),
+            ):
+                subprocess.run(
+                    ["git", "-C", str(source), "config", key, value], check=True
+                )
+            (source / "tracked.txt").write_text("reviewed bytes\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(source), "add", "tracked.txt"], check=True)
+            subprocess.run(
+                ["git", "-C", str(source), "commit", "-m", "fixture"],
+                check=True,
+                capture_output=True,
+            )
+            target_oid = subprocess.run(
+                ["git", "-C", str(source), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            subprocess.run(
+                ["git", "clone", "--bare", str(source), str(remote)],
+                check=True,
+                capture_output=True,
+            )
+            with (
+                contextlib.chdir(source),
+                mock.patch.object(
+                    guard, "THEYOS_REPOSITORY_URL", remote.as_uri()
+                ),
+            ):
+                refs = guard.TheyosV0126TagGit().remote_refs(
+                    ("refs/heads/main",)
+                )
+            self.assertEqual({"refs/heads/main": target_oid}, refs)
 
     def test_real_credential_boundary_uses_only_the_fixed_helper(self) -> None:
         class UnauthorizedHandler(http.server.BaseHTTPRequestHandler):
