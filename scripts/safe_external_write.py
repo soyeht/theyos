@@ -1754,6 +1754,14 @@ class TheyosV0126TagGit:
             "http.proxy=",
             "-c",
             f"http.{THEYOS_REPOSITORY_URL}.proxy=",
+            "-c",
+            "http.sslVerify=true",
+            "-c",
+            f"http.{THEYOS_REPOSITORY_URL}.sslVerify=true",
+            "-c",
+            "http.curloptResolve=",
+            "-c",
+            f"http.{THEYOS_REPOSITORY_URL}.curloptResolve=",
         ]
         if authenticated:
             configuration.extend(
@@ -1796,6 +1804,25 @@ class TheyosV0126TagGit:
         if returncode == 1:
             return ()
         return tuple(output.decode("utf-8", errors="strict").splitlines())
+
+    def effective_configuration_keys(self) -> tuple[str, ...]:
+        _, output = self.output(
+            ["config", "--includes", "--null", "--name-only", "--list"]
+        )
+        keys: list[str] = []
+        for raw_key in self._split_zero_records(output):
+            try:
+                key = raw_key.decode("utf-8", errors="strict")
+            except UnicodeDecodeError as error:
+                raise TheyosTagGuardError(
+                    "effective Git configuration key is not UTF-8"
+                ) from error
+            if not key:
+                raise TheyosTagGuardError(
+                    "effective Git configuration key is empty"
+                )
+            keys.append(key)
+        return tuple(keys)
 
     def head_oid(self) -> str:
         _, output = self.output(["rev-parse", "HEAD"])
@@ -2081,7 +2108,7 @@ class TheyosV0126TagGit:
                 "--no-signed",
                 "--no-verify",
                 "--porcelain",
-                "origin",
+                THEYOS_REPOSITORY_URL,
                 f"{THEYOS_TAG_REF}:{THEYOS_TAG_REF}",
             ]
         )
@@ -2219,6 +2246,22 @@ def _assert_theyos_main_api(api: GitHubAPI, expected_main: str) -> None:
         raise TheyosTagGuardError("GitHub API main ref drifted")
 
 
+def _assert_theyos_network_configuration(git: TheyosV0126TagGit) -> None:
+    for key in git.effective_configuration_keys():
+        normalized = key.casefold()
+        remote_proxy = (
+            normalized.startswith("remote.")
+            and normalized.endswith(".proxy")
+        )
+        url_rewrite = normalized.startswith("url.") and normalized.endswith(
+            (".insteadof", ".pushinsteadof")
+        )
+        if normalized.startswith("http.") or remote_proxy or url_rewrite:
+            raise TheyosTagGuardError(
+                f"unsafe persistent Git network configuration is set: {key}"
+            )
+
+
 def _assert_theyos_destination_namespace(
     git: TheyosV0126TagGit,
     api: GitHubAPI,
@@ -2233,6 +2276,7 @@ def _assert_theyos_destination_namespace(
         raise TheyosTagGuardError(
             "origin must have exactly one canonical theyos push URL"
         )
+    _assert_theyos_network_configuration(git)
     for key in (
         "remote.origin.push",
         "remote.origin.receivepack",

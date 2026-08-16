@@ -9,6 +9,7 @@ test can reach GitHub.
 
 from __future__ import annotations
 
+import ast
 import base64
 import contextlib
 import copy
@@ -938,6 +939,9 @@ class FakeTheyosTagGit:
     def config_values(self, key: str) -> tuple[str, ...]:
         return self.config.get(key, ())
 
+    def effective_configuration_keys(self) -> tuple[str, ...]:
+        return tuple(self.config)
+
     def head_oid(self) -> str:
         return self.head
 
@@ -988,6 +992,48 @@ class FakeTheyosTagGit:
 
 
 class GovernedTheyosV0126TagTests(unittest.TestCase):
+    def _push_tag_to_isolated_destination(self, destination: str) -> None:
+        self.assertNotEqual(guard.THEYOS_REPOSITORY_URL, destination)
+        self.assertTrue(
+            destination.startswith("file://")
+            or destination.startswith("http://127.0.0.1:"),
+            f"real push control destination is not isolated: {destination}",
+        )
+        with mock.patch.object(guard, "THEYOS_REPOSITORY_URL", destination):
+            guard.TheyosV0126TagGit().push_tag()
+
+    def test_real_push_controls_cannot_call_the_production_destination_directly(
+        self,
+    ) -> None:
+        class DirectPushVisitor(ast.NodeVisitor):
+            def __init__(self) -> None:
+                self.functions: list[str] = []
+                self.callers: list[str] = []
+
+            def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+                self.functions.append(node.name)
+                self.generic_visit(node)
+                self.functions.pop()
+
+            def visit_Call(self, node: ast.Call) -> None:
+                function = node.func
+                receiver = function.value if isinstance(function, ast.Attribute) else None
+                constructor = receiver.func if isinstance(receiver, ast.Call) else None
+                if (
+                    isinstance(function, ast.Attribute)
+                    and function.attr == "push_tag"
+                    and isinstance(constructor, ast.Attribute)
+                    and constructor.attr == "TheyosV0126TagGit"
+                ):
+                    self.callers.append(self.functions[-1])
+                self.generic_visit(node)
+
+        visitor = DirectPushVisitor()
+        visitor.visit(ast.parse(Path(__file__).read_text(encoding="utf-8")))
+        self.assertEqual(
+            ["_push_tag_to_isolated_destination"], visitor.callers
+        )
+
     @staticmethod
     def weakened_git_run_without_environment_guard(
         disabled_environment_key: str,
@@ -2873,6 +2919,14 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                 "-c",
                 f"http.{guard.THEYOS_REPOSITORY_URL}.proxy=",
                 "-c",
+                "http.sslVerify=true",
+                "-c",
+                f"http.{guard.THEYOS_REPOSITORY_URL}.sslVerify=true",
+                "-c",
+                "http.curloptResolve=",
+                "-c",
+                f"http.{guard.THEYOS_REPOSITORY_URL}.curloptResolve=",
+                "-c",
                 f"credential.helper={guard.THEYOS_GH_CREDENTIAL_HELPER}",
                 "-c",
                 "push.followTags=false",
@@ -2883,7 +2937,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                 "--no-signed",
                 "--no-verify",
                 "--porcelain",
-                "origin",
+                guard.THEYOS_REPOSITORY_URL,
                 f"{guard.THEYOS_TAG_REF}:{guard.THEYOS_TAG_REF}",
             ],
             run.call_args.args[0],
@@ -2937,6 +2991,14 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                 "http.proxy=",
                 "-c",
                 f"http.{guard.THEYOS_REPOSITORY_URL}.proxy=",
+                "-c",
+                "http.sslVerify=true",
+                "-c",
+                f"http.{guard.THEYOS_REPOSITORY_URL}.sslVerify=true",
+                "-c",
+                "http.curloptResolve=",
+                "-c",
+                f"http.{guard.THEYOS_REPOSITORY_URL}.curloptResolve=",
                 "ls-remote",
                 guard.THEYOS_REPOSITORY_URL,
                 "refs/heads/main",
@@ -3248,6 +3310,337 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                 )
             self.assertEqual({"refs/heads/main": target_oid}, refs)
 
+    def test_persistent_network_configuration_is_rejected_with_includes(self) -> None:
+        unsafe_cases = (
+            ("remote.origin.proxy", "http://127.0.0.1:9"),
+            ("remote.secondary.proxy", "http://127.0.0.1:9"),
+            ("http.proxy", "http://127.0.0.1:9"),
+            (
+                f"http.{guard.THEYOS_REPOSITORY_URL}.proxy",
+                "http://127.0.0.1:9",
+            ),
+            ("http.curloptResolve", "github.com:443:127.0.0.1"),
+            ("http.sslCAInfo", "/tmp/adversarial-ca.pem"),
+            ("http.sslCAPath", "/tmp/adversarial-ca"),
+            ("http.sslCert", "/tmp/adversarial-cert.pem"),
+            ("http.sslKey", "/tmp/adversarial-key.pem"),
+            ("http.sslVerify", "false"),
+            ("http.extraHeader", "Authorization: Basic invalid"),
+            ("http.cookieFile", "/tmp/adversarial-cookies"),
+            ("url.https://adversary.invalid/.insteadOf", "https://github.com/"),
+            (
+                "url.https://adversary.invalid/.pushInsteadOf",
+                "https://github.com/",
+            ),
+        )
+        for source in ("local", "include"):
+            for key, value in unsafe_cases:
+                with (
+                    self.subTest(source=source, key=key),
+                    tempfile.TemporaryDirectory() as root,
+                ):
+                    root_path = Path(root)
+                    repository_path = root_path / "repository"
+                    subprocess.run(
+                        ["git", "init", str(repository_path)],
+                        check=True,
+                        capture_output=True,
+                    )
+                    if source == "local":
+                        subprocess.run(
+                            [
+                                "git",
+                                "-C",
+                                str(repository_path),
+                                "config",
+                                "--add",
+                                key,
+                                value,
+                            ],
+                            check=True,
+                        )
+                    else:
+                        included = root_path / "included.config"
+                        subprocess.run(
+                            [
+                                "git",
+                                "config",
+                                "--file",
+                                str(included),
+                                "--add",
+                                key,
+                                value,
+                            ],
+                            check=True,
+                        )
+                        subprocess.run(
+                            [
+                                "git",
+                                "-C",
+                                str(repository_path),
+                                "config",
+                                "--add",
+                                "include.path",
+                                str(included),
+                            ],
+                            check=True,
+                        )
+                    real = guard.TheyosV0126TagGit()
+                    with contextlib.chdir(repository_path):
+                        effective = real.effective_configuration_keys()
+                    self.assertIn(key.casefold(), {item.casefold() for item in effective})
+
+                    for operation in ("create", "push"):
+                        api = FakeTheyosTagAPI()
+                        state = FakeTheyosTagGit(api)
+                        if operation == "push":
+                            state.add_local_tag()
+                        state.effective_configuration_keys = (
+                            real.effective_configuration_keys
+                        )
+                        stdout = io.StringIO()
+                        with (
+                            contextlib.chdir(repository_path),
+                            contextlib.redirect_stdout(stdout),
+                            self.assertRaises(guard.TheyosTagGuardError),
+                        ):
+                            guard.execute_governed_theyos_v0126_tag(
+                                self.arguments(operation),
+                                "",
+                                git=state,
+                                api=api,
+                            )
+                        self.assertEqual([], state.mutations)
+                        self.assertEqual("", stdout.getvalue())
+
+        with tempfile.TemporaryDirectory() as root:
+            repository_path = Path(root) / "repository"
+            subprocess.run(
+                ["git", "init", str(repository_path)],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repository_path),
+                    "remote",
+                    "add",
+                    "origin",
+                    guard.THEYOS_REPOSITORY_URL,
+                ],
+                check=True,
+            )
+            with contextlib.chdir(repository_path):
+                guard._assert_theyos_network_configuration(
+                    guard.TheyosV0126TagGit()
+                )
+
+    def test_real_origin_proxy_is_rejected_before_contact_or_credentials(self) -> None:
+        class ProxyHandler(http.server.BaseHTTPRequestHandler):
+            authorization_headers: list[str | None] = []
+
+            def do_GET(self) -> None:
+                self.authorization_headers.append(self.headers.get("Authorization"))
+                self.send_response(401)
+                self.send_header("WWW-Authenticate", 'Basic realm="proxy-fixture"')
+                self.end_headers()
+
+            def log_message(self, format: str, *args: object) -> None:
+                del format, args
+
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            repository_path = root_path / "repository"
+            side_remote = root_path / "side.git"
+            subprocess.run(
+                ["git", "init", "--bare", str(side_remote)],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "init", "--initial-branch=main", str(repository_path)],
+                check=True,
+                capture_output=True,
+            )
+            for key, value in (
+                ("user.name", "Release Test"),
+                ("user.email", "release@example.invalid"),
+            ):
+                subprocess.run(
+                    ["git", "-C", str(repository_path), "config", key, value],
+                    check=True,
+                )
+            tracked = repository_path / "tracked.txt"
+            tracked.write_text("reviewed bytes\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "-C", str(repository_path), "add", "tracked.txt"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repository_path), "commit", "-m", "fixture"],
+                check=True,
+                capture_output=True,
+            )
+            target_oid = subprocess.run(
+                ["git", "-C", str(repository_path), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            subprocess.run(
+                ["git", "-C", str(repository_path), "tag", "unrelated"],
+                check=True,
+            )
+            marker = root_path / "malicious-helper-executed"
+            helper = root_path / "malicious-helper"
+            helper.write_text(
+                "#!/bin/sh\n"
+                f": > {marker}\n"
+                f"/usr/bin/git -C {repository_path} push --no-verify "
+                f"{side_remote} refs/tags/unrelated:refs/tags/unrelated\n"
+                "if test \"$1\" = get; then\n"
+                "  printf 'username=fixture\\npassword=fixture\\n'\n"
+                "fi\n",
+                encoding="utf-8",
+            )
+            helper.chmod(0o700)
+
+            server = http.server.ThreadingHTTPServer(
+                ("127.0.0.1", 0), ProxyHandler
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            canonical_url = "http://example.invalid/soyeht/theyos.git"
+            try:
+                proxy_url = f"http://127.0.0.1:{server.server_address[1]}"
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(repository_path),
+                        "remote",
+                        "add",
+                        "origin",
+                        canonical_url,
+                    ],
+                    check=True,
+                )
+                for key, value in (
+                    ("remote.origin.proxy", proxy_url),
+                    ("http.sslVerify", "false"),
+                    ("credential.helper", f"!{helper}"),
+                ):
+                    subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(repository_path),
+                            "config",
+                            "--add",
+                            key,
+                            value,
+                        ],
+                        check=True,
+                    )
+                weakened = subprocess.run(
+                    [
+                        guard.THEYOS_GIT_EXECUTABLE,
+                        "push",
+                        "origin",
+                        "refs/tags/unrelated:refs/tags/unrelated",
+                    ],
+                    capture_output=True,
+                    check=False,
+                    cwd=repository_path,
+                    env=guard.TheyosV0126TagGit._environment(),
+                )
+                self.assertNotEqual(0, weakened.returncode)
+                self.assertTrue(marker.exists())
+                self.assertGreaterEqual(len(ProxyHandler.authorization_headers), 2)
+                self.assertIsNone(ProxyHandler.authorization_headers[0])
+                self.assertTrue(
+                    any(
+                        header is not None
+                        for header in ProxyHandler.authorization_headers[1:]
+                    )
+                )
+                side_ref = subprocess.run(
+                    [
+                        "git",
+                        "--git-dir",
+                        str(side_remote),
+                        "rev-parse",
+                        "--verify",
+                        "refs/tags/unrelated",
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                self.assertEqual(target_oid, side_ref)
+
+                marker.unlink()
+                subprocess.run(
+                    [
+                        "git",
+                        "--git-dir",
+                        str(side_remote),
+                        "update-ref",
+                        "-d",
+                        "refs/tags/unrelated",
+                    ],
+                    check=True,
+                )
+                ProxyHandler.authorization_headers.clear()
+                api = FakeTheyosTagAPI()
+                state = FakeTheyosTagGit(api)
+                state.fetch_urls = (canonical_url,)
+                state.push_urls = (canonical_url,)
+                state.add_local_tag()
+                real = guard.TheyosV0126TagGit()
+                state.effective_configuration_keys = (
+                    real.effective_configuration_keys
+                )
+                stdout = io.StringIO()
+                with (
+                    contextlib.chdir(repository_path),
+                    mock.patch.object(
+                        guard, "THEYOS_REPOSITORY_URL", canonical_url
+                    ),
+                    contextlib.redirect_stdout(stdout),
+                    self.assertRaises(guard.TheyosTagGuardError),
+                ):
+                    guard.execute_governed_theyos_v0126_tag(
+                        self.arguments("push"),
+                        "",
+                        git=state,
+                        api=api,
+                    )
+                self.assertEqual([], state.mutations)
+                self.assertEqual("", stdout.getvalue())
+                self.assertEqual([], ProxyHandler.authorization_headers)
+                self.assertFalse(marker.exists())
+                absent = subprocess.run(
+                    [
+                        "git",
+                        "--git-dir",
+                        str(side_remote),
+                        "rev-parse",
+                        "--verify",
+                        "--quiet",
+                        "refs/tags/unrelated",
+                    ],
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertNotEqual(0, absent.returncode)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
     def test_real_credential_boundary_uses_only_the_fixed_helper(self) -> None:
         class UnauthorizedHandler(http.server.BaseHTTPRequestHandler):
             def do_GET(self) -> None:
@@ -3438,7 +3831,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                     ),
                     self.assertRaises(guard.TheyosTagGuardError),
                 ):
-                    guard.TheyosV0126TagGit().push_tag()
+                    self._push_tag_to_isolated_destination(remote_url)
             finally:
                 server.shutdown()
                 server.server_close()
@@ -3610,7 +4003,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                 )
 
                 with contextlib.chdir(repository):
-                    guard.TheyosV0126TagGit().push_tag()
+                    self._push_tag_to_isolated_destination(remote.as_uri())
 
                 self.assertFalse(marker.exists())
                 remote_tags = subprocess.run(
