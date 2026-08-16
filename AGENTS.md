@@ -57,11 +57,12 @@ build-only release workflow, the required `build` workflow, its phase
 dispatcher, and the dedicated release-contract checker. Change any of those
 four files by updating and landing this adapter contract first, then re-anchor
 the consumer. A pin-only follow-up, including one that corrects the consumer's
-required-secret inventory guard, must change only these four digests, their
+required-secret inventory guard or re-anchors a reviewed engine-pin and
+provider-key-removal candidate, must change only these four digests, their
 exact-value tests, and this narrow ordering policy; it must not broaden adapter
 grammar or mutations. Land changes in this order: first the adapter pins and
-tests in `theyos`; then re-anchor and land the byte-identical `soyeht-ios`
-workflow/docs consumer.
+tests in `theyos`; then re-anchor and land the byte-identical reviewed
+`soyeht-ios` consumer candidate.
 There is no direct `git tag`, `git push`, `gh release`, clobber, or
 missing-guard fallback.
 
