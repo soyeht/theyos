@@ -4468,7 +4468,7 @@ class GitHubAPIIOSTargetBoundaryTests(unittest.TestCase):
 
 
 class GovernedReleasePinTests(unittest.TestCase):
-    def test_engine_pin_and_provider_key_removal_consumer_quartet_is_exact(
+    def test_backend_patch_reanchor_consumer_quartet_is_exact(
         self,
     ) -> None:
         self.assertEqual(
@@ -4480,7 +4480,7 @@ class GovernedReleasePinTests(unittest.TestCase):
                 "scripts/ci/test-ios":
                     "6359805f5fa0bb9c435cd20b6e1eafb6747c4d4baa730b142502e39c61bffb7e",
                 "scripts/ci/check-governed-macos-release.py":
-                    "3d1b76a0a358239d12aaf68f045564006b9b97af4cd1264aa62919d886af680e",
+                    "8adc4694d6c4b688a64aa1dc71efeebd3b0b7fc9bdf15ff706369856f87fa224",
             },
             guard.RELEASE_EXECUTION_CONTRACT_SHA256,
         )
