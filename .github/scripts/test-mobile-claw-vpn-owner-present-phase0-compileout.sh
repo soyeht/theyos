@@ -1338,6 +1338,54 @@ expect_checker_failure alternate_publisher \
   ".github/workflows contains an unclassified publisher or attestation workflow" \
   "${alternate_publisher}"
 
+# The issuer bridge is deliberately classified by authority rather than pinned
+# byte-for-byte. The unmodified workflow is the positive control; independent
+# mutations prove that its filename alone does not grant publishing or access
+# to another Apple credential.
+issuer_bridge_known="${TMP_ROOT}/issuer-bridge-known"
+clone_head "${issuer_bridge_known}"
+prepare_empty_authority_inputs
+if ! PHASE0_TARGET="${MUTATION_TARGET}" \
+    PHASE0_BUILD_TOOL="${MUTATION_BUILD_TOOL}" \
+    PHASE0_CARGO_TARGET_DIR="${AUTHORITY_TARGET}" \
+    run_checker "${issuer_bridge_known}/${CHECKER_REL}" "${issuer_bridge_known}" \
+      >"${TMP_ROOT}/issuer-bridge-known.log" 2>&1; then
+  echo "error: checker rejected the property-classified issuer bridge" >&2
+  cat "${TMP_ROOT}/issuer-bridge-known.log" >&2
+  exit 1
+fi
+echo "PASS issuer_bridge_known"
+
+issuer_bridge_publisher="${TMP_ROOT}/issuer-bridge-publisher"
+clone_head "${issuer_bridge_publisher}"
+perl -0pi -e \
+  's/(permissions:\n)/$1  contents: write\n/' \
+  "${issuer_bridge_publisher}/.github/workflows/provision-ios-notary-issuer.yml"
+commit_mutation "${issuer_bridge_publisher}" issuer-bridge-publisher
+expect_checker_failure issuer_bridge_publisher \
+  "issuer bridge must not publish or mint attestations" \
+  "${issuer_bridge_publisher}"
+
+issuer_bridge_other_apple_secret="${TMP_ROOT}/issuer-bridge-other-apple-secret"
+clone_head "${issuer_bridge_other_apple_secret}"
+perl -0pi -e \
+  's/(      SOURCE_ISSUER:.*\n)/$1      FORBIDDEN_APPLE_SECRET: \$\{\{ secrets.APPLE_NOTARY_KEY_P8_BASE64 \}\}\n/' \
+  "${issuer_bridge_other_apple_secret}/.github/workflows/provision-ios-notary-issuer.yml"
+commit_mutation "${issuer_bridge_other_apple_secret}" issuer-bridge-other-apple-secret
+expect_checker_failure issuer_bridge_other_apple_secret \
+  "issuer bridge must consume exactly the allowed source issuer and temporary token secrets" \
+  "${issuer_bridge_other_apple_secret}"
+
+issuer_bridge_apns_capability="${TMP_ROOT}/issuer-bridge-apns-capability"
+clone_head "${issuer_bridge_apns_capability}"
+perl -0pi -e \
+  's/(      SOURCE_ISSUER:.*\n)/$1      FORBIDDEN_CAPABILITY: SOYEHT_APNS_P8_BASE64\n/' \
+  "${issuer_bridge_apns_capability}/.github/workflows/provision-ios-notary-issuer.yml"
+commit_mutation "${issuer_bridge_apns_capability}" issuer-bridge-apns-capability
+expect_checker_failure issuer_bridge_apns_capability \
+  "issuer bridge must not reference APNs credentials or capabilities" \
+  "${issuer_bridge_apns_capability}"
+
 marker="${TMP_ROOT}/marker"
 clone_head "${marker}"
 printf '%s\n' '{"contract":"activation"}' > \
