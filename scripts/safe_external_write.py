@@ -38,6 +38,11 @@ The ``governed-theyos-v0127-tag`` adapter is narrower still: it can author
 the one annotated backend tag ``v0.1.27`` locally, or push only that already
 validated ref. Creation and push are separate invocations, each with one
 mutation and a complete readback.
+The ``governed-macos-release-recovery`` adapter has no caller-controlled
+arguments. It can dispatch only workflow 331985341 for the immutable failed
+``mac-v0.1.19`` tag and exact peeled commit, with the workflow's complete ref
+and OID inputs fixed in code. It cannot rerun, recycle a tag, read a secret,
+or dispatch a second recovery run.
 Any further repository or operation requires an explicit code change and
 review.
 """
@@ -57,9 +62,10 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 from urllib.parse import quote
 
 
@@ -110,6 +116,17 @@ RELEASE_CONTRACT_FORBIDDEN = (
     b"--clobber",
 )
 RELEASE_ASSET_NAMES = frozenset({"Soyeht.dmg", "appcast.xml"})
+RELEASE_RECOVERY_WORKFLOW_ID = 331985341
+RELEASE_RECOVERY_WORKFLOW_NAME = "macOS Release"
+RELEASE_RECOVERY_WORKFLOW_PATH = ".github/workflows/macos-release.yml"
+RELEASE_RECOVERY_TAG = "mac-v0.1.19"
+RELEASE_RECOVERY_TAG_REF = f"refs/tags/{RELEASE_RECOVERY_TAG}"
+RELEASE_RECOVERY_VERSION = "0.1.19"
+RELEASE_RECOVERY_TARGET_OID = "3b7182cfeecc03a8a6c08e2c9191caa1420a019c"
+RELEASE_RECOVERY_TAG_OBJECT_OID = "bffb86a7e483d04ba059fbc74444033fbefb371a"
+RELEASE_RECOVERY_FAILED_RUN_ID = 32048601391
+RELEASE_RECOVERY_READBACK_POLLS = 30
+RELEASE_RECOVERY_POLL_SECONDS = 2.0
 THEYOS_REPOSITORY_URL = "https://github.com/soyeht/theyos.git"
 THEYOS_TAG_VERSION = "0.1.27"
 THEYOS_TAG = f"v{THEYOS_TAG_VERSION}"
@@ -465,6 +482,7 @@ class GitHubAPI:
         body: bytes | None = None,
         headers: Sequence[str] = (),
         paginate: bool = False,
+        expect_no_content: bool = False,
     ) -> Any:
         command = [
             "gh",
@@ -502,6 +520,12 @@ class GitHubAPI:
                 completed.returncode,
                 completed.stderr.decode("utf-8", errors="replace"),
             )
+        if expect_no_content:
+            if completed.stdout:
+                raise ReleaseGuardError(
+                    f"GitHub API returned unexpected content for {method} {endpoint}"
+                )
+            return None
         try:
             return json.loads(completed.stdout)
         except json.JSONDecodeError as error:
@@ -538,6 +562,18 @@ class GitHubAPI:
             endpoint,
             body=body,
             headers=("Content-Type: application/json",),
+        )
+
+    def mutate_no_content(
+        self, method: str, endpoint: str, payload: Mapping[str, Any]
+    ) -> None:
+        body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        self._request(
+            method,
+            endpoint,
+            body=body,
+            headers=("Content-Type: application/json",),
+            expect_no_content=True,
         )
 
     def upload_asset(
@@ -809,6 +845,7 @@ class TheyosV0127GitHubAPI(GitHubAPI):
         body: bytes | None = None,
         headers: Sequence[str] = (),
         paginate: bool = False,
+        expect_no_content: bool = False,
     ) -> Any:
         command = [
             THEYOS_GH_EXECUTABLE,
@@ -839,6 +876,12 @@ class TheyosV0127GitHubAPI(GitHubAPI):
                 completed.returncode,
                 completed.stderr.decode("utf-8", errors="replace"),
             )
+        if expect_no_content:
+            if completed.stdout:
+                raise TheyosTagGuardError(
+                    f"GitHub API returned unexpected content for {method} {endpoint}"
+                )
+            return None
         try:
             return json.loads(completed.stdout)
         except json.JSONDecodeError as error:
@@ -1541,6 +1584,194 @@ def execute_governed_ios_pr_body_update(
                 "operation": "governed-ios-pr-body-update",
                 "pr_number": IOS_PR_NUMBER,
                 "repository": RELEASE_GITHUB_REPO,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    return 0
+
+
+def _release_recovery_common() -> ReleaseCommon:
+    return ReleaseCommon(
+        tag_ref=RELEASE_RECOVERY_TAG_REF,
+        tag=RELEASE_RECOVERY_TAG,
+        version=RELEASE_RECOVERY_VERSION,
+        target_oid=RELEASE_RECOVERY_TARGET_OID,
+        expected_main=RELEASE_RECOVERY_TARGET_OID,
+    )
+
+
+def _assert_release_recovery_workflow(api: GitHubAPI) -> None:
+    workflow = _expect_mapping(
+        api.read(
+            f"repos/{RELEASE_GITHUB_REPO}/actions/workflows/"
+            f"{RELEASE_RECOVERY_WORKFLOW_ID}"
+        ),
+        "release recovery workflow",
+    )
+    if (
+        workflow.get("id") != RELEASE_RECOVERY_WORKFLOW_ID
+        or workflow.get("name") != RELEASE_RECOVERY_WORKFLOW_NAME
+        or workflow.get("path") != RELEASE_RECOVERY_WORKFLOW_PATH
+        or workflow.get("state") != "active"
+    ):
+        raise ReleaseGuardError("release recovery workflow identity or state mismatch")
+
+
+def _read_release_recovery_runs(api: GitHubAPI) -> list[Mapping[str, Any]]:
+    response = _expect_mapping(
+        api.read(
+            f"repos/{RELEASE_GITHUB_REPO}/actions/workflows/"
+            f"{RELEASE_RECOVERY_WORKFLOW_ID}/runs?branch="
+            f"{RELEASE_RECOVERY_TAG}&per_page=100"
+        ),
+        "release recovery workflow runs",
+    )
+    runs_value = response.get("workflow_runs")
+    total_count = response.get("total_count")
+    if (
+        not isinstance(runs_value, list)
+        or not isinstance(total_count, int)
+        or isinstance(total_count, bool)
+        or total_count != len(runs_value)
+        or total_count > 100
+    ):
+        raise ReleaseGuardError("release recovery workflow run set is incomplete")
+    return [
+        _expect_mapping(run, "release recovery workflow run")
+        for run in runs_value
+    ]
+
+
+def _expected_failed_release_run() -> dict[str, Any]:
+    return {
+        "id": RELEASE_RECOVERY_FAILED_RUN_ID,
+        "event": "push",
+        "head_branch": RELEASE_RECOVERY_TAG,
+        "head_sha": RELEASE_RECOVERY_TARGET_OID,
+        "run_attempt": 1,
+        "status": "completed",
+        "conclusion": "failure",
+        "path": RELEASE_RECOVERY_WORKFLOW_PATH,
+        "workflow_id": RELEASE_RECOVERY_WORKFLOW_ID,
+    }
+
+
+def _release_run_projection(run: Mapping[str, Any]) -> dict[str, Any]:
+    expected_keys = _expected_failed_release_run().keys()
+    return {key: run.get(key) for key in expected_keys}
+
+
+def _assert_release_recovery_preconditions(api: GitHubAPI) -> None:
+    common = _release_recovery_common()
+    _assert_common_release_state(api, common)
+    _assert_release_recovery_workflow(api)
+    _read_tag(api, common, RELEASE_RECOVERY_TAG_OBJECT_OID)
+    _assert_release_absent(api, common)
+    runs = _read_release_recovery_runs(api)
+    if len(runs) != 1 or _release_run_projection(runs[0]) != _expected_failed_release_run():
+        raise ReleaseGuardError(
+            "release recovery requires the one immutable failed push attempt"
+        )
+
+
+def _assert_release_recovery_readback(
+    api: GitHubAPI,
+    *,
+    sleep: Callable[[float], None],
+) -> Mapping[str, Any]:
+    expected_failed = _expected_failed_release_run()
+    for poll_index in range(RELEASE_RECOVERY_READBACK_POLLS):
+        runs = _read_release_recovery_runs(api)
+        failed = [
+            run
+            for run in runs
+            if run.get("id") == RELEASE_RECOVERY_FAILED_RUN_ID
+        ]
+        dispatched = [
+            run
+            for run in runs
+            if run.get("event") == "workflow_dispatch"
+        ]
+        if len(runs) == 2 and len(failed) == 1 and len(dispatched) == 1:
+            if _release_run_projection(failed[0]) != expected_failed:
+                raise ReleaseGuardError("immutable failed release run changed after dispatch")
+            run = dispatched[0]
+            if (
+                run.get("id") == RELEASE_RECOVERY_FAILED_RUN_ID
+                or run.get("head_branch") != RELEASE_RECOVERY_TAG
+                or run.get("head_sha") != RELEASE_RECOVERY_TARGET_OID
+                or run.get("run_attempt") != 1
+                or run.get("path") != RELEASE_RECOVERY_WORKFLOW_PATH
+                or run.get("workflow_id") != RELEASE_RECOVERY_WORKFLOW_ID
+                or run.get("status")
+                not in {
+                    "requested",
+                    "waiting",
+                    "pending",
+                    "queued",
+                    "in_progress",
+                    "completed",
+                }
+            ):
+                raise ReleaseGuardError("release recovery run readback mismatch")
+            return run
+        if len(runs) > 2 or len(dispatched) > 1 or not failed:
+            raise ReleaseGuardError("release recovery produced an ambiguous workflow run set")
+        if poll_index + 1 < RELEASE_RECOVERY_READBACK_POLLS:
+            sleep(RELEASE_RECOVERY_POLL_SECONDS)
+    raise ReleaseGuardError("release recovery run did not materialize after dispatch")
+
+
+def execute_governed_macos_release_recovery(
+    arguments: Sequence[str],
+    payload: str,
+    *,
+    api: GitHubAPI | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> int:
+    """Dispatch the one fixed failed macOS release recovery and read it back."""
+    if arguments:
+        raise UnsafeCommand("governed macOS release recovery accepts no arguments")
+    if payload:
+        raise ReleaseGuardError("governed macOS release recovery requires empty stdin")
+    client = api or GitHubAPI()
+    _assert_release_recovery_preconditions(client)
+    client.mutate_no_content(
+        "POST",
+        f"repos/{RELEASE_GITHUB_REPO}/actions/workflows/"
+        f"{RELEASE_RECOVERY_WORKFLOW_ID}/dispatches",
+        {
+            "ref": RELEASE_RECOVERY_TAG,
+            "inputs": {
+                "expected_ref": RELEASE_RECOVERY_TAG_REF,
+                "expected_oid": RELEASE_RECOVERY_TARGET_OID,
+            },
+        },
+    )
+    _assert_common_release_state(client, _release_recovery_common())
+    _assert_release_recovery_workflow(client)
+    _read_tag(
+        client,
+        _release_recovery_common(),
+        RELEASE_RECOVERY_TAG_OBJECT_OID,
+    )
+    _assert_release_absent(client, _release_recovery_common())
+    run = _assert_release_recovery_readback(client, sleep=sleep)
+    print(
+        json.dumps(
+            {
+                "event": "workflow_dispatch",
+                "expected_oid": RELEASE_RECOVERY_TARGET_OID,
+                "expected_ref": RELEASE_RECOVERY_TAG_REF,
+                "operation": "governed-macos-release-recovery",
+                "repository": RELEASE_GITHUB_REPO,
+                "run_attempt": 1,
+                "run_id": run.get("id"),
+                "tag_object_oid": RELEASE_RECOVERY_TAG_OBJECT_OID,
+                "workflow_id": RELEASE_RECOVERY_WORKFLOW_ID,
+                "workflow_path": RELEASE_RECOVERY_WORKFLOW_PATH,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -2655,6 +2886,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if command[:1] == ["governed-release"]:
         try:
             return execute_governed_release(command[1:], payload)
+        except (UnsafeCommand, ReleaseGuardError, GitHubAPIError) as error:
+            print(f"BLOCKED: {error}", file=sys.stderr)
+            return 2
+
+    if command[:1] == ["governed-macos-release-recovery"]:
+        try:
+            return execute_governed_macos_release_recovery(command[1:], payload)
         except (UnsafeCommand, ReleaseGuardError, GitHubAPIError) as error:
             print(f"BLOCKED: {error}", file=sys.stderr)
             return 2

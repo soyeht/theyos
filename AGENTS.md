@@ -68,6 +68,20 @@ tests in `theyos`; then re-anchor and land the byte-identical reviewed
 There is no direct `git tag`, `git push`, `gh release`, clobber, or
 missing-guard fallback.
 
+The separate `governed-macos-release-recovery` adapter is a one-shot recovery
+for the immutable failed `mac-v0.1.19` push run. It accepts no caller-selected
+repository, workflow, ref, OID, run, or secret. It may dispatch only workflow
+331985341 at `.github/workflows/macos-release.yml`, with `ref=mac-v0.1.19`,
+`expected_ref=refs/tags/mac-v0.1.19`, and the reviewed full peeled commit OID.
+It first proves the annotated tag object and target, active workflow identity,
+absence of every release object and asset, and the exact prior push failure
+with no prior success or manual recovery. Its sole mutation is one
+`workflow_dispatch`; it then requires exactly one new attempt-1 run and
+byte-stable preconditions. It never invokes a run rerun, recycles the tag, or
+reads secret values. A missing-secret recovery is allowed only after the
+required secret names have been provisioned through a separately governed
+path; this adapter does not provision or inspect them.
+
 The consumer's required `build` context validates the release docs and both
 matching agent-instruction blocks. That checker is versioned in the same head:
 simultaneously removing the checker and its invocation can only be made
