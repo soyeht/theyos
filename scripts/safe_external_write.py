@@ -43,6 +43,12 @@ arguments. It can dispatch only workflow 331985341 for the immutable failed
 ``mac-v0.1.19`` tag and exact peeled commit, with the workflow's complete ref
 and OID inputs fixed in code. It cannot rerun, recycle a tag, read a secret,
 or dispatch a second recovery run.
+The ``governed-ios-notary-issuer-provision`` adapter can dispatch only the
+reviewed one-shot bridge on current ``soyeht/theyos:main``. Its sole argument
+is the full expected main OID, which must agree with the remote ref, comparison,
+workflow bytes, and resulting attempt-1 run. The workflow transfers only the
+existing issuer secret between GitHub secret stores and removes its temporary
+provisioning token; neither value enters this process.
 Any further repository or operation requires an explicit code change and
 review.
 """
@@ -127,6 +133,16 @@ RELEASE_RECOVERY_TAG_OBJECT_OID = "bffb86a7e483d04ba059fbc74444033fbefb371a"
 RELEASE_RECOVERY_FAILED_RUN_ID = 32048601391
 RELEASE_RECOVERY_READBACK_POLLS = 30
 RELEASE_RECOVERY_POLL_SECONDS = 2.0
+IOS_ISSUER_PROVISION_WORKFLOW_NAME = "Provision iOS notary issuer"
+IOS_ISSUER_PROVISION_WORKFLOW_FILE = "provision-ios-notary-issuer.yml"
+IOS_ISSUER_PROVISION_WORKFLOW_PATH = (
+    f".github/workflows/{IOS_ISSUER_PROVISION_WORKFLOW_FILE}"
+)
+IOS_ISSUER_PROVISION_WORKFLOW_SHA256 = (
+    "2cd48c07a0a542de265f3333cf2a7971ef6d8e2e9b5b72f3bc0a96042789be05"
+)
+IOS_ISSUER_PROVISION_REF = "main"
+IOS_ISSUER_PROVISION_FULL_REF = "refs/heads/main"
 THEYOS_REPOSITORY_URL = "https://github.com/soyeht/theyos.git"
 THEYOS_TAG_VERSION = "0.1.27"
 THEYOS_TAG = f"v{THEYOS_TAG_VERSION}"
@@ -1602,6 +1618,254 @@ def _release_recovery_common() -> ReleaseCommon:
     )
 
 
+def _read_theyos_repository_file(
+    api: GitHubAPI,
+    path: str,
+    oid: str,
+    label: str,
+) -> bytes:
+    value = _expect_mapping(
+        api.read(f"repos/{SAFE_GITHUB_REPO}/contents/{path}?ref={oid}"),
+        label,
+    )
+    if value.get("type") != "file" or value.get("encoding") != "base64":
+        raise ReleaseGuardError(f"{label} is not a base64 file")
+    try:
+        encoded = re.sub(r"\s+", "", str(value.get("content", "")))
+        return base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError) as error:
+        raise ReleaseGuardError(f"{label} has invalid base64") from error
+
+
+def _parse_ios_issuer_provision_arguments(arguments: Sequence[str]) -> str:
+    if len(arguments) != 2 or arguments[0] != "--expected-head":
+        raise UnsafeCommand(
+            "governed iOS issuer provision requires one --expected-head"
+        )
+    return _full_oid(arguments[1], "expected theyos head")
+
+
+def _read_ios_issuer_provision_workflow(
+    api: GitHubAPI,
+) -> Mapping[str, Any]:
+    workflow = _expect_mapping(
+        api.read(
+            f"repos/{SAFE_GITHUB_REPO}/actions/workflows/"
+            f"{IOS_ISSUER_PROVISION_WORKFLOW_FILE}"
+        ),
+        "iOS issuer provision workflow",
+    )
+    workflow_id = workflow.get("id")
+    if (
+        not isinstance(workflow_id, int)
+        or isinstance(workflow_id, bool)
+        or workflow_id <= 0
+        or workflow.get("name") != IOS_ISSUER_PROVISION_WORKFLOW_NAME
+        or workflow.get("path") != IOS_ISSUER_PROVISION_WORKFLOW_PATH
+        or workflow.get("state") != "active"
+    ):
+        raise ReleaseGuardError("iOS issuer provision workflow identity mismatch")
+    return workflow
+
+
+def _read_ios_issuer_provision_runs(api: GitHubAPI) -> list[Mapping[str, Any]]:
+    response = _expect_mapping(
+        api.read(
+            f"repos/{SAFE_GITHUB_REPO}/actions/workflows/"
+            f"{IOS_ISSUER_PROVISION_WORKFLOW_FILE}/runs?"
+            f"event=workflow_dispatch&branch={IOS_ISSUER_PROVISION_REF}&per_page=100"
+        ),
+        "iOS issuer provision workflow runs",
+    )
+    runs_value = response.get("workflow_runs")
+    total_count = response.get("total_count")
+    if (
+        not isinstance(runs_value, list)
+        or not isinstance(total_count, int)
+        or isinstance(total_count, bool)
+        or total_count != len(runs_value)
+        or total_count > 100
+    ):
+        raise ReleaseGuardError("iOS issuer provision run set is incomplete")
+    return [
+        _expect_mapping(run, "iOS issuer provision workflow run")
+        for run in runs_value
+    ]
+
+
+def _assert_ios_issuer_provision_workflow_bytes(workflow_bytes: bytes) -> None:
+    secret_references = re.findall(
+        rb"\$\{\{\s*secrets\.([A-Z0-9_]+)\s*\}\}",
+        workflow_bytes,
+    )
+    if secret_references != [
+        b"APPLE_NOTARY_ISSUER_ID",
+        b"SOYEHT_IOS_SECRET_PROVISION_TOKEN",
+    ]:
+        raise ReleaseGuardError("iOS issuer bridge secret-reference set mismatch")
+    required_counts = {
+        b"  workflow_dispatch:": 1,
+        b"      expected_oid:": 1,
+        b'          printf \'%s\' "${SOURCE_ISSUER}" |': 1,
+        b"gh secret set \\": 1,
+        b"gh secret delete \\": 1,
+        b'--json name,updatedAt': 3,
+        b'target_repo="soyeht/soyeht-ios"': 1,
+        b'source_repo="soyeht/theyos"': 1,
+        b'trap cleanup_token EXIT': 1,
+        b'trap - EXIT': 1,
+    }
+    mismatched = [
+        fragment.decode("utf-8", errors="replace")
+        for fragment, count in required_counts.items()
+        if workflow_bytes.count(fragment) != count
+    ]
+    forbidden = (
+        b"echo ",
+        b"set -x",
+        b"gh run rerun",
+        b"gh workflow run",
+        b"SOYEHT_APNS_P8_BASE64",
+    )
+    present_forbidden = [
+        token.decode("ascii", errors="replace")
+        for token in forbidden
+        if token in workflow_bytes
+    ]
+    if mismatched or present_forbidden:
+        raise ReleaseGuardError(
+            "iOS issuer bridge source mismatch: "
+            f"required={mismatched!r}, forbidden={present_forbidden!r}"
+        )
+
+
+def _assert_ios_issuer_provision_source_state(
+    api: GitHubAPI,
+    expected_head: str,
+) -> Mapping[str, Any]:
+    main_ref = _expect_mapping(
+        api.read(f"repos/{SAFE_GITHUB_REPO}/git/ref/heads/main"),
+        "theyos main ref",
+    )
+    main_object = _expect_mapping(main_ref.get("object"), "theyos main ref object")
+    if (
+        main_ref.get("ref") != IOS_ISSUER_PROVISION_FULL_REF
+        or main_object.get("type") != "commit"
+        or main_object.get("sha") != expected_head
+    ):
+        raise ReleaseGuardError("theyos main ref drifted from the expected head")
+    commit = _expect_mapping(
+        api.read(f"repos/{SAFE_GITHUB_REPO}/commits/{expected_head}"),
+        "theyos expected head commit",
+    )
+    if commit.get("sha") != expected_head:
+        raise ReleaseGuardError("theyos expected head commit readback mismatch")
+    comparison = _expect_mapping(
+        api.read(
+            f"repos/{SAFE_GITHUB_REPO}/compare/{expected_head}...{expected_head}"
+        ),
+        "theyos expected head comparison",
+    )
+    merge_base = _expect_mapping(
+        comparison.get("merge_base_commit"),
+        "theyos expected head merge base",
+    )
+    if (
+        comparison.get("status") != "identical"
+        or comparison.get("ahead_by") != 0
+        or comparison.get("behind_by") != 0
+        or comparison.get("total_commits") != 0
+        or merge_base.get("sha") != expected_head
+    ):
+        raise ReleaseGuardError("theyos expected head comparison mismatch")
+    workflow_bytes = _read_theyos_repository_file(
+        api,
+        IOS_ISSUER_PROVISION_WORKFLOW_PATH,
+        expected_head,
+        "iOS issuer provision workflow source",
+    )
+    _assert_ios_issuer_provision_workflow_bytes(workflow_bytes)
+    if hashlib.sha256(workflow_bytes).hexdigest() != IOS_ISSUER_PROVISION_WORKFLOW_SHA256:
+        raise ReleaseGuardError("iOS issuer provision workflow bytes are not reviewed")
+    return _read_ios_issuer_provision_workflow(api)
+
+
+def execute_governed_ios_notary_issuer_provision(
+    arguments: Sequence[str],
+    payload: str,
+    *,
+    api: GitHubAPI | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> int:
+    """Dispatch the one-shot cross-repository secret-store bridge."""
+    expected_head = _parse_ios_issuer_provision_arguments(arguments)
+    if payload:
+        raise ReleaseGuardError("governed iOS issuer provision requires empty stdin")
+    client = api or GitHubAPI()
+    workflow = _assert_ios_issuer_provision_source_state(client, expected_head)
+    if _read_ios_issuer_provision_runs(client):
+        raise ReleaseGuardError("iOS issuer provision workflow already has a run")
+    client.mutate_no_content(
+        "POST",
+        f"repos/{SAFE_GITHUB_REPO}/actions/workflows/"
+        f"{IOS_ISSUER_PROVISION_WORKFLOW_FILE}/dispatches",
+        {
+            "ref": IOS_ISSUER_PROVISION_REF,
+            "inputs": {"expected_oid": expected_head},
+        },
+    )
+    workflow_after = _assert_ios_issuer_provision_source_state(client, expected_head)
+    if workflow_after.get("id") != workflow.get("id"):
+        raise ReleaseGuardError("iOS issuer provision workflow ID drifted after dispatch")
+    for poll_index in range(RELEASE_RECOVERY_READBACK_POLLS):
+        runs = _read_ios_issuer_provision_runs(client)
+        if len(runs) == 1:
+            run = runs[0]
+            if (
+                run.get("event") != "workflow_dispatch"
+                or run.get("head_branch") != IOS_ISSUER_PROVISION_REF
+                or run.get("head_sha") != expected_head
+                or run.get("run_attempt") != 1
+                or run.get("path") != IOS_ISSUER_PROVISION_WORKFLOW_PATH
+                or run.get("workflow_id") != workflow.get("id")
+                or run.get("status")
+                not in {
+                    "requested",
+                    "waiting",
+                    "pending",
+                    "queued",
+                    "in_progress",
+                    "completed",
+                }
+            ):
+                raise ReleaseGuardError("iOS issuer provision run readback mismatch")
+            run_id = run.get("id")
+            if not isinstance(run_id, int) or isinstance(run_id, bool) or run_id <= 0:
+                raise ReleaseGuardError("iOS issuer provision run ID is invalid")
+            print(
+                json.dumps(
+                    {
+                        "event": "workflow_dispatch",
+                        "expected_head": expected_head,
+                        "operation": "governed-ios-notary-issuer-provision",
+                        "repository": SAFE_GITHUB_REPO,
+                        "run_attempt": 1,
+                        "run_id": run_id,
+                        "workflow_id": workflow.get("id"),
+                        "workflow_path": IOS_ISSUER_PROVISION_WORKFLOW_PATH,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+            return 0
+        if len(runs) > 1:
+            raise ReleaseGuardError("iOS issuer provision produced multiple runs")
+        if poll_index + 1 < RELEASE_RECOVERY_READBACK_POLLS:
+            sleep(RELEASE_RECOVERY_POLL_SECONDS)
+    raise ReleaseGuardError("iOS issuer provision run did not materialize")
+
+
 def _assert_release_recovery_workflow(api: GitHubAPI) -> None:
     workflow = _expect_mapping(
         api.read(
@@ -2893,6 +3157,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     if command[:1] == ["governed-macos-release-recovery"]:
         try:
             return execute_governed_macos_release_recovery(command[1:], payload)
+        except (UnsafeCommand, ReleaseGuardError, GitHubAPIError) as error:
+            print(f"BLOCKED: {error}", file=sys.stderr)
+            return 2
+
+    if command[:1] == ["governed-ios-notary-issuer-provision"]:
+        try:
+            return execute_governed_ios_notary_issuer_provision(
+                command[1:], payload
+            )
         except (UnsafeCommand, ReleaseGuardError, GitHubAPIError) as error:
             print(f"BLOCKED: {error}", file=sys.stderr)
             return 2

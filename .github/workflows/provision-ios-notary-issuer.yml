@@ -1,0 +1,124 @@
+name: Provision iOS notary issuer
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_oid:
+        description: Exact reviewed theyos main commit containing this one-shot bridge
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  provision:
+    name: Transfer notary issuer between secret stores
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      EXPECTED_OID: ${{ inputs.expected_oid }}
+      SOURCE_ISSUER: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+      PROVISION_TOKEN: ${{ secrets.SOYEHT_IOS_SECRET_PROVISION_TOKEN }}
+      SOURCE_API_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Provision the fixed iOS secret and retire the temporary token
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          source_repo="soyeht/theyos"
+          target_repo="soyeht/soyeht-ios"
+          workflow_file="provision-ios-notary-issuer.yml"
+          workflow_path=".github/workflows/${workflow_file}"
+          target_secret="APPLE_NOTARY_ISSUER_ID"
+          temporary_secret="SOYEHT_IOS_SECRET_PROVISION_TOKEN"
+
+          test "${GITHUB_REPOSITORY}" = "${source_repo}"
+          test "${GITHUB_EVENT_NAME}" = "workflow_dispatch"
+          test "${GITHUB_REF}" = "refs/heads/main"
+          test "${GITHUB_RUN_ATTEMPT}" = "1"
+          test "${GITHUB_WORKFLOW_REF}" = "${source_repo}/${workflow_path}@refs/heads/main"
+          [[ "${EXPECTED_OID}" =~ ^[0-9a-f]{40}$ ]]
+          test "${GITHUB_SHA}" = "${EXPECTED_OID}"
+
+          if [[ -z "${PROVISION_TOKEN:-}" ]]; then
+            printf '%s\n' "Temporary provisioning token is empty." >&2
+            exit 1
+          fi
+
+          cleanup_attempted=0
+          cleanup_token() {
+            if [[ "${cleanup_attempted}" = "1" ]]; then
+              return 0
+            fi
+            cleanup_attempted=1
+            GH_TOKEN="${PROVISION_TOKEN}" gh secret delete \
+              "${temporary_secret}" --repo "${source_repo}" >/dev/null
+            source_after="$(
+              GH_TOKEN="${PROVISION_TOKEN}" gh secret list \
+                --repo "${source_repo}" --json name,updatedAt
+            )"
+            jq -e --arg name "${temporary_secret}" \
+              'map(select(.name == $name)) | length == 0' \
+              <<< "${source_after}" >/dev/null
+          }
+          trap cleanup_token EXIT
+
+          if [[ -z "${SOURCE_ISSUER:-}" ]]; then
+            printf '%s\n' "Source notary issuer secret is empty." >&2
+            exit 1
+          fi
+
+          runs="$(
+            GH_TOKEN="${SOURCE_API_TOKEN}" gh api --method GET \
+              "repos/${source_repo}/actions/workflows/${workflow_file}/runs?event=workflow_dispatch&branch=main&per_page=100"
+          )"
+          jq -e \
+            --argjson run_id "${GITHUB_RUN_ID}" \
+            --arg expected_oid "${EXPECTED_OID}" \
+            --arg workflow_path "${workflow_path}" '
+              .total_count == 1
+              and (.workflow_runs | length) == 1
+              and .workflow_runs[0].id == $run_id
+              and .workflow_runs[0].event == "workflow_dispatch"
+              and .workflow_runs[0].head_branch == "main"
+              and .workflow_runs[0].head_sha == $expected_oid
+              and .workflow_runs[0].run_attempt == 1
+              and .workflow_runs[0].path == $workflow_path
+            ' <<< "${runs}" >/dev/null
+
+          target_before="$(
+            GH_TOKEN="${PROVISION_TOKEN}" gh secret list \
+              --repo "${target_repo}" --json name,updatedAt
+          )"
+          jq -e --arg name "${target_secret}" \
+            'map(select(.name == $name)) | length == 0' \
+            <<< "${target_before}" >/dev/null
+          target_unchanged="$(
+            jq -cS --arg name "${target_secret}" \
+              'map(select(.name != $name)) | sort_by(.name)' \
+              <<< "${target_before}"
+          )"
+
+          printf '%s' "${SOURCE_ISSUER}" | \
+            GH_TOKEN="${PROVISION_TOKEN}" gh secret set \
+              "${target_secret}" --repo "${target_repo}" >/dev/null
+
+          target_after="$(
+            GH_TOKEN="${PROVISION_TOKEN}" gh secret list \
+              --repo "${target_repo}" --json name,updatedAt
+          )"
+          jq -e \
+            --arg name "${target_secret}" \
+            --argjson unchanged "${target_unchanged}" '
+              (map(select(.name == $name)) | length) == 1
+              and (map(select(.name == $name))[0].updatedAt
+                | type == "string" and length > 0)
+              and (map(select(.name != $name)) | sort_by(.name)) == $unchanged
+            ' <<< "${target_after}" >/dev/null
+
+          cleanup_token
+          trap - EXIT
