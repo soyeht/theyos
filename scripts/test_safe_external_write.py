@@ -343,6 +343,218 @@ class ExecutionBoundaryTests(unittest.TestCase):
         self.assertIn("khai", stderr.getvalue())
 
 
+class PullRequestBodyRESTAdapterTests(unittest.TestCase):
+    HEAD = "1" * 40
+    BASE = "2" * 40
+    ENDPOINT = "repos/soyeht/theyos/pulls/20"
+
+    class FakeAPI:
+        def __init__(self, reads: list[object], mutations: list[object]) -> None:
+            self.reads = list(reads)
+            self.mutations = list(mutations)
+            self.calls: list[tuple[object, ...]] = []
+
+        def read(self, endpoint: str) -> object:
+            self.calls.append(("read", endpoint))
+            value = self.reads.pop(0)
+            if isinstance(value, BaseException):
+                raise value
+            return value
+
+        def mutate_json(
+            self, method: str, endpoint: str, payload: dict[str, object]
+        ) -> object:
+            self.calls.append(("mutate", method, endpoint, payload))
+            value = self.mutations.pop(0)
+            if isinstance(value, BaseException):
+                raise value
+            return value
+
+    def snapshot(
+        self,
+        body: str,
+        *,
+        head: str | None = None,
+        draft: bool = True,
+    ) -> dict[str, object]:
+        return {
+            "number": 20,
+            "state": "open",
+            "draft": draft,
+            "head": {"sha": head or self.HEAD},
+            "base": {"sha": self.BASE},
+            "body": body,
+        }
+
+    @staticmethod
+    def api_error(status: int, detail: str = "sensitive-header: redacted") -> Exception:
+        return guard.GitHubAPIError(
+            ["gh", "api", "--method", "PATCH", "endpoint"],
+            1,
+            f"HTTP {status}: {detail}",
+        )
+
+    def execute(
+        self,
+        api: "PullRequestBodyRESTAdapterTests.FakeAPI",
+        payload: str = "new body",
+    ) -> tuple[int, list[float], str, str]:
+        sleeps: list[float] = []
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = guard.execute_pr_body_update(
+                ["gh", "pr", "edit", "20"],
+                payload,
+                api=api,
+                sleep=sleeps.append,
+            )
+        return code, sleeps, stdout.getvalue(), stderr.getvalue()
+
+    def test_normal_200_patch_and_readback(self) -> None:
+        old = self.snapshot("old body")
+        new = self.snapshot("new body")
+        api = self.FakeAPI([old, new], [new])
+        code, sleeps, stdout, stderr = self.execute(api)
+        self.assertEqual(0, code)
+        self.assertEqual([], sleeps)
+        self.assertEqual(
+            [
+                ("read", self.ENDPOINT),
+                ("mutate", "PATCH", self.ENDPOINT, {"body": "new body"}),
+                ("read", self.ENDPOINT),
+            ],
+            api.calls,
+        )
+        self.assertIn('"mutation_attempts":1', stdout)
+        self.assertNotIn("new body", stdout + stderr)
+
+    def test_applied_patch_returning_503_is_success_without_second_mutation(self) -> None:
+        api = self.FakeAPI(
+            [self.snapshot("old body"), self.snapshot("new body")],
+            [self.api_error(503)],
+        )
+        code, sleeps, stdout, stderr = self.execute(api)
+        self.assertEqual(0, code)
+        self.assertEqual([], sleeps)
+        self.assertEqual(1, sum(call[0] == "mutate" for call in api.calls))
+        self.assertNotIn("new body", stdout + stderr)
+
+    def test_503_with_old_body_retries_then_succeeds(self) -> None:
+        old = self.snapshot("old body")
+        new = self.snapshot("new body")
+        api = self.FakeAPI([old, old, new], [self.api_error(503), new])
+        code, sleeps, stdout, _ = self.execute(api)
+        self.assertEqual(0, code)
+        self.assertEqual([5.0], sleeps)
+        self.assertEqual(2, sum(call[0] == "mutate" for call in api.calls))
+        self.assertIn('"mutation_attempts":2', stdout)
+
+    def test_three_503_with_old_body_exhausts(self) -> None:
+        old = self.snapshot("old body")
+        api = self.FakeAPI(
+            [old, old, old, old],
+            [self.api_error(503), self.api_error(503), self.api_error(503)],
+        )
+        sleeps: list[float] = []
+        with self.assertRaisesRegex(
+            guard.PullRequestBodyGuardError, "exhausted HTTP 503"
+        ):
+            guard.execute_pr_body_update(
+                ["gh", "pr", "edit", "20"],
+                "new body",
+                api=api,
+                sleep=sleeps.append,
+            )
+        self.assertEqual([5.0, 5.0], sleeps)
+        self.assertEqual(3, sum(call[0] == "mutate" for call in api.calls))
+
+    def test_4xx_is_single_mutation_and_sanitized(self) -> None:
+        api = self.FakeAPI([self.snapshot("old body")], [self.api_error(403)])
+        sleeps: list[float] = []
+        with self.assertRaisesRegex(
+            guard.PullRequestBodyGuardError, "PATCH failed with HTTP 403"
+        ) as raised:
+            guard.execute_pr_body_update(
+                ["gh", "pr", "edit", "20"],
+                "private body marker",
+                api=api,
+                sleep=sleeps.append,
+            )
+        self.assertEqual([], sleeps)
+        self.assertEqual(1, sum(call[0] == "mutate" for call in api.calls))
+        self.assertNotIn("sensitive-header", str(raised.exception))
+        self.assertNotIn("private body marker", str(raised.exception))
+
+    def test_drift_and_third_body_state_fail_without_retry(self) -> None:
+        cases = (
+            self.snapshot("old body", head="3" * 40),
+            self.snapshot("third body"),
+        )
+        for observed in cases:
+            with self.subTest(observed=observed):
+                api = self.FakeAPI(
+                    [self.snapshot("old body"), observed],
+                    [self.api_error(503)],
+                )
+                sleeps: list[float] = []
+                with self.assertRaises(guard.PullRequestBodyGuardError):
+                    guard.execute_pr_body_update(
+                        ["gh", "pr", "edit", "20"],
+                        "new body",
+                        api=api,
+                        sleep=sleeps.append,
+                    )
+                self.assertEqual([], sleeps)
+                self.assertEqual(1, sum(call[0] == "mutate" for call in api.calls))
+
+    def test_invalid_patch_shape_stops_without_readback_or_retry(self) -> None:
+        api = self.FakeAPI([self.snapshot("old body")], [{}])
+        sleeps: list[float] = []
+        with self.assertRaisesRegex(
+            guard.PullRequestBodyGuardError, "shape is invalid"
+        ):
+            guard.execute_pr_body_update(
+                ["gh", "pr", "edit", "20"],
+                "new body",
+                api=api,
+                sleep=sleeps.append,
+            )
+        self.assertEqual([], sleeps)
+        self.assertEqual(2, len(api.calls))
+
+    def test_readback_503_has_bounded_read_only_retry(self) -> None:
+        new = self.snapshot("new body")
+        api = self.FakeAPI(
+            [self.snapshot("old body"), self.api_error(503), new],
+            [new],
+        )
+        code, sleeps, _, _ = self.execute(api)
+        self.assertEqual(0, code)
+        self.assertEqual([5.0], sleeps)
+        self.assertEqual(1, sum(call[0] == "mutate" for call in api.calls))
+
+    def test_body_only_main_uses_rest_adapter_and_preserves_other_modes(self) -> None:
+        stream = mock.Mock()
+        stream.buffer.read.return_value = b"safe body"
+        with (
+            mock.patch.object(guard.sys, "stdin", stream),
+            mock.patch.object(guard, "execute_pr_body_update", return_value=0) as rest,
+            mock.patch.object(guard.subprocess, "run") as run,
+        ):
+            code = guard.main(["--stdin", "--", "gh", "pr", "edit", "20"])
+        self.assertEqual(0, code)
+        rest.assert_called_once_with(
+            ["gh", "pr", "edit", "20"], "safe body"
+        )
+        run.assert_not_called()
+
+        prepared = guard.prepare_command(
+            ["gh", "pr", "edit", "20", "--title", "safe title"]
+        )
+        self.assertEqual(["--body-file", "-"], prepared[-2:])
+
+
 def load_tests(
     loader: unittest.TestLoader,
     tests: unittest.TestSuite,

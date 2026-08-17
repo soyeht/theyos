@@ -26,6 +26,10 @@ adapters are intentionally pinned to ``github.com/soyeht/theyos``. Their only
 permitted explicit issue or pull-request target is a strict positive decimal
 identifier in that repository; URLs, owner/repository selectors, refs, and
 branch names are rejected before execution. The separate
+exact body-only form ``gh pr edit <number>`` uses a REST snapshot, PATCH, and
+readback adapter. It reconciles an ambiguous HTTP 503 before any bounded
+idempotent repetition and never exposes the body in diagnostics. Other
+``gh pr edit`` modes retain the closed CLI grammar below. The separate
 ``governed-release`` family is hardcoded to
 ``github.com/soyeht/soyeht-ios`` and cannot redirect at runtime. The dedicated
 ``governed-ios-pr-create`` adapter can create only the draft consumer PR from
@@ -211,6 +215,10 @@ class TheyosTagGuardError(ValueError):
     """Raised when the fixed theyos v0.1.27 tag boundary fails closed."""
 
 
+class PullRequestBodyGuardError(ValueError):
+    """Raised when the same-repository body-only PR adapter fails closed."""
+
+
 def find_mentions(payload: str, allowed: frozenset[str] = frozenset()) -> tuple[Mention, ...]:
     """Return non-allowlisted mention-shaped tokens with 1-based locations."""
     normalized_allowed = {name.lower() for name in allowed}
@@ -383,6 +391,9 @@ LOCAL_GITHUB_TARGET_COMMANDS = frozenset(
     }
 )
 LOCAL_GITHUB_NUMBER_PATTERN = re.compile(r"[1-9][0-9]*")
+PR_BODY_WRITE_ATTEMPTS = 3
+PR_BODY_READ_ATTEMPTS = 3
+PR_BODY_RETRY_SECONDS = 5.0
 
 
 def _parse_closed_flags(
@@ -486,9 +497,16 @@ class GitHubAPIError(RuntimeError):
     def is_not_found(self) -> bool:
         return "HTTP 404" in self.stderr
 
+    @property
+    def is_service_unavailable(self) -> bool:
+        return re.search(r"\bHTTP 503\b", self.stderr, re.IGNORECASE) is not None
+
 
 class GitHubAPI:
     """Minimal API client pinned to the governed iOS repository."""
+
+    def __init__(self, repository: str = RELEASE_GITHUB_REPO) -> None:
+        self.repository = repository
 
     def _request(
         self,
@@ -522,7 +540,7 @@ class GitHubAPI:
 
         environment = os.environ.copy()
         environment["GH_HOST"] = SAFE_GITHUB_HOST
-        environment["GH_REPO"] = RELEASE_GITHUB_REPO
+        environment["GH_REPO"] = self.repository
         completed = subprocess.run(
             command,
             input=body,
@@ -647,6 +665,183 @@ class GitHubAPI:
             return json.loads(response_bytes)
         except json.JSONDecodeError as error:
             raise ReleaseGuardError("asset upload returned non-JSON success") from error
+
+
+@dataclass(frozen=True)
+class PullRequestBodySnapshot:
+    number: int
+    state: str
+    draft: bool
+    head_oid: str
+    base_oid: str
+    body: str
+
+    def same_object_as(self, other: "PullRequestBodySnapshot") -> bool:
+        return (
+            self.number,
+            self.state,
+            self.draft,
+            self.head_oid,
+            self.base_oid,
+        ) == (
+            other.number,
+            other.state,
+            other.draft,
+            other.head_oid,
+            other.base_oid,
+        )
+
+
+def _pr_body_snapshot(value: Any, number: int) -> PullRequestBodySnapshot:
+    if not isinstance(value, Mapping):
+        raise PullRequestBodyGuardError("pull-request response is not an object")
+    head = value.get("head")
+    base = value.get("base")
+    if not isinstance(head, Mapping) or not isinstance(base, Mapping):
+        raise PullRequestBodyGuardError("pull-request head or base shape is invalid")
+    response_number = value.get("number")
+    state = value.get("state")
+    draft = value.get("draft")
+    head_oid = head.get("sha")
+    base_oid = base.get("sha")
+    body = value.get("body")
+    if (
+        response_number != number
+        or state not in {"open", "closed"}
+        or type(draft) is not bool
+        or not isinstance(head_oid, str)
+        or FULL_OID_PATTERN.fullmatch(head_oid) is None
+        or not isinstance(base_oid, str)
+        or FULL_OID_PATTERN.fullmatch(base_oid) is None
+        or not isinstance(body, str)
+    ):
+        raise PullRequestBodyGuardError("pull-request response shape is invalid")
+    return PullRequestBodySnapshot(
+        number=number,
+        state=state,
+        draft=draft,
+        head_oid=head_oid,
+        base_oid=base_oid,
+        body=body,
+    )
+
+
+def _sanitized_pr_body_api_failure(
+    error: GitHubAPIError,
+    operation: str,
+) -> PullRequestBodyGuardError:
+    if error.is_service_unavailable:
+        return PullRequestBodyGuardError(f"{operation} failed with HTTP 503")
+    status = re.search(r"\bHTTP ([1-5][0-9]{2})\b", error.stderr, re.IGNORECASE)
+    if status is not None:
+        return PullRequestBodyGuardError(
+            f"{operation} failed with HTTP {status.group(1)}"
+        )
+    return PullRequestBodyGuardError(f"{operation} failed")
+
+
+def _read_pr_body_snapshot(
+    client: GitHubAPI,
+    endpoint: str,
+    number: int,
+    *,
+    sleep: Callable[[float], None],
+) -> PullRequestBodySnapshot:
+    for attempt in range(1, PR_BODY_READ_ATTEMPTS + 1):
+        try:
+            return _pr_body_snapshot(client.read(endpoint), number)
+        except GitHubAPIError as error:
+            if not error.is_service_unavailable:
+                raise _sanitized_pr_body_api_failure(
+                    error, "pull-request readback"
+                ) from None
+            if attempt == PR_BODY_READ_ATTEMPTS:
+                raise PullRequestBodyGuardError(
+                    "pull-request readback exhausted HTTP 503 attempts"
+                ) from None
+            sleep(PR_BODY_RETRY_SECONDS)
+    raise AssertionError("unreachable pull-request readback state")
+
+
+def execute_pr_body_update(
+    command: Sequence[str],
+    payload: str,
+    *,
+    api: GitHubAPI | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> int:
+    """Update exactly one theyos PR body through reconcilable REST PATCH calls."""
+    if (
+        len(command) != 4
+        or command[:3] != ["gh", "pr", "edit"]
+        or LOCAL_GITHUB_NUMBER_PATTERN.fullmatch(command[3]) is None
+    ):
+        raise UnsafeCommand(
+            "body-only REST PR edit requires exactly: gh pr edit <positive-number>"
+        )
+    number = int(command[3])
+    endpoint = f"repos/{SAFE_GITHUB_REPO}/pulls/{number}"
+    client = api or GitHubAPI(SAFE_GITHUB_REPO)
+    original = _read_pr_body_snapshot(
+        client, endpoint, number, sleep=sleep
+    )
+
+    for mutation_attempt in range(1, PR_BODY_WRITE_ATTEMPTS + 1):
+        mutation_returned_503 = False
+        try:
+            patch_snapshot = _pr_body_snapshot(
+                client.mutate_json("PATCH", endpoint, {"body": payload}), number
+            )
+            if not patch_snapshot.same_object_as(original):
+                raise PullRequestBodyGuardError(
+                    "pull-request identity drifted in PATCH response"
+                )
+            if patch_snapshot.body != payload:
+                raise PullRequestBodyGuardError(
+                    "pull-request PATCH response body mismatch"
+                )
+        except GitHubAPIError as error:
+            if not error.is_service_unavailable:
+                raise _sanitized_pr_body_api_failure(
+                    error, "pull-request PATCH"
+                ) from None
+            mutation_returned_503 = True
+
+        observed = _read_pr_body_snapshot(
+            client, endpoint, number, sleep=sleep
+        )
+        if not observed.same_object_as(original):
+            raise PullRequestBodyGuardError(
+                "pull-request identity drifted during body update"
+            )
+        if observed.body == payload:
+            print(
+                json.dumps(
+                    {
+                        "operation": "gh-pr-edit-body-rest",
+                        "pull_request": number,
+                        "mutation_attempts": mutation_attempt,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+            return 0
+        if not mutation_returned_503:
+            raise PullRequestBodyGuardError(
+                "pull-request body did not match successful PATCH"
+            )
+        if observed.body != original.body:
+            raise PullRequestBodyGuardError(
+                "pull-request body reached an unexpected third state"
+            )
+        if mutation_attempt == PR_BODY_WRITE_ATTEMPTS:
+            raise PullRequestBodyGuardError(
+                "pull-request PATCH exhausted HTTP 503 attempts"
+            )
+        sleep(PR_BODY_RETRY_SECONDS)
+
+    raise AssertionError("unreachable pull-request body update state")
 
 
 @dataclass(frozen=True)
@@ -3157,6 +3352,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 2
 
+    if len(command) == 4 and command[:3] == ["gh", "pr", "edit"]:
+        try:
+            return execute_pr_body_update(command, payload)
+        except (
+            UnsafeCommand,
+            PullRequestBodyGuardError,
+            ReleaseGuardError,
+            GitHubAPIError,
+        ) as error:
+            print(f"BLOCKED: {error}", file=sys.stderr)
+            return 2
 
     if command[:1] == ["governed-release"]:
         try:
