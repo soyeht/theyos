@@ -49,6 +49,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
+use tower::ServiceExt;
 use tracing::info;
 
 const TERMINAL_REPLAY_REBIND_INTERVAL: Duration = Duration::from_millis(100);
@@ -58,6 +59,537 @@ const TERMINAL_REPLAY_REBIND_INTERVAL: Duration = Duration::from_millis(100);
 static BOOTSTRAP_STATE: OnceLock<BootstrapStateArc> = OnceLock::new();
 
 const HOUSEHOLD_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(30);
+const PHASE3_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Clone)]
+pub struct Phase3RuntimeController {
+    inner: Arc<RwLock<Option<Phase3RuntimeBundle>>>,
+    router: Phase3RouterSlot,
+    state_dir: PathBuf,
+    household: HouseholdState,
+    pair_machine_window: Arc<PairMachineWindow>,
+    key_policy: KeyBackingPolicy,
+    shared_state: Option<SharedState>,
+}
+
+#[derive(Clone)]
+struct Phase3RouterSlot {
+    state_dir: Arc<PathBuf>,
+    router: Arc<RwLock<Option<Phase3RouterEntry>>>,
+}
+
+#[derive(Clone)]
+struct Phase3RouterEntry {
+    generation: household_rs::household_lifecycle::HouseholdLifecycleGenerationV1,
+    router: axum::Router,
+    cancel: tokio::sync::watch::Sender<bool>,
+    active: Arc<Phase3ActiveLeases>,
+}
+
+#[derive(Default)]
+struct Phase3ActiveLeases {
+    count: std::sync::atomic::AtomicUsize,
+    idle: tokio::sync::Notify,
+}
+
+struct Phase3ActiveLease(Arc<Phase3ActiveLeases>);
+
+impl Drop for Phase3ActiveLease {
+    fn drop(&mut self) {
+        if self
+            .0
+            .count
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+        {
+            self.0.idle.notify_waiters();
+        }
+    }
+}
+
+impl Phase3RouterSlot {
+    fn new(state_dir: PathBuf) -> Self {
+        Self {
+            state_dir: Arc::new(state_dir),
+            router: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    async fn publish(
+        &self,
+        generation: household_rs::household_lifecycle::HouseholdLifecycleGenerationV1,
+        router: axum::Router,
+    ) {
+        let (cancel, _) = tokio::sync::watch::channel(false);
+        *self.router.write().await = Some(Phase3RouterEntry {
+            generation,
+            router,
+            cancel,
+            active: Arc::new(Phase3ActiveLeases::default()),
+        });
+    }
+
+    async fn retire(&self) {
+        let entry = self.router.write().await.take();
+        let Some(entry) = entry else {
+            return;
+        };
+        let _ = entry.cancel.send(true);
+        loop {
+            // Register the waiter before observing the counter so the final
+            // lease cannot drop between the load and `notified()` creation.
+            let idle = entry.active.idle.notified();
+            if entry
+                .active
+                .count
+                .load(std::sync::atomic::Ordering::Acquire)
+                == 0
+            {
+                break;
+            }
+            idle.await;
+        }
+    }
+
+    async fn route_or_reject(&self, request: axum::extract::Request) -> axum::response::Response {
+        let (entry, _lease) = {
+            let slot = self.router.read().await;
+            let Some(entry) = slot.as_ref() else {
+                return handlers_pair_machine::pre_household_reject().await;
+            };
+            entry
+                .active
+                .count
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            (entry.clone(), Phase3ActiveLease(Arc::clone(&entry.active)))
+        };
+        let state_dir = Arc::clone(&self.state_dir);
+        let lifecycle_guard = tokio::task::spawn_blocking(move || {
+            let lifecycle = HouseholdLifecycleLock::open_verified(state_dir.as_ref())?;
+            let deadline = Instant::now()
+                .checked_add(HOUSEHOLD_LIFECYCLE_TIMEOUT)
+                .ok_or(HouseholdLifecycleLockError::Io)?;
+            lifecycle.lock_shared_until(deadline)
+        })
+        .await;
+        let Ok(Ok(lifecycle_guard)) = lifecycle_guard else {
+            return handlers_pair_machine::pre_household_reject().await;
+        };
+        if lifecycle_guard.lifecycle_generation().ok().flatten() != Some(entry.generation) {
+            return handlers_pair_machine::pre_household_reject().await;
+        }
+        let mut cancel = entry.cancel.subscribe();
+        let response = tokio::select! {
+            response = entry.router.oneshot(request) => {
+                response.unwrap_or_else(|error| match error {})
+            }
+            changed = cancel.changed() => {
+                let _ = changed;
+                handlers_pair_machine::pre_household_reject().await
+            }
+        };
+        drop(lifecycle_guard);
+        response
+    }
+}
+
+struct Phase3RuntimeBundle {
+    generation: household_rs::household_lifecycle::HouseholdLifecycleGenerationV1,
+    router: axum::Router,
+    _event_log: Arc<OwnerEventLog>,
+    _event_broadcaster: OwnerEventsBroadcaster,
+    watchdog_cancel: tokio::sync::watch::Sender<bool>,
+    watchdog_task: tokio::task::JoinHandle<()>,
+    bonjour_task: Option<tokio::task::JoinHandle<()>>,
+    #[cfg(target_os = "macos")]
+    macos_local_listener:
+        Option<crate::macos_local_registration_listener::MacosLocalRegistrationListener>,
+}
+
+impl Phase3RuntimeBundle {
+    async fn shutdown(mut self) -> Result<(), String> {
+        let _ = self.watchdog_cancel.send(true);
+        match tokio::time::timeout(PHASE3_TASK_SHUTDOWN_TIMEOUT, &mut self.watchdog_task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    stage = "phase3_runtime.watchdog_join_failed",
+                    error = %error,
+                );
+            }
+            Err(_) => {
+                self.watchdog_task.abort();
+                let _ = self.watchdog_task.await;
+                tracing::warn!(stage = "phase3_runtime.watchdog_shutdown_forced");
+            }
+        }
+        if let Some(task) = self.bonjour_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(listener) = self.macos_local_listener.take()
+            && let Err(error) = listener.shutdown().await
+        {
+            return Err(format!(
+                "shut down macOS local registration listener: {error}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Phase3RuntimeController {
+    fn new(
+        state_dir: PathBuf,
+        household: HouseholdState,
+        pair_machine_window: Arc<PairMachineWindow>,
+        key_policy: KeyBackingPolicy,
+        shared_state: Option<SharedState>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(None)),
+            router: Phase3RouterSlot::new(state_dir.clone()),
+            state_dir,
+            household,
+            pair_machine_window,
+            key_policy,
+            shared_state,
+        }
+    }
+
+    pub(crate) async fn install_under_lifecycle(
+        &self,
+        lifecycle: &LifecycleWriteGuard,
+        loaded: Arc<household_rs::LoadedIdentity>,
+    ) -> Result<(), String> {
+        let broadcaster = OwnerEventsBroadcaster::new();
+        let event_log = OwnerEventLog::open_with_broadcaster_under_lifecycle(
+            lifecycle,
+            self.state_dir.clone(),
+            loaded.record.hh_id.as_str(),
+            broadcaster.clone(),
+        )
+        .map_err(|error| format!("open owner event log: {error}"))?;
+        self.install_with_resources_under_lifecycle(lifecycle, loaded, event_log, broadcaster)
+            .await
+    }
+
+    async fn install_with_resources_under_lifecycle(
+        &self,
+        lifecycle: &LifecycleWriteGuard,
+        loaded: Arc<household_rs::LoadedIdentity>,
+        event_log: Arc<OwnerEventLog>,
+        event_broadcaster: OwnerEventsBroadcaster,
+    ) -> Result<(), String> {
+        let generation = lifecycle
+            .lifecycle_generation()
+            .map_err(|error| format!("read lifecycle generation: {error}"))?
+            .ok_or_else(|| "installed household has no lifecycle generation".to_string())?;
+        let published = self
+            .household
+            .current()
+            .await
+            .ok_or_else(|| "installed household is not published in memory".to_string())?;
+        if published.record.hh_id != loaded.record.hh_id || published.cert.m_id != loaded.cert.m_id
+        {
+            return Err("installed household differs from published in-memory identity".into());
+        }
+
+        // Retire the old generation before binding any replacement-owned
+        // resources (notably the fixed macOS UDS path). The router slot is
+        // cleared first, so no request can enter G0 while its tasks are being
+        // joined or while G1 is still incomplete.
+        self.router.retire().await;
+        let previous = self.inner.write().await.take();
+        if let Some(previous) = previous {
+            previous.shutdown().await?;
+        }
+
+        let pair_machine_state = handlers_pair_machine::PairMachineRouterState {
+            window: Arc::clone(&self.pair_machine_window),
+            household: self.household.clone(),
+            event_log: Arc::clone(&event_log),
+            event_broadcaster: event_broadcaster.clone(),
+            state_dir: self.state_dir.clone(),
+        };
+        let owner_approval_policy = handlers_owner_events::owner_approval_policy_from_env();
+        let mut owner_events_state = handlers_owner_events::OwnerEventsRouterState::new(
+            self.household.clone(),
+            Arc::clone(&self.pair_machine_window),
+            Arc::clone(&event_log),
+            event_broadcaster.clone(),
+            self.state_dir.clone(),
+            self.key_policy,
+        )
+        .with_owner_approval_policy(owner_approval_policy.clone());
+        if owner_approval_policy.secure_upgrade_strong_minting_enabled() {
+            match handlers_owner_events::secure_upgrade_runtime_config_from_env() {
+                Ok(config) => {
+                    owner_events_state = owner_events_state.with_secure_upgrade_runtime(config);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        stage = "secure_upgrade.runtime_unavailable",
+                        reason = %error,
+                        "Secure/Upgrade rollout is enabled but runtime config is unavailable"
+                    );
+                }
+            }
+        }
+        if let Some(state) = self.shared_state.as_ref() {
+            owner_events_state = owner_events_state
+                .with_recovery_consume_rate_limiter(Arc::clone(&state.rate_limiter));
+        }
+        let router = phase3_router(
+            pair_machine_state.clone(),
+            owner_events_state.clone(),
+            self.household.clone(),
+            Arc::clone(&event_log),
+            self.state_dir.clone(),
+        );
+        #[cfg(target_os = "macos")]
+        let macos_local_listener = {
+            let state_dir = self.state_dir.clone();
+            let verifier: Arc<dyn crate::macos_local_caller_auth::MacosLocalCallerAuth> = Arc::new(
+                crate::macos_local_caller_auth::DesignatedRequirementMacosLocalCallerAuth::new(
+                    macos_local_app_profile_for_state_dir(&state_dir),
+                ),
+            );
+            match macos_local_owner_webauthn_registration_state(
+                owner_events_state.clone(),
+                &state_dir,
+                verifier,
+            ) {
+                Ok(state) => {
+                    let router =
+                        handlers_owner_events::owner_webauthn_macos_local_registration_router(
+                            state,
+                        );
+                    Some(
+                        crate::macos_local_registration_listener::spawn_macos_local_registration_listener(
+                            &state_dir,
+                            router,
+                        )
+                        .map_err(|error| format!("start macOS local registration listener: {error}"))?,
+                    )
+                }
+                Err(error) => {
+                    return Err(format!("build macOS local registration state: {error}"));
+                }
+            }
+        };
+
+        // Spawn tasks only after every fallible resource in the bundle has
+        // been constructed. An install error therefore leaves no detached
+        // watchdog/browser behind.
+        let (watchdog_cancel, watchdog_rx) = tokio::sync::watch::channel(false);
+        let watchdog_task = handlers_owner_events::spawn_owner_timeout_watchdog(
+            owner_events_state.clone(),
+            watchdog_rx,
+        );
+        let bonjour_task = (loaded.record.shamir_n == 1)
+            .then(|| bonjour_browser::spawn_bonjour_browser(pair_machine_state));
+
+        let replacement = Phase3RuntimeBundle {
+            generation,
+            router,
+            _event_log: event_log,
+            _event_broadcaster: event_broadcaster,
+            watchdog_cancel,
+            watchdog_task,
+            bonjour_task,
+            #[cfg(target_os = "macos")]
+            macos_local_listener,
+        };
+        self.router
+            .publish(replacement.generation, replacement.router.clone())
+            .await;
+        *self.inner.write().await = Some(replacement);
+        tracing::info!(
+            stage = "phase3_runtime.installed",
+            hh_id = %loaded.record.hh_id,
+            m_id = %loaded.cert.m_id,
+        );
+        Ok(())
+    }
+
+    pub(crate) async fn deactivate(&self) -> Result<(), String> {
+        self.router.retire().await;
+        let bundle = self.inner.write().await.take();
+        if let Some(bundle) = bundle {
+            bundle.shutdown().await?;
+        }
+        Ok(())
+    }
+
+    async fn route_or_reject(&self, request: axum::extract::Request) -> axum::response::Response {
+        self.router.route_or_reject(request).await
+    }
+}
+
+fn phase3_router(
+    pair_machine_state: handlers_pair_machine::PairMachineRouterState,
+    owner_events_state: handlers_owner_events::OwnerEventsRouterState,
+    household: HouseholdState,
+    event_log: Arc<OwnerEventLog>,
+    state_dir: PathBuf,
+) -> axum::Router {
+    let sign_machine_cert_router = crate::handlers_sign_machine_cert::sign_machine_cert_router(
+        crate::handlers_sign_machine_cert::SignMachineCertRouterState {
+            household,
+            event_log,
+            state_dir,
+        },
+    );
+    let router = axum::Router::new()
+        .route(
+            "/api/v1/household/join-request",
+            axum::routing::post(handlers_pair_machine::founder_join_request_handler),
+        )
+        .with_state(pair_machine_state)
+        .merge(
+            axum::Router::new()
+                .route(
+                    "/api/v1/household/owner-events",
+                    axum::routing::get(handlers_owner_events::owner_events_long_poll),
+                )
+                .route(
+                    "/api/v1/household/owner-device/push-token",
+                    axum::routing::post(handlers_owner_events::push_token_register_handler),
+                )
+                .route(
+                    "/api/v1/household/owner-webauthn/registration/start",
+                    axum::routing::post(
+                        handlers_owner_events::owner_webauthn_registration_start_handler,
+                    ),
+                )
+                .route(
+                    "/api/v1/household/owner-webauthn/registration/finish",
+                    axum::routing::post(
+                        handlers_owner_events::owner_webauthn_registration_finish_handler,
+                    ),
+                )
+                .route(
+                    "/api/v1/household/owner-webauthn/registration/status",
+                    axum::routing::post(
+                        handlers_owner_events::owner_webauthn_registration_status_handler,
+                    ),
+                )
+                .route(
+                    handlers_owner_events::SECURE_UPGRADE_APP_ATTEST_START_PATH,
+                    axum::routing::post(
+                        handlers_owner_events::secure_upgrade_app_attest_start_handler,
+                    ),
+                )
+                .route(
+                    handlers_owner_events::SECURE_UPGRADE_APP_ATTEST_FINISH_PATH,
+                    axum::routing::post(
+                        handlers_owner_events::secure_upgrade_app_attest_finish_handler,
+                    ),
+                )
+                .route(
+                    "/api/v1/household/owner-webauthn/revoke/start",
+                    axum::routing::post(
+                        handlers_owner_events::owner_webauthn_revoke_credential_start_handler,
+                    ),
+                )
+                .route(
+                    "/api/v1/household/owner-webauthn/revoke/finish",
+                    axum::routing::post(
+                        handlers_owner_events::owner_webauthn_revoke_credential_finish_handler,
+                    ),
+                )
+                .route(
+                    "/api/v1/household/owner-webauthn/add-credential/start",
+                    axum::routing::post(
+                        handlers_owner_events::owner_webauthn_add_credential_start_handler,
+                    ),
+                )
+                .route(
+                    "/api/v1/household/owner-webauthn/add-credential/finish",
+                    axum::routing::post(
+                        handlers_owner_events::owner_webauthn_add_credential_finish_handler,
+                    ),
+                )
+                .route(
+                    "/api/v1/household/owner-webauthn/recovery/status",
+                    axum::routing::post(
+                        handlers_owner_events::owner_webauthn_recovery_status_handler,
+                    ),
+                )
+                .route(
+                    "/api/v1/household/owner-webauthn/recovery/start",
+                    axum::routing::post(
+                        handlers_owner_events::owner_webauthn_recovery_start_handler,
+                    ),
+                )
+                .route(
+                    "/api/v1/household/owner-webauthn/recovery/finish",
+                    axum::routing::post(
+                        handlers_owner_events::owner_webauthn_recovery_finish_handler,
+                    ),
+                )
+                .route(
+                    "/api/v1/household/owner-webauthn/recovery/consume/start",
+                    axum::routing::post(
+                        handlers_owner_events::owner_webauthn_recovery_consume_start_handler,
+                    ),
+                )
+                .route(
+                    "/api/v1/household/owner-webauthn/recovery/consume/finish",
+                    axum::routing::post(
+                        handlers_owner_events::owner_webauthn_recovery_consume_finish_handler,
+                    ),
+                )
+                .route(
+                    "/api/v1/household/owner-events/{cursor}/approve",
+                    axum::routing::post(handlers_owner_events::owner_approve_handler),
+                )
+                .route(
+                    "/api/v1/household/owner-events/{cursor}/approval-v2/start",
+                    axum::routing::post(handlers_owner_events::owner_approval_v2_start_handler),
+                )
+                .route(
+                    "/api/v1/household/owner-events/{cursor}/decline",
+                    axum::routing::post(handlers_owner_events::owner_decline_handler),
+                )
+                .route(
+                    "/api/v1/household/device-pairing/request",
+                    axum::routing::post(handlers_device_pairing::device_pairing_request_handler),
+                )
+                .route(
+                    "/api/v1/household/device-pairing/approve",
+                    axum::routing::post(handlers_device_pairing::device_pairing_approve_handler),
+                )
+                .route(
+                    "/api/v1/household/device-pairing/requests",
+                    axum::routing::get(handlers_device_pairing::device_pairing_requests_handler),
+                )
+                .route(
+                    "/api/v1/household/device-pairing/reject",
+                    axum::routing::post(handlers_device_pairing::device_pairing_reject_handler),
+                )
+                .route(
+                    "/api/v1/household/device-pairing/{request_id}",
+                    axum::routing::get(handlers_device_pairing::device_pairing_poll_handler),
+                )
+                .with_state(owner_events_state),
+        )
+        .merge(sign_machine_cert_router);
+    #[cfg(test)]
+    let router = router.layer(axum::middleware::from_fn(
+        |request: axum::extract::Request, next: axum::middleware::Next| async move {
+            PHASE3_TEST_DISPATCH_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            next.run(request).await
+        },
+    ));
+    router.fallback(handlers_pair_machine::pre_household_reject)
+}
+
+#[cfg(test)]
+static PHASE3_TEST_DISPATCH_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 #[derive(Debug, thiserror::Error)]
 enum LifecycleIdentityLoadError {
@@ -1226,9 +1758,43 @@ pub async fn bootstrap_household(
         }
     }
 
+    let phase3_runtime = Phase3RuntimeController::new(
+        state_dir.clone(),
+        identity_state.clone(),
+        Arc::clone(&pair_machine_window),
+        key_policy,
+        shared_state.clone(),
+    );
+    if let Some(loaded) = identity_load.loaded.as_ref() {
+        let Some(Ok(event_log)) = owner_event_log.as_ref() else {
+            tracing::error!(
+                stage = "phase3_runtime.startup_dependencies_unavailable",
+                "installed household cannot start without its Phase 3 runtime"
+            );
+            return;
+        };
+        if let Err(error) = phase3_runtime
+            .install_with_resources_under_lifecycle(
+                identity_load.lifecycle_guard(),
+                Arc::clone(loaded),
+                Arc::clone(event_log),
+                owner_event_broadcaster.clone(),
+            )
+            .await
+        {
+            tracing::error!(
+                stage = "phase3_runtime.startup_install_failed",
+                error = %error,
+                "installed household cannot start without its Phase 3 runtime"
+            );
+            return;
+        }
+    }
+
     // `identity_state`, `bootstrap_state_arc`, both ceremony windows, and the
-    // optional owner-event handle now all describe the exact disk generation
-    // observed under this transaction. Only now may teardown detach it.
+    // generation-bound Phase 3 bundle now all describe the exact disk
+    // generation observed under this transaction. Only now may teardown
+    // detach it.
     drop(identity_load);
 
     if machine_joined_reconciled {
@@ -1304,300 +1870,7 @@ pub async fn bootstrap_household(
             state_dir: state_dir.clone(),
         });
 
-    // Phase 3 join-request endpoint (T042–T046). Distinct router so the
-    // shared `PairMachineRouterState` (window + event log + broadcaster +
-    // household identity slot) lives independently of the Phase 2
-    // pair-device state.
-    let mut bonjour_browser_state = None;
-    let pair_machine_router = match owner_event_log {
-        Some(Ok(owner_event_log)) => {
-            let pair_machine_state = handlers_pair_machine::PairMachineRouterState {
-                window: Arc::clone(&pair_machine_window),
-                household: identity_state.clone(),
-                event_log: Arc::clone(&owner_event_log),
-                event_broadcaster: owner_event_broadcaster.clone(),
-                state_dir: state_dir.clone(),
-            };
-            bonjour_browser_state = Some(pair_machine_state.clone());
-            let owner_approval_policy = handlers_owner_events::owner_approval_policy_from_env();
-            let mut owner_events_state = handlers_owner_events::OwnerEventsRouterState::new(
-                identity_state.clone(),
-                Arc::clone(&pair_machine_window),
-                owner_event_log,
-                owner_event_broadcaster,
-                state_dir.clone(),
-                key_policy,
-            )
-            .with_owner_approval_policy(owner_approval_policy.clone());
-            if owner_approval_policy.secure_upgrade_strong_minting_enabled() {
-                match handlers_owner_events::secure_upgrade_runtime_config_from_env() {
-                    Ok(config) => {
-                        owner_events_state = owner_events_state.with_secure_upgrade_runtime(config);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            stage = "secure_upgrade.runtime_unavailable",
-                            reason = %e,
-                            "Secure/Upgrade rollout is enabled but runtime config is unavailable"
-                        );
-                    }
-                }
-            }
-            if let Some(state) = shared_state.as_ref() {
-                owner_events_state = owner_events_state
-                    .with_recovery_consume_rate_limiter(Arc::clone(&state.rate_limiter));
-            }
-            let sign_machine_cert_state =
-                crate::handlers_sign_machine_cert::SignMachineCertRouterState {
-                    household: identity_state.clone(),
-                    event_log: Arc::clone(&pair_machine_state.event_log),
-                    state_dir: state_dir.clone(),
-                };
-            let sign_machine_cert_router =
-                crate::handlers_sign_machine_cert::sign_machine_cert_router(
-                    sign_machine_cert_state,
-                );
-            // Spawn the runtime owner-timeout watchdog (FR-019 active
-            // half: the in-process counterpart to load_state_dir's
-            // boot recovery).
-            //
-            // The cancel sender is `Box::leak`'d into `'static`. Two
-            // reasons:
-            //
-            // 1. The watchdog's `watch::Receiver::changed()` returns
-            //    `Err` when ALL senders drop. If we let the local
-            //    `cancel_tx` go out of scope at end of this match
-            //    arm, the watchdog would observe the drop and exit
-            //    immediately — defeating its purpose.
-            // 2. Production currently relies on `tokio::Runtime` drop
-            //    on SIGTERM to abort the watchdog (no in-process
-            //    restart path yet). Leaking the sender into `'static`
-            //    means the daemon process owns it for its full
-            //    lifetime, with no risk of accidental drop, and
-            //    leaves a genuine hook (`&'static
-            //    watch::Sender<bool>`) available to a future
-            //    graceful-shutdown path that wants to call
-            //    `cancel_tx.send(true)` instead of relying on runtime
-            //    abort.
-            //
-            // The leak is bounded: one `watch::channel<bool>` per
-            // household-router lifetime. Memory cost is constant.
-            let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-            let _: &'static tokio::sync::watch::Sender<bool> = Box::leak(Box::new(cancel_tx));
-            let _timeout_watchdog = handlers_owner_events::spawn_owner_timeout_watchdog(
-                owner_events_state.clone(),
-                cancel_rx,
-            );
-            #[cfg(target_os = "macos")]
-            {
-                let macos_local_verifier: Arc<
-                    dyn crate::macos_local_caller_auth::MacosLocalCallerAuth,
-                > = Arc::new(
-                    crate::macos_local_caller_auth::DesignatedRequirementMacosLocalCallerAuth::new(
-                        macos_local_app_profile_for_state_dir(&state_dir),
-                    ),
-                );
-                match macos_local_owner_webauthn_registration_state(
-                    owner_events_state.clone(),
-                    &state_dir,
-                    macos_local_verifier,
-                ) {
-                    Ok(macos_local_state) => {
-                        let macos_local_router =
-                            handlers_owner_events::owner_webauthn_macos_local_registration_router(
-                                macos_local_state,
-                            );
-                        if let Err(e) =
-                            crate::macos_local_registration_listener::spawn_macos_local_registration_listener(
-                                &state_dir,
-                                macos_local_router,
-                            )
-                        {
-                            tracing::warn!(
-                                stage = "macos_local_registration.listener_unavailable",
-                                error = %e,
-                                "macOS local registration listener unavailable"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            stage = "macos_local_registration.state_unavailable",
-                            error = %e,
-                            "macOS local registration state unavailable"
-                        );
-                    }
-                }
-            }
-            Some(
-                axum::Router::new()
-                    .route(
-                        "/api/v1/household/join-request",
-                        axum::routing::post(handlers_pair_machine::founder_join_request_handler),
-                    )
-                    .with_state(pair_machine_state)
-                    .merge(
-                        axum::Router::new()
-                            .route(
-                                "/api/v1/household/owner-events",
-                                axum::routing::get(handlers_owner_events::owner_events_long_poll),
-                            )
-                            .route(
-                                "/api/v1/household/owner-device/push-token",
-                                axum::routing::post(
-                                    handlers_owner_events::push_token_register_handler,
-                                ),
-                            )
-                            .route(
-                                "/api/v1/household/owner-webauthn/registration/start",
-                                axum::routing::post(
-                                    handlers_owner_events::owner_webauthn_registration_start_handler,
-                                ),
-                            )
-                            .route(
-                                "/api/v1/household/owner-webauthn/registration/finish",
-                                axum::routing::post(
-                                    handlers_owner_events::owner_webauthn_registration_finish_handler,
-                                ),
-                            )
-                            .route(
-                                "/api/v1/household/owner-webauthn/registration/status",
-                                axum::routing::post(
-                                    handlers_owner_events::owner_webauthn_registration_status_handler,
-                                ),
-                            )
-                            .route(
-                                handlers_owner_events::SECURE_UPGRADE_APP_ATTEST_START_PATH,
-                                axum::routing::post(
-                                    handlers_owner_events::secure_upgrade_app_attest_start_handler,
-                                ),
-                            )
-                            .route(
-                                handlers_owner_events::SECURE_UPGRADE_APP_ATTEST_FINISH_PATH,
-                                axum::routing::post(
-                                    handlers_owner_events::secure_upgrade_app_attest_finish_handler,
-                                ),
-                            )
-                            .route(
-                                "/api/v1/household/owner-webauthn/revoke/start",
-                                axum::routing::post(
-                                    handlers_owner_events::owner_webauthn_revoke_credential_start_handler,
-                                ),
-                            )
-                            .route(
-                                "/api/v1/household/owner-webauthn/revoke/finish",
-                                axum::routing::post(
-                                    handlers_owner_events::owner_webauthn_revoke_credential_finish_handler,
-                                ),
-                            )
-                            .route(
-                                "/api/v1/household/owner-webauthn/add-credential/start",
-                                axum::routing::post(
-                                    handlers_owner_events::owner_webauthn_add_credential_start_handler,
-                                ),
-                            )
-                            .route(
-                                "/api/v1/household/owner-webauthn/add-credential/finish",
-                                axum::routing::post(
-                                    handlers_owner_events::owner_webauthn_add_credential_finish_handler,
-                                ),
-                            )
-                            .route(
-                                "/api/v1/household/owner-webauthn/recovery/status",
-                                axum::routing::post(
-                                    handlers_owner_events::owner_webauthn_recovery_status_handler,
-                                ),
-                            )
-                            .route(
-                                "/api/v1/household/owner-webauthn/recovery/start",
-                                axum::routing::post(
-                                    handlers_owner_events::owner_webauthn_recovery_start_handler,
-                                ),
-                            )
-                            .route(
-                                "/api/v1/household/owner-webauthn/recovery/finish",
-                                axum::routing::post(
-                                    handlers_owner_events::owner_webauthn_recovery_finish_handler,
-                                ),
-                            )
-                            .route(
-                                "/api/v1/household/owner-webauthn/recovery/consume/start",
-                                axum::routing::post(
-                                    handlers_owner_events::owner_webauthn_recovery_consume_start_handler,
-                                ),
-                            )
-                            .route(
-                                "/api/v1/household/owner-webauthn/recovery/consume/finish",
-                                axum::routing::post(
-                                    handlers_owner_events::owner_webauthn_recovery_consume_finish_handler,
-                                ),
-                            )
-                            .route(
-                                "/api/v1/household/owner-events/{cursor}/approve",
-                                axum::routing::post(handlers_owner_events::owner_approve_handler),
-                            )
-                            .route(
-                                "/api/v1/household/owner-events/{cursor}/approval-v2/start",
-                                axum::routing::post(
-                                    handlers_owner_events::owner_approval_v2_start_handler,
-                                ),
-                            )
-                            .route(
-                                "/api/v1/household/owner-events/{cursor}/decline",
-                                axum::routing::post(handlers_owner_events::owner_decline_handler),
-                            )
-                            .route(
-                                "/api/v1/household/device-pairing/request",
-                                axum::routing::post(
-                                    handlers_device_pairing::device_pairing_request_handler,
-                                ),
-                            )
-                            .route(
-                                "/api/v1/household/device-pairing/approve",
-                                axum::routing::post(
-                                    handlers_device_pairing::device_pairing_approve_handler,
-                                ),
-                            )
-                            .route(
-                                "/api/v1/household/device-pairing/requests",
-                                axum::routing::get(
-                                    handlers_device_pairing::device_pairing_requests_handler,
-                                ),
-                            )
-                            .route(
-                                "/api/v1/household/device-pairing/reject",
-                                axum::routing::post(
-                                    handlers_device_pairing::device_pairing_reject_handler,
-                                ),
-                            )
-                            .route(
-                                "/api/v1/household/device-pairing/{request_id}",
-                                axum::routing::get(
-                                    handlers_device_pairing::device_pairing_poll_handler,
-                                ),
-                            )
-                            .with_state(owner_events_state),
-                    )
-                    .merge(sign_machine_cert_router),
-            )
-        }
-        Some(Err(e)) => {
-            // Refuse to bring up the join-request endpoint without a
-            // working append log: silently dropping events would leave
-            // the iPhone long-poll permanently empty after a partial
-            // boot. Surface the error, skip mounting the route, and
-            // continue with the Phase 2 surface so the rest of the
-            // identity stack stays available.
-            tracing::error!(
-                stage = "owner_event_log.open_failed",
-                error = %e,
-                "Phase 3 join-request endpoint will be unavailable until owner-events log opens cleanly",
-            );
-            None
-        }
-        None => None,
-    };
-
+    // ── Bootstrap router (T008 / T009 / T010 / T011) ─────────────────────
     // ── Bootstrap router (T008 / T009 / T010 / T011) ─────────────────────
     // Always live — even on a cold, uninitialized engine.
     let bootstrap_handler_state = BootstrapHandlerState::new(
@@ -1607,7 +1880,8 @@ pub async fn bootstrap_household(
         Arc::clone(&pair_device_window),
         Arc::clone(&pair_machine_window),
         port,
-    );
+    )
+    .with_phase3_runtime(phase3_runtime.clone());
     if matches!(
         initial_bootstrap_state,
         BootstrapState::Uninitialized | BootstrapState::ReadyForNaming
@@ -1700,7 +1974,7 @@ pub async fn bootstrap_household(
     // stage handler so the seed lookup is a zero-cost memory read, and lets
     // `local_finalize_handler` consult the engine `BootstrapState` to refuse
     // a finalize that would race a sibling `accept_household_confirm`.
-    let pre_household_rt = handlers_pair_machine::pre_household_router(
+    let pre_household_rt = handlers_pair_machine::pre_household_routes(
         handlers_pair_machine::PreHouseholdRouterState {
             window: Arc::clone(&pair_machine_window),
             state_dir: state_dir.clone(),
@@ -1782,9 +2056,11 @@ pub async fn bootstrap_household(
     if let Some(r) = claws_router {
         household_router = household_router.merge(r);
     }
-    if let Some(r) = pair_machine_router {
-        household_router = household_router.merge(r);
-    }
+    let phase3_fallback = phase3_runtime.clone();
+    household_router = household_router.fallback(move |request| {
+        let phase3_fallback = phase3_fallback.clone();
+        async move { phase3_fallback.route_or_reject(request).await }
+    });
 
     let bound_set = household_listener::BoundSet::default();
     let initial_bound = household_listener::spawn_household_listeners(
@@ -1888,19 +2164,14 @@ pub async fn bootstrap_household(
             port,
         )
         .await;
-        if loaded.record.shamir_n == 1 {
-            if let Some(state) = bonjour_browser_state.clone() {
-                drop(bonjour_browser::spawn_bonjour_browser(state));
-            }
-        }
     } else {
         let deps = HouseholdIdentityWatcherDeps {
             pair_device_window: Arc::clone(&pair_device_window),
             pair_machine_window: Arc::clone(&pair_machine_window),
             targets: initial_bound,
             port,
-            bonjour_browser_state,
             claw_share: Some(claw_share_runtime),
+            phase3_runtime: phase3_runtime.clone(),
             shared_state: shared_state.clone(),
         };
         spawn_household_identity_watcher(state_dir, identity_state, key_policy, deps);
@@ -2012,8 +2283,8 @@ struct HouseholdIdentityWatcherDeps {
     pair_machine_window: Arc<household_rs::pair_machine::PairMachineWindow>,
     targets: Vec<(IpAddr, InterfaceClass)>,
     port: u16,
-    bonjour_browser_state: Option<handlers_pair_machine::PairMachineRouterState>,
     claw_share: Option<ClawShareRuntimeHandles>,
+    phase3_runtime: Phase3RuntimeController,
     /// Carried solely so the two post-pairing REMOUNTS below can hand it to the
     /// relay-stream mount. The watcher closure cannot reach `bootstrap_household`'s
     /// `shared_state` any other way, and without it those remounts would silently
@@ -2048,8 +2319,8 @@ fn spawn_household_identity_watcher_with_interval(
         pair_machine_window,
         targets,
         port,
-        bonjour_browser_state,
         claw_share,
+        phase3_runtime,
         shared_state,
     } = deps;
     tokio::spawn(async move {
@@ -2072,11 +2343,6 @@ fn spawn_household_identity_watcher_with_interval(
                     port,
                 )
                 .await;
-                if loaded.record.shamir_n == 1 {
-                    if let Some(state) = bonjour_browser_state.clone() {
-                        drop(bonjour_browser::spawn_bonjour_browser(state));
-                    }
-                }
                 if let Some(runtime) = &claw_share {
                     mount_claw_share_relay_stream_live_if_enabled(
                         state_dir.clone(),
@@ -2108,6 +2374,20 @@ fn spawn_household_identity_watcher_with_interval(
                     // until both pieces of memory authority are published.
                     let close_window = identity_load.owner_auth.is_some();
                     identity_load.publish_into(&identity_state).await;
+                    if let Err(error) = phase3_runtime
+                        .install_under_lifecycle(
+                            identity_load.lifecycle_guard(),
+                            Arc::clone(&loaded),
+                        )
+                        .await
+                    {
+                        tracing::error!(
+                            stage = "phase3_runtime.hot_install_failed",
+                            error = %error,
+                            "hot-loaded household remains fail-closed without Phase 3"
+                        );
+                        return;
+                    }
                     if close_window {
                         let _ = pair_device_window.close().await;
                     }
@@ -2135,15 +2415,6 @@ fn spawn_household_identity_watcher_with_interval(
                         port,
                     )
                     .await;
-                    if identity_state
-                        .current()
-                        .await
-                        .is_some_and(|id| id.record.shamir_n == 1)
-                    {
-                        if let Some(state) = bonjour_browser_state.clone() {
-                            drop(bonjour_browser::spawn_bonjour_browser(state));
-                        }
-                    }
                     break;
                 }
                 Ok(Ok(_cold)) => {}
@@ -2362,12 +2633,865 @@ fn persist_bootstrap_state_under_lifecycle(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::{Method, Request, StatusCode};
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
     use household_rs::claw_share::{SlotId, SlotState};
     use household_rs::household_mesh_log::{LogEntry, MeshEvent};
     use household_rs::keys::{IdentityKey, P256Keypair};
     use household_rs::person_cert::SignOwnerOptions;
+    use household_rs::pop::{PairingProofContext, RequestSigningContext};
+    use serde::Serialize;
 
     static RECOVERY_TIMEOUT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static PHASE3_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn phase3_surface_has_one_production_factory() {
+        let source = include_str!("household_bootstrap.rs");
+        let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+        assert_eq!(production.matches("fn phase3_router(").count(), 1);
+        assert!(!production.contains("pair_machine_router"));
+        for path in [
+            "/api/v1/household/join-request",
+            "/api/v1/household/owner-events",
+            "/api/v1/household/owner-device/push-token",
+            "/api/v1/household/owner-webauthn/registration/start",
+            "/api/v1/household/owner-webauthn/registration/finish",
+            "/api/v1/household/owner-webauthn/registration/status",
+            "/api/v1/household/owner-webauthn/revoke/start",
+            "/api/v1/household/owner-webauthn/revoke/finish",
+            "/api/v1/household/owner-webauthn/add-credential/start",
+            "/api/v1/household/owner-webauthn/add-credential/finish",
+            "/api/v1/household/owner-webauthn/recovery/status",
+            "/api/v1/household/owner-webauthn/recovery/start",
+            "/api/v1/household/owner-webauthn/recovery/finish",
+            "/api/v1/household/owner-webauthn/recovery/consume/start",
+            "/api/v1/household/owner-webauthn/recovery/consume/finish",
+            "/api/v1/household/owner-events/{cursor}/approve",
+            "/api/v1/household/owner-events/{cursor}/approval-v2/start",
+            "/api/v1/household/owner-events/{cursor}/decline",
+            "/api/v1/household/device-pairing/request",
+            "/api/v1/household/device-pairing/approve",
+            "/api/v1/household/device-pairing/requests",
+            "/api/v1/household/device-pairing/reject",
+            "/api/v1/household/device-pairing/{request_id}",
+        ] {
+            let literal = format!("\"{path}\"");
+            assert_eq!(
+                production.matches(&literal).count(),
+                1,
+                "Phase 3 path must be declared only by the single factory: {path}"
+            );
+        }
+        for symbol in [
+            "SECURE_UPGRADE_APP_ATTEST_START_PATH",
+            "SECURE_UPGRADE_APP_ATTEST_FINISH_PATH",
+            "sign_machine_cert_router(",
+            "spawn_owner_timeout_watchdog(",
+            "spawn_macos_local_registration_listener(",
+            "spawn_bonjour_browser(",
+        ] {
+            assert_eq!(
+                production.matches(symbol).count(),
+                1,
+                "Phase 3 resource/route must have one production owner: {symbol}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn phase3_router_slot_rejects_a_router_from_an_old_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let lifecycle = HouseholdLifecycleLock::open_verified(temp.path()).unwrap();
+        let write = lifecycle.lock_exclusive().unwrap();
+        let generation = write.ensure_lifecycle_generation().unwrap();
+        drop(write);
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_handler = Arc::clone(&calls);
+        let router = axum::Router::new().fallback(move || {
+            let calls = Arc::clone(&calls_for_handler);
+            async move {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                StatusCode::NO_CONTENT
+            }
+        });
+        let slot = Phase3RouterSlot::new(temp.path().to_path_buf());
+        slot.publish(generation, router).await;
+
+        let live = slot
+            .route_or_reject(Request::new(axum::body::Body::empty()))
+            .await;
+        assert_eq!(live.status(), StatusCode::NO_CONTENT);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        std::fs::create_dir(temp.path().join("household")).unwrap();
+        std::fs::write(
+            temp.path().join("household/household_record.cbor"),
+            b"generation-rotation-fixture",
+        )
+        .unwrap();
+        let lifecycle = HouseholdLifecycleLock::open_verified(temp.path()).unwrap();
+        let write = lifecycle.lock_exclusive().unwrap();
+        assert!(write.rename_household_to_tearing_down().unwrap());
+        drop(write);
+
+        let stale = slot
+            .route_or_reject(Request::new(axum::body::Body::empty()))
+            .await;
+        assert_eq!(stale.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the stale generation must be rejected before its handler runs"
+        );
+    }
+
+    #[tokio::test]
+    async fn phase3_retire_cancels_a_pending_request_before_exclusive_rotation() {
+        let temp = tempfile::tempdir().unwrap();
+        let lifecycle = HouseholdLifecycleLock::open_verified(temp.path()).unwrap();
+        let write = lifecycle.lock_exclusive().unwrap();
+        let generation = write.ensure_lifecycle_generation().unwrap();
+        drop(write);
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let entered_by_handler = Arc::clone(&entered);
+        let router = axum::Router::new().route(
+            "/pending",
+            axum::routing::get(move || {
+                let entered = Arc::clone(&entered_by_handler);
+                async move {
+                    entered.notify_one();
+                    std::future::pending::<StatusCode>().await
+                }
+            }),
+        );
+        let slot = Phase3RouterSlot::new(temp.path().to_path_buf());
+        slot.publish(generation, router).await;
+        let request_slot = slot.clone();
+        let request = tokio::spawn(async move {
+            request_slot
+                .route_or_reject(
+                    Request::builder()
+                        .uri("/pending")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("pending handler entered");
+
+        tokio::time::timeout(Duration::from_secs(2), slot.retire())
+            .await
+            .expect("retire cancels and joins the pending route lease");
+        let response = tokio::time::timeout(Duration::from_secs(2), request)
+            .await
+            .expect("request cancellation completes")
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        std::fs::create_dir(temp.path().join("household")).unwrap();
+        std::fs::write(
+            temp.path().join("household/household_record.cbor"),
+            b"concurrent-generation-rotation-fixture",
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::task::spawn_blocking({
+                let state_dir = temp.path().to_path_buf();
+                move || {
+                    let lifecycle = HouseholdLifecycleLock::open_verified(&state_dir).unwrap();
+                    let write = lifecycle.lock_exclusive().unwrap();
+                    assert!(write.rename_household_to_tearing_down().unwrap());
+                }
+            })
+            .await
+            .unwrap();
+        })
+        .await
+        .expect("exclusive lifecycle rotation is not starved by the long-poll");
+
+        let stale = slot
+            .route_or_reject(Request::new(axum::body::Body::empty()))
+            .await;
+        assert_eq!(stale.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[derive(Serialize)]
+    struct TestInitializeRequest<'a> {
+        v: u8,
+        name: &'a str,
+    }
+
+    #[allow(unsafe_code)]
+    async fn initialize_and_confirm_phase3_owner(
+        state: BootstrapHandlerState,
+        household: &HouseholdState,
+        pair_device_window: &Arc<household_rs::pair_device::PairDeviceWindow>,
+        state_dir: &Path,
+    ) -> P256Keypair {
+        let prior_force_software = std::env::var_os("THEYOS_FORCE_SOFTWARE_KEYS");
+        // SAFETY: the value is restored immediately after the initialize
+        // request. Existing first-owner tests use the same process fixture.
+        unsafe { std::env::set_var("THEYOS_FORCE_SOFTWARE_KEYS", "1") };
+        let initialize_body = household_rs::cbor::to_canonical_vec(&TestInitializeRequest {
+            v: 1,
+            name: "Phase Three Home",
+        })
+        .unwrap();
+        let initialized = crate::handlers_bootstrap::bootstrap_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/bootstrap/initialize")
+                    .body(axum::body::Body::from(initialize_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        match prior_force_software {
+            Some(value) => unsafe { std::env::set_var("THEYOS_FORCE_SOFTWARE_KEYS", value) },
+            None => unsafe { std::env::remove_var("THEYOS_FORCE_SOFTWARE_KEYS") },
+        }
+        assert_eq!(initialized.status(), StatusCode::OK);
+
+        let identity = household.current().await.expect("identity published");
+        let token = pair_device_window
+            .current_token()
+            .await
+            .expect("initialize opened pair-device window");
+        let owner = P256Keypair::generate();
+        let pairing_context =
+            PairingProofContext::new(identity.record.hh_id.clone(), token.nonce.0, owner.public());
+        let proof = owner
+            .sign(&pairing_context.canonical_bytes().unwrap())
+            .unwrap();
+        let confirm_body = serde_json::json!({
+            "v": 1,
+            "nonce": token.nonce.as_b64(),
+            "p_pub": B64URL.encode(owner.public().as_bytes()),
+            "display_name": "Owner",
+            "proof_sig": B64URL.encode(proof.as_bytes()),
+        });
+        let confirmed = axum::Router::new()
+            .route(
+                "/api/v1/household/pair-device/confirm",
+                axum::routing::post(handlers_pair_device::confirm),
+            )
+            .with_state(handlers_pair_device::PairDeviceState {
+                window: Arc::clone(pair_device_window),
+                household: household.clone(),
+                state_dir: state_dir.to_path_buf(),
+            })
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/household/pair-device/confirm")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&confirm_body).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(confirmed.status(), StatusCode::OK);
+        assert!(household.current_owner_auth().await.is_some());
+        owner
+    }
+
+    #[tokio::test]
+    async fn cold_initialize_confirm_installs_the_full_phase3_router_before_success() {
+        let _phase3_test = PHASE3_TEST_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let bootstrap = Arc::new(RwLock::new(BootstrapState::Uninitialized));
+        let household = HouseholdState::empty();
+        let pair_device_window = Arc::new(
+            household_rs::pair_device::PairDeviceWindow::with_persistence(
+                temp.path().to_path_buf(),
+            )
+            .unwrap(),
+        );
+        let pair_machine_window = Arc::new(PairMachineWindow::new_in_memory());
+        let runtime = Phase3RuntimeController::new(
+            temp.path().to_path_buf(),
+            household.clone(),
+            Arc::clone(&pair_machine_window),
+            KeyBackingPolicy::ForceSoftware,
+            None,
+        );
+        let state = BootstrapHandlerState::new(
+            Arc::clone(&bootstrap),
+            household.clone(),
+            temp.path().to_path_buf(),
+            Arc::clone(&pair_device_window),
+            Arc::clone(&pair_machine_window),
+            8091,
+        )
+        .with_phase3_runtime(runtime.clone());
+
+        let pre_initialize_dispatch =
+            PHASE3_TEST_DISPATCH_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+        let before = runtime
+            .route_or_reject(
+                Request::builder()
+                    .uri("/api/v1/household/owner-events?since=AA")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(before.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            PHASE3_TEST_DISPATCH_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            pre_initialize_dispatch,
+            "an absent cold runtime must reject before any Phase 3 handler"
+        );
+
+        let owner = initialize_and_confirm_phase3_owner(
+            state,
+            &household,
+            &pair_device_window,
+            temp.path(),
+        )
+        .await;
+        let generation0 = runtime.inner.read().await.as_ref().unwrap().generation;
+
+        let dispatch_before = PHASE3_TEST_DISPATCH_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+        let invented = runtime
+            .route_or_reject(
+                Request::builder()
+                    .uri("/api/v1/household/not-a-route")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(invented.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            PHASE3_TEST_DISPATCH_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            dispatch_before,
+            "an invented route must not enter the Phase 3 handler surface"
+        );
+
+        let invalid_pop = runtime
+            .route_or_reject(
+                Request::builder()
+                    .uri("/api/v1/household/owner-events?since=AA")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(invalid_pop.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            PHASE3_TEST_DISPATCH_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            dispatch_before + 1,
+            "invalid PoP must reach the mounted owner-events handler"
+        );
+
+        let complete_surface = [
+            (Method::POST, "/api/v1/household/join-request"),
+            (Method::POST, "/api/v1/household/owner-device/push-token"),
+            (
+                Method::POST,
+                "/api/v1/household/owner-webauthn/registration/start",
+            ),
+            (
+                Method::POST,
+                "/api/v1/household/owner-webauthn/registration/finish",
+            ),
+            (
+                Method::POST,
+                "/api/v1/household/owner-webauthn/registration/status",
+            ),
+            (
+                Method::POST,
+                handlers_owner_events::SECURE_UPGRADE_APP_ATTEST_START_PATH,
+            ),
+            (
+                Method::POST,
+                handlers_owner_events::SECURE_UPGRADE_APP_ATTEST_FINISH_PATH,
+            ),
+            (
+                Method::POST,
+                "/api/v1/household/owner-webauthn/revoke/start",
+            ),
+            (
+                Method::POST,
+                "/api/v1/household/owner-webauthn/revoke/finish",
+            ),
+            (
+                Method::POST,
+                "/api/v1/household/owner-webauthn/add-credential/start",
+            ),
+            (
+                Method::POST,
+                "/api/v1/household/owner-webauthn/add-credential/finish",
+            ),
+            (
+                Method::POST,
+                "/api/v1/household/owner-webauthn/recovery/status",
+            ),
+            (
+                Method::POST,
+                "/api/v1/household/owner-webauthn/recovery/start",
+            ),
+            (
+                Method::POST,
+                "/api/v1/household/owner-webauthn/recovery/finish",
+            ),
+            (
+                Method::POST,
+                "/api/v1/household/owner-webauthn/recovery/consume/start",
+            ),
+            (
+                Method::POST,
+                "/api/v1/household/owner-webauthn/recovery/consume/finish",
+            ),
+            (Method::POST, "/api/v1/household/owner-events/AA/approve"),
+            (
+                Method::POST,
+                "/api/v1/household/owner-events/AA/approval-v2/start",
+            ),
+            (Method::POST, "/api/v1/household/owner-events/AA/decline"),
+            (Method::POST, "/api/v1/household/device-pairing/request"),
+            (Method::POST, "/api/v1/household/device-pairing/approve"),
+            (Method::GET, "/api/v1/household/device-pairing/requests"),
+            (Method::POST, "/api/v1/household/device-pairing/reject"),
+            (
+                Method::GET,
+                "/api/v1/household/device-pairing/request-alpha",
+            ),
+            (Method::POST, "/api/v1/household/sign-machine-cert"),
+        ];
+        for (method, path) in complete_surface {
+            let before = PHASE3_TEST_DISPATCH_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+            let response = tokio::time::timeout(
+                Duration::from_secs(2),
+                runtime.route_or_reject(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("Phase 3 route did not complete: {path}"));
+            assert_ne!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "missing route: {path}"
+            );
+            assert_ne!(
+                response.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "wrong method binding: {path}"
+            );
+            assert_eq!(
+                PHASE3_TEST_DISPATCH_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+                before + 1,
+                "route bypassed the sole Phase 3 factory: {path}"
+            );
+        }
+
+        let uri = "/api/v1/household/owner-events?since=AA";
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let signing = RequestSigningContext::new("GET", uri, now, b"");
+        let signature = owner.sign(&signing.canonical_bytes().unwrap()).unwrap();
+        let authorization = format!(
+            "Soyeht-PoP v1:{}:{}:{}",
+            household_rs::derive_person_id(&owner.public()).0,
+            now,
+            B64URL.encode(signature.as_bytes())
+        );
+        let pending_runtime = runtime.clone();
+        let pending = tokio::spawn(async move {
+            pending_runtime
+                .route_or_reject(
+                    Request::builder()
+                        .uri(uri)
+                        .header(axum::http::header::AUTHORIZATION, authorization)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !pending.is_finished(),
+            "valid owner-events request must remain in long-poll"
+        );
+        tokio::time::timeout(Duration::from_secs(2), runtime.deactivate())
+            .await
+            .expect("teardown cancels the owner-events long-poll")
+            .unwrap();
+        assert_eq!(pending.await.unwrap().status(), StatusCode::UNAUTHORIZED);
+
+        let state_dir = temp.path().to_path_buf();
+        tokio::task::spawn_blocking({
+            let state_dir = state_dir.clone();
+            move || {
+                let lifecycle = HouseholdLifecycleLock::open_verified(&state_dir).unwrap();
+                let write = lifecycle.lock_exclusive().unwrap();
+                assert!(write.rename_household_to_tearing_down().unwrap());
+                assert!(write.remove_tearing_down().unwrap());
+            }
+        })
+        .await
+        .unwrap();
+        household.clear().await;
+        household_rs::bootstrap_or_load(
+            &state_dir,
+            household_rs::BootstrapOpts {
+                household_name: "Generation One Home".to_string(),
+                hostname_label: Some("engine-beta".to_string()),
+            },
+            KeyBackingPolicy::ForceSoftware,
+        )
+        .unwrap();
+        let generation1_load =
+            acquire_and_load_identity_under_lifecycle(&state_dir, KeyBackingPolicy::ForceSoftware)
+                .unwrap();
+        let generation1_identity = Arc::clone(generation1_load.loaded.as_ref().unwrap());
+        generation1_load.publish_into(&household).await;
+        runtime
+            .install_under_lifecycle(generation1_load.lifecycle_guard(), generation1_identity)
+            .await
+            .unwrap();
+        let generation1 = runtime.inner.read().await.as_ref().unwrap().generation;
+        assert_ne!(
+            generation1, generation0,
+            "reinitialize must rotate generation"
+        );
+        drop(generation1_load);
+
+        let old_owner_before = PHASE3_TEST_DISPATCH_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let old_owner_signing = RequestSigningContext::new("GET", uri, now, b"");
+        let old_owner_signature = owner
+            .sign(&old_owner_signing.canonical_bytes().unwrap())
+            .unwrap();
+        let old_owner_authorization = format!(
+            "Soyeht-PoP v1:{}:{}:{}",
+            household_rs::derive_person_id(&owner.public()).0,
+            now,
+            B64URL.encode(old_owner_signature.as_bytes())
+        );
+        let old_owner_response = runtime
+            .route_or_reject(
+                Request::builder()
+                    .uri(uri)
+                    .header(axum::http::header::AUTHORIZATION, old_owner_authorization)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(old_owner_response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            PHASE3_TEST_DISPATCH_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            old_owner_before + 1,
+            "G1 handles the request but must reject G0 owner authority"
+        );
+        runtime.deactivate().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cold_initialize_without_runtime_install_stays_on_generic_401() {
+        let _phase3_test = PHASE3_TEST_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let bootstrap = Arc::new(RwLock::new(BootstrapState::Uninitialized));
+        let household = HouseholdState::empty();
+        let pair_device_window = Arc::new(
+            household_rs::pair_device::PairDeviceWindow::with_persistence(
+                temp.path().to_path_buf(),
+            )
+            .unwrap(),
+        );
+        let pair_machine_window = Arc::new(PairMachineWindow::new_in_memory());
+        let runtime = Phase3RuntimeController::new(
+            temp.path().to_path_buf(),
+            household.clone(),
+            Arc::clone(&pair_machine_window),
+            KeyBackingPolicy::ForceSoftware,
+            None,
+        );
+        let state_without_install = BootstrapHandlerState::new(
+            bootstrap,
+            household.clone(),
+            temp.path().to_path_buf(),
+            Arc::clone(&pair_device_window),
+            pair_machine_window,
+            8091,
+        );
+        initialize_and_confirm_phase3_owner(
+            state_without_install,
+            &household,
+            &pair_device_window,
+            temp.path(),
+        )
+        .await;
+
+        let before = PHASE3_TEST_DISPATCH_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+        let response = runtime
+            .route_or_reject(
+                Request::builder()
+                    .uri("/api/v1/household/owner-events?since=AA")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            PHASE3_TEST_DISPATCH_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            before,
+            "mutant without the cold install must never reach owner-events"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_identity_installs_and_retires_the_complete_phase3_bundle() {
+        let _phase3_test = PHASE3_TEST_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        household_rs::bootstrap_or_load(
+            temp.path(),
+            household_rs::BootstrapOpts {
+                household_name: "Warm Home".to_string(),
+                hostname_label: Some("engine-alpha".to_string()),
+            },
+            KeyBackingPolicy::ForceSoftware,
+        )
+        .unwrap();
+        let household = HouseholdState::empty();
+        let pair_machine_window =
+            Arc::new(PairMachineWindow::with_persistence(temp.path().to_path_buf()).unwrap());
+        let runtime = Phase3RuntimeController::new(
+            temp.path().to_path_buf(),
+            household.clone(),
+            pair_machine_window,
+            KeyBackingPolicy::ForceSoftware,
+            None,
+        );
+        let identity_load =
+            acquire_and_load_identity_under_lifecycle(temp.path(), KeyBackingPolicy::ForceSoftware)
+                .unwrap();
+        let loaded = Arc::clone(identity_load.loaded.as_ref().unwrap());
+        identity_load.publish_into(&household).await;
+        runtime
+            .install_under_lifecycle(identity_load.lifecycle_guard(), loaded)
+            .await
+            .unwrap();
+        let expected_generation = identity_load
+            .lifecycle_guard()
+            .lifecycle_generation()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            runtime.inner.read().await.as_ref().unwrap().generation,
+            expected_generation
+        );
+        #[cfg(target_os = "macos")]
+        let socket_path = runtime
+            .inner
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .macos_local_listener
+            .as_ref()
+            .unwrap()
+            .socket_path()
+            .to_path_buf();
+        #[cfg(target_os = "macos")]
+        assert!(socket_path.exists(), "warm bundle owns the local UDS");
+        drop(identity_load);
+
+        let before = PHASE3_TEST_DISPATCH_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+        let invalid_pop = runtime
+            .route_or_reject(
+                Request::builder()
+                    .uri("/api/v1/household/owner-events?since=AA")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(invalid_pop.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            PHASE3_TEST_DISPATCH_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            before + 1,
+            "warm startup must publish the complete Phase 3 factory"
+        );
+
+        runtime.deactivate().await.unwrap();
+        assert!(runtime.inner.read().await.is_none());
+        #[cfg(target_os = "macos")]
+        assert!(
+            !socket_path.exists(),
+            "retiring the warm bundle removes its owned local UDS"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn phase3_deactivate_propagates_replaced_uds_ownership_failure() {
+        let _phase3_test = PHASE3_TEST_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        household_rs::bootstrap_or_load(
+            temp.path(),
+            household_rs::BootstrapOpts {
+                household_name: "Socket Ownership Home".to_string(),
+                hostname_label: Some("engine-alpha".to_string()),
+            },
+            KeyBackingPolicy::ForceSoftware,
+        )
+        .unwrap();
+        let household = HouseholdState::empty();
+        let runtime = Phase3RuntimeController::new(
+            temp.path().to_path_buf(),
+            household.clone(),
+            Arc::new(PairMachineWindow::with_persistence(temp.path().to_path_buf()).unwrap()),
+            KeyBackingPolicy::ForceSoftware,
+            None,
+        );
+        let identity_load =
+            acquire_and_load_identity_under_lifecycle(temp.path(), KeyBackingPolicy::ForceSoftware)
+                .unwrap();
+        let loaded = Arc::clone(identity_load.loaded.as_ref().unwrap());
+        identity_load.publish_into(&household).await;
+        runtime
+            .install_under_lifecycle(identity_load.lifecycle_guard(), loaded)
+            .await
+            .unwrap();
+        let socket_path = runtime
+            .inner
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .macos_local_listener
+            .as_ref()
+            .unwrap()
+            .socket_path()
+            .to_path_buf();
+        drop(identity_load);
+
+        std::fs::remove_file(&socket_path).unwrap();
+        let replacement = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let error = runtime.deactivate().await.unwrap_err();
+        assert!(
+            error.contains("refusing to remove replaced macOS local socket identity"),
+            "ownership failure must propagate through the runtime: {error}"
+        );
+        assert!(
+            socket_path.exists(),
+            "runtime must not unlink a replacement socket"
+        );
+        drop(replacement);
+        std::fs::remove_file(socket_path).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn phase3_replace_stops_before_binding_over_any_replaced_uds_path() {
+        let _phase3_test = PHASE3_TEST_LOCK.lock().await;
+        for replacement_kind in ["file", "symlink", "socket"] {
+            let temp = tempfile::tempdir().unwrap();
+            household_rs::bootstrap_or_load(
+                temp.path(),
+                household_rs::BootstrapOpts {
+                    household_name: format!("Replacement {replacement_kind} Home"),
+                    hostname_label: Some("engine-alpha".to_string()),
+                },
+                KeyBackingPolicy::ForceSoftware,
+            )
+            .unwrap();
+            let household = HouseholdState::empty();
+            let runtime = Phase3RuntimeController::new(
+                temp.path().to_path_buf(),
+                household.clone(),
+                Arc::new(PairMachineWindow::with_persistence(temp.path().to_path_buf()).unwrap()),
+                KeyBackingPolicy::ForceSoftware,
+                None,
+            );
+            let identity_load = acquire_and_load_identity_under_lifecycle(
+                temp.path(),
+                KeyBackingPolicy::ForceSoftware,
+            )
+            .unwrap();
+            let loaded = Arc::clone(identity_load.loaded.as_ref().unwrap());
+            identity_load.publish_into(&household).await;
+            runtime
+                .install_under_lifecycle(identity_load.lifecycle_guard(), Arc::clone(&loaded))
+                .await
+                .unwrap();
+            let old_generation = runtime.inner.read().await.as_ref().unwrap().generation;
+            let socket_path = runtime
+                .inner
+                .read()
+                .await
+                .as_ref()
+                .unwrap()
+                .macos_local_listener
+                .as_ref()
+                .unwrap()
+                .socket_path()
+                .to_path_buf();
+            std::fs::remove_file(&socket_path).unwrap();
+
+            let mut replacement_socket = None;
+            let mut symlink_target = None;
+            match replacement_kind {
+                "file" => std::fs::write(&socket_path, b"replacement").unwrap(),
+                "symlink" => {
+                    let target = temp.path().join("replacement-target");
+                    std::fs::write(&target, b"target").unwrap();
+                    std::os::unix::fs::symlink(&target, &socket_path).unwrap();
+                    symlink_target = Some(target);
+                }
+                "socket" => {
+                    replacement_socket =
+                        Some(std::os::unix::net::UnixListener::bind(&socket_path).unwrap());
+                }
+                _ => unreachable!(),
+            }
+
+            let error = runtime
+                .install_under_lifecycle(identity_load.lifecycle_guard(), loaded)
+                .await
+                .unwrap_err();
+            assert!(
+                error.contains("refusing to remove replaced macOS local socket"),
+                "{replacement_kind} ownership failure must stop replacement install: {error}"
+            );
+            assert!(runtime.inner.read().await.is_none());
+            assert!(runtime.router.router.read().await.is_none());
+            assert!(
+                socket_path.exists() || socket_path.symlink_metadata().is_ok(),
+                "{replacement_kind} path must not be removed or rebound"
+            );
+            assert_ne!(
+                runtime
+                    .inner
+                    .read()
+                    .await
+                    .as_ref()
+                    .map(|bundle| bundle.generation),
+                Some(old_generation),
+                "no old or new generation may remain published after failed replacement"
+            );
+
+            drop(replacement_socket);
+            std::fs::remove_file(&socket_path).unwrap();
+            drop(symlink_target);
+        }
+    }
 
     struct RecoveryTimeoutEnvRestore(Option<std::ffi::OsString>);
 
@@ -2939,6 +4063,7 @@ mod tests {
 
     #[tokio::test]
     async fn identity_watcher_hot_loads_after_install_without_restart() {
+        let _phase3_test = PHASE3_TEST_LOCK.lock().await;
         let td = tempfile::tempdir().unwrap();
         let identity_state = HouseholdState::empty();
         let pair_device_window = Arc::new(
@@ -2951,6 +4076,14 @@ mod tests {
             )
             .unwrap(),
         );
+        let phase3_runtime = Phase3RuntimeController::new(
+            td.path().to_path_buf(),
+            identity_state.clone(),
+            Arc::clone(&pair_machine_window),
+            household_rs::KeyBackingPolicy::ForceSoftware,
+            None,
+        );
+        let phase3_runtime_for_assertion = phase3_runtime.clone();
         let watcher = spawn_household_identity_watcher_with_interval(
             td.path().to_path_buf(),
             identity_state.clone(),
@@ -2961,8 +4094,8 @@ mod tests {
                 pair_machine_window,
                 targets: Vec::new(),
                 port: 8091,
-                bonjour_browser_state: None,
                 claw_share: None,
+                phase3_runtime,
                 shared_state: None,
             },
         );
@@ -2990,8 +4123,26 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-
-        watcher.abort();
+        tokio::time::timeout(Duration::from_secs(2), watcher)
+            .await
+            .expect("hot-load watcher completed")
+            .expect("hot-load watcher did not panic");
+        let before = PHASE3_TEST_DISPATCH_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+        let invalid_pop = phase3_runtime_for_assertion
+            .route_or_reject(
+                Request::builder()
+                    .uri("/api/v1/household/owner-events?since=AA")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(invalid_pop.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            PHASE3_TEST_DISPATCH_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            before + 1,
+            "hot-loaded identity must install the whole Phase 3 router before the watcher exits"
+        );
+        phase3_runtime_for_assertion.deactivate().await.unwrap();
     }
 
     async fn wait_for_nonce(

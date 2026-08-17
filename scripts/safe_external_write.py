@@ -34,8 +34,8 @@ ready, review, or merge a PR and does not add a general destination selector.
 The companion ``governed-ios-pr-body-update`` adapter can change only the body
 of that same consumer PR number 16 while it remains open and draft; every
 other field is a hardcoded readback invariant.
-The ``governed-theyos-v0126-tag`` adapter is narrower still: it can author
-the one annotated backend tag ``v0.1.26`` locally, or push only that already
+The ``governed-theyos-v0127-tag`` adapter is narrower still: it can author
+the one annotated backend tag ``v0.1.27`` locally, or push only that already
 validated ref. Creation and push are separate invocations, each with one
 mutation and a complete readback.
 Any further repository or operation requires an explicit code change and
@@ -111,7 +111,7 @@ RELEASE_CONTRACT_FORBIDDEN = (
 )
 RELEASE_ASSET_NAMES = frozenset({"Soyeht.dmg", "appcast.xml"})
 THEYOS_REPOSITORY_URL = "https://github.com/soyeht/theyos.git"
-THEYOS_TAG_VERSION = "0.1.26"
+THEYOS_TAG_VERSION = "0.1.27"
 THEYOS_TAG = f"v{THEYOS_TAG_VERSION}"
 THEYOS_TAG_REF = f"refs/tags/{THEYOS_TAG}"
 THEYOS_TAG_MESSAGE = f"theyos-engine {THEYOS_TAG_VERSION}\n"
@@ -175,7 +175,7 @@ class ReleaseGuardError(ValueError):
 
 
 class TheyosTagGuardError(ValueError):
-    """Raised when the fixed theyos v0.1.26 tag boundary fails closed."""
+    """Raised when the fixed theyos v0.1.27 tag boundary fails closed."""
 
 
 def find_mentions(payload: str, allowed: frozenset[str] = frozenset()) -> tuple[Mention, ...]:
@@ -743,8 +743,8 @@ def _isolated_theyos_gh_environment(
                 )
 
 
-class TheyosV0126GitHubAPI(GitHubAPI):
-    """Read-only API boundary for the governed theyos v0.1.26 tag."""
+class TheyosV0127GitHubAPI(GitHubAPI):
+    """Read-only API boundary for the governed theyos v0.1.27 tag."""
 
     @staticmethod
     def _environment() -> dict[str, str]:
@@ -1791,8 +1791,8 @@ def execute_governed_release(
     raise AssertionError(f"unhandled governed release operation: {operation}")
 
 
-class TheyosV0126TagGit:
-    """Git boundary for the one governed theyos v0.1.26 annotated tag."""
+class TheyosV0127TagGit:
+    """Git boundary for the one governed theyos v0.1.27 annotated tag."""
 
     @staticmethod
     def _environment() -> dict[str, str]:
@@ -2270,15 +2270,15 @@ class TheyosV0126TagGit:
         )
 
 
-def _parse_theyos_v0126_tag_arguments(
+def _parse_theyos_v0127_tag_arguments(
     arguments: Sequence[str],
 ) -> tuple[str, str, str]:
     if not arguments:
-        raise UnsafeCommand("governed-theyos-v0126-tag requires an operation")
+        raise UnsafeCommand("governed-theyos-v0127-tag requires an operation")
     operation = arguments[0]
     if operation not in {"create", "push"}:
         raise UnsafeCommand(
-            f"unsupported governed-theyos-v0126-tag operation: {operation}"
+            f"unsupported governed-theyos-v0127-tag operation: {operation}"
         )
     values: dict[str, str] = {}
     index = 1
@@ -2286,22 +2286,22 @@ def _parse_theyos_v0126_tag_arguments(
         flag = arguments[index]
         if flag not in {"--target-oid", "--expected-main"}:
             raise UnsafeCommand(
-                f"unsupported governed-theyos-v0126-tag argument: {flag}"
+                f"unsupported governed-theyos-v0127-tag argument: {flag}"
             )
         if flag in values:
             raise UnsafeCommand(
-                f"duplicate governed-theyos-v0126-tag argument: {flag}"
+                f"duplicate governed-theyos-v0127-tag argument: {flag}"
             )
         if index + 1 >= len(arguments):
             raise UnsafeCommand(
-                f"missing value for governed-theyos-v0126-tag argument: {flag}"
+                f"missing value for governed-theyos-v0127-tag argument: {flag}"
             )
         values[flag] = arguments[index + 1]
         index += 2
     missing = {"--target-oid", "--expected-main"} - values.keys()
     if missing:
         raise UnsafeCommand(
-            "missing governed-theyos-v0126-tag arguments: "
+            "missing governed-theyos-v0127-tag arguments: "
             + ", ".join(sorted(missing))
         )
     target_oid = _full_oid(values["--target-oid"], "target OID")
@@ -2361,7 +2361,7 @@ def _tag_object_fields(payload: bytes) -> tuple[dict[bytes, bytes], bytes]:
 
 
 def _assert_local_tag(
-    git: TheyosV0126TagGit,
+    git: TheyosV0127TagGit,
     target_oid: str,
 ) -> str:
     tag_object_oid = git.local_ref(THEYOS_TAG_REF)
@@ -2402,7 +2402,7 @@ def _assert_theyos_main_api(api: GitHubAPI, expected_main: str) -> None:
         raise TheyosTagGuardError("GitHub API main ref drifted")
 
 
-def _assert_theyos_network_configuration(git: TheyosV0126TagGit) -> None:
+def _assert_theyos_network_configuration(git: TheyosV0127TagGit) -> None:
     for key in git.effective_configuration_keys():
         normalized = key.casefold()
         remote_proxy = (
@@ -2419,7 +2419,7 @@ def _assert_theyos_network_configuration(git: TheyosV0126TagGit) -> None:
 
 
 def _assert_theyos_destination_namespace(
-    git: TheyosV0126TagGit,
+    git: TheyosV0127TagGit,
     api: GitHubAPI,
     expected_main: str,
 ) -> None:
@@ -2485,8 +2485,8 @@ def _assert_theyos_tag_api_readback(
         raise TheyosTagGuardError("GitHub API annotated tag readback mismatch")
 
 
-def _assert_theyos_v0126_preconditions(
-    git: TheyosV0126TagGit,
+def _assert_theyos_v0127_preconditions(
+    git: TheyosV0127TagGit,
     api: GitHubAPI,
     target_oid: str,
     expected_main: str,
@@ -2509,27 +2509,27 @@ def _assert_theyos_v0126_preconditions(
         raise TheyosTagGuardError("canonical Cargo version is not the governed version")
 
 
-def execute_governed_theyos_v0126_tag(
+def execute_governed_theyos_v0127_tag(
     arguments: Sequence[str],
     payload: str,
     *,
-    git: TheyosV0126TagGit | None = None,
+    git: TheyosV0127TagGit | None = None,
     api: GitHubAPI | None = None,
 ) -> int:
-    """Create locally or push the one fixed annotated theyos v0.1.26 tag."""
-    operation, target_oid, expected_main = _parse_theyos_v0126_tag_arguments(
+    """Create locally or push the one fixed annotated theyos v0.1.27 tag."""
+    operation, target_oid, expected_main = _parse_theyos_v0127_tag_arguments(
         arguments
     )
     # Reject inherited object-database redirection before constructing or
     # invoking the Git boundary. Presence is unsafe even when the value is
     # empty because the caller's environment is then ambiguous.
     _assert_theyos_object_database_environment()
-    repository = git or TheyosV0126TagGit()
-    client = api or TheyosV0126GitHubAPI()
-    if isinstance(client, TheyosV0126GitHubAPI):
+    repository = git or TheyosV0127TagGit()
+    client = api or TheyosV0127GitHubAPI()
+    if isinstance(client, TheyosV0127GitHubAPI):
         client.assert_runtime()
     repository.assert_runtime(operation)
-    _assert_theyos_v0126_preconditions(
+    _assert_theyos_v0127_preconditions(
         repository, client, target_oid, expected_main
     )
 
@@ -2554,7 +2554,7 @@ def execute_governed_theyos_v0126_tag(
         ):
             raise TheyosTagGuardError("governed tag appeared during creation")
         _assert_theyos_tag_api_absent(client)
-        _assert_theyos_v0126_preconditions(
+        _assert_theyos_v0127_preconditions(
             repository, client, target_oid, expected_main
         )
     else:
@@ -2562,7 +2562,7 @@ def execute_governed_theyos_v0126_tag(
             raise TheyosTagGuardError("tag push accepts no payload")
         tag_object_oid = _assert_local_tag(repository, target_oid)
         # Re-read every moving precondition immediately before the sole push.
-        _assert_theyos_v0126_preconditions(
+        _assert_theyos_v0127_preconditions(
             repository, client, target_oid, expected_main
         )
         if repository.remote_refs(
@@ -2584,14 +2584,14 @@ def execute_governed_theyos_v0126_tag(
         _assert_theyos_tag_api_readback(
             client, tag_object_oid, target_oid
         )
-        _assert_theyos_v0126_preconditions(
+        _assert_theyos_v0127_preconditions(
             repository, client, target_oid, expected_main
         )
 
     print(
         json.dumps(
             {
-                "operation": f"governed-theyos-v0126-tag-{operation}",
+                "operation": f"governed-theyos-v0127-tag-{operation}",
                 "tag_ref": THEYOS_TAG_REF,
                 "tag_object_oid": tag_object_oid,
                 "target_oid": target_oid,
@@ -2673,9 +2673,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"BLOCKED: {error}", file=sys.stderr)
             return 2
 
-    if command[:1] == ["governed-theyos-v0126-tag"]:
+    if command[:1] == ["governed-theyos-v0127-tag"]:
         try:
-            return execute_governed_theyos_v0126_tag(command[1:], payload)
+            return execute_governed_theyos_v0127_tag(command[1:], payload)
         except (
             UnsafeCommand,
             ReleaseGuardError,

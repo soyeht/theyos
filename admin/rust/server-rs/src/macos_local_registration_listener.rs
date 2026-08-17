@@ -6,12 +6,15 @@
 
 use std::io;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use axum::Router;
 use axum::extract::connect_info::Connected;
 use axum::serve::IncomingStream;
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::macos_local_caller_auth::MacosLocalPeer;
@@ -20,6 +23,7 @@ const SOCKET_NAME: &str = "owner-webauthn.sock";
 const PROD_SOCKET_NAMESPACE: &str = "soyeht-local-reg-prod";
 const DEV_SOCKET_NAMESPACE: &str = "soyeht-local-reg-dev";
 const MACOS_SUN_PATH_LIMIT: usize = 104;
+const LISTENER_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MacosLocalPeerConnectInfo {
@@ -78,15 +82,75 @@ fn macos_local_registration_socket_path_from_roots(
         .expect("/tmp macOS local registration socket path must fit SUN_LEN")
 }
 
+pub struct MacosLocalRegistrationListener {
+    socket_path: PathBuf,
+    socket_identity: SocketIdentity,
+    cancel: watch::Sender<bool>,
+    task: JoinHandle<()>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SocketIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl MacosLocalRegistrationListener {
+    #[must_use]
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+
+    pub async fn shutdown(self) -> io::Result<()> {
+        self.shutdown_with_timeout(LISTENER_SHUTDOWN_TIMEOUT).await
+    }
+
+    async fn shutdown_with_timeout(mut self, timeout: std::time::Duration) -> io::Result<()> {
+        let _ = self.cancel.send(true);
+        let join_error = match tokio::time::timeout(timeout, &mut self.task).await {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(io::Error::other(format!(
+                "join macOS local listener: {error}"
+            ))),
+            Err(_) => {
+                self.task.abort();
+                let _ = self.task.await;
+                warn!(stage = "macos_local_registration.shutdown_forced");
+                None
+            }
+        };
+        let cleanup = remove_owned_socket(&self.socket_path, self.socket_identity);
+        match (join_error, cleanup) {
+            (Some(join_error), Err(cleanup_error)) => Err(io::Error::other(format!(
+                "{join_error}; cleanup macOS local socket: {cleanup_error}"
+            ))),
+            (Some(error), Ok(())) => Err(error),
+            (None, cleanup) => cleanup,
+        }
+    }
+}
+
 pub fn spawn_macos_local_registration_listener(
     state_dir: &Path,
     router: Router,
-) -> io::Result<PathBuf> {
+) -> io::Result<MacosLocalRegistrationListener> {
     let socket_path = prepare_socket_path(state_dir)?;
+    spawn_macos_local_registration_listener_at(socket_path, router)
+}
+
+fn spawn_macos_local_registration_listener_at(
+    socket_path: PathBuf,
+    router: Router,
+) -> io::Result<MacosLocalRegistrationListener> {
     let listener = UnixListener::bind(&socket_path)?;
-    tokio::spawn(async move {
+    let socket_identity = socket_identity_from_path(&socket_path)?;
+    let (cancel, mut cancel_rx) = watch::channel(false);
+    let task = tokio::spawn(async move {
+        let shutdown =
+            async move { while !*cancel_rx.borrow() && cancel_rx.changed().await.is_ok() {} };
         if let Err(e) =
             core_rs::phase0_axum_serve!(listener, router, connect_info = MacosLocalPeerConnectInfo)
+                .with_graceful_shutdown(shutdown)
                 .await
         {
             warn!(
@@ -99,7 +163,52 @@ pub fn spawn_macos_local_registration_listener(
         stage = "macos_local_registration.listener_started",
         "macOS local registration UDS listener started"
     );
-    Ok(socket_path)
+    Ok(MacosLocalRegistrationListener {
+        socket_path,
+        socket_identity,
+        cancel,
+        task,
+    })
+}
+
+fn socket_identity_from_path(socket_path: &Path) -> io::Result<SocketIdentity> {
+    let stat = std::fs::symlink_metadata(socket_path)?;
+    if !std::os::unix::fs::FileTypeExt::is_socket(&stat.file_type()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "bound macOS local socket path is not a socket",
+        ));
+    }
+    Ok(SocketIdentity {
+        device: stat.dev(),
+        inode: stat.ino(),
+    })
+}
+
+fn remove_owned_socket(socket_path: &Path, expected: SocketIdentity) -> io::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+
+    match std::fs::symlink_metadata(socket_path) {
+        Ok(meta)
+            if meta.file_type().is_socket()
+                && SocketIdentity {
+                    device: meta.dev(),
+                    inode: meta.ino(),
+                } == expected =>
+        {
+            std::fs::remove_file(socket_path)
+        }
+        Ok(meta) if meta.file_type().is_socket() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to remove replaced macOS local socket identity",
+        )),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to remove replaced macOS local socket path",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn prepare_socket_path(state_dir: &Path) -> io::Result<PathBuf> {
@@ -421,5 +530,121 @@ mod tests {
         let prepared = prepare_socket_path_at(path.clone()).unwrap();
         assert_eq!(prepared, path);
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_an_incomplete_connection_and_removes_the_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = prepare_socket_path_at(dir.path().join("runtime").join(SOCKET_NAME)).unwrap();
+        let listener = spawn_macos_local_registration_listener_at(
+            path.clone(),
+            Router::new().fallback(|| async { axum::http::StatusCode::NO_CONTENT }),
+        )
+        .unwrap();
+        let _incomplete_client = UnixStream::connect(&path).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::timeout(
+            LISTENER_SHUTDOWN_TIMEOUT + std::time::Duration::from_secs(1),
+            listener.shutdown(),
+        )
+        .await
+        .expect("listener shutdown remains bounded")
+        .unwrap();
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn shutdown_cleans_the_socket_after_join_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SOCKET_NAME);
+        let bound = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let socket_identity = socket_identity_from_path(&path).unwrap();
+        let (cancel, _cancel_rx) = watch::channel(false);
+        let task = tokio::spawn(async { panic!("listener task fixture failure") });
+        let listener = MacosLocalRegistrationListener {
+            socket_path: path.clone(),
+            socket_identity,
+            cancel,
+            task,
+        };
+        let error = listener.shutdown().await.unwrap_err();
+        assert!(error.to_string().contains("join macOS local listener"));
+        assert!(!path.exists());
+        drop(bound);
+    }
+
+    #[tokio::test]
+    async fn shutdown_timeout_aborts_the_task_and_cleans_the_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SOCKET_NAME);
+        let bound = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let socket_identity = socket_identity_from_path(&path).unwrap();
+        let (cancel, _cancel_rx) = watch::channel(false);
+        let task = tokio::spawn(std::future::pending());
+        let listener = MacosLocalRegistrationListener {
+            socket_path: path.clone(),
+            socket_identity,
+            cancel,
+            task,
+        };
+        listener
+            .shutdown_with_timeout(std::time::Duration::from_millis(20))
+            .await
+            .unwrap();
+        assert!(!path.exists());
+        drop(bound);
+    }
+
+    #[tokio::test]
+    async fn shutdown_refuses_a_replaced_path_without_masking_join_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SOCKET_NAME);
+        let bound = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let socket_identity = socket_identity_from_path(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
+        let (cancel, _cancel_rx) = watch::channel(false);
+        let task = tokio::spawn(async { panic!("listener task fixture failure") });
+        let listener = MacosLocalRegistrationListener {
+            socket_path: path.clone(),
+            socket_identity,
+            cancel,
+            task,
+        };
+        let error = listener.shutdown().await.unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("join macOS local listener"));
+        assert!(message.contains("refusing to remove replaced macOS local socket path"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+        drop(bound);
+    }
+
+    #[tokio::test]
+    async fn shutdown_refuses_a_replacement_socket_with_a_different_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SOCKET_NAME);
+        let owned = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let socket_identity = socket_identity_from_path(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let replacement = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let replacement_identity = socket_identity_from_path(&path).unwrap();
+        assert_ne!(socket_identity, replacement_identity);
+        let (cancel, _cancel_rx) = watch::channel(false);
+        let listener = MacosLocalRegistrationListener {
+            socket_path: path.clone(),
+            socket_identity,
+            cancel,
+            task: tokio::spawn(async {}),
+        };
+        let error = listener.shutdown().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to remove replaced macOS local socket identity")
+        );
+        assert!(path.exists());
+        drop(owned);
+        drop(replacement);
+        std::fs::remove_file(path).unwrap();
     }
 }

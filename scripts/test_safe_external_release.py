@@ -992,7 +992,7 @@ class FakeTheyosTagGit:
         self.api.add_tag(tag_object_oid, THEYOS_TAG_TARGET)
 
 
-class GovernedTheyosV0126TagTests(unittest.TestCase):
+class GovernedTheyosV0127TagTests(unittest.TestCase):
     def _push_tag_to_isolated_destination(self, destination: str) -> None:
         self.assertNotEqual(guard.THEYOS_REPOSITORY_URL, destination)
         self.assertTrue(
@@ -1001,7 +1001,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
             f"real push control destination is not isolated: {destination}",
         )
         with mock.patch.object(guard, "THEYOS_REPOSITORY_URL", destination):
-            guard.TheyosV0126TagGit().push_tag()
+            guard.TheyosV0127TagGit().push_tag()
 
     def test_real_push_controls_cannot_call_the_production_destination_directly(
         self,
@@ -1024,7 +1024,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                     isinstance(function, ast.Attribute)
                     and function.attr == "push_tag"
                     and isinstance(constructor, ast.Attribute)
-                    and constructor.attr == "TheyosV0126TagGit"
+                    and constructor.attr == "TheyosV0127TagGit"
                 ):
                     self.callers.append(self.functions[-1])
                 self.generic_visit(node)
@@ -1091,14 +1091,14 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
     def execute(self, operation: str, payload: str) -> int:
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
-            result = guard.execute_governed_theyos_v0126_tag(
+            result = guard.execute_governed_theyos_v0127_tag(
                 self.arguments(operation),
                 payload,
                 git=self.git,
                 api=self.api,
             )
         self.assertIn(
-            f'"operation":"governed-theyos-v0126-tag-{operation}"',
+            f'"operation":"governed-theyos-v0127-tag-{operation}"',
             stdout.getvalue(),
         )
         return result
@@ -1115,7 +1115,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                 guard.TheyosTagGuardError,
             )
         ):
-            guard.execute_governed_theyos_v0126_tag(
+            guard.execute_governed_theyos_v0127_tag(
                 self.arguments(operation),
                 payload,
                 git=self.git,
@@ -1173,7 +1173,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                             "unsafe Git object database environment is present",
                         ),
                     ):
-                        guard.execute_governed_theyos_v0126_tag(
+                        guard.execute_governed_theyos_v0127_tag(
                             self.arguments(operation),
                             guard.THEYOS_TAG_MESSAGE if operation == "create" else "",
                             git=repository,
@@ -1217,7 +1217,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                             "unsafe inherited Git environment is present",
                         ),
                     ):
-                        guard.execute_governed_theyos_v0126_tag(
+                        guard.execute_governed_theyos_v0127_tag(
                             self.arguments(operation),
                             guard.THEYOS_TAG_MESSAGE if operation == "create" else "",
                             git=repository,
@@ -1368,10 +1368,10 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                             "unsafe Git object database environment is present",
                         ),
                     ):
-                        guard.execute_governed_theyos_v0126_tag(
+                        guard.execute_governed_theyos_v0127_tag(
                             arguments,
                             guard.THEYOS_TAG_MESSAGE if operation == "create" else "",
-                            git=guard.TheyosV0126TagGit(),
+                            git=guard.TheyosV0127TagGit(),
                             api=FakeTheyosTagAPI(),
                         )
                     run.assert_not_called()
@@ -1520,7 +1520,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                     contextlib.redirect_stdout(stdout),
                     self.assertRaises(guard.TheyosTagGuardError),
                 ):
-                    guard.execute_governed_theyos_v0126_tag(
+                    guard.execute_governed_theyos_v0127_tag(
                         self.arguments("create"),
                         guard.THEYOS_TAG_MESSAGE,
                         git=repository,
@@ -1534,7 +1534,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
 
     def test_create_command_neutralizes_signing_and_cleanup_configuration(self) -> None:
         completed = mock.Mock(returncode=0, stdout=b"", stderr=b"")
-        repository = guard.TheyosV0126TagGit()
+        repository = guard.TheyosV0127TagGit()
         with mock.patch.object(
             guard.subprocess, "run", return_value=completed
         ) as run:
@@ -1573,7 +1573,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
         self.assertEqual(repository._environment(), run.call_args.kwargs["env"])
 
     def test_runtime_preflight_uses_fixed_gh_version_and_hostname(self) -> None:
-        repository = guard.TheyosV0126TagGit()
+        repository = guard.TheyosV0127TagGit()
         version = subprocess.CompletedProcess(
             args=[],
             returncode=0,
@@ -1660,7 +1660,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                 mock.patch.object(guard.subprocess, "run", side_effect=results),
                 self.assertRaisesRegex(guard.TheyosTagGuardError, expected_error),
             ):
-                guard.TheyosV0126TagGit().assert_runtime("push")
+                guard.TheyosV0127TagGit().assert_runtime("push")
 
     def test_dedicated_api_uses_only_absolute_approved_gh_and_minimal_env(self) -> None:
         with tempfile.TemporaryDirectory() as root:
@@ -1741,7 +1741,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                     guard, "THEYOS_GH_REALPATH", str(approved_gh.resolve())
                 ),
             ):
-                client = guard.TheyosV0126GitHubAPI()
+                client = guard.TheyosV0127GitHubAPI()
                 client.assert_runtime()
                 payload = client.read(
                     f"repos/{guard.SAFE_GITHUB_REPO}/git/ref/heads/main"
@@ -1758,7 +1758,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                     self.git.add_local_tag()
                 with (
                     mock.patch.object(
-                        guard.TheyosV0126GitHubAPI,
+                        guard.TheyosV0127GitHubAPI,
                         "assert_runtime",
                         side_effect=guard.TheyosTagGuardError("bad API client"),
                     ),
@@ -1766,7 +1766,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                         guard.TheyosTagGuardError, "bad API client"
                     ),
                 ):
-                    guard.execute_governed_theyos_v0126_tag(
+                    guard.execute_governed_theyos_v0127_tag(
                         self.arguments(operation),
                         guard.THEYOS_TAG_MESSAGE if operation == "create" else "",
                         git=self.git,
@@ -1881,7 +1881,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                                     "persistent gh transport routing",
                                 ),
                             ):
-                                guard.execute_governed_theyos_v0126_tag(
+                                guard.execute_governed_theyos_v0127_tag(
                                     self.arguments(operation),
                                     guard.THEYOS_TAG_MESSAGE
                                     if operation == "create"
@@ -1903,7 +1903,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
         "approved gh 2.96.0 is unavailable",
     )
     def test_real_approved_gh_is_authenticated_through_isolated_config(self) -> None:
-        client = guard.TheyosV0126GitHubAPI()
+        client = guard.TheyosV0127GitHubAPI()
         client.assert_runtime()
         payload = client.read(
             f"repos/{guard.SAFE_GITHUB_REPO}/git/ref/heads/main"
@@ -1995,7 +1995,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
 
                 if guarded:
                     with contextlib.chdir(repository):
-                        self.assertTrue(guard.TheyosV0126TagGit().clean())
+                        self.assertTrue(guard.TheyosV0127TagGit().clean())
                 else:
                     subprocess.run(
                         [
@@ -2193,7 +2193,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                                 ),
                                 contextlib.chdir(repository),
                             ):
-                                self.assertTrue(guard.TheyosV0126TagGit().clean())
+                                self.assertTrue(guard.TheyosV0127TagGit().clean())
                         else:
                             subprocess.run(
                                 [
@@ -2332,13 +2332,13 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                         check=True,
                     )
 
-                weakened = guard.TheyosV0126TagGit()
+                weakened = guard.TheyosV0127TagGit()
                 weakened._run = self.weakened_git_run_without_environment_guard(
                     "GIT_NO_REPLACE_OBJECTS"
                 )
                 with contextlib.chdir(repository):
                     self.assertTrue(weakened.clean())
-                    self.assertFalse(guard.TheyosV0126TagGit().clean())
+                    self.assertFalse(guard.TheyosV0127TagGit().clean())
 
     def test_real_raw_clean_disables_promisor_lazy_fetch(self) -> None:
         for guarded in (False, True):
@@ -2415,7 +2415,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                     check=True,
                 )
 
-                boundary = guard.TheyosV0126TagGit()
+                boundary = guard.TheyosV0127TagGit()
                 if not guarded:
                     boundary._run = self.weakened_git_run_without_environment_guard(
                         "GIT_NO_LAZY_FETCH"
@@ -2457,9 +2457,9 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
             ).stdout.strip()
-            branch_ref = "refs/heads/v0.1.26"
+            branch_ref = "refs/heads/v0.1.27"
             tag_ref = guard.THEYOS_TAG_REF
-            boundary = guard.TheyosV0126TagGit()
+            boundary = guard.TheyosV0127TagGit()
             with contextlib.chdir(repository):
                 self.assertIsNone(boundary.local_ref(branch_ref))
                 self.assertIsNone(boundary.local_ref(tag_ref))
@@ -2508,7 +2508,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                 completed = subprocess.CompletedProcess(
                     args=[], returncode=returncode, stdout=stdout, stderr=stderr
                 )
-                boundary = guard.TheyosV0126TagGit()
+                boundary = guard.TheyosV0127TagGit()
                 with mock.patch.object(boundary, "_run", return_value=completed) as run:
                     if isinstance(expected, type) and issubclass(expected, Exception):
                         with self.assertRaises(expected):
@@ -2558,7 +2558,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
 
             api = FakeTheyosTagAPI()
             api.main_oid = target_oid
-            real = guard.TheyosV0126TagGit()
+            real = guard.TheyosV0127TagGit()
 
             class HybridGit(FakeTheyosTagGit):
                 def __init__(self) -> None:
@@ -2607,7 +2607,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                 create_git = HybridGit()
                 self.assertEqual(
                     0,
-                    guard.execute_governed_theyos_v0126_tag(
+                    guard.execute_governed_theyos_v0127_tag(
                         arguments,
                         guard.THEYOS_TAG_MESSAGE,
                         git=create_git,
@@ -2628,7 +2628,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                     guard.TheyosTagGuardError,
                     "local branch makes the tag name ambiguous",
                 ):
-                    guard.execute_governed_theyos_v0126_tag(
+                    guard.execute_governed_theyos_v0127_tag(
                         arguments,
                         guard.THEYOS_TAG_MESSAGE,
                         git=blocked_create,
@@ -2646,7 +2646,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                 push_arguments = ["push", *arguments[1:]]
                 self.assertEqual(
                     0,
-                    guard.execute_governed_theyos_v0126_tag(
+                    guard.execute_governed_theyos_v0127_tag(
                         push_arguments, "", git=push_git, api=push_api
                     ),
                 )
@@ -2667,7 +2667,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                     guard.TheyosTagGuardError,
                     "local branch makes the tag name ambiguous",
                 ):
-                    guard.execute_governed_theyos_v0126_tag(
+                    guard.execute_governed_theyos_v0127_tag(
                         push_arguments, "", git=blocked_push, api=blocked_api
                     )
                 self.assertEqual([], blocked_push.mutations)
@@ -2782,11 +2782,11 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                 with contextlib.chdir(repository):
                     if raises:
                         with self.assertRaises(guard.TheyosTagGuardError):
-                            guard.TheyosV0126TagGit().clean()
+                            guard.TheyosV0127TagGit().clean()
                     else:
                         self.assertEqual(
                             expected,
-                            guard.TheyosV0126TagGit().clean(),
+                            guard.TheyosV0127TagGit().clean(),
                         )
 
     def test_real_raw_clean_rejects_tracked_symlink_mode(self) -> None:
@@ -2819,7 +2819,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
             with contextlib.chdir(repository), self.assertRaises(
                 guard.TheyosTagGuardError
             ):
-                guard.TheyosV0126TagGit().clean()
+                guard.TheyosV0127TagGit().clean()
 
     def test_real_create_bypasses_reference_transaction_hooks(self) -> None:
         for hook_mode in ("standard", "configured"):
@@ -2926,7 +2926,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
 
                     if guarded:
                         with contextlib.chdir(repository):
-                            guard.TheyosV0126TagGit().create_tag(
+                            guard.TheyosV0127TagGit().create_tag(
                                 target,
                                 guard.THEYOS_TAG_MESSAGE.encode("utf-8"),
                             )
@@ -3029,7 +3029,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                     contextlib.redirect_stdout(stdout),
                     self.assertRaises(guard.TheyosTagGuardError),
                 ):
-                    guard.execute_governed_theyos_v0126_tag(
+                    guard.execute_governed_theyos_v0127_tag(
                         self.arguments("push"),
                         "",
                         git=repository,
@@ -3043,7 +3043,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
 
     def test_push_command_is_exact_and_neutralizes_ambient_side_effects(self) -> None:
         completed = mock.Mock(returncode=0, stdout=b"", stderr=b"")
-        repository = guard.TheyosV0126TagGit()
+        repository = guard.TheyosV0127TagGit()
         with mock.patch.object(
             guard.subprocess, "run", return_value=completed
         ) as run:
@@ -3115,7 +3115,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
             stdout=f"{THEYOS_TAG_TARGET}\trefs/heads/main\n".encode("ascii"),
             stderr=b"",
         )
-        repository = guard.TheyosV0126TagGit()
+        repository = guard.TheyosV0127TagGit()
         with mock.patch.object(
             guard.subprocess, "run", return_value=completed
         ) as run:
@@ -3286,7 +3286,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                         capture_output=True,
                         check=False,
                         cwd=repository,
-                        env=guard.TheyosV0126TagGit._environment(),
+                        env=guard.TheyosV0127TagGit._environment(),
                     )
                     self.assertNotEqual(0, weakened.returncode)
                     self.assertTrue(marker.exists())
@@ -3326,7 +3326,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                             state.push_urls = (remote_url,)
                             if operation == "push":
                                 state.add_local_tag()
-                            real_remote = guard.TheyosV0126TagGit()
+                            real_remote = guard.TheyosV0127TagGit()
                             state.remote_refs = real_remote.remote_refs
                             stdout = io.StringIO()
                             with (
@@ -3337,7 +3337,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                                 contextlib.redirect_stdout(stdout),
                                 self.assertRaises(guard.TheyosTagGuardError),
                             ):
-                                guard.execute_governed_theyos_v0126_tag(
+                                guard.execute_governed_theyos_v0127_tag(
                                     self.arguments(operation),
                                     "",
                                     git=state,
@@ -3434,7 +3434,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
             ):
                 self.assertEqual(
                     {},
-                    guard.TheyosV0126TagGit().remote_refs(
+                    guard.TheyosV0127TagGit().remote_refs(
                         ("refs/heads/main",)
                     ),
                 )
@@ -3467,7 +3467,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                     guard, "THEYOS_REPOSITORY_URL", remote.as_uri()
                 ),
             ):
-                refs = guard.TheyosV0126TagGit().remote_refs(
+                refs = guard.TheyosV0127TagGit().remote_refs(
                     ("refs/heads/main",)
                 )
             self.assertEqual({"refs/heads/main": target_oid}, refs)
@@ -3547,7 +3547,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                             ],
                             check=True,
                         )
-                    real = guard.TheyosV0126TagGit()
+                    real = guard.TheyosV0127TagGit()
                     with contextlib.chdir(repository_path):
                         effective = real.effective_configuration_keys()
                     self.assertIn(key.casefold(), {item.casefold() for item in effective})
@@ -3566,7 +3566,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                             contextlib.redirect_stdout(stdout),
                             self.assertRaises(guard.TheyosTagGuardError),
                         ):
-                            guard.execute_governed_theyos_v0126_tag(
+                            guard.execute_governed_theyos_v0127_tag(
                                 self.arguments(operation),
                                 "",
                                 git=state,
@@ -3596,7 +3596,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
             )
             with contextlib.chdir(repository_path):
                 guard._assert_theyos_network_configuration(
-                    guard.TheyosV0126TagGit()
+                    guard.TheyosV0127TagGit()
                 )
 
     def test_real_origin_proxy_is_rejected_before_contact_or_credentials(self) -> None:
@@ -3716,7 +3716,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                     capture_output=True,
                     check=False,
                     cwd=repository_path,
-                    env=guard.TheyosV0126TagGit._environment(),
+                    env=guard.TheyosV0127TagGit._environment(),
                 )
                 self.assertNotEqual(0, weakened.returncode)
                 self.assertTrue(marker.exists())
@@ -3761,7 +3761,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                 state.fetch_urls = (canonical_url,)
                 state.push_urls = (canonical_url,)
                 state.add_local_tag()
-                real = guard.TheyosV0126TagGit()
+                real = guard.TheyosV0127TagGit()
                 state.effective_configuration_keys = (
                     real.effective_configuration_keys
                 )
@@ -3774,7 +3774,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                     contextlib.redirect_stdout(stdout),
                     self.assertRaises(guard.TheyosTagGuardError),
                 ):
-                    guard.execute_governed_theyos_v0126_tag(
+                    guard.execute_governed_theyos_v0127_tag(
                         self.arguments("push"),
                         "",
                         git=state,
@@ -3967,7 +3967,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                     capture_output=True,
                     check=False,
                     cwd=repository,
-                    env=guard.TheyosV0126TagGit._environment(),
+                    env=guard.TheyosV0127TagGit._environment(),
                 )
                 self.assertNotEqual(0, weakened.returncode)
                 self.assertTrue(malicious_marker.exists())
@@ -4246,8 +4246,8 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                 with contextlib.chdir(repository), self.assertRaisesRegex(
                     guard.TheyosTagGuardError, expected_error
                 ):
-                    guard._assert_theyos_v0126_preconditions(
-                        guard.TheyosV0126TagGit(),
+                    guard._assert_theyos_v0127_preconditions(
+                        guard.TheyosV0127TagGit(),
                         FakeTheyosTagAPI(),
                         THEYOS_TAG_TARGET,
                         THEYOS_TAG_TARGET,
@@ -4319,7 +4319,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                         guard.TheyosTagGuardError,
                     )
                 ):
-                    guard.execute_governed_theyos_v0126_tag(
+                    guard.execute_governed_theyos_v0127_tag(
                         arguments,
                         guard.THEYOS_TAG_MESSAGE,
                         git=self.git,
@@ -4392,7 +4392,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
     def test_create_post_mutation_readback_mismatch_is_red_without_cleanup(self) -> None:
         self.git.create_readback_override = self.git.tag_bytes("4" * 40)
         with self.assertRaises(guard.TheyosTagGuardError):
-            guard.execute_governed_theyos_v0126_tag(
+            guard.execute_governed_theyos_v0127_tag(
                 self.arguments("create"),
                 guard.THEYOS_TAG_MESSAGE,
                 git=self.git,
@@ -4414,7 +4414,7 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
                 else:
                     self.api.tag_type = "commit"
                 with self.assertRaises(guard.TheyosTagGuardError):
-                    guard.execute_governed_theyos_v0126_tag(
+                    guard.execute_governed_theyos_v0127_tag(
                         self.arguments("push"),
                         "",
                         git=self.git,
@@ -4430,12 +4430,12 @@ class GovernedTheyosV0126TagTests(unittest.TestCase):
             mock.patch.object(guard.sys, "stdin", stdin),
             mock.patch.object(
                 guard,
-                "execute_governed_theyos_v0126_tag",
+                "execute_governed_theyos_v0127_tag",
                 return_value=0,
             ) as execute,
         ):
             code = guard.main(
-                ["--stdin", "--", "governed-theyos-v0126-tag", *arguments]
+                ["--stdin", "--", "governed-theyos-v0127-tag", *arguments]
             )
         self.assertEqual(0, code)
         execute.assert_called_once_with(arguments, guard.THEYOS_TAG_MESSAGE)

@@ -144,6 +144,7 @@ async fn measured_initialize_once(sample: usize) -> std::time::Duration {
         setup_invitation_cache: crate::setup_invitation::new_cache(),
         engine_port: 8091,
         tailnet_resolver: || None,
+        phase3_runtime: None,
     };
     let body = household_rs::cbor::to_canonical_vec(&InitializeRequest {
         v: 1,
@@ -217,6 +218,7 @@ async fn first_owner_loopback_http_smoke_has_liveness_before_and_after() {
         setup_invitation_cache: crate::setup_invitation::new_cache(),
         engine_port: 8091,
         tailnet_resolver: || None,
+        phase3_runtime: None,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -314,6 +316,7 @@ async fn first_owner_initialize_rebinds_and_persists_one_recoverable_attempt() {
         setup_invitation_cache: crate::setup_invitation::new_cache(),
         engine_port: 8091,
         tailnet_resolver: || None,
+        phase3_runtime: None,
     };
     let app = bootstrap_router(state.clone());
 

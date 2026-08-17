@@ -712,7 +712,7 @@ mod tests {
             .expect("release member directory");
         std::fs::create_dir_all(root.path().join("admin/rust/household-rs"))
             .expect("independent member directory");
-        std::fs::write(root.path().join("VERSION"), "0.1.26\n").expect("fixture VERSION");
+        std::fs::write(root.path().join("VERSION"), "0.1.27\n").expect("fixture VERSION");
         std::fs::write(
             root.path().join("admin/rust/Cargo.toml"),
             "[workspace]\nmembers = [\"server-rs\", \"household-rs\"]\n",
@@ -720,7 +720,7 @@ mod tests {
         .expect("fixture workspace");
         std::fs::write(
             root.path().join("admin/rust/server-rs/Cargo.toml"),
-            "[package]\nname = \"server-rs\"\nversion = \"0.1.26\"\n",
+            "[package]\nname = \"server-rs\"\nversion = \"0.1.27\"\n",
         )
         .expect("fixture release manifest");
         std::fs::write(
@@ -730,7 +730,7 @@ mod tests {
         .expect("fixture independent manifest");
         std::fs::write(
             root.path().join("admin/rust/Cargo.lock"),
-            "version = 4\n\n[[package]]\nname = \"server-rs\"\nversion = \"0.1.26\"\n\n[[package]]\nname = \"household-rs\"\nversion = \"0.1.0\"\n",
+            "version = 4\n\n[[package]]\nname = \"server-rs\"\nversion = \"0.1.27\"\n\n[[package]]\nname = \"household-rs\"\nversion = \"0.1.0\"\n",
         )
         .expect("fixture lock");
         root
@@ -754,7 +754,7 @@ mod tests {
         .expect("mutate release manifest");
         let error = release_version_surface(fixture.path(), &["household-rs"])
             .expect_err("drift must fail");
-        assert!(error.contains("server-rs has version 0.1.25, expected 0.1.26"));
+        assert!(error.contains("server-rs has version 0.1.25, expected 0.1.27"));
     }
 
     #[test]
@@ -787,7 +787,7 @@ mod tests {
         .expect("new member manifest");
         let error = release_version_surface(fixture.path(), &["household-rs"])
             .expect_err("new member must fail");
-        assert!(error.contains("new-tool has version 0.1.0, expected 0.1.26"));
+        assert!(error.contains("new-tool has version 0.1.0, expected 0.1.27"));
     }
 
     // ─── P-46: tier model tests ─────────────────────────────────────────

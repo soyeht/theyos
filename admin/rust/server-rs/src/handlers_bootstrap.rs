@@ -253,6 +253,9 @@ pub struct BootstrapHandlerState {
     /// walks `getifaddrs(3)`. Tests inject a deterministic resolver so they
     /// don't depend on whether the test host is on a Tailnet.
     pub tailnet_resolver: crate::tailnet_address::TailnetResolver,
+    /// Stable generation-bound Phase 3 router/task slot owned by the daemon.
+    /// Short-lived handler tests and CLI-only routers leave this unset.
+    pub phase3_runtime: Option<crate::household_bootstrap::Phase3RuntimeController>,
 }
 
 pub type BootstrapStateArc = Arc<RwLock<BootstrapState>>;
@@ -277,7 +280,17 @@ impl BootstrapHandlerState {
             setup_invitation_cache: crate::setup_invitation::new_cache(),
             engine_port,
             tailnet_resolver: crate::tailnet_address::current_tailnet_ipv4,
+            phase3_runtime: None,
         }
+    }
+
+    #[must_use]
+    pub(crate) fn with_phase3_runtime(
+        mut self,
+        runtime: crate::household_bootstrap::Phase3RuntimeController,
+    ) -> Self {
+        self.phase3_runtime = Some(runtime);
+        self
     }
 }
 
@@ -1959,6 +1972,22 @@ pub async fn post_teardown(State(state): State<BootstrapHandlerState>, body: Byt
         }
     }
 
+    // Remove the stable Phase 3 delegation before acquiring lifecycle-
+    // exclusive. `deactivate` cancels and awaits in-flight route leases, so a
+    // pending owner-events long-poll releases its shared lifecycle guard and
+    // cannot deadlock the teardown that must rotate that same generation.
+    if let Some(runtime) = state.phase3_runtime.as_ref() {
+        if let Err(error) = runtime.deactivate().await {
+            tracing::error!(stage = "teardown.phase3_runtime_shutdown_failed", error = %error);
+            return cbor_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                BootstrapErrorCode::InternalError.as_str(),
+                None,
+                None,
+            );
+        }
+    }
+
     // Steps 10-11: drain lifecycle-shared ledger transactions, re-check the
     // installed disk identity under lifecycle-exclusive, detach the household,
     // fsync the state-root rename, and durably persist Uninitialized. All
@@ -2603,10 +2632,21 @@ pub async fn post_accept_household_confirm(
 
     let hh_id = loaded.record.hh_id.to_string();
     let m_id = loaded.cert.m_id.to_string();
-    state
-        .household
-        .set_loaded(SharedHouseholdIdentity::new(loaded))
-        .await;
+    let loaded = SharedHouseholdIdentity::new(loaded);
+    state.household.set_loaded(Arc::clone(&loaded)).await;
+    if let Some(runtime) = state.phase3_runtime.as_ref()
+        && let Err(error) = runtime
+            .install_under_lifecycle(&lifecycle_guard, Arc::clone(&loaded))
+            .await
+    {
+        tracing::error!(stage = "phase3_runtime.accept_install_failed", error = %error);
+        return cbor_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            BootstrapErrorCode::InternalError.as_str(),
+            None,
+            None,
+        );
+    }
     drop(lifecycle_guard);
 
     tracing::info!(
@@ -2825,10 +2865,21 @@ pub async fn post_initialize(
     }
 
     // 7. Update HouseholdState in memory.
-    state
-        .household
-        .set_loaded(SharedHouseholdIdentity::new(loaded))
-        .await;
+    let loaded = SharedHouseholdIdentity::new(loaded);
+    state.household.set_loaded(Arc::clone(&loaded)).await;
+    if let Some(runtime) = state.phase3_runtime.as_ref()
+        && let Err(error) = runtime
+            .install_under_lifecycle(&lifecycle_guard, Arc::clone(&loaded))
+            .await
+    {
+        tracing::error!(stage = "phase3_runtime.initialize_install_failed", error = %error);
+        return cbor_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            BootstrapErrorCode::InternalError.as_str(),
+            None,
+            None,
+        );
+    }
 
     // 8. Mint pair-device window and build QR URI.
     //
@@ -3570,6 +3621,7 @@ mod tests {
             setup_invitation_cache: crate::setup_invitation::new_cache(),
             engine_port: 8091,
             tailnet_resolver: || None,
+            phase3_runtime: None,
         }
     }
 
@@ -3948,6 +4000,7 @@ mod tests {
             setup_invitation_cache: crate::setup_invitation::new_cache(),
             engine_port: 8091,
             tailnet_resolver: || None,
+            phase3_runtime: None,
         };
         (state, td)
     }
