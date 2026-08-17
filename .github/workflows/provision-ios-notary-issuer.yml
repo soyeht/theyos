@@ -35,6 +35,12 @@ jobs:
           workflow_path=".github/workflows/${workflow_file}"
           target_secret="APPLE_NOTARY_ISSUER_ID"
           temporary_secret="SOYEHT_IOS_SECRET_PROVISION_TOKEN"
+          retry_limit=3
+          retry_delay_seconds=5
+          gh_error_file="${RUNNER_TEMP}/issuer-provision-gh-error"
+
+          : > "${gh_error_file}"
+          chmod 600 "${gh_error_file}"
 
           test "${GITHUB_REPOSITORY}" = "${source_repo}"
           test "${GITHUB_EVENT_NAME}" = "workflow_dispatch"
@@ -49,21 +55,123 @@ jobs:
             exit 1
           fi
 
+          is_transient_503() {
+            grep -Eiq '(^|[^0-9])503([^0-9]|$)|service unavailable' \
+              "${gh_error_file}"
+          }
+
+          list_secret_metadata() {
+            local repository="$1"
+            local attempt=1
+            local result=""
+            while (( attempt <= retry_limit )); do
+              : > "${gh_error_file}"
+              if result="$(
+                GH_TOKEN="${PROVISION_TOKEN}" gh secret list \
+                  --repo "${repository}" --json name,updatedAt \
+                  2>"${gh_error_file}"
+              )"; then
+                printf '%s' "${result}"
+                return 0
+              fi
+              if ! is_transient_503 || (( attempt == retry_limit )); then
+                printf '%s\n' "Secret metadata read failed closed." >&2
+                return 1
+              fi
+              sleep "${retry_delay_seconds}"
+              ((attempt += 1))
+            done
+            return 1
+          }
+
+          read_current_runs() {
+            local attempt=1
+            local result=""
+            while (( attempt <= retry_limit )); do
+              : > "${gh_error_file}"
+              if result="$(
+                GH_TOKEN="${SOURCE_API_TOKEN}" gh api --method GET \
+                  "repos/${source_repo}/actions/workflows/${workflow_file}/runs?event=workflow_dispatch&branch=main&per_page=100" \
+                  2>"${gh_error_file}"
+              )"; then
+                printf '%s' "${result}"
+                return 0
+              fi
+              if ! is_transient_503 || (( attempt == retry_limit )); then
+                printf '%s\n' "Workflow run readback failed closed." >&2
+                return 1
+              fi
+              sleep "${retry_delay_seconds}"
+              ((attempt += 1))
+            done
+            return 1
+          }
+
+          set_target_secret() {
+            local attempt=1
+            while (( attempt <= retry_limit )); do
+              : > "${gh_error_file}"
+              if printf '%s' "${SOURCE_ISSUER}" | \
+                GH_TOKEN="${PROVISION_TOKEN}" gh secret set \
+                  "${target_secret}" --repo "${target_repo}" \
+                  >/dev/null 2>"${gh_error_file}"
+              then
+                return 0
+              fi
+              if ! is_transient_503 || (( attempt == retry_limit )); then
+                printf '%s\n' "Target secret write failed closed." >&2
+                return 1
+              fi
+              sleep "${retry_delay_seconds}"
+              ((attempt += 1))
+            done
+            return 1
+          }
+
+          delete_temporary_token() {
+            local attempt=1
+            local source_probe=""
+            while (( attempt <= retry_limit )); do
+              : > "${gh_error_file}"
+              if GH_TOKEN="${PROVISION_TOKEN}" gh secret delete \
+                "${temporary_secret}" --repo "${source_repo}" \
+                >/dev/null 2>"${gh_error_file}"
+              then
+                return 0
+              fi
+              if ! is_transient_503; then
+                printf '%s\n' "Temporary token deletion failed closed." >&2
+                return 1
+              fi
+              source_probe="$(list_secret_metadata "${source_repo}")" || return 1
+              if jq -e --arg name "${temporary_secret}" \
+                'map(select(.name == $name)) | length == 0' \
+                <<< "${source_probe}" >/dev/null
+              then
+                return 0
+              fi
+              if (( attempt == retry_limit )); then
+                printf '%s\n' "Temporary token deletion exhausted retries." >&2
+                return 1
+              fi
+              sleep "${retry_delay_seconds}"
+              ((attempt += 1))
+            done
+            return 1
+          }
+
           cleanup_attempted=0
           cleanup_token() {
             if [[ "${cleanup_attempted}" = "1" ]]; then
               return 0
             fi
             cleanup_attempted=1
-            GH_TOKEN="${PROVISION_TOKEN}" gh secret delete \
-              "${temporary_secret}" --repo "${source_repo}" >/dev/null
-            source_after="$(
-              GH_TOKEN="${PROVISION_TOKEN}" gh secret list \
-                --repo "${source_repo}" --json name,updatedAt
-            )"
+            delete_temporary_token
+            source_after="$(list_secret_metadata "${source_repo}")"
             jq -e --arg name "${temporary_secret}" \
               'map(select(.name == $name)) | length == 0' \
               <<< "${source_after}" >/dev/null
+            rm -f "${gh_error_file}"
           }
           trap cleanup_token EXIT
 
@@ -72,10 +180,7 @@ jobs:
             exit 1
           fi
 
-          runs="$(
-            GH_TOKEN="${SOURCE_API_TOKEN}" gh api --method GET \
-              "repos/${source_repo}/actions/workflows/${workflow_file}/runs?event=workflow_dispatch&branch=main&per_page=100"
-          )"
+          runs="$(read_current_runs)"
           jq -e \
             --argjson run_id "${GITHUB_RUN_ID}" \
             --arg expected_oid "${EXPECTED_OID}" \
@@ -90,10 +195,7 @@ jobs:
               and .workflow_runs[0].path == $workflow_path
             ' <<< "${runs}" >/dev/null
 
-          target_before="$(
-            GH_TOKEN="${PROVISION_TOKEN}" gh secret list \
-              --repo "${target_repo}" --json name,updatedAt
-          )"
+          target_before="$(list_secret_metadata "${target_repo}")"
           jq -e --arg name "${target_secret}" \
             'map(select(.name == $name)) | length == 0' \
             <<< "${target_before}" >/dev/null
@@ -103,14 +205,9 @@ jobs:
               <<< "${target_before}"
           )"
 
-          printf '%s' "${SOURCE_ISSUER}" | \
-            GH_TOKEN="${PROVISION_TOKEN}" gh secret set \
-              "${target_secret}" --repo "${target_repo}" >/dev/null
+          set_target_secret
 
-          target_after="$(
-            GH_TOKEN="${PROVISION_TOKEN}" gh secret list \
-              --repo "${target_repo}" --json name,updatedAt
-          )"
+          target_after="$(list_secret_metadata "${target_repo}")"
           jq -e \
             --arg name "${target_secret}" \
             --argjson unchanged "${target_unchanged}" '

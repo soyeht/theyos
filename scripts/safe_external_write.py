@@ -139,7 +139,7 @@ IOS_ISSUER_PROVISION_WORKFLOW_PATH = (
     f".github/workflows/{IOS_ISSUER_PROVISION_WORKFLOW_FILE}"
 )
 IOS_ISSUER_PROVISION_WORKFLOW_SHA256 = (
-    "2cd48c07a0a542de265f3333cf2a7971ef6d8e2e9b5b72f3bc0a96042789be05"
+    "7ab0d78bc84e5d6edc0bfae55b57b5bc0f92334a7d80f05d62e5c4fd1f8b4242"
 )
 IOS_ISSUER_PROVISION_REF = "main"
 IOS_ISSUER_PROVISION_FULL_REF = "refs/heads/main"
@@ -1706,12 +1706,23 @@ def _assert_ios_issuer_provision_workflow_bytes(workflow_bytes: bytes) -> None:
     required_counts = {
         b"  workflow_dispatch:": 1,
         b"      expected_oid:": 1,
-        b'          printf \'%s\' "${SOURCE_ISSUER}" |': 1,
+        b'if printf \'%s\' "${SOURCE_ISSUER}" |': 1,
         b"gh secret set \\": 1,
         b"gh secret delete \\": 1,
-        b'--json name,updatedAt': 3,
+        b'--json name,updatedAt': 1,
         b'target_repo="soyeht/soyeht-ios"': 1,
         b'source_repo="soyeht/theyos"': 1,
+        b"          retry_limit=3\n": 1,
+        b"retry_delay_seconds=5": 1,
+        b"is_transient_503() {": 1,
+        b"503([^0-9]|$)|service unavailable": 1,
+        b"list_secret_metadata() {": 1,
+        b"read_current_runs() {": 1,
+        b"set_target_secret() {": 1,
+        b"delete_temporary_token() {": 1,
+        b"while (( attempt <= retry_limit )); do": 4,
+        b"if ! is_transient_503": 4,
+        b'sleep "${retry_delay_seconds}"': 4,
         b'trap cleanup_token EXIT': 1,
         b'trap - EXIT': 1,
     }
