@@ -82,6 +82,7 @@ fn make_bootstrap_state(bs: BootstrapState, state_dir: PathBuf) -> BootstrapHand
         setup_invitation_cache: server_rs::setup_invitation::new_cache(),
         engine_port: 8091,
         tailnet_resolver: || None,
+        phase3_runtime: None,
     }
 }
 
@@ -266,6 +267,7 @@ async fn scenario_b_full_happy_path() {
         setup_invitation_cache: server_rs::setup_invitation::new_cache(),
         engine_port: 8091,
         tailnet_resolver: || None,
+        phase3_runtime: None,
     };
     let (status, body) = {
         let app = bootstrap_router(state.clone());
@@ -452,6 +454,7 @@ async fn scenario_b_second_claim_after_initialize_returns_409() {
         setup_invitation_cache: server_rs::setup_invitation::new_cache(),
         engine_port: 8091,
         tailnet_resolver: || None,
+        phase3_runtime: None,
     };
 
     // Claim and initialize to advance state.
