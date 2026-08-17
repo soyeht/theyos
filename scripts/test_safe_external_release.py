@@ -4474,7 +4474,7 @@ class GovernedReleasePinTests(unittest.TestCase):
         self.assertEqual(
             {
                 ".github/workflows/macos-release.yml":
-                    "522a852c2601b431266fd7de3718daaa028cbf45a5dfbc22d69a0cb52802bd3b",
+                    "efc18ec38fb50adfbcc56fb3d42d8a7ffd864683e89fe8391a7cb4cd714e8e24",
                 ".github/workflows/xcode.yml":
                     "7fedc9ebe251950479eead626e3fb89d880077d51c68b8df4aaf7f383602d486",
                 "scripts/ci/test-ios":
