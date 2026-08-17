@@ -59,8 +59,8 @@ MANIFEST_NAMES = ("Cargo.toml", "package.json", "pyproject.toml", "go.mod")
 PATH_CHUNK = 300
 DEFAULT_MAIN_REF = "origin/main"
 DEFAULT_GIT_TIMEOUT = 300
-GH_PR_LIST_ATTEMPTS = 3
-GH_PR_LIST_RETRY_SECONDS = 5.0
+GH_PR_LIST_ATTEMPTS = 6
+GH_PR_LIST_RETRY_SECONDS = 15.0
 GH_HTTP_STATUS = re.compile(
     rb"(?:HTTP(?:/\d(?:\.\d)?)?[: ]+|status code:\s*)([45]\d\d)\b",
     re.IGNORECASE,

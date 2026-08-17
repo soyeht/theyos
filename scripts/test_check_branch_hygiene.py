@@ -651,19 +651,22 @@ class GitHubPRStateRetryTests(unittest.TestCase):
             )
         return states, run, sleep
 
-    def test_transient_http_503_then_success_returns_exact_stdout_state(self) -> None:
+    def test_http_503_until_last_attempt_then_success_returns_exact_stdout_state(self) -> None:
         states, run, sleep = self.load_with_results(
             [
-                self.result(
-                    1,
-                    stderr=b"non-200 OK status code: 503 Service Unavailable",
-                ),
+                *[
+                    self.result(
+                        1,
+                        stderr=b"non-200 OK status code: 503 Service Unavailable",
+                    )
+                    for _ in range(5)
+                ],
                 self.result(0, stdout=self.success_stdout),
             ]
         )
         self.assertEqual({"fix/recovery": (20, "OPEN")}, states)
-        self.assertEqual(2, run.call_count)
-        sleep.assert_called_once_with(5.0)
+        self.assertEqual(6, run.call_count)
+        self.assertEqual([mock.call(15.0)] * 5, sleep.call_args_list)
         command = run.call_args_list[0].args[0]
         self.assertEqual(
             (
@@ -680,10 +683,10 @@ class GitHubPRStateRetryTests(unittest.TestCase):
             command,
         )
 
-    def test_three_http_503_responses_exhaust_and_fail_red(self) -> None:
+    def test_six_http_503_responses_exhaust_and_fail_red(self) -> None:
         failures = [
             self.result(1, stderr=b"HTTP 503: Service Unavailable sensitive-header")
-            for _ in range(3)
+            for _ in range(6)
         ]
         with (
             mock.patch.object(gate.shutil, "which", return_value="/usr/bin/gh"),
@@ -692,9 +695,9 @@ class GitHubPRStateRetryTests(unittest.TestCase):
         ):
             with self.assertRaises(gate.GateError) as raised:
                 gate.load_pr_states(self.root, None, False, timeout=60)
-        self.assertEqual(3, run.call_count)
-        self.assertEqual(2, sleep.call_count)
-        self.assertIn("exhausted 3 attempts after HTTP 503", str(raised.exception))
+        self.assertEqual(6, run.call_count)
+        self.assertEqual(5, sleep.call_count)
+        self.assertIn("exhausted 6 attempts after HTTP 503", str(raised.exception))
         self.assertNotIn("sensitive-header", str(raised.exception))
 
     def test_non_503_http_errors_fail_on_one_call_without_raw_stderr(self) -> None:
@@ -737,12 +740,12 @@ class GitHubPRStateRetryTests(unittest.TestCase):
     def test_allow_missing_preserves_incomplete_state_after_503_exhaustion(self) -> None:
         failures = [
             self.result(1, stderr=b"503 Service Unavailable")
-            for _ in range(3)
+            for _ in range(6)
         ]
         states, run, sleep = self.load_with_results(failures, allow_missing=True)
         self.assertIsNone(states)
-        self.assertEqual(3, run.call_count)
-        self.assertEqual(2, sleep.call_count)
+        self.assertEqual(6, run.call_count)
+        self.assertEqual(5, sleep.call_count)
 
 
 class PredicateUnitTests(unittest.TestCase):
