@@ -21,6 +21,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT = Path(__file__).with_name("check-branch-hygiene.py")
@@ -607,6 +608,141 @@ class FailClosedTests(BranchHygieneTestCase):
         self.assertIn("classification is INCOMPLETE, not clean", out)
         self.assertIn("cannot classify: PR state unavailable", out)
         self.assertNotIn("merged-PR branches still present: 0", out)
+
+
+class GitHubPRStateRetryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.root = Path(tempfile.mkdtemp(prefix="branch-hygiene-gh-"))
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.success_stdout = json.dumps(
+            [{"number": 20, "headRefName": "fix/recovery", "state": "OPEN"}]
+        ).encode()
+
+    @staticmethod
+    def result(
+        returncode: int,
+        *,
+        stdout: bytes = b"",
+        stderr: bytes = b"",
+    ) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(
+            args=("gh", "pr", "list"),
+            returncode=returncode,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
+    def load_with_results(
+        self,
+        results: list[subprocess.CompletedProcess[bytes]],
+        *,
+        allow_missing: bool = False,
+    ) -> tuple[dict[str, tuple[int | None, str]] | None, mock.Mock, mock.Mock]:
+        with (
+            mock.patch.object(gate.shutil, "which", return_value="/usr/bin/gh"),
+            mock.patch.object(gate.subprocess, "run", side_effect=results) as run,
+            mock.patch.object(gate.time, "sleep") as sleep,
+        ):
+            states = gate.load_pr_states(
+                self.root,
+                None,
+                allow_missing,
+                timeout=60,
+            )
+        return states, run, sleep
+
+    def test_transient_http_503_then_success_returns_exact_stdout_state(self) -> None:
+        states, run, sleep = self.load_with_results(
+            [
+                self.result(
+                    1,
+                    stderr=b"non-200 OK status code: 503 Service Unavailable",
+                ),
+                self.result(0, stdout=self.success_stdout),
+            ]
+        )
+        self.assertEqual({"fix/recovery": (20, "OPEN")}, states)
+        self.assertEqual(2, run.call_count)
+        sleep.assert_called_once_with(5.0)
+        command = run.call_args_list[0].args[0]
+        self.assertEqual(
+            (
+                "gh",
+                "pr",
+                "list",
+                "--state",
+                "all",
+                "--limit",
+                "1000",
+                "--json",
+                "number,headRefName,state",
+            ),
+            command,
+        )
+
+    def test_three_http_503_responses_exhaust_and_fail_red(self) -> None:
+        failures = [
+            self.result(1, stderr=b"HTTP 503: Service Unavailable sensitive-header")
+            for _ in range(3)
+        ]
+        with (
+            mock.patch.object(gate.shutil, "which", return_value="/usr/bin/gh"),
+            mock.patch.object(gate.subprocess, "run", side_effect=failures) as run,
+            mock.patch.object(gate.time, "sleep") as sleep,
+        ):
+            with self.assertRaises(gate.GateError) as raised:
+                gate.load_pr_states(self.root, None, False, timeout=60)
+        self.assertEqual(3, run.call_count)
+        self.assertEqual(2, sleep.call_count)
+        self.assertIn("exhausted 3 attempts after HTTP 503", str(raised.exception))
+        self.assertNotIn("sensitive-header", str(raised.exception))
+
+    def test_non_503_http_errors_fail_on_one_call_without_raw_stderr(self) -> None:
+        for status, label in ((403, "Forbidden"), (502, "Bad Gateway")):
+            with self.subTest(status=status):
+                failure = self.result(
+                    1,
+                    stderr=f"HTTP {status} {label} secret-header".encode(),
+                )
+                with (
+                    mock.patch.object(gate.shutil, "which", return_value="gh"),
+                    mock.patch.object(gate.subprocess, "run", return_value=failure) as run,
+                    mock.patch.object(gate.time, "sleep") as sleep,
+                ):
+                    with self.assertRaises(gate.GateError) as raised:
+                        gate.load_pr_states(self.root, None, False, timeout=60)
+                self.assertEqual(1, run.call_count)
+                sleep.assert_not_called()
+                self.assertIn(f"HTTP {status}", str(raised.exception))
+                self.assertNotIn("secret-header", str(raised.exception))
+
+    def test_malformed_json_and_wrong_shape_fail_after_one_successful_call(self) -> None:
+        for stdout, expected in (
+            (b"{not-json", "did not return valid JSON"),
+            (b"{}", "PR state must be a JSON list"),
+        ):
+            with self.subTest(stdout=stdout):
+                success = self.result(0, stdout=stdout)
+                with (
+                    mock.patch.object(gate.shutil, "which", return_value="gh"),
+                    mock.patch.object(gate.subprocess, "run", return_value=success) as run,
+                    mock.patch.object(gate.time, "sleep") as sleep,
+                ):
+                    with self.assertRaises(gate.GateError) as raised:
+                        gate.load_pr_states(self.root, None, False, timeout=60)
+                self.assertEqual(1, run.call_count)
+                sleep.assert_not_called()
+                self.assertIn(expected, str(raised.exception))
+
+    def test_allow_missing_preserves_incomplete_state_after_503_exhaustion(self) -> None:
+        failures = [
+            self.result(1, stderr=b"503 Service Unavailable")
+            for _ in range(3)
+        ]
+        states, run, sleep = self.load_with_results(failures, allow_missing=True)
+        self.assertIsNone(states)
+        self.assertEqual(3, run.call_count)
+        self.assertEqual(2, sleep.call_count)
 
 
 class PredicateUnitTests(unittest.TestCase):

@@ -44,9 +44,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,6 +59,17 @@ MANIFEST_NAMES = ("Cargo.toml", "package.json", "pyproject.toml", "go.mod")
 PATH_CHUNK = 300
 DEFAULT_MAIN_REF = "origin/main"
 DEFAULT_GIT_TIMEOUT = 300
+GH_PR_LIST_ATTEMPTS = 3
+GH_PR_LIST_RETRY_SECONDS = 5.0
+GH_HTTP_STATUS = re.compile(
+    rb"(?:HTTP(?:/\d(?:\.\d)?)?[: ]+|status code:\s*)([45]\d\d)\b",
+    re.IGNORECASE,
+)
+GH_NAMED_HTTP_STATUS = re.compile(
+    rb"\b([45]\d\d)\s+(?:Bad Request|Unauthorized|Forbidden|Not Found|"
+    rb"Service Unavailable|Bad Gateway|Gateway Timeout)\b",
+    re.IGNORECASE,
+)
 
 
 class GateError(RuntimeError):
@@ -269,6 +282,56 @@ def discover_branches(repo: Path, main_ref: str, timeout: int) -> list[tuple[str
     return sorted(branches)
 
 
+def gh_http_status(stderr: bytes) -> int | None:
+    """Classify a GitHub CLI HTTP status without exposing raw stderr."""
+    for pattern in (GH_HTTP_STATUS, GH_NAMED_HTTP_STATUS):
+        match = pattern.search(stderr)
+        if match is not None:
+            return int(match.group(1))
+    return None
+
+
+def read_pr_state_from_github(repo: Path, timeout: int) -> bytes:
+    """Read PR metadata, retrying only an explicitly classified HTTP 503."""
+    command = (
+        "gh",
+        "pr",
+        "list",
+        "--state",
+        "all",
+        "--limit",
+        "1000",
+        "--json",
+        "number,headRefName,state",
+    )
+    for attempt in range(1, GH_PR_LIST_ATTEMPTS + 1):
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                cwd=str(repo),
+                timeout=timeout,
+            )
+        except FileNotFoundError as error:  # pragma: no cover - environment shaped
+            raise GateError("gh executable disappeared during PR state read") from error
+        except subprocess.TimeoutExpired as error:
+            raise GateError(f"gh pr list timed out after {timeout}s") from error
+        if result.returncode == 0:
+            return result.stdout
+        status = gh_http_status(result.stderr)
+        if status != 503:
+            category = f"HTTP {status}" if status is not None else "unclassified error"
+            raise GateError(
+                f"gh pr list failed with exit {result.returncode} ({category})"
+            )
+        if attempt == GH_PR_LIST_ATTEMPTS:
+            raise GateError(
+                f"gh pr list exhausted {GH_PR_LIST_ATTEMPTS} attempts after HTTP 503"
+            )
+        time.sleep(GH_PR_LIST_RETRY_SECONDS)
+    raise GateError("gh pr list retry loop ended without a result")  # pragma: no cover
+
+
 def load_pr_states(
     repo: Path,
     pr_state_file: str | None,
@@ -291,30 +354,13 @@ def load_pr_states(
                 return None
             raise GateError("gh unavailable: PR state cannot be classified (see --allow-missing-pr-state)")
         try:
-            result = subprocess.run(
-                (
-                    "gh",
-                    "pr",
-                    "list",
-                    "--state",
-                    "all",
-                    "--limit",
-                    "1000",
-                    "--json",
-                    "number,headRefName,state",
-                ),
-                capture_output=True,
-                cwd=str(repo),
-                timeout=timeout,
-            )
-        except subprocess.TimeoutExpired as error:
-            raise GateError(f"gh pr list timed out after {timeout}s") from error
-        if result.returncode != 0:
+            raw = read_pr_state_from_github(repo, timeout)
+        except GateError:
             if allow_missing:
                 return None
-            raise GateError(f"gh pr list failed with exit {result.returncode}")
+            raise
         try:
-            data = json.loads(result.stdout.decode("utf-8", "replace"))
+            data = json.loads(raw.decode("utf-8", "replace"))
         except json.JSONDecodeError as error:
             raise GateError("gh pr list did not return valid JSON") from error
 
