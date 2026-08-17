@@ -119,6 +119,7 @@ fn make_bootstrap_handler_state(
         setup_invitation_cache: server_rs::setup_invitation::new_cache(),
         engine_port: 8091,
         tailnet_resolver: no_tailnet,
+        phase3_runtime: None,
     }
 }
 

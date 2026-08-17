@@ -92,12 +92,12 @@ PATCH is followed by byte-exact readback. It cannot change a title, create a
 second mutation, or ready, review, merge, or redirect the PR. A post-mutation
 readback failure is RED and has no automatic rollback.
 
-### Governed theyos v0.1.26 tag
+### Governed theyos v0.1.27 tag
 
-The dedicated `governed-theyos-v0126-tag` adapter is the only authorized
-writer for the annotated backend tag `refs/tags/v0.1.26`. It is hardcoded to
+The dedicated `governed-theyos-v0127-tag` adapter is the only authorized
+writer for the annotated backend tag `refs/tags/v0.1.27`. It is hardcoded to
 the canonical `soyeht/theyos` origin, version, ref, and exact message
-`theyos-engine v0.1.26\n`. The caller supplies only the full target and
+`theyos-engine 0.1.27\n`. The caller supplies only the full target and
 expected-main OIDs, which must be identical to each other, `HEAD`,
 `origin/main`, the remote main ref, and the GitHub API main ref.
 

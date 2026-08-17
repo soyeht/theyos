@@ -56,6 +56,7 @@ fn make_state(bs: BootstrapState, state_dir: PathBuf) -> BootstrapHandlerState {
         setup_invitation_cache: server_rs::setup_invitation::new_cache(),
         engine_port: 8091,
         tailnet_resolver: no_tailnet,
+        phase3_runtime: None,
     }
 }
 

@@ -693,12 +693,20 @@ pub enum PreHouseholdRuntimeSignal {
 }
 
 pub fn pre_household_router(state: PreHouseholdRouterState) -> Router {
+    pre_household_routes(state).fallback(pre_household_reject)
+}
+
+/// Pre-household routes without a fallback.
+///
+/// The daemon uses this form so the stable listener can delegate unmatched
+/// requests to the generation-bound Phase 3 runtime. One-shot CLI listeners
+/// keep the fixed rejection supplied by [`pre_household_router`].
+pub(crate) fn pre_household_routes(state: PreHouseholdRouterState) -> Router {
     Router::new()
         .route("/pair-machine/anchor-handoff", get(anchor_handoff_handler))
         .route("/pair-machine/local/seed", get(local_seed_handler))
         .route("/pair-machine/local/anchor", post(local_anchor_handler))
         .route("/pair-machine/local/finalize", post(local_finalize_handler))
-        .fallback(pre_household_reject)
         .with_state(state)
 }
 
@@ -877,7 +885,7 @@ fn unauthenticated_response() -> Response {
     cbor_response(StatusCode::UNAUTHORIZED, bytes)
 }
 
-async fn pre_household_reject() -> Response {
+pub(crate) async fn pre_household_reject() -> Response {
     unauthenticated_response()
 }
 

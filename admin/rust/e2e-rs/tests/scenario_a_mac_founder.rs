@@ -62,6 +62,7 @@ fn bootstrap_app(
         setup_invitation_cache: server_rs::setup_invitation::new_cache(),
         engine_port: 8091,
         tailnet_resolver: || None,
+        phase3_runtime: None,
     };
     bootstrap_router(state)
 }
