@@ -41,8 +41,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -51,6 +53,17 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ENROLLMENT = "scripts/chronic-reds-enrollment.json"
 MARKER_LABEL = "chronic-red"
 ISSUE_TITLE_PREFIX = "[chronic-red] "
+GH_READ_ATTEMPTS = 6
+GH_READ_RETRY_SECONDS = 15.0
+GH_HTTP_STATUS = re.compile(
+    r"(?:HTTP(?:/\d(?:\.\d)?)?[: ]+|status code:\s*)([45]\d\d)\b",
+    re.IGNORECASE,
+)
+GH_NAMED_HTTP_STATUS = re.compile(
+    r"\b([45]\d\d)\s+(?:Bad Request|Unauthorized|Forbidden|Not Found|"
+    r"Service Unavailable|Bad Gateway|Gateway Timeout)\b",
+    re.IGNORECASE,
+)
 
 EPOCH = datetime(2000, 1, 1, tzinfo=timezone.utc)
 
@@ -233,6 +246,7 @@ def classify(
 
 
 def _gh(args: list[str], **kwargs) -> str:
+    """Execute exactly one GitHub mutation; this path never retries."""
     env = dict(os.environ)
     env.setdefault("GH", "gh")
     try:
@@ -241,11 +255,58 @@ def _gh(args: list[str], **kwargs) -> str:
         )
         return out.stdout
     except subprocess.CalledProcessError as e:
-        raise GateCannotRun(f"gh {' '.join(args)} failed: {e.stderr.strip() or e.stdout.strip()}") from e
+        status = _gh_http_status(e.stderr)
+        category = f"HTTP {status}" if status is not None else "unclassified error"
+        raise GateCannotRun(
+            f"gh mutation failed with exit {e.returncode} ({category})"
+        ) from e
+
+
+def _gh_http_status(stderr: str) -> int | None:
+    """Classify one HTTP status without exposing the underlying stderr."""
+    for pattern in (GH_HTTP_STATUS, GH_NAMED_HTTP_STATUS):
+        match = pattern.search(stderr)
+        if match is not None:
+            return int(match.group(1))
+    return None
+
+
+def _gh_read(args: list[str], **kwargs) -> str:
+    """Execute a read-only gh call with bounded retry only for HTTP 503."""
+    env = dict(os.environ)
+    env.setdefault("GH", "gh")
+    for attempt in range(1, GH_READ_ATTEMPTS + 1):
+        try:
+            result = subprocess.run(
+                ["gh", *args],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=env,
+                **kwargs,
+            )
+        except FileNotFoundError as error:  # pragma: no cover - environment shaped
+            raise GateCannotRun("gh executable not found during read") from error
+        except subprocess.TimeoutExpired as error:
+            raise GateCannotRun("gh read timed out") from error
+        if result.returncode == 0:
+            return result.stdout
+        status = _gh_http_status(result.stderr)
+        if status != 503:
+            category = f"HTTP {status}" if status is not None else "unclassified error"
+            raise GateCannotRun(
+                f"gh read failed with exit {result.returncode} ({category})"
+            )
+        if attempt == GH_READ_ATTEMPTS:
+            raise GateCannotRun(
+                f"gh read exhausted {GH_READ_ATTEMPTS} attempts after HTTP 503"
+            )
+        time.sleep(GH_READ_RETRY_SECONDS)
+    raise GateCannotRun("gh read retry loop ended without a result")  # pragma: no cover
 
 
 def main_tip_sha(repo: str) -> str:
-    return _gh(["api", f"repos/{repo}/branches/main", "-q", ".commit.sha"]).strip()
+    return _gh_read(["api", f"repos/{repo}/branches/main", "-q", ".commit.sha"]).strip()
 
 
 def fetch_check_observations(repo: str, sha: str) -> dict[str, CheckObservation]:
@@ -258,7 +319,7 @@ def fetch_check_observations(repo: str, sha: str) -> dict[str, CheckObservation]
     runs: dict[str, tuple[int, CheckObservation]] = {}
     page = 1
     while True:
-        js = _gh(
+        js = _gh_read(
             [
                 "api",
                 f"repos/{repo}/commits/{sha}/check-runs",
@@ -312,7 +373,7 @@ def _parse_context_from_title(title: str) -> str | None:
 def fetch_orphan_issues(repo: str) -> list[OrphanIssue]:
     """Open issues carrying the marker label. last_ping is the latest comment
     timestamp authored by the gate's re-ping marker, else None."""
-    js = _gh(
+    js = _gh_read(
         [
             "issue", "list", "--repo", repo, "--state", "open",
             "--label", MARKER_LABEL, "--json", "number,title,createdAt",
@@ -322,20 +383,35 @@ def fetch_orphan_issues(repo: str) -> list[OrphanIssue]:
     out: list[OrphanIssue] = []
     try:
         rows = json.loads(js) if js.strip() else []
-    except json.JSONDecodeError:
-        raise GateCannotRun("could not parse orphan issue list")
+    except json.JSONDecodeError as error:
+        raise GateCannotRun("could not parse orphan issue list") from error
+    if not isinstance(rows, list):
+        raise GateCannotRun("orphan issue list is not an array")
     for row in rows:
-        ctx = _parse_context_from_title(row.get("title", ""))
+        if not isinstance(row, dict):
+            raise GateCannotRun("orphan issue entry is not an object")
+        number = row.get("number")
+        title = row.get("title")
+        created_at = row.get("createdAt")
+        if (
+            type(number) is not int
+            or not isinstance(title, str)
+            or not isinstance(created_at, str)
+        ):
+            raise GateCannotRun(
+                "orphan issue entry lacks integer number or string title/createdAt"
+            )
+        ctx = _parse_context_from_title(title)
         if ctx is None:
             continue
-        created = parse_date(row["createdAt"])
-        last_ping = _latest_ping(repo, row["number"])
-        out.append(OrphanIssue(row["number"], ctx, created, last_ping))
+        created = parse_date(created_at)
+        last_ping = _latest_ping(repo, number)
+        out.append(OrphanIssue(number, ctx, created, last_ping))
     return out
 
 
 def _latest_ping(repo: str, number: int) -> datetime | None:
-    js = _gh(
+    js = _gh_read(
         [
             "api", "--paginate", "--slurp",
             f"repos/{repo}/issues/{number}/comments",

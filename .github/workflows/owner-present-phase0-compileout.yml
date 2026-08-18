@@ -16,13 +16,18 @@ permissions:
   contents: read
 
 jobs:
-  structural-boundary:
-    name: Owner-present structural boundary
+  structural-shard:
+    name: Owner-present structural boundary (shard ${{ matrix.shard }})
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     runs-on: ubuntu-latest
-    # The 39-control matrix reached 37 real refusals at the former 90-minute
-    # ceiling and was cancelled before its final two controls and composer.
-    # Keep enough measured headroom to distinguish a verdict from cancellation.
-    timeout-minutes: 120
+    # One monolithic mutation matrix was externally cancelled after 99 minutes,
+    # below its YAML timeout. Four independently bounded shards keep the same
+    # controls, and the coverage job below rejects any missing or duplicate
+    # result before the route composer can run.
+    timeout-minutes: 75
     steps:
       - name: Checkout theyos
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
@@ -45,13 +50,103 @@ jobs:
           components: clippy
           targets: x86_64-unknown-linux-musl
 
+      - name: Prove excluded controls cannot execute a boundary
+        shell: bash
+        run: PHASE0_STRUCTURAL_MODE=execution-gate-selftest bash .github/scripts/test-mobile-claw-vpn-owner-present-phase0-compileout.sh
+
       - name: Exercise structural mutations
         shell: bash
         run: |
           env -u CARGO_HOME -u RUSTUP_HOME -u PHASE0_RUSTUP_HOME \
+            PHASE0_REQUIRE_ALL=1 \
+            PHASE0_STRUCTURAL_SHARD="${{ matrix.shard }}" \
+            PHASE0_CONTROL_REPORT="${RUNNER_TEMP}/structural-shard-${{ matrix.shard }}.txt" \
+            PHASE0_EXECUTION_TRACE="${RUNNER_TEMP}/structural-shard-${{ matrix.shard }}.trace" \
+            PHASE0_EFFECT_TRACE="${RUNNER_TEMP}/structural-shard-${{ matrix.shard }}.effects" \
             bash .github/scripts/test-mobile-claw-vpn-owner-present-phase0-compileout.sh
 
-      - name: Test the exact Phase 0 route composer
+      - name: Require the complete shard report
+        shell: bash
+        run: |
+          set -euo pipefail
+          report="${RUNNER_TEMP}/structural-shard-${{ matrix.shard }}.txt"
+          trace="${RUNNER_TEMP}/structural-shard-${{ matrix.shard }}.trace"
+          effects="${RUNNER_TEMP}/structural-shard-${{ matrix.shard }}.effects"
+          test -s "${report}"
+          test -s "${trace}"
+          test -f "${effects}"
+          cmp <(LC_ALL=C sort "${report}") <(LC_ALL=C sort "${trace}")
+
+      - name: Publish the structural shard report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: owner-present-phase0-structural-shard-${{ matrix.shard }}
+          path: |
+            ${{ runner.temp }}/structural-shard-${{ matrix.shard }}.txt
+            ${{ runner.temp }}/structural-shard-${{ matrix.shard }}.trace
+            ${{ runner.temp }}/structural-shard-${{ matrix.shard }}.effects
+          if-no-files-found: error
+          retention-days: 30
+
+  structural-coverage:
+    name: Owner-present structural coverage
+    needs: structural-shard
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Require all structural shards green
+        shell: bash
+        env:
+          STRUCTURAL_RESULT: ${{ needs.structural-shard.result }}
+        run: |
+          set -euo pipefail
+          test "${STRUCTURAL_RESULT}" = success
+
+      - name: Checkout theyos
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+
+      - name: Download every structural shard report
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          pattern: owner-present-phase0-structural-shard-*
+          path: structural-reports
+          merge-multiple: true
+
+      - name: Compose exact structural coverage
+        shell: bash
+        run: |
+          set -euo pipefail
+          PHASE0_STRUCTURAL_MODE=compose \
+            PHASE0_REQUIRE_ALL=1 \
+            PHASE0_CONTROL_REPORT_DIR=structural-reports \
+            bash .github/scripts/test-mobile-claw-vpn-owner-present-phase0-compileout.sh
+
+  structural-route-composer:
+    name: Test the exact Phase 0 route composer
+    needs: [structural-shard, structural-coverage]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Require all structural producers green
+        shell: bash
+        env:
+          SHARDS_RESULT: ${{ needs.structural-shard.result }}
+          COVERAGE_RESULT: ${{ needs.structural-coverage.result }}
+        run: |
+          set -euo pipefail
+          test "${SHARDS_RESULT}" = success
+          test "${COVERAGE_RESULT}" = success
+
+      - name: Checkout theyos
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+
+      - name: Exercise the exact Phase 0 route composer
         working-directory: admin/rust
         run: |
           cargo test --locked -p server-rs mobile_claw_vpn_phase0

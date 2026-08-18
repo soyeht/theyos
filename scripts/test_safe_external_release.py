@@ -4466,6 +4466,827 @@ class GitHubAPIIOSTargetBoundaryTests(unittest.TestCase):
         self.assertEqual("github.com", environment["GH_HOST"])
         self.assertEqual("soyeht/soyeht-ios", environment["GH_REPO"])
 
+    def test_no_content_mutation_uses_exact_json_and_rejects_response_bytes(self) -> None:
+        endpoint = (
+            "repos/soyeht/soyeht-ios/actions/workflows/331985341/dispatches"
+        )
+        payload = {
+            "ref": "mac-v0.1.19",
+            "inputs": {
+                "expected_ref": "refs/tags/mac-v0.1.19",
+                "expected_oid": guard.RELEASE_RECOVERY_TARGET_OID,
+            },
+        }
+        completed = mock.Mock(returncode=0, stdout=b"", stderr=b"")
+        with mock.patch.object(
+            guard.subprocess, "run", return_value=completed
+        ) as run:
+            self.assertIsNone(
+                guard.GitHubAPI().mutate_no_content("POST", endpoint, payload)
+            )
+        command = run.call_args.args[0]
+        self.assertEqual("POST", command[command.index("--method") + 1])
+        self.assertEqual(endpoint, command[-3])
+        self.assertEqual(["--input", "-"], command[-2:])
+        self.assertEqual(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(),
+            run.call_args.kwargs["input"],
+        )
+        environment = run.call_args.kwargs["env"]
+        self.assertEqual("github.com", environment["GH_HOST"])
+        self.assertEqual("soyeht/soyeht-ios", environment["GH_REPO"])
+
+        nonempty = mock.Mock(returncode=0, stdout=b"{}", stderr=b"")
+        with (
+            mock.patch.object(guard.subprocess, "run", return_value=nonempty),
+            self.assertRaisesRegex(
+                guard.ReleaseGuardError, "unexpected content"
+            ),
+        ):
+            guard.GitHubAPI().mutate_no_content("POST", endpoint, payload)
+
+
+class FakeMacOSReleaseRecoveryAPI(FakeReleaseAPI):
+    def __init__(self) -> None:
+        super().__init__()
+        self.main_oid = guard.RELEASE_RECOVERY_TARGET_OID
+        self.target_oid = guard.RELEASE_RECOVERY_TARGET_OID
+        self.merge_base = guard.RELEASE_RECOVERY_TARGET_OID
+        self.tag_objects = {
+            guard.RELEASE_RECOVERY_TAG_OBJECT_OID: {
+                "sha": guard.RELEASE_RECOVERY_TAG_OBJECT_OID,
+                "tag": guard.RELEASE_RECOVERY_TAG,
+                "message": f"Soyeht {guard.RELEASE_RECOVERY_VERSION}\n",
+                "object": {
+                    "type": "commit",
+                    "sha": guard.RELEASE_RECOVERY_TARGET_OID,
+                },
+            }
+        }
+        self.tags = {
+            guard.RELEASE_RECOVERY_TAG: guard.RELEASE_RECOVERY_TAG_OBJECT_OID
+        }
+        self.workflow_record = {
+            "id": guard.RELEASE_RECOVERY_WORKFLOW_ID,
+            "name": guard.RELEASE_RECOVERY_WORKFLOW_NAME,
+            "path": guard.RELEASE_RECOVERY_WORKFLOW_PATH,
+            "state": "active",
+        }
+        self.runs: list[dict[str, Any]] = [guard._expected_failed_release_run()]
+        self.new_run = {
+            "id": guard.RELEASE_RECOVERY_FAILED_RUN_ID + 100,
+            "event": "workflow_dispatch",
+            "head_branch": guard.RELEASE_RECOVERY_TAG,
+            "head_sha": guard.RELEASE_RECOVERY_TARGET_OID,
+            "run_attempt": 1,
+            "status": "queued",
+            "conclusion": None,
+            "path": guard.RELEASE_RECOVERY_WORKFLOW_PATH,
+            "workflow_id": guard.RELEASE_RECOVERY_WORKFLOW_ID,
+        }
+        self.materialize_dispatch = True
+        self.drift_failed_run_after_dispatch = False
+        self.extra_dispatch_runs: list[dict[str, Any]] = []
+        self.dispatch_payload: Mapping[str, Any] | None = None
+
+    def read(self, endpoint: str) -> Any:
+        workflow_endpoint = (
+            f"repos/{guard.RELEASE_GITHUB_REPO}/actions/workflows/"
+            f"{guard.RELEASE_RECOVERY_WORKFLOW_ID}"
+        )
+        if endpoint == workflow_endpoint:
+            return copy.deepcopy(self.workflow_record)
+        if endpoint == (
+            f"{workflow_endpoint}/runs?branch={guard.RELEASE_RECOVERY_TAG}"
+            "&per_page=100"
+        ):
+            return {
+                "total_count": len(self.runs),
+                "workflow_runs": copy.deepcopy(self.runs),
+            }
+        if endpoint.endswith(
+            f"/commits/{guard.RELEASE_RECOVERY_TARGET_OID}"
+        ):
+            return {"sha": self.target_oid}
+        if endpoint.endswith(
+            f"/compare/{guard.RELEASE_RECOVERY_TARGET_OID}..."
+            f"{guard.RELEASE_RECOVERY_TARGET_OID}"
+        ):
+            return {
+                "status": self.compare_status,
+                "merge_base_commit": {"sha": self.merge_base},
+            }
+        fixed_ref = f"?ref={guard.RELEASE_RECOVERY_TARGET_OID}"
+        if fixed_ref in endpoint:
+            return super().read(endpoint.replace(fixed_ref, f"?ref={TARGET}"))
+        return super().read(endpoint)
+
+    def mutate_no_content(
+        self, method: str, endpoint: str, payload: Mapping[str, Any]
+    ) -> None:
+        expected_endpoint = (
+            f"repos/{guard.RELEASE_GITHUB_REPO}/actions/workflows/"
+            f"{guard.RELEASE_RECOVERY_WORKFLOW_ID}/dispatches"
+        )
+        if method != "POST" or endpoint != expected_endpoint:
+            raise AssertionError(f"unexpected no-content mutation: {method} {endpoint}")
+        self.mutations.append((method, endpoint))
+        self.dispatch_payload = copy.deepcopy(payload)
+        if self.materialize_dispatch:
+            if self.drift_failed_run_after_dispatch:
+                self.runs[0]["conclusion"] = "success"
+            self.runs.append(copy.deepcopy(self.new_run))
+            self.runs.extend(copy.deepcopy(self.extra_dispatch_runs))
+
+
+class GovernedMacOSReleaseRecoveryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.api = FakeMacOSReleaseRecoveryAPI()
+        execution_contract_digests = {
+            path: hashlib.sha256(
+                self.api.workflow
+                if path == guard.RELEASE_WORKFLOW_FILE
+                else self.api.execution_contract[path]
+            ).hexdigest()
+            for path in guard.RELEASE_EXECUTION_CONTRACT_SHA256
+        }
+        patcher = mock.patch.object(
+            guard,
+            "RELEASE_EXECUTION_CONTRACT_SHA256",
+            execution_contract_digests,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def execute(self) -> str:
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(
+                0,
+                guard.execute_governed_macos_release_recovery(
+                    [], "", api=self.api, sleep=lambda _: None
+                ),
+            )
+        return stdout.getvalue()
+
+    def assert_blocked_before_mutation(self) -> None:
+        with self.assertRaises((guard.ReleaseGuardError, guard.UnsafeCommand)):
+            guard.execute_governed_macos_release_recovery(
+                [], "", api=self.api, sleep=lambda _: None
+            )
+        self.assertEqual([], self.api.mutations)
+
+    def test_success_is_one_exact_dispatch_and_attempt_one_readback(self) -> None:
+        receipt = self.execute()
+        self.assertEqual(1, len(self.api.mutations))
+        self.assertEqual(
+            {
+                "ref": guard.RELEASE_RECOVERY_TAG,
+                "inputs": {
+                    "expected_ref": guard.RELEASE_RECOVERY_TAG_REF,
+                    "expected_oid": guard.RELEASE_RECOVERY_TARGET_OID,
+                },
+            },
+            self.api.dispatch_payload,
+        )
+        self.assertNotIn("secret", json.dumps(self.api.dispatch_payload).lower())
+        self.assertIn('"event":"workflow_dispatch"', receipt)
+        self.assertIn('"run_attempt":1', receipt)
+
+    def test_arguments_and_payload_are_not_caller_controlled(self) -> None:
+        for arguments, payload in ((["--repo", "other/repo"], ""), ([], "x")):
+            with self.subTest(arguments=arguments, payload=payload):
+                with self.assertRaises((guard.UnsafeCommand, guard.ReleaseGuardError)):
+                    guard.execute_governed_macos_release_recovery(
+                        arguments, payload, api=self.api, sleep=lambda _: None
+                    )
+                self.assertEqual([], self.api.mutations)
+
+    def test_every_workflow_identity_field_is_load_bearing(self) -> None:
+        for field, value in (
+            ("id", 1),
+            ("name", "Other Release"),
+            ("path", ".github/workflows/other.yml"),
+            ("state", "disabled_manually"),
+        ):
+            with self.subTest(field=field):
+                self.api = FakeMacOSReleaseRecoveryAPI()
+                self.api.workflow_record[field] = value
+                self.assert_blocked_before_mutation()
+
+    def test_tag_release_main_and_consumer_drift_block_before_dispatch(self) -> None:
+        mutators = (
+            lambda api: setattr(api, "main_oid", WRONG),
+            lambda api: setattr(api, "merge_base", WRONG),
+            lambda api: setattr(api, "compare_status", "diverged"),
+            lambda api: setattr(api, "branch_exists", True),
+            lambda api: api.tag_objects[guard.RELEASE_RECOVERY_TAG_OBJECT_OID][
+                "object"
+            ].update({"sha": WRONG}),
+            lambda api: api.tag_objects[guard.RELEASE_RECOVERY_TAG_OBJECT_OID].update(
+                {"message": "different\n"}
+            ),
+            lambda api: api.releases.update(
+                {
+                    9: {
+                        "id": 9,
+                        "tag_name": guard.RELEASE_RECOVERY_TAG,
+                        "assets": [],
+                    }
+                }
+            ),
+            lambda api: setattr(api, "project", b"MARKETING_VERSION = 9.9.9;"),
+            lambda api: setattr(api, "workflow", api.workflow + b"\n# drift"),
+        )
+        for mutate in mutators:
+            with self.subTest(mutate=mutate):
+                self.api = FakeMacOSReleaseRecoveryAPI()
+                mutate(self.api)
+                self.assert_blocked_before_mutation()
+
+    def test_prior_run_must_be_the_one_immutable_failed_push_attempt(self) -> None:
+        cases = (
+            [],
+            [{**guard._expected_failed_release_run(), "conclusion": "success"}],
+            [{**guard._expected_failed_release_run(), "event": "workflow_dispatch"}],
+            [{**guard._expected_failed_release_run(), "run_attempt": 2}],
+            [{**guard._expected_failed_release_run(), "head_sha": WRONG}],
+            [
+                guard._expected_failed_release_run(),
+                {
+                    **guard._expected_failed_release_run(),
+                    "id": guard.RELEASE_RECOVERY_FAILED_RUN_ID + 1,
+                    "conclusion": "success",
+                },
+            ],
+        )
+        for runs in cases:
+            with self.subTest(runs=runs):
+                self.api = FakeMacOSReleaseRecoveryAPI()
+                self.api.runs = copy.deepcopy(runs)
+                self.assert_blocked_before_mutation()
+
+    def test_post_dispatch_missing_duplicate_or_wrong_run_is_red_once(self) -> None:
+        scenarios = (
+            lambda api: setattr(api, "materialize_dispatch", False),
+            lambda api: api.extra_dispatch_runs.append(copy.deepcopy(api.new_run)),
+            lambda api: api.new_run.update({"run_attempt": 2}),
+            lambda api: api.new_run.update({"head_sha": WRONG}),
+            lambda api: api.new_run.update({"event": "push"}),
+            lambda api: setattr(api, "drift_failed_run_after_dispatch", True),
+        )
+        for mutate in scenarios:
+            with self.subTest(mutate=mutate):
+                self.api = FakeMacOSReleaseRecoveryAPI()
+                mutate(self.api)
+                with self.assertRaises(guard.ReleaseGuardError):
+                    guard.execute_governed_macos_release_recovery(
+                        [], "", api=self.api, sleep=lambda _: None
+                    )
+                self.assertEqual(1, len(self.api.mutations))
+
+    def test_main_routes_empty_payload_to_the_dedicated_adapter(self) -> None:
+        stdin = mock.Mock()
+        stdin.buffer.read.return_value = b""
+        with (
+            mock.patch.object(guard.sys, "stdin", stdin),
+            mock.patch.object(
+                guard,
+                "execute_governed_macos_release_recovery",
+                return_value=0,
+            ) as execute,
+        ):
+            self.assertEqual(
+                0,
+                guard.main(
+                    ["--stdin", "--", "governed-macos-release-recovery"]
+                ),
+            )
+        execute.assert_called_once_with([], "")
+
+
+PROVISION_HEAD = "5" * 40
+
+
+class FakeIOSIssuerProvisionAPI:
+    def __init__(self) -> None:
+        self.main_oid = PROVISION_HEAD
+        self.commit_oid = PROVISION_HEAD
+        self.compare_status = "identical"
+        self.ahead_by = 0
+        self.behind_by = 0
+        self.total_commits = 0
+        self.merge_base = PROVISION_HEAD
+        self.workflow_bytes = (
+            Path(__file__).parents[1]
+            / guard.IOS_ISSUER_PROVISION_WORKFLOW_PATH
+        ).read_bytes()
+        self.workflow = {
+            "id": 771,
+            "name": guard.IOS_ISSUER_PROVISION_WORKFLOW_NAME,
+            "path": guard.IOS_ISSUER_PROVISION_WORKFLOW_PATH,
+            "state": "active",
+        }
+        self.runs: list[dict[str, Any]] = []
+        self.new_run = {
+            "id": 991,
+            "event": "workflow_dispatch",
+            "head_branch": "main",
+            "head_sha": PROVISION_HEAD,
+            "run_attempt": 1,
+            "status": "queued",
+            "conclusion": None,
+            "path": guard.IOS_ISSUER_PROVISION_WORKFLOW_PATH,
+            "workflow_id": 771,
+        }
+        self.materialize_dispatch = True
+        self.extra_runs: list[dict[str, Any]] = []
+        self.mutations: list[tuple[str, str]] = []
+        self.dispatch_payload: Mapping[str, Any] | None = None
+
+    def read(self, endpoint: str) -> Any:
+        prefix = f"repos/{guard.SAFE_GITHUB_REPO}"
+        if endpoint == f"{prefix}/git/ref/heads/main":
+            return {
+                "ref": "refs/heads/main",
+                "object": {"type": "commit", "sha": self.main_oid},
+            }
+        if endpoint == f"{prefix}/commits/{PROVISION_HEAD}":
+            return {"sha": self.commit_oid}
+        if endpoint == f"{prefix}/compare/{PROVISION_HEAD}...{PROVISION_HEAD}":
+            return {
+                "status": self.compare_status,
+                "ahead_by": self.ahead_by,
+                "behind_by": self.behind_by,
+                "total_commits": self.total_commits,
+                "merge_base_commit": {"sha": self.merge_base},
+            }
+        if endpoint == (
+            f"{prefix}/contents/{guard.IOS_ISSUER_PROVISION_WORKFLOW_PATH}"
+            f"?ref={PROVISION_HEAD}"
+        ):
+            return {
+                "type": "file",
+                "encoding": "base64",
+                "content": base64.b64encode(self.workflow_bytes).decode(),
+            }
+        workflow_endpoint = (
+            f"{prefix}/actions/workflows/"
+            f"{guard.IOS_ISSUER_PROVISION_WORKFLOW_FILE}"
+        )
+        if endpoint == workflow_endpoint:
+            return copy.deepcopy(self.workflow)
+        if endpoint == (
+            f"{workflow_endpoint}/runs?event=workflow_dispatch&branch=main&per_page=100"
+        ):
+            return {
+                "total_count": len(self.runs),
+                "workflow_runs": copy.deepcopy(self.runs),
+            }
+        raise AssertionError(f"unexpected read: {endpoint}")
+
+    def mutate_no_content(
+        self, method: str, endpoint: str, payload: Mapping[str, Any]
+    ) -> None:
+        expected_endpoint = (
+            f"repos/{guard.SAFE_GITHUB_REPO}/actions/workflows/"
+            f"{guard.IOS_ISSUER_PROVISION_WORKFLOW_FILE}/dispatches"
+        )
+        if method != "POST" or endpoint != expected_endpoint:
+            raise AssertionError(f"unexpected mutation: {method} {endpoint}")
+        self.mutations.append((method, endpoint))
+        self.dispatch_payload = copy.deepcopy(payload)
+        if self.materialize_dispatch:
+            self.runs.append(copy.deepcopy(self.new_run))
+            self.runs.extend(copy.deepcopy(self.extra_runs))
+
+
+class GovernedIOSIssuerProvisionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.api = FakeIOSIssuerProvisionAPI()
+
+    @staticmethod
+    def arguments() -> list[str]:
+        return ["--expected-head", PROVISION_HEAD]
+
+    def execute(self) -> str:
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(
+                0,
+                guard.execute_governed_ios_notary_issuer_provision(
+                    self.arguments(), "", api=self.api, sleep=lambda _: None
+                ),
+            )
+        return stdout.getvalue()
+
+    def assert_blocked_before_mutation(self) -> None:
+        with self.assertRaises((guard.ReleaseGuardError, guard.UnsafeCommand)):
+            guard.execute_governed_ios_notary_issuer_provision(
+                self.arguments(), "", api=self.api, sleep=lambda _: None
+            )
+        self.assertEqual([], self.api.mutations)
+
+    def test_success_is_one_fixed_dispatch_with_exact_attempt_one_readback(self) -> None:
+        receipt = self.execute()
+        self.assertEqual(1, len(self.api.mutations))
+        self.assertEqual(
+            {"ref": "main", "inputs": {"expected_oid": PROVISION_HEAD}},
+            self.api.dispatch_payload,
+        )
+        self.assertNotIn("secret", json.dumps(self.api.dispatch_payload).lower())
+        self.assertIn('"run_attempt":1', receipt)
+        self.assertIn('"repository":"soyeht/theyos"', receipt)
+
+    def test_arguments_payload_and_destination_overrides_are_red(self) -> None:
+        cases = (
+            ([], ""),
+            (["--expected-head", "1"], ""),
+            (["--expected-head", PROVISION_HEAD, "--repo", "other/repo"], ""),
+            (self.arguments(), "payload"),
+        )
+        for arguments, payload in cases:
+            with self.subTest(arguments=arguments, payload=payload):
+                with self.assertRaises((guard.ReleaseGuardError, guard.UnsafeCommand)):
+                    guard.execute_governed_ios_notary_issuer_provision(
+                        arguments, payload, api=self.api, sleep=lambda _: None
+                    )
+                self.assertEqual([], self.api.mutations)
+
+    def test_source_main_comparison_workflow_and_prior_run_are_load_bearing(self) -> None:
+        mutators = (
+            lambda api: setattr(api, "main_oid", WRONG),
+            lambda api: setattr(api, "commit_oid", WRONG),
+            lambda api: setattr(api, "compare_status", "ahead"),
+            lambda api: setattr(api, "ahead_by", 1),
+            lambda api: setattr(api, "behind_by", 1),
+            lambda api: setattr(api, "total_commits", 1),
+            lambda api: setattr(api, "merge_base", WRONG),
+            lambda api: api.workflow.update({"id": 0}),
+            lambda api: api.workflow.update({"name": "Other"}),
+            lambda api: api.workflow.update({"path": ".github/workflows/other.yml"}),
+            lambda api: api.workflow.update({"state": "disabled_manually"}),
+            lambda api: setattr(api, "workflow_bytes", api.workflow_bytes + b"\n"),
+            lambda api: api.runs.append(copy.deepcopy(api.new_run)),
+        )
+        for mutate in mutators:
+            with self.subTest(mutate=mutate):
+                self.api = FakeIOSIssuerProvisionAPI()
+                mutate(self.api)
+                self.assert_blocked_before_mutation()
+
+    def test_bridge_semantic_mutants_are_red_even_with_matching_digest(self) -> None:
+        original = self.api.workflow_bytes
+        mutants = (
+            original.replace(b"secrets.APPLE_NOTARY_ISSUER_ID", b"secrets.OTHER"),
+            original.replace(
+                b"secrets.SOYEHT_IOS_SECRET_PROVISION_TOKEN", b"secrets.OTHER"
+            ),
+            original.replace(
+                b"if printf '%s' \"${SOURCE_ISSUER}\" |",
+                b"if printf '%s\\n' \"${SOURCE_ISSUER}\" |",
+                1,
+            ),
+            original.replace(b"gh secret set \\", b"gh secret create \\", 1),
+            original.replace(b"gh secret delete \\", b"gh secret show \\", 1),
+            original.replace(b"target_repo=\"soyeht/soyeht-ios\"", b"target_repo=\"other/repo\""),
+            original.replace(b"retry_limit=3", b"retry_limit=30", 1),
+            original.replace(b"retry_delay_seconds=5", b"retry_delay_seconds=0", 1),
+            original.replace(
+                b"503([^0-9]|$)|service unavailable",
+                b"500([^0-9]|$)|server error",
+                1,
+            ),
+            original.replace(b"read_current_runs() {", b"read_runs() {", 1),
+            original.replace(b"delete_temporary_token() {", b"delete_token() {", 1),
+            original + b"\necho unsafe\n",
+            original + b"\nset -x\n",
+            original + b"\nSOYEHT_APNS_P8_BASE64\n",
+        )
+        guard._assert_ios_issuer_provision_workflow_bytes(original)
+        for mutant in mutants:
+            with self.subTest(mutant=mutant[-40:]):
+                with self.assertRaises(guard.ReleaseGuardError):
+                    guard._assert_ios_issuer_provision_workflow_bytes(mutant)
+
+    def test_missing_duplicate_or_wrong_post_dispatch_run_is_red_once(self) -> None:
+        scenarios = (
+            lambda api: setattr(api, "materialize_dispatch", False),
+            lambda api: api.extra_runs.append(copy.deepcopy(api.new_run)),
+            lambda api: api.new_run.update({"run_attempt": 2}),
+            lambda api: api.new_run.update({"head_sha": WRONG}),
+            lambda api: api.new_run.update({"head_branch": "other"}),
+            lambda api: api.new_run.update({"event": "push"}),
+            lambda api: api.new_run.update({"workflow_id": 1}),
+        )
+        for mutate in scenarios:
+            with self.subTest(mutate=mutate):
+                self.api = FakeIOSIssuerProvisionAPI()
+                mutate(self.api)
+                with self.assertRaises(guard.ReleaseGuardError):
+                    guard.execute_governed_ios_notary_issuer_provision(
+                        self.arguments(), "", api=self.api, sleep=lambda _: None
+                    )
+                self.assertEqual(1, len(self.api.mutations))
+
+    def test_dispatch_503_is_never_retried(self) -> None:
+        failure = guard.GitHubAPIError(
+            ["gh", "api", "dispatches"],
+            1,
+            "HTTP 503 Service Unavailable",
+        )
+        with mock.patch.object(
+            self.api,
+            "mutate_no_content",
+            side_effect=failure,
+        ) as mutate:
+            with self.assertRaises(guard.GitHubAPIError):
+                guard.execute_governed_ios_notary_issuer_provision(
+                    self.arguments(), "", api=self.api, sleep=lambda _: None
+                )
+        mutate.assert_called_once()
+
+    def test_main_routes_exact_head_and_empty_payload_to_adapter(self) -> None:
+        stdin = mock.Mock()
+        stdin.buffer.read.return_value = b""
+        with (
+            mock.patch.object(guard.sys, "stdin", stdin),
+            mock.patch.object(
+                guard,
+                "execute_governed_ios_notary_issuer_provision",
+                return_value=0,
+            ) as execute,
+        ):
+            self.assertEqual(
+                0,
+                guard.main(
+                    [
+                        "--stdin",
+                        "--",
+                        "governed-ios-notary-issuer-provision",
+                        *self.arguments(),
+                    ]
+                ),
+            )
+        execute.assert_called_once_with(self.arguments(), "")
+
+
+class IOSIssuerProvisionWorkflowRuntimeTests(unittest.TestCase):
+    @staticmethod
+    def workflow_script() -> str:
+        lines = (
+            Path(__file__).parents[1]
+            / guard.IOS_ISSUER_PROVISION_WORKFLOW_PATH
+        ).read_text().splitlines()
+        start = lines.index("        run: |") + 1
+        return "\n".join(line[10:] for line in lines[start:]) + "\n"
+
+    def run_workflow(
+        self,
+        scenario: str = "success",
+        *,
+        source_issuer: str = "issuer-value",
+    ) -> tuple[subprocess.CompletedProcess[str], dict[str, Any]]:
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            bin_path = root_path / "bin"
+            bin_path.mkdir()
+            state_path = root_path / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "api_calls": 0,
+                        "delete_calls": 0,
+                        "list_calls": 0,
+                        "set_calls": 0,
+                        "target_exists": False,
+                        "token_exists": True,
+                    }
+                )
+            )
+            fake_gh = bin_path / "gh"
+            fake_gh.write_text(
+                """#!/usr/bin/env python3
+import json
+import os
+import pathlib
+import sys
+
+state_path = pathlib.Path(os.environ["FAKE_GH_STATE"])
+state = json.loads(state_path.read_text())
+scenario = os.environ["FAKE_GH_SCENARIO"]
+args = sys.argv[1:]
+
+def save():
+    state_path.write_text(json.dumps(state, sort_keys=True))
+
+def fail(code):
+    save()
+    if code == 503:
+        sys.stderr.write("HTTP 503 Service Unavailable\\n")
+    else:
+        sys.stderr.write(f"HTTP {code} request rejected\\n")
+    raise SystemExit(1)
+
+def metadata(repository):
+    if repository == "soyeht/soyeht-ios":
+        names = [
+            "APPLE_CODESIGN_IDENTITY",
+            "APPLE_DEVELOPER_ID_P12_BASE64",
+            "APPLE_DEVELOPER_ID_P12_PASSWORD",
+            "APPLE_NOTARY_KEY_ID",
+            "APPLE_NOTARY_KEY_P8_BASE64",
+            "APPLE_TEAM_ID",
+            "SOYEHT_SPARKLE_PUBLIC_ED_KEY",
+            "SPARKLE_PRIVATE_KEY",
+        ]
+        if state["target_exists"]:
+            names.append("APPLE_NOTARY_ISSUER_ID")
+    elif repository == "soyeht/theyos":
+        names = ["APPLE_NOTARY_ISSUER_ID"]
+        if state["token_exists"]:
+            names.append("SOYEHT_IOS_SECRET_PROVISION_TOKEN")
+    else:
+        fail(400)
+    return [
+        {"name": name, "updatedAt": "2026-08-17T17:00:00Z"}
+        for name in sorted(names)
+    ]
+
+if args[:1] == ["api"]:
+    state["api_calls"] += 1
+    call = state["api_calls"]
+    if scenario == "api_503_once" and call == 1:
+        fail(503)
+    if scenario == "api_503_exhaust":
+        fail(503)
+    if scenario == "api_4xx":
+        fail(403)
+    save()
+    if scenario == "api_shape_wrong":
+        print(json.dumps({"total_count": 1, "workflow_runs": []}))
+        raise SystemExit(0)
+    print(json.dumps({
+        "total_count": 1,
+        "workflow_runs": [{
+            "id": int(os.environ["GITHUB_RUN_ID"]),
+            "event": "workflow_dispatch",
+            "head_branch": "main",
+            "head_sha": os.environ["EXPECTED_OID"],
+            "run_attempt": 1,
+            "path": ".github/workflows/provision-ios-notary-issuer.yml",
+        }],
+    }))
+    raise SystemExit(0)
+
+if args[:2] == ["secret", "list"]:
+    state["list_calls"] += 1
+    call = state["list_calls"]
+    if scenario == "list_503_once" and call == 1:
+        fail(503)
+    if scenario == "list_503_exhaust":
+        fail(503)
+    if scenario == "list_4xx":
+        fail(403)
+    repository = args[args.index("--repo") + 1]
+    save()
+    if scenario == "list_shape_wrong":
+        print(json.dumps({}))
+        raise SystemExit(0)
+    print(json.dumps(metadata(repository)))
+    raise SystemExit(0)
+
+if args[:2] == ["secret", "set"]:
+    state["set_calls"] += 1
+    call = state["set_calls"]
+    value = sys.stdin.read()
+    if value != "issuer-value":
+        fail(400)
+    if scenario == "set_applied_503_once" and call == 1:
+        state["target_exists"] = True
+        fail(503)
+    if scenario == "set_503_exhaust":
+        fail(503)
+    if scenario == "set_4xx":
+        fail(403)
+    state["target_exists"] = True
+    save()
+    raise SystemExit(0)
+
+if args[:2] == ["secret", "delete"]:
+    state["delete_calls"] += 1
+    call = state["delete_calls"]
+    if scenario == "delete_applied_503_once" and call == 1:
+        state["token_exists"] = False
+        fail(503)
+    if scenario == "delete_503_once" and call == 1:
+        fail(503)
+    if scenario == "delete_503_exhaust":
+        fail(503)
+    if scenario == "delete_4xx":
+        fail(403)
+    state["token_exists"] = False
+    save()
+    raise SystemExit(0)
+
+fail(400)
+"""
+            )
+            fake_gh.chmod(0o700)
+            fake_sleep = bin_path / "sleep"
+            fake_sleep.write_text("#!/bin/sh\nexit 0\n")
+            fake_sleep.chmod(0o700)
+            environment = dict(os.environ)
+            environment.update(
+                {
+                    "EXPECTED_OID": PROVISION_HEAD,
+                    "FAKE_GH_SCENARIO": scenario,
+                    "FAKE_GH_STATE": str(state_path),
+                    "GITHUB_EVENT_NAME": "workflow_dispatch",
+                    "GITHUB_REF": "refs/heads/main",
+                    "GITHUB_REPOSITORY": "soyeht/theyos",
+                    "GITHUB_RUN_ATTEMPT": "1",
+                    "GITHUB_RUN_ID": "991",
+                    "GITHUB_SHA": PROVISION_HEAD,
+                    "GITHUB_WORKFLOW_REF": (
+                        "soyeht/theyos/.github/workflows/"
+                        "provision-ios-notary-issuer.yml@refs/heads/main"
+                    ),
+                    "PATH": f"{bin_path}:{environment['PATH']}",
+                    "PROVISION_TOKEN": "temporary-token",
+                    "RUNNER_TEMP": str(root_path),
+                    "SOURCE_API_TOKEN": "source-api-token",
+                    "SOURCE_ISSUER": source_issuer,
+                }
+            )
+            completed = subprocess.run(
+                ["/bin/bash"],
+                input=self.workflow_script(),
+                cwd=root_path,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            state = json.loads(state_path.read_text())
+        self.assertNotIn("issuer-value", completed.stdout)
+        self.assertNotIn("issuer-value", completed.stderr)
+        self.assertNotIn("temporary-token", completed.stdout)
+        self.assertNotIn("temporary-token", completed.stderr)
+        return completed, state
+
+    def test_success_transfers_only_target_and_deletes_token(self) -> None:
+        completed, state = self.run_workflow()
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertTrue(state["target_exists"])
+        self.assertFalse(state["token_exists"])
+        self.assertEqual(1, state["set_calls"])
+        self.assertEqual(1, state["delete_calls"])
+
+    def test_transient_503s_recover_only_on_idempotent_operations(self) -> None:
+        for scenario in (
+            "api_503_once",
+            "list_503_once",
+            "set_applied_503_once",
+            "delete_503_once",
+            "delete_applied_503_once",
+        ):
+            with self.subTest(scenario=scenario):
+                completed, state = self.run_workflow(scenario)
+                self.assertEqual(0, completed.returncode, completed.stderr)
+                self.assertTrue(state["target_exists"])
+                self.assertFalse(state["token_exists"])
+                if scenario == "set_applied_503_once":
+                    self.assertEqual(2, state["set_calls"])
+
+    def test_4xx_and_exhausted_503_fail_closed(self) -> None:
+        for scenario in (
+            "api_4xx",
+            "list_4xx",
+            "set_4xx",
+            "delete_4xx",
+            "api_shape_wrong",
+            "list_shape_wrong",
+            "api_503_exhaust",
+            "list_503_exhaust",
+            "set_503_exhaust",
+            "delete_503_exhaust",
+        ):
+            with self.subTest(scenario=scenario):
+                completed, state = self.run_workflow(scenario)
+                self.assertNotEqual(0, completed.returncode)
+                self.assertGreaterEqual(state["delete_calls"], 1)
+                if scenario != "delete_4xx" and scenario != "delete_503_exhaust":
+                    self.assertFalse(state["token_exists"])
+
+    def test_empty_source_still_attempts_cleanup_and_requires_absence(self) -> None:
+        completed, state = self.run_workflow(source_issuer="")
+        self.assertNotEqual(0, completed.returncode)
+        self.assertEqual(1, state["delete_calls"])
+        self.assertFalse(state["token_exists"])
+        self.assertFalse(state["target_exists"])
+
 
 class GovernedReleasePinTests(unittest.TestCase):
     def test_backend_patch_reanchor_consumer_quartet_is_exact(

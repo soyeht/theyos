@@ -68,6 +68,46 @@ tests in `theyos`; then re-anchor and land the byte-identical reviewed
 There is no direct `git tag`, `git push`, `gh release`, clobber, or
 missing-guard fallback.
 
+The separate `governed-macos-release-recovery` adapter is a one-shot recovery
+for the immutable failed `mac-v0.1.19` push run. It accepts no caller-selected
+repository, workflow, ref, OID, run, or secret. It may dispatch only workflow
+331985341 at `.github/workflows/macos-release.yml`, with `ref=mac-v0.1.19`,
+`expected_ref=refs/tags/mac-v0.1.19`, and the reviewed full peeled commit OID.
+It first proves the annotated tag object and target, active workflow identity,
+absence of every release object and asset, and the exact prior push failure
+with no prior success or manual recovery. Its sole mutation is one
+`workflow_dispatch`; it then requires exactly one new attempt-1 run and
+byte-stable preconditions. It never invokes a run rerun, recycles the tag, or
+reads secret values. A missing-secret recovery is allowed only after the
+required secret names have been provisioned through a separately governed
+path; this adapter does not provision or inspect them.
+
+The separate `governed-ios-notary-issuer-provision` adapter dispatches only
+the reviewed one-shot workflow
+`.github/workflows/provision-ios-notary-issuer.yml` on current theyos `main`.
+The caller supplies one full expected-head OID; the adapter requires that OID
+to equal the API main ref, identical self-comparison, reviewed workflow bytes,
+and the single resulting attempt-1 run. Any prior run blocks before mutation.
+The workflow receives the existing `APPLE_NOTARY_ISSUER_ID` only through the
+theyos secret store and writes only the homonymous iOS repository secret over
+stdin. The only credential for that write is the temporary theyos secret
+`SOYEHT_IOS_SECRET_PROVISION_TOKEN`; the workflow retires that secret and
+requires name-only readback proving its absence. It rejects empty
+source/token values, an existing target secret, another run, a non-main ref,
+or head drift. Neither the adapter nor its receipt can read or print either
+secret value.
+
+The bridge retries only bounded, internally idempotent GitHub operations when
+their error is explicitly HTTP 503: run/secret metadata readback, setting the
+same issuer value, and deleting the temporary token. Three attempts use a
+fixed five-second cadence. A write that took effect before returning 503 is
+safe to repeat with the same source value; an ambiguous delete is first
+resolved by name-only readback. Authentication failures, other status codes,
+malformed responses, and retry exhaustion fail closed. Cleanup is attempted
+on every path after the temporary token becomes available, and success still
+requires name-only proof that the token is absent. The dispatch adapters
+themselves never retry.
+
 The consumer's required `build` context validates the release docs and both
 matching agent-instruction blocks. That checker is versioned in the same head:
 simultaneously removing the checker and its invocation can only be made

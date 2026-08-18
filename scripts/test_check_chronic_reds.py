@@ -26,6 +26,7 @@ import sys
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 from unittest.mock import patch
 
 SCRIPT = Path(__file__).with_name("check-chronic-reds.py")
@@ -195,9 +196,108 @@ class ClassifyTests(unittest.TestCase):
         self.assertFalse(any(a.kind == "block" or a.kind == "promote" for a in c.actions))
 
 
+class GitHubReadRetryTests(unittest.TestCase):
+    @staticmethod
+    def result(
+        returncode: int,
+        *,
+        stdout: str = "",
+        stderr: str = "",
+    ):
+        return gate.subprocess.CompletedProcess(
+            ["gh", "api"], returncode, stdout=stdout, stderr=stderr
+        )
+
+    def test_http_503_until_last_attempt_then_success(self):
+        results = [
+            self.result(1, stderr="HTTP 503: Service Unavailable sensitive-header")
+            for _ in range(5)
+        ] + [self.result(0, stdout="exact stdout")]
+        with (
+            patch.object(gate.subprocess, "run", side_effect=results) as run,
+            patch.object(gate.time, "sleep") as sleep,
+        ):
+            actual = gate._gh_read(["api", "repos/owner/repo/branches/main"])
+        self.assertEqual("exact stdout", actual)
+        self.assertEqual(6, run.call_count)
+        self.assertEqual([mock.call(15.0)] * 5, sleep.call_args_list)
+
+    def test_six_http_503_responses_exhaust_privacy_safe(self):
+        results = [
+            self.result(1, stderr="HTTP 503: Service Unavailable sensitive-header")
+            for _ in range(6)
+        ]
+        with (
+            patch.object(gate.subprocess, "run", side_effect=results) as run,
+            patch.object(gate.time, "sleep") as sleep,
+        ):
+            with self.assertRaises(gate.GateCannotRun) as raised:
+                gate._gh_read(["issue", "list"])
+        self.assertEqual(6, run.call_count)
+        self.assertEqual(5, sleep.call_count)
+        self.assertIn("exhausted 6 attempts after HTTP 503", str(raised.exception))
+        self.assertNotIn("sensitive-header", str(raised.exception))
+
+    def test_403_and_502_are_single_call_without_raw_stderr(self):
+        for status in (403, 502):
+            with self.subTest(status=status):
+                result = self.result(
+                    1, stderr=f"HTTP {status}: failure sensitive-header"
+                )
+                with (
+                    patch.object(gate.subprocess, "run", return_value=result) as run,
+                    patch.object(gate.time, "sleep") as sleep,
+                ):
+                    with self.assertRaises(gate.GateCannotRun) as raised:
+                        gate._gh_read(["issue", "list"])
+                self.assertEqual(1, run.call_count)
+                sleep.assert_not_called()
+                self.assertIn(f"HTTP {status}", str(raised.exception))
+                self.assertNotIn("sensitive-header", str(raised.exception))
+
+    def test_invalid_json_and_shape_fail_after_one_read(self):
+        for stdout in ("not json", json.dumps({})):
+            with self.subTest(stdout=stdout):
+                result = self.result(0, stdout=stdout)
+                with (
+                    patch.object(gate.subprocess, "run", return_value=result) as run,
+                    patch.object(gate.time, "sleep") as sleep,
+                ):
+                    with self.assertRaises(gate.GateCannotRun):
+                        gate.fetch_check_observations("owner/repo", "sha")
+                self.assertEqual(1, run.call_count)
+                sleep.assert_not_called()
+
+    def test_mutation_503_is_single_call_without_retry_or_payload_log(self):
+        failure = gate.subprocess.CalledProcessError(
+            1,
+            ["gh", "issue", "comment"],
+            output="",
+            stderr="HTTP 503: Service Unavailable secret-body-marker",
+        )
+        with (
+            patch.object(gate.subprocess, "run", side_effect=failure) as run,
+            patch.object(gate.time, "sleep") as sleep,
+        ):
+            with self.assertRaises(gate.GateCannotRun) as raised:
+                gate._gh(
+                    [
+                        "issue",
+                        "comment",
+                        "7",
+                        "--body",
+                        "secret-body-marker",
+                    ]
+                )
+        self.assertEqual(1, run.call_count)
+        sleep.assert_not_called()
+        self.assertIn("HTTP 503", str(raised.exception))
+        self.assertNotIn("secret-body-marker", str(raised.exception))
+
+
 class CheckObservationFetchTests(unittest.TestCase):
     def fetch(self, payload: object):
-        with patch.object(gate, "_gh", return_value=json.dumps(payload)):
+        with patch.object(gate, "_gh_read", return_value=json.dumps(payload)):
             return gate.fetch_check_observations("owner/repo", "current-main-sha")
 
     def test_fetch_keeps_the_newest_run_id_per_context(self):
@@ -224,10 +324,10 @@ class CheckObservationFetchTests(unittest.TestCase):
             [{"id": 1, "name": "Foo", "status": "completed", "conclusion": 7}],
         ]
         for payload in invalid_payloads:
-            with self.subTest(payload=payload), patch.object(gate, "_gh", return_value=json.dumps(payload)):
+            with self.subTest(payload=payload), patch.object(gate, "_gh_read", return_value=json.dumps(payload)):
                 with self.assertRaises(gate.GateCannotRun):
                     gate.fetch_check_observations("owner/repo", "current-main-sha")
-        with patch.object(gate, "_gh", return_value=""):
+        with patch.object(gate, "_gh_read", return_value=""):
             with self.assertRaises(gate.GateCannotRun):
                 gate.fetch_check_observations("owner/repo", "current-main-sha")
 
@@ -337,7 +437,7 @@ class LatestPingTests(unittest.TestCase):
         return {"body": body, "created_at": created_at}
 
     def latest(self, pages: list[list[dict[str, str]]]):
-        with patch.object(gate, "_gh", return_value=json.dumps(pages)) as mocked:
+        with patch.object(gate, "_gh_read", return_value=json.dumps(pages)) as mocked:
             actual = gate._latest_ping("owner/repo", 17)
         self.assertEqual(
             mocked.call_args.args[0],
@@ -389,7 +489,7 @@ class LatestPingTests(unittest.TestCase):
             json.dumps([[{"body": "chronic-red re-ping", "created_at": "not-a-date"}]]),
         ]
         for payload in invalid_payloads:
-            with self.subTest(payload=payload), patch.object(gate, "_gh", return_value=payload):
+            with self.subTest(payload=payload), patch.object(gate, "_gh_read", return_value=payload):
                 with self.assertRaises(gate.GateCannotRun):
                     gate._latest_ping("owner/repo", 17)
 

@@ -1320,6 +1320,25 @@ else
 fi
 
 RELEASE_CHECKER_REL=".github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh"
+PHASE0_WORKFLOW_REL=".github/workflows/owner-present-phase0-compileout.yml"
+PHASE0_WORKFLOW="${SNAPSHOT}/${PHASE0_WORKFLOW_REL}"
+for structural_binding in \
+  'structural-shard:' \
+  'shard: [0, 1, 2, 3]' \
+  'PHASE0_REQUIRE_ALL=1' \
+  'PHASE0_STRUCTURAL_MODE=compose' \
+  'structural-coverage:' \
+  'structural-route-composer:' \
+  'needs: [structural-shard, structural-coverage]'; do
+  if ! grep -Fq -- "${structural_binding}" "${PHASE0_WORKFLOW}"; then
+    echo "::error file=${PHASE0_WORKFLOW_REL}::structural shard workflow binding is missing: ${structural_binding}"
+    exit 1
+  fi
+done
+if [[ "$(grep -Fc 'if: always()' "${PHASE0_WORKFLOW}")" -lt 2 ]]; then
+  echo "::error file=${PHASE0_WORKFLOW_REL}::structural coverage and route composer must run fail-closed after every shard outcome"
+  exit 1
+fi
 if [[ "$(grep -Fc "${RELEASE_CHECKER_REL}" "${SNAPSHOT}/.github/workflows/release-linux.yml")" -ne 2 \
   || "$(grep -Fc "${RELEASE_CHECKER_REL}" "${SNAPSHOT}/.github/workflows/release-macos.yml")" -ne 1 ]]; then
   echo "::error::every theyos-engine release target must run the Phase 0 checker on its own subject"
@@ -1462,6 +1481,7 @@ printf '%s\n' \
   owner-present-phase0-compileout.yml \
   owner-present-phase0-integrity.yml \
   owner-present-phase0-nix-runtime.yml \
+  provision-ios-notary-issuer.yml \
   release-linux.yml \
   release-macos.yml \
   repo-hygiene.yml \
@@ -1474,12 +1494,41 @@ if ! cmp -s "${KNOWN_WORKFLOWS}" "${ACTUAL_WORKFLOWS}"; then
   diff -u "${KNOWN_WORKFLOWS}" "${ACTUAL_WORKFLOWS}" || true
   exit 1
 fi
+ISSUER_BRIDGE_WORKFLOW="${SNAPSHOT}/.github/workflows/provision-ios-notary-issuer.yml"
+ISSUER_BRIDGE_SECRETS="${TMP_ROOT}/issuer-bridge-secrets.txt"
+ISSUER_BRIDGE_EXPECTED_SECRETS="${TMP_ROOT}/issuer-bridge-expected-secrets.txt"
+# This one-shot bridge is classified by capability rather than pinned as a
+# land-exact object. Its workflow bytes may evolve, but its authority may not:
+# it can transfer only the notary issuer through the temporary provisioning
+# token, and it can never publish repository or attestation content.
+if grep -Eq \
+    'contents:[[:space:]]*write|id-token:[[:space:]]*write|attestations:[[:space:]]*write|actions/(attest-build-provenance|upload-artifact)@|softprops/action-gh-release@|gh[[:space:]]+release|git[[:space:]]+push' \
+    "${ISSUER_BRIDGE_WORKFLOW}"; then
+  echo "::error file=.github/workflows/provision-ios-notary-issuer.yml::issuer bridge must not publish or mint attestations"
+  exit 1
+fi
+if grep -Eiq 'apns' "${ISSUER_BRIDGE_WORKFLOW}"; then
+  echo "::error file=.github/workflows/provision-ios-notary-issuer.yml::issuer bridge must not reference APNs credentials or capabilities"
+  exit 1
+fi
+grep -Eo 'secrets\.[A-Za-z0-9_]+' "${ISSUER_BRIDGE_WORKFLOW}" \
+  | LC_ALL=C sort > "${ISSUER_BRIDGE_SECRETS}" || true
+printf '%s\n' \
+  secrets.APPLE_NOTARY_ISSUER_ID \
+  secrets.SOYEHT_IOS_SECRET_PROVISION_TOKEN \
+  | LC_ALL=C sort > "${ISSUER_BRIDGE_EXPECTED_SECRETS}"
+if ! cmp -s "${ISSUER_BRIDGE_EXPECTED_SECRETS}" "${ISSUER_BRIDGE_SECRETS}"; then
+  echo "::error file=.github/workflows/provision-ios-notary-issuer.yml::issuer bridge must consume exactly the allowed source issuer and temporary token secrets"
+  diff -u "${ISSUER_BRIDGE_EXPECTED_SECRETS}" "${ISSUER_BRIDGE_SECRETS}" || true
+  exit 1
+fi
 while IFS= read -r workflow_path; do
   workflow_name="$(basename "${workflow_path}")"
   if grep -Eq 'contents:[[:space:]]*write|actions/attest-build-provenance@|secrets\.APPLE_' \
       "${workflow_path}" \
     && [[ "${workflow_name}" != "release-linux.yml" \
       && "${workflow_name}" != "release-macos.yml" \
+      && "${workflow_name}" != "provision-ios-notary-issuer.yml" \
       && "${workflow_name}" != "owner-present-phase0-compileout.yml" \
       && "${workflow_name}" != "owner-present-phase0-nix-runtime.yml" ]]; then
     echo "::error file=.github/workflows/${workflow_name}::unclassified workflow can publish, attest, or consume release credentials"
