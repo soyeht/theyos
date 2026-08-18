@@ -14,9 +14,6 @@ name: Consumption Coverage
 # at zero, as its own reviewed change.
 
 on:
-  pull_request:
-    branches:
-      - main
   push:
     branches:
       - main
