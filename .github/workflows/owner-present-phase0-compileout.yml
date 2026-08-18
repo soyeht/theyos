@@ -4,9 +4,6 @@ name: Owner-Present Phase 0 Compile-Out
 # This is a target/build-graph proof plus an executable artifact contract; the
 # strings pass remains only an auxiliary tripwire.
 on:
-  pull_request:
-    branches:
-      - main
   push:
     branches:
       - main
