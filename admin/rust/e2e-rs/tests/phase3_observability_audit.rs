@@ -37,7 +37,7 @@ mod phase3_support;
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use axum::http::StatusCode;
 use household_rs::KeyBackingPolicy;
@@ -97,124 +97,6 @@ fn contains_constant_time(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
         .any(|w| bool::from(w.ct_eq(needle)))
-}
-
-const OWNER_TIMEOUT_QUARANTINE_CUTOFF: u64 = 1_787_011_200;
-
-fn quarantine_is_live(now: u64, cutoff: u64) -> bool {
-    now < cutoff
-}
-
-fn workflow_job_block<'a>(workflow: &'a str, job: &str) -> &'a str {
-    let marker = format!("\n  {job}:\n");
-    let start = workflow
-        .find(&marker)
-        .map(|index| index + 1)
-        .unwrap_or_else(|| panic!("workflow job {job} is present"));
-    let after_start = &workflow[start..];
-    let end = after_start
-        .match_indices('\n')
-        .filter_map(|(index, _)| {
-            after_start
-                .get(index + 1..)
-                .map(|remainder| (index, remainder))
-        })
-        .find_map(|(index, remainder)| {
-            let line = remainder.lines().next().unwrap_or_default();
-            (line.starts_with("  ") && !line.starts_with("    ") && line.trim_end().ends_with(':'))
-                .then_some(index)
-        })
-        .unwrap_or(after_start.len());
-    &after_start[..end]
-}
-
-fn quarantine_probe_is_in_required_linux_job(workflow: &str) -> bool {
-    workflow_job_block(workflow, "build-and-test-linux")
-        .contains("      - name: Quarantine probe (issue #470)")
-}
-
-fn quarantine_probe_step(workflow: &str) -> &str {
-    let linux_job = workflow_job_block(workflow, "build-and-test-linux");
-    let start = linux_job
-        .find("      - name: Quarantine probe (issue #470)")
-        .expect("issue #470 probe step is present in required Linux job");
-    let after_start = &linux_job[start..];
-    let end = after_start
-        .find("\n      - name:")
-        .unwrap_or(after_start.len());
-    &after_start[..end]
-}
-
-fn active_lines(input: &str) -> impl Iterator<Item = &str> {
-    input
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-}
-
-fn quarantine_probe_command(step: &str) -> Option<String> {
-    let lines: Vec<_> = active_lines(step).collect();
-    let starts: Vec<_> = lines
-        .iter()
-        .enumerate()
-        .filter_map(|(index, line)| {
-            line.starts_with("python3 scripts/quarantine_probe.py")
-                .then_some(index)
-        })
-        .collect();
-    let [start] = starts.as_slice() else {
-        return None;
-    };
-
-    let mut command = Vec::new();
-    for line in &lines[*start..] {
-        let continues = line.ends_with('\\');
-        command.push(line.trim_end_matches('\\').trim());
-        if !continues {
-            return Some(command.join(" "));
-        }
-    }
-    None
-}
-
-fn quarantine_probe_guard_is_intact(step: &str) -> bool {
-    let active: Vec<_> = active_lines(step).collect();
-    let Some(command) = quarantine_probe_command(step) else {
-        return false;
-    };
-    let command_tokens: Vec<_> = command.split_whitespace().collect();
-    active
-        == [
-            "- name: Quarantine probe (issue #470)",
-            "run: |",
-            "python3 scripts/test_quarantine_probe.py",
-            "python3 scripts/quarantine_probe.py \\",
-            "--issue 470 \\",
-            "--attempts 5 \\",
-            "--attempt-timeout-seconds 120 \\",
-            "--package e2e-rs \\",
-            "--test-target phase3_observability_audit \\",
-            "--test test_owner_timeout_aborts_window_and_emits_tracing \\",
-            "--require-pass",
-        ]
-        && command_tokens
-            == [
-                "python3",
-                "scripts/quarantine_probe.py",
-                "--issue",
-                "470",
-                "--attempts",
-                "5",
-                "--attempt-timeout-seconds",
-                "120",
-                "--package",
-                "e2e-rs",
-                "--test-target",
-                "phase3_observability_audit",
-                "--test",
-                "test_owner_timeout_aborts_window_and_emits_tracing",
-                "--require-pass",
-            ]
 }
 
 #[tokio::test]
@@ -404,128 +286,6 @@ async fn test_phase3_happy_path_observability_is_complete_and_leak_free() {
     );
 }
 
-#[test]
-fn owner_timeout_quarantine_has_not_expired() {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock is after the Unix epoch")
-        .as_secs();
-    assert!(
-        quarantine_is_live(now, OWNER_TIMEOUT_QUARANTINE_CUTOFF),
-        "issue #470 quarantine for @gloria expired at 2026-08-18T00:00:00Z; re-evaluate test_owner_timeout_aborts_window_and_emits_tracing"
-    );
-}
-
-#[test]
-fn owner_timeout_quarantine_cutoff_is_exclusive() {
-    assert!(quarantine_is_live(
-        OWNER_TIMEOUT_QUARANTINE_CUTOFF - 1,
-        OWNER_TIMEOUT_QUARANTINE_CUTOFF
-    ));
-    assert!(!quarantine_is_live(
-        OWNER_TIMEOUT_QUARANTINE_CUTOFF,
-        OWNER_TIMEOUT_QUARANTINE_CUTOFF
-    ));
-}
-
-#[test]
-fn owner_timeout_quarantine_probe_contract_is_enforced() {
-    let workflow = include_str!("../../../../.github/workflows/backend-ci.yml");
-    assert!(
-        quarantine_probe_is_in_required_linux_job(workflow),
-        "issue #470 probe must remain inside the required build-and-test-linux job"
-    );
-    let probe = quarantine_probe_step(workflow);
-
-    assert!(
-        probe.contains("# QUARANTINE_PROBE_470_BEGIN")
-            && probe.contains("# QUARANTINE_PROBE_470_END"),
-        "issue #470 probe markers must remain inside the probe step"
-    );
-    assert!(
-        quarantine_probe_guard_is_intact(probe),
-        "issue #470 required probe must use the validated integration-test selector, make five attempts, reject invalid instruments, and require at least one pass"
-    );
-}
-
-#[test]
-fn owner_timeout_quarantine_guard_rejects_required_probe_mutations() {
-    let workflow = include_str!("../../../../.github/workflows/backend-ci.yml");
-    let probe = quarantine_probe_step(workflow);
-
-    let step_level_continue = probe.replacen(
-        "        run:",
-        "        continue-on-error: true\n        run:",
-        1,
-    );
-    assert!(step_level_continue.contains("continue-on-error"));
-    assert!(!quarantine_probe_guard_is_intact(&step_level_continue));
-
-    for required_argument in [
-        "python3 scripts/test_quarantine_probe.py",
-        "python3 scripts/quarantine_probe.py",
-        "--issue 470",
-        "--attempts 5",
-        "--attempt-timeout-seconds 120",
-        "--package e2e-rs",
-        "--test-target phase3_observability_audit",
-        "--test test_owner_timeout_aborts_window_and_emits_tracing",
-        "--require-pass",
-    ] {
-        let mutation = probe.replacen(required_argument, "", 1);
-        assert!(
-            !quarantine_probe_guard_is_intact(&mutation),
-            "removing {required_argument} must break the required probe contract"
-        );
-    }
-
-    let detached_required_policy = probe
-        .replacen(
-            "            --test test_owner_timeout_aborts_window_and_emits_tracing \\",
-            "            --test test_owner_timeout_aborts_window_and_emits_tracing",
-            1,
-        )
-        .replacen(
-            "            --require-pass",
-            "          echo --require-pass",
-            1,
-        );
-    assert!(detached_required_policy.contains("echo --require-pass"));
-    assert!(!quarantine_probe_guard_is_intact(&detached_required_policy));
-
-    let dead_branch = probe
-        .replacen(
-            "          python3 scripts/quarantine_probe.py \\\n",
-            "          if false; then\n          python3 scripts/quarantine_probe.py \\\n",
-            1,
-        )
-        .replacen(
-            "            --require-pass\n",
-            "            --require-pass\n          fi\n",
-            1,
-        );
-    assert!(dead_branch.contains("if false; then"));
-    assert!(dead_branch.contains("\n          fi\n"));
-    assert_eq!(
-        quarantine_probe_command(&dead_branch),
-        quarantine_probe_command(probe),
-        "the dead-branch mutant must preserve the exact harness command"
-    );
-    assert!(
-        !quarantine_probe_guard_is_intact(&dead_branch),
-        "an exact command hidden in a dead shell branch must break the required probe contract"
-    );
-
-    let without_required_probe = workflow.replacen(probe, "", 1);
-    let moved_to_non_required =
-        without_required_probe.replacen("    steps:\n", &format!("    steps:\n{probe}"), 1);
-    assert!(moved_to_non_required.contains("Quarantine probe (issue #470)"));
-    assert!(
-        !quarantine_probe_is_in_required_linux_job(&moved_to_non_required),
-        "moving the intact probe text outside the required Linux job must break containment"
-    );
-}
-
 /// FR-019 "owner timed out" coverage — the active half. Distinct from
 /// `owner_events.long_poll.timeout` (HTTP keep-alive returning 204):
 /// THIS test exercises the runtime watchdog that fires when the
@@ -535,19 +295,16 @@ fn owner_timeout_quarantine_guard_rejects_required_probe_mutations() {
 /// long-poll wakes up with the cancellation, and emit
 /// `pair_machine.owner_timed_out` for the audit trail.
 ///
-/// Issue #470 quarantine: 4 of 23 hosted-Linux verdict-bearing attempts failed
-/// across 20 runs; the exact cause and rate remain unisolated.
-/// Attempt Wilson95 is [7.0%, 37.1%]; run-cluster Wilson95 is [8.1%, 41.6%].
-/// Three rerun second attempts passed. Owner: @gloria. Expiry: 2026-08-17.
-/// Separately, Saira's macOS-local sweep of predecessor 9e27e8ec had one
-/// failure followed by four passes; fe159617 had five passes. Neither result is
-/// included in the hosted-Linux count, and the macOS cause and rate are not
-/// established.
-/// The expiry guard below makes the quarantine fail closed on 2026-08-18.
-/// 0/5 detects total breakage immediately but partial degradation more slowly;
-/// the mandatory expiry review covers that middle range. A green probe run is
-/// not evidence that the flake rate stayed constant.
-#[ignore = "issue #470: owner-timeout flake observed across environments; expires 2026-08-17"]
+/// Previously quarantined (issue #470): `abort_with_cancel_event` has a
+/// three-step tail — enter_aborted() flips the state, then a durable
+/// event append and a tracing emit follow as independent async work.
+/// The prior version of this test observed only the state flip, then
+/// slept a fixed duration guessing the tail was done before asserting
+/// on it — a guess, not an observation. See
+/// `owner_timeout_aborted_state_alone_does_not_imply_tail_observables`
+/// for a deterministic proof the two are separable. Fixed by polling
+/// for the actual tail observables with a deadline instead of guessing
+/// their timing.
 #[tokio::test]
 async fn test_owner_timeout_aborts_window_and_emits_tracing() {
     let (buf, _guard) = install_capture();
@@ -613,39 +370,55 @@ async fn test_owner_timeout_aborts_window_and_emits_tracing() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    // Allow the post-abort owner-event append + tracing flush.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // `Aborted` is only the first of abort_with_cancel_event's three
+    // steps (state flip, durable event append, tracing emit); the
+    // other two are independent async work with no ordering guarantee
+    // relative to this loop finishing. Poll for the actual observables
+    // the assertions below check, not a fixed sleep guessing how long
+    // that work takes — a guess is exactly what raced in issue #470's
+    // original flake (see
+    // owner_timeout_aborted_state_alone_does_not_imply_tail_observables
+    // for the deterministic proof that state alone is insufficient).
+    let tail_deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let (saw_timeout, captured) = loop {
+        let founder_read = founder
+            .lifecycle
+            .lock_shared()
+            .expect("lock lifecycle shared");
+        let events = founder
+            .event_log
+            .read_since(&founder_read, 0)
+            .expect("read events");
+        drop(founder_read);
+        let saw_timeout = events.iter().any(|e| {
+            matches!(e.event_type, OwnerEventType::JoinCancelled)
+                && matches!(
+                    &e.payload,
+                    OwnerEventPayload::JoinCancelled(p) if p.reason == "timeout"
+                )
+        });
+        let captured = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+        let saw_aborted_trace = captured.contains("pair_machine.ceremony_aborted");
+        if saw_timeout && saw_aborted_trace {
+            break (saw_timeout, captured);
+        }
+        assert!(
+            std::time::Instant::now() < tail_deadline,
+            "abort tail did not complete within 3s: saw_timeout={saw_timeout} saw_aborted_trace={saw_aborted_trace}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
 
     // Owner-event log must contain a `JoinCancelled` with
     // `reason="timeout"` so the iPhone long-poll observes the abort
     // semantically (this is the wake-up signal, not just an internal
     // state flip).
-    let founder_read = founder
-        .lifecycle
-        .lock_shared()
-        .expect("lock lifecycle shared");
-    let events = founder
-        .event_log
-        .read_since(&founder_read, 0)
-        .expect("read events");
-    drop(founder_read);
-    let saw_timeout = events.iter().any(|e| {
-        matches!(e.event_type, OwnerEventType::JoinCancelled)
-            && matches!(
-                &e.payload,
-                OwnerEventPayload::JoinCancelled(p) if p.reason == "timeout"
-            )
-    });
-    assert!(
-        saw_timeout,
-        "expected JoinCancelled timeout event, got: {events:?}"
-    );
+    assert!(saw_timeout, "expected JoinCancelled timeout event");
 
     // Tracing must include both the positive owner_timed_out stage
     // AND the downstream ceremony_aborted that abort_with_cancel_event
     // emits. The audit's positive coverage thereby covers FR-019's
     // "owner timed out" AND "ceremony aborted" simultaneously.
-    let captured = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
     assert!(
         captured.contains("pair_machine.owner_timed_out"),
         "missing pair_machine.owner_timed_out in:\n---\n{captured}\n---"
@@ -667,4 +440,64 @@ async fn test_owner_timeout_aborts_window_and_emits_tracing() {
     watchdog
         .await
         .expect("watchdog returns cleanly on shutdown");
+}
+
+#[tokio::test]
+async fn owner_timeout_aborted_state_alone_does_not_imply_tail_observables() {
+    // Structural proof that `Aborted` state and the abort's durable
+    // event/tracing tail are genuinely separate observables, not one
+    // atomic step. `enter_aborted()` is exactly the first of
+    // abort_with_cancel_event's three steps; calling it alone
+    // demonstrates the other two provably have not happened yet,
+    // deterministically, with no timing dependence.
+    let (buf, _guard) = install_capture();
+    let founder = founder_harness();
+
+    let dummy_m_pub: [u8; 33] = [0x02; 33];
+    let dummy_nonce: [u8; 32] = [0x33; 32];
+    founder
+        .window
+        .enter_staging(
+            dummy_m_pub,
+            dummy_nonce,
+            JoinTransport::Tailscale,
+            "127.0.0.1:0".to_string(),
+            "alpha bravo charlie delta echo foxtrot".to_string(),
+            vec![0x80],
+            300,
+            None,
+        )
+        .await
+        .expect("enter_staging");
+    founder
+        .window
+        .enter_awaiting_owner(0)
+        .await
+        .expect("enter_awaiting_owner");
+
+    founder.window.enter_aborted().await.expect("enter_aborted");
+    assert_eq!(
+        founder.window.snapshot().await.state,
+        PairMachineState::Aborted,
+        "enter_aborted must flip the state on its own"
+    );
+
+    let founder_read = founder
+        .lifecycle
+        .lock_shared()
+        .expect("lock lifecycle shared");
+    let events = founder
+        .event_log
+        .read_since(&founder_read, 0)
+        .expect("read events");
+    drop(founder_read);
+    assert!(
+        events.is_empty(),
+        "enter_aborted alone must not append any owner event — got: {events:?}"
+    );
+    let captured = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+    assert!(
+        !captured.contains("pair_machine.ceremony_aborted"),
+        "enter_aborted alone must not emit ceremony_aborted tracing"
+    );
 }
