@@ -306,9 +306,9 @@ verdade. Os três `kSecAttrAccessible*` bateram com o esperado. A premissa
 do M4 (reconexão em background sobrevive o aparelho travado, via
 `AfterFirstUnlockThisDeviceOnly`) está provada, não assumida.
 
-Medido por @gianna com @Caio travando o aparelho fisicamente no momento
-certo — a parte que nenhuma automação podia fazer sem reintroduzir o
-mesmo contexto anexado que invalidou a primeira medição.
+Medido com o aparelho travado fisicamente no momento certo — a parte que
+nenhuma automação podia fazer sem reintroduzir o mesmo contexto anexado que
+invalidou a primeira medição.
 
 ### O passo 4 não era executável no contexto de teste anexado que foi medido primeiro (histórico)
 
@@ -354,10 +354,9 @@ cronometrada, então o tempo está controlado e não é a variável.
 > mediu foi o instrumento, não o comportamento do sistema. Nenhum veredito sobre
 > a Apple é afirmado aqui — não temos medição que o sustente.
 >
-> Achado e medido por @gianna, que recusou três vezes aplicar o "conserto"
-> (`AfterFirstUnlock`) por cima de um verde que não media nada — o conserto teria
-> fechado o marco, e o furo apareceria só em campo, com a VPN não reconectando
-> com o telefone no bolso.
+> O "conserto" (`AfterFirstUnlock`) foi recusado três vezes, por ser aplicado
+> por cima de um verde que não media nada — teria fechado o marco, e o furo
+> apareceria só em campo, com a VPN não reconectando com o telefone no bolso.
 
 ## M1a — Conformance Noise independente
 
@@ -542,7 +541,7 @@ para o comando default; remover um dos dois targets gated; tirar uma
 `required-feature`. Assim o teste também prova que não inspeciona só o primeiro
 job que encontra. Vive no mecanismo de testes de governança que já existe — sem
 acoplar a biblioteca de protocolo ao `.github/`. Não é bloqueador do gate atual;
-é hardening contra regressão futura. Especificação de @saira.
+é hardening contra regressão futura.
 
 > Muda `.github/`, então vai em PR e revisão próprios — não entra de carona num
 > branch de feature.
@@ -890,8 +889,8 @@ aliases neutros.
 
 ## Proveniência
 
-Revisão conjunta 2026-08-08. Auditoria do stack existente e decisão do datapath:
-`@gloria`. Releitura marco a marco de M2–M12b, substituições concretas e ordem/DAG:
-`@saira`. Contexto de iOS/NetworkExtension e as duas amostras de campo do M0a:
-`@gianna`. A v4 original é do Caio e continua sendo a fonte dos objetivos de
-produto — o que mudou é a arquitetura por baixo deles, não o que o produto promete.
+Revisão conjunta 2026-08-08, em três frentes: auditoria do stack existente e
+decisão do datapath; releitura marco a marco de M2–M12b, com as substituições
+concretas e a ordem/DAG; contexto de iOS/NetworkExtension e as duas amostras de
+campo do M0a. A v4 original continua sendo a fonte dos objetivos de produto — o
+que mudou é a arquitetura por baixo deles, não o que o produto promete.
