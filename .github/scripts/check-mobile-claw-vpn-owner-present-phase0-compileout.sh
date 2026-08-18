@@ -1322,23 +1322,25 @@ fi
 RELEASE_CHECKER_REL=".github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh"
 PHASE0_WORKFLOW_REL=".github/workflows/owner-present-phase0-compileout.yml"
 PHASE0_WORKFLOW="${SNAPSHOT}/${PHASE0_WORKFLOW_REL}"
+# The structural mutation battery and its shard/coverage jobs were removed: they
+# cost ~95 minutes per pull request, gated no merge, and their absence is now the
+# intended state. What survives is the route composer, which is cheap and tests a
+# real product property, so that is what is pinned here.
 for structural_binding in \
-  'structural-shard:' \
-  'shard: [0, 1, 2, 3]' \
-  'PHASE0_REQUIRE_ALL=1' \
-  'PHASE0_STRUCTURAL_MODE=compose' \
-  'structural-coverage:' \
-  'structural-route-composer:' \
-  'needs: [structural-shard, structural-coverage]'; do
+  'structural-route-composer:'; do
   if ! grep -Fq -- "${structural_binding}" "${PHASE0_WORKFLOW}"; then
-    echo "::error file=${PHASE0_WORKFLOW_REL}::structural shard workflow binding is missing: ${structural_binding}"
+    echo "::error file=${PHASE0_WORKFLOW_REL}::structural workflow binding is missing: ${structural_binding}"
     exit 1
   fi
 done
-if [[ "$(grep -Fc 'if: always()' "${PHASE0_WORKFLOW}")" -lt 2 ]]; then
-  echo "::error file=${PHASE0_WORKFLOW_REL}::structural coverage and route composer must run fail-closed after every shard outcome"
-  exit 1
-fi
+for removed_binding in \
+  'structural-shard:' \
+  'structural-coverage:'; do
+  if grep -Fq -- "${removed_binding}" "${PHASE0_WORKFLOW}"; then
+    echo "::error file=${PHASE0_WORKFLOW_REL}::removed structural job reappeared: ${removed_binding}"
+    exit 1
+  fi
+done
 if [[ "$(grep -Fc "${RELEASE_CHECKER_REL}" "${SNAPSHOT}/.github/workflows/release-linux.yml")" -ne 2 \
   || "$(grep -Fc "${RELEASE_CHECKER_REL}" "${SNAPSHOT}/.github/workflows/release-macos.yml")" -ne 1 ]]; then
   echo "::error::every theyos-engine release target must run the Phase 0 checker on its own subject"
