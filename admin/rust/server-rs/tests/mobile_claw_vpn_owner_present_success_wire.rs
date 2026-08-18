@@ -2257,7 +2257,6 @@ fn success_contract_is_pre_effect_and_the_phase0_compileout_gate_is_registered()
 
     for script in [
         ".github/scripts/check-mobile-claw-vpn-owner-present-phase0-compileout.sh",
-        ".github/scripts/test-mobile-claw-vpn-owner-present-phase0-compileout.sh",
         ".github/scripts/check-mobile-claw-vpn-owner-present-phase0-integrity.sh",
         ".github/scripts/test-mobile-claw-vpn-owner-present-phase0-integrity.sh",
     ] {
@@ -2270,16 +2269,27 @@ fn success_contract_is_pre_effect_and_the_phase0_compileout_gate_is_registered()
         fs::read_to_string(repo.join(".github/workflows/owner-present-phase0-compileout.yml"))
             .expect("phase0-compileout workflow");
     for required in [
-        "pull_request:",
         "push:",
         "check-mobile-claw-vpn-owner-present-phase0-compileout.sh",
-        "test-mobile-claw-vpn-owner-present-phase0-compileout.sh",
     ] {
         assert!(workflow.contains(required), "workflow misses {required}");
     }
+    // The structural mutation battery and its shard/coverage jobs were removed:
+    // ~95 minutes per pull request for a job that gated no merge. Their absence
+    // is the intended state, so it is asserted rather than left to drift back.
+    for removed in [
+        "test-mobile-claw-vpn-owner-present-phase0-compileout.sh",
+        "structural-shard:",
+        "structural-coverage:",
+    ] {
+        assert!(
+            !workflow.contains(removed),
+            "removed structural job or script reappeared: {removed}"
+        );
+    }
     assert!(
-        !workflow.contains("paths:"),
-        "the authoritative compile-out job must run for every PR and main push"
+        workflow.contains("structural-route-composer:"),
+        "the route composer must survive the structural battery removal"
     );
     let integrity_workflow =
         fs::read_to_string(repo.join(".github/workflows/owner-present-phase0-integrity.yml"))
