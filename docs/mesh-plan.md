@@ -10,21 +10,24 @@ pessoal e não entram em documento versionado.
 
 ---
 
-## A decisão que gerou esta versão (medida 2026-08-18 @ `6bd13fe3`)
+## A decisão que gerou esta versão (medida 2026-08-18 @ `b4aae5cc`)
 
 <!-- doc-freshness-anchor
 measured: 2026-08-18
-sha: 6bd13fe3679138248355205b15356b4bdaaeb0f2
+sha: b4aae5cc934498ed6b555c29661858c12990daff
 paths:
   - admin/rust/mesh-session-core-rs/**
   - admin/rust/mesh-session-control-model-rs/**
   - admin/rust/server-rs/src/claw_vpn_*
+  - admin/rust/server-rs/src/bonjour_trust.rs
+  - admin/rust/server-rs/src/setup_invitation.rs
+  - admin/rust/server-rs/src/tailnet_address.rs
+  - admin/rust/server-rs/src/handlers_pair_machine.rs
   - admin/rust/t1-iptunnel-dev-runner-rs/**
   - admin/rust/nat-probe-rs/**
   - admin/rust/scripts/graph-gate/**
   - admin/rust/scripts/backend-rust
   - scripts/noise-conformance-peer.py
-  - .github/workflows/backend-ci.yml
 -->
 
 
@@ -77,6 +80,80 @@ O substituto é conformance do protocolo contra uma segunda implementação:
 
 Isso vira **M1a** (conformance) e **M1b** (wire/auth cross-language), e é o
 começo do caminho crítico.
+
+---
+
+## Tailscale é carrier suportado, não substituído
+
+**Decisão do Caio, 2026-08-18.** Quem já usa Tailscale continua usando. O mesh
+próprio não existe para substituir o Tailscale — os dois convivem, e onde os dois
+estiverem disponíveis, os dois são usados.
+
+Até esta versão o documento era **silencioso** quanto a Tailscale: a v5 decide
+WireGuard vs. stack Noise próprio e nunca trata do assunto. O silêncio vinha sendo
+lido como condenação, leitura que custaria a remoção de código de produção que
+funciona hoje.
+
+**O encaixe é o `PathProvider` do M12a.** Tailscale entra como mais um candidato de
+carrier, ao lado de direct e relay, com o mesmo contrato que o relay já tem:
+**transporta bytes, não concede nada**. A sessão Noise roda por cima; grant
+assinado, revogação em <10 s, rota escopada e as negativas seguem valendo sem uma
+linha de exceção.
+
+**Efeito no custo de relay** — requisito de produto, não conveniência: peer que
+fecha por tailnet **não consome relay nosso**, porque hole punching e fallback são
+da Tailscale. Suporte a Tailscale é também alavanca de conta, e mais barata que
+construir carrier datagrama próprio — que o M12a estaciona como decisão explícita.
+
+### O que precisa mudar na integração de hoje
+
+Medido em `b4aae5cc`, 2026-08-18. A integração atual usa **faixa de endereço como
+rótulo de confiança**, e o rótulo promete mais do que o mecanismo entrega.
+
+`bonjour_trust.rs::classify_source` decide por faixa e só por faixa —
+`100.64.0.0/10`, `fd7a:115c:a1e0::/48` e **`fc00::/7` inteiro** ⇒
+`DiscoverySource::Tailnet`, documentado como *"→ trusted"*.
+
+Dos três usos em produção, dois têm segundo fator e um não tem:
+
+| sítio | fator além da faixa |
+|---|---|
+| `setup_invitation.rs::source_ip_matches` | `iphone_addrs.contains(&src_ip)` — endereço exato gravado no claim |
+| `setup_invitation.rs::validate_initialize_source` | resolução ao vivo de `.local`, com fallback para os `iphone_addrs` |
+| `handlers_pair_machine.rs::anchor_handoff_handler` | **nenhum** — faixa é o único teste de origem, seguida de gate de estado/janela |
+
+Quatro consertos. A ordem não é de esforço, é de risco de propagação:
+
+1. **Estreitar as faixas.** `fc00::/7` admite toda rede privada IPv6 que existe, e
+   o comentário no código admite o chute (*"pode ser outra implementação de
+   Tailnet"* — hipotética, sem consumidor conhecido). O M6 **deste documento** já
+   enuncia a regra: *não liberar globalmente um prefixo amplo (`fc00::/7`)*. Trocar
+   por `fd7a:115c:a1e0::/48`. Uma constante.
+2. **Classificar por interface, não por faixa.** `tailnet_address.rs` já faz o
+   certo para o endereço local: exige interface (`utun*`/`tailscale*`) **e** faixa.
+   `classify_source` recebe um `IpAddr` sem contexto nenhum. Para conexão de
+   entrada, o sinal forte é a **interface local em que ela chegou** — que não é
+   escolhida por quem conecta.
+3. **Os nomes não podem prometer confiança.** `DiscoverySource::Tailnet`,
+   documentado como *"trusted"*, estabelece de fato "veio de faixa privada".
+   Renomear para localidade de rede e tirar "trusted" da prosa. **Não muda
+   comportamento; muda o que a próxima pessoa acredita** — e é exatamente ao plugar
+   Tailscale no `PathProvider` que alguém vai reencontrar esse classificador e
+   reusá-lo como autorização.
+4. **`anchor_handoff` pede desenho próprio, não remendo.** É superfície
+   pré-household: não existe roster nem grant para conferir ainda. O conserto certo
+   é o fator primário ser um **segredo de curta duração** (a própria janela), com o
+   IP como defesa em profundidade, nunca como porta. Fora do escopo desta seção.
+
+> `100.64.0.0/10` é RFC 6598 — o espaço que operadoras usam para CGNAT **real**:
+> estar nele não prova tailnet. E `fc00::/7` é o RFC 4193 inteiro. Nenhum dos dois
+> exige falsificação sofisticada; é coincidência de endereçamento, que acontece
+> sozinha.
+
+> **Não coberto por esta medição:**
+> `household_listener.rs::InterfaceClass::Tailscale`, que decide **onde o servidor
+> escuta**. É superfície de exposição — assunto vizinho, distinto, com suposições
+> próprias.
 
 ---
 
@@ -229,9 +306,9 @@ verdade. Os três `kSecAttrAccessible*` bateram com o esperado. A premissa
 do M4 (reconexão em background sobrevive o aparelho travado, via
 `AfterFirstUnlockThisDeviceOnly`) está provada, não assumida.
 
-Medido por @gianna com @Caio travando o aparelho fisicamente no momento
-certo — a parte que nenhuma automação podia fazer sem reintroduzir o
-mesmo contexto anexado que invalidou a primeira medição.
+Medido com o aparelho travado fisicamente no momento certo — a parte que
+nenhuma automação podia fazer sem reintroduzir o mesmo contexto anexado que
+invalidou a primeira medição.
 
 ### O passo 4 não era executável no contexto de teste anexado que foi medido primeiro (histórico)
 
@@ -277,10 +354,9 @@ cronometrada, então o tempo está controlado e não é a variável.
 > mediu foi o instrumento, não o comportamento do sistema. Nenhum veredito sobre
 > a Apple é afirmado aqui — não temos medição que o sustente.
 >
-> Achado e medido por @gianna, que recusou três vezes aplicar o "conserto"
-> (`AfterFirstUnlock`) por cima de um verde que não media nada — o conserto teria
-> fechado o marco, e o furo apareceria só em campo, com a VPN não reconectando
-> com o telefone no bolso.
+> O "conserto" (`AfterFirstUnlock`) foi recusado três vezes, por ser aplicado
+> por cima de um verde que não media nada — teria fechado o marco, e o furo
+> apareceria só em campo, com a VPN não reconectando com o telefone no bolso.
 
 ## M1a — Conformance Noise independente
 
@@ -465,7 +541,7 @@ para o comando default; remover um dos dois targets gated; tirar uma
 `required-feature`. Assim o teste também prova que não inspeciona só o primeiro
 job que encontra. Vive no mecanismo de testes de governança que já existe — sem
 acoplar a biblioteca de protocolo ao `.github/`. Não é bloqueador do gate atual;
-é hardening contra regressão futura. Especificação de @saira.
+é hardening contra regressão futura.
 
 > Muda `.github/`, então vai em PR e revisão próprios — não entra de carona num
 > branch de feature.
@@ -736,7 +812,13 @@ fica testável.
 - `PathProvider`/connector abstrato que entrega um stream ordenado, seja relay ou
   direct — o pump não sabe qual;
 - probe autenticado do candidato (candidato não autenticado nunca vira caminho);
-- seleção direct-first com fallback para relay;
+- carrier **Tailscale** como candidato adicional, quando o tailnet estiver
+  disponível nas duas pontas — mesmo contrato dos demais: transporta bytes, não
+  concede nada (ver "Tailscale é carrier suportado, não substituído");
+- seleção direct-first, tailnet antes do relay, relay por último. **A ordem entre
+  tailnet e direct próprio é para medir, não para presumir**: o tailnet costuma
+  fechar direto pelo `magicsock`, e qual dos dois ganha depende de latência real,
+  não de preferência arquitetural;
 - cerimônia Noise completa nova a cada carrier, revalidando cert/intent/grant/expiry
   antes de trocar o pump;
 - métricas de latência, CPU e `bytes_relayed`.
@@ -744,7 +826,9 @@ fica testável.
 **Pronto quando:** em LAN/IPv6 alcançável o caminho é direto e `bytes_relayed`
 fica em zero durante tráfego real; bloquear o direct cai para relay de forma
 transparente; candidato falso ou peer errado falha sem causar downgrade para uma
-sessão menos autorizada; direct e relay entregam a **mesma** rota e audience; e
+sessão menos autorizada; direct, tailnet e relay entregam a **mesma** rota e audience; com
+tailnet disponível nas duas pontas a sessão fecha por ele e `bytes_relayed` fica
+em zero, sem que o pump saiba a diferença; e
 **cada sessão aberta num carrier diferente** mostra handshake novo e recusa
 records antigos — redação deliberada, para não reintroduzir migração ao vivo, que
 é M12b.
@@ -805,8 +889,8 @@ aliases neutros.
 
 ## Proveniência
 
-Revisão conjunta 2026-08-08. Auditoria do stack existente e decisão do datapath:
-`@gloria`. Releitura marco a marco de M2–M12b, substituições concretas e ordem/DAG:
-`@saira`. Contexto de iOS/NetworkExtension e as duas amostras de campo do M0a:
-`@gianna`. A v4 original é do Caio e continua sendo a fonte dos objetivos de
-produto — o que mudou é a arquitetura por baixo deles, não o que o produto promete.
+Revisão conjunta 2026-08-08, em três frentes: auditoria do stack existente e
+decisão do datapath; releitura marco a marco de M2–M12b, com as substituições
+concretas e a ordem/DAG; contexto de iOS/NetworkExtension e as duas amostras de
+campo do M0a. A v4 original continua sendo a fonte dos objetivos de produto — o
+que mudou é a arquitetura por baixo deles, não o que o produto promete.
