@@ -96,6 +96,7 @@ pub mod cloudflared_sync;
 pub mod config;
 #[cfg(any(test, feature = "failure-injection"))]
 pub mod failure_injection;
+pub mod folder_access_sentinel;
 pub mod guest_image_state;
 pub mod handlers_admin;
 pub mod handlers_bootstrap;

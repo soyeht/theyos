@@ -608,6 +608,13 @@ async fn main() {
     // Start lease reaper — cleans up expired provisioning leases.
     let _reaper_handle = server_rs::lease_reaper::start_lease_reaper(Arc::clone(&state));
 
+    // Start the folder-access sentinel — self-diagnosis for the silent TCC
+    // degradation of 2026-08-28: a long-lived engine whose folder grants rot
+    // exits so launchd replaces it with a process that evaluates clean. The
+    // destructive step is gated by a tested state machine; a process that
+    // never saw the folder readable never restarts.
+    let _sentinel_handle = server_rs::folder_access_sentinel::start_folder_access_sentinel();
+
     // Monitor jobs worker for panics in a separate tokio task.
     tokio::spawn(async move {
         match jobs_handle.await {
