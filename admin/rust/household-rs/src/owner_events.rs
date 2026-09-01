@@ -277,6 +277,7 @@ impl OwnerEventLog {
         // the installed household while a torn tail is being truncated.
         let _lock = log.lock_log_exclusive()?;
         log.verify_binding_write(lifecycle)?;
+        repair_legacy_log_mode(&log.log_dir)?;
         let head = scan_and_repair_fd(&log.log_dir)?;
         log.head.store(head, Ordering::Release);
         Ok(log)
@@ -639,6 +640,66 @@ fn decode_length_prefixed(bytes: &[u8]) -> (Vec<OwnerEvent>, usize) {
         }
     }
     (out, off)
+}
+
+/// Tighten a legacy world-readable log in place before it is validated.
+///
+/// Builds before the `0600` requirement created `owner_events/log.cbor`
+/// through a path that left it `0644`, and [`validate_regular_file`] now
+/// refuses any `mode & 0o077 != 0`. Every installation that paired a phone
+/// under an older build therefore fails to open its own installed log on the
+/// first boot after updating, with no listener and no migration. The repair
+/// runs under the same exclusive log flock as scan-and-repair, and only on a
+/// file that already satisfies the ownership, link-count, and name
+/// invariants: anything else is left exactly as found so
+/// [`validate_regular_file`] still rejects it.
+fn repair_legacy_log_mode(log_dir: &File) -> Result<(), EventError> {
+    let fd = match rustix::fs::openat(
+        log_dir,
+        OWNER_EVENTS_LOG_FILENAME,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Ok(()),
+        Err(error) => return Err(errno_to_event_err(error, OWNER_EVENTS_LOG_FILENAME)),
+    };
+    let file = File::from(fd);
+    let parent_meta = log_dir
+        .metadata()
+        .map_err(|error| io_to_event_err(&error, Path::new(OWNER_EVENTS_SUBDIR)))?;
+    let meta = file
+        .metadata()
+        .map_err(|error| io_to_event_err(&error, Path::new(OWNER_EVENTS_LOG_FILENAME)))?;
+    let mode = meta.permissions().mode();
+    // Either there is nothing to repair, or the file fails an invariant the
+    // repair must not paper over — a second link, a foreign owner, a name that
+    // no longer resolves to these bytes. Leave it exactly as found and let
+    // `validate_regular_file` reach its own verdict.
+    let repairable = mode & 0o077 != 0
+        && meta.is_file()
+        && meta.uid() == parent_meta.uid()
+        && meta.nlink() == 1
+        && named_file_matches(log_dir, OWNER_EVENTS_LOG_FILENAME, &file);
+    if !repairable {
+        return Ok(());
+    }
+    rustix::fs::fchmod(&file, Mode::RUSR | Mode::WUSR)
+        .map_err(|error| errno_to_event_err(error, OWNER_EVENTS_LOG_FILENAME))?;
+    // Metadata durability, so a crash right after the repair cannot resurrect
+    // the old mode on a log this boot already treated as tightened.
+    file.sync_all()
+        .map_err(|error| io_to_event_err(&error, Path::new(OWNER_EVENTS_LOG_FILENAME)))?;
+    log_dir
+        .sync_all()
+        .map_err(|error| io_to_event_err(&error, Path::new(OWNER_EVENTS_SUBDIR)))?;
+    tracing::warn!(
+        stage = "owner_events.open.repaired_legacy_log_mode",
+        path = OWNER_EVENTS_LOG_FILENAME,
+        previous_mode = %format!("{:o}", mode & 0o7777),
+        "tightened a pre-0600 owner-event log left by an older build"
+    );
+    Ok(())
 }
 
 fn scan_and_repair_fd(log_dir: &File) -> Result<u64, EventError> {
@@ -1188,6 +1249,90 @@ mod lifecycle_tests {
         };
         assert!(matches!(error, EventError::StaleLifecycleBinding));
         assert!(!log_dir(state.path()).exists());
+    }
+
+    /// A log written by a build that predates the `0600` requirement. Every
+    /// installation that paired a phone before that change carries one, and
+    /// without the in-place repair the first boot after updating cannot open
+    /// its own installed log — which is exactly the fixture that was missing
+    /// when the requirement landed.
+    #[test]
+    fn legacy_world_readable_log_is_repaired_instead_of_rejected() {
+        let fixture = fixture(None);
+        let read = fixture.lifecycle.lock_shared().unwrap();
+        let appended = fixture
+            .log
+            .append(
+                &read,
+                "m_test_issuer",
+                &P256Keypair::generate(),
+                OwnerEventType::JoinRequest,
+                payload(),
+            )
+            .unwrap();
+        drop(read);
+
+        let path = log_path(fixture.state.path());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let write = fixture.lifecycle.lock_exclusive().unwrap();
+        let reopened = OwnerEventLog::open_under_lifecycle(
+            &write,
+            fixture.state.path().to_path_buf(),
+            &fixture.hh_id,
+        )
+        .expect("a pre-0600 log left by an older build must be repaired, not refused");
+        drop(write);
+
+        assert_eq!(reopened.cursor_head(), appended.cursor);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            0o600,
+            "the repair must tighten the log in place",
+        );
+    }
+
+    /// The repair is not a way around the invariant. A second link means the
+    /// mode cannot be tightened for every name the bytes answer to, so the
+    /// file is left as found and validation still refuses it.
+    #[test]
+    fn multiply_linked_world_readable_log_is_left_alone_and_still_rejected() {
+        let fixture = fixture(None);
+        let read = fixture.lifecycle.lock_shared().unwrap();
+        fixture
+            .log
+            .append(
+                &read,
+                "m_test_issuer",
+                &P256Keypair::generate(),
+                OwnerEventType::JoinRequest,
+                payload(),
+            )
+            .unwrap();
+        drop(read);
+
+        let path = log_path(fixture.state.path());
+        let second_link = log_dir(fixture.state.path()).join("log.cbor.link");
+        fs::hard_link(&path, &second_link).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let write = fixture.lifecycle.lock_exclusive().unwrap();
+        let result = OwnerEventLog::open_under_lifecycle(
+            &write,
+            fixture.state.path().to_path_buf(),
+            &fixture.hh_id,
+        );
+        drop(write);
+
+        let Err(error) = result else {
+            panic!("a multiply linked log must not be opened");
+        };
+        assert!(matches!(error, EventError::StaleLifecycleBinding));
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            0o644,
+            "a log that fails the guard must not be touched",
+        );
     }
 
     #[test]
