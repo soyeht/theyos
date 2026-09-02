@@ -1,6 +1,6 @@
 [package]
 name = "rootfsbuilder-rs"
-version = "0.1.27"
+version = "0.1.28"
 edition.workspace = true
 rust-version.workspace = true
 description = "Build Ubuntu 24.04 ext4 rootfs for Firecracker VMs (replaces build-rootfs.sh)"
