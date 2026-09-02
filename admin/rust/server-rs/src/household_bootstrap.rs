@@ -411,6 +411,12 @@ impl Phase3RuntimeController {
             hh_id = %loaded.record.hh_id,
             m_id = %loaded.cert.m_id,
         );
+        // A household that became live in this process (fresh install →
+        // initialize → pair) never went through the boot-time adoption
+        // above, and its "Mac Host" would stay invisible until a restart.
+        if let Some(state) = self.shared_state.as_ref() {
+            adopt_seeded_mac_host(state, loaded.record.hh_id.as_str(), loaded.cert.m_id.as_str());
+        }
         Ok(())
     }
 
@@ -667,6 +673,32 @@ fn persist_phase3_fail_stop(state_dir: &Path, lifecycle: &LifecycleWriteGuard) {
             stage = "bootstrap.phase3_outbox_fail_stop_sync_failed",
             error = %sync_error,
         );
+    }
+}
+
+/// Give the seeded `mac-host` row the household scope it was born without.
+///
+/// `seed_mac_host_instance` runs in `main` before any household exists, so
+/// the row is inserted with a null `household_id` and `list_for_household`
+/// keeps it invisible. Stamping must therefore happen every time a household
+/// becomes live in this process — at boot for an installed one, and again
+/// when a fresh install is initialized and paired without a restart. Until
+/// 2026-09-01 only the boot path did it, so a first-time user finished
+/// pairing and saw no "Mac Host" (and no way to open a new session) until
+/// the engine was restarted. Idempotent: only a fully unscoped row changes.
+fn adopt_seeded_mac_host(state: &SharedState, hh_id: &str, m_id: &str) {
+    match state.instance_db.stamp_mac_host_household(hh_id, m_id) {
+        Ok(true) => info!(
+            stage = "bootstrap.mac_host.scoped",
+            hh_id = %hh_id,
+            "seeded mac-host instance adopted into the household"
+        ),
+        Ok(false) => {}
+        Err(e) => tracing::warn!(
+            stage = "bootstrap.mac_host.scope_failed",
+            error = %e,
+            "could not scope the seeded mac-host instance to the household"
+        ),
     }
 }
 
@@ -1544,21 +1576,7 @@ pub async fn bootstrap_household(
     // unscoped, and reports whether it did, so a partially scoped row (which is
     // ambiguous about its owner) is left alone rather than guessed at.
     if let (Some(arc), Some(state)) = (loaded_arc.as_ref(), shared_state.as_ref()) {
-        let hh_id = arc.record.hh_id.to_string();
-        let m_id = arc.cert.m_id.to_string();
-        match state.instance_db.stamp_mac_host_household(&hh_id, &m_id) {
-            Ok(true) => info!(
-                stage = "bootstrap.mac_host.scoped",
-                hh_id = %hh_id,
-                "seeded mac-host instance adopted into the household"
-            ),
-            Ok(false) => {}
-            Err(e) => tracing::warn!(
-                stage = "bootstrap.mac_host.scope_failed",
-                error = %e,
-                "could not scope the seeded mac-host instance to the household"
-            ),
-        }
+        adopt_seeded_mac_host(state, arc.record.hh_id.as_str(), arc.cert.m_id.as_str());
     }
 
     // ── Bootstrap state machine (T007 / T011) ─────────────────────────────
