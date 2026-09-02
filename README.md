@@ -31,9 +31,9 @@ Soyeht runs on both platforms with different strengths:
 
 ### macOS
 
-Download **Soyeht.app** from [soyeht.com/install](https://soyeht.com/install), open it, and follow the on-screen setup. The app guides you through naming your casa and pairing your iPhone as the owner key.
+Download **Soyeht.dmg** from the [latest release](https://github.com/soyeht/soyeht-ios/releases/latest/download/Soyeht.dmg), open it, and follow the on-screen setup. The app guides you through naming your casa and pairing your iPhone as the owner key.
 
-**Requirements:** Apple Silicon (M1/M2/M3/M4), macOS 14+, 100 GB free disk space.
+**Requirements:** Apple Silicon (M1/M2/M3/M4), macOS 15+, 100 GB free disk space. Intel Macs are not supported: the app and its engine are arm64-only.
 
 ### Linux — release installer
 
