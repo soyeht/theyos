@@ -68,8 +68,11 @@ async fn main() {
             "json".to_string()
         }
     });
+    // `household_rs` owns the installed-state repairs (owner-event log
+    // scan-and-repair, legacy mode tightening); without it in the default
+    // filter its warn!/error! lines never reach the production log.
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        "server=info,server_rs=info,tower_http=info"
+        "server=info,server_rs=info,household_rs=info,tower_http=info"
             .parse()
             .unwrap()
     });

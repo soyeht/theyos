@@ -41,7 +41,7 @@ use household_rs::household_lifecycle::{
     HouseholdLifecycleLock, HouseholdLifecycleLockError, LifecycleWriteGuard,
 };
 use household_rs::household_mesh_log::MeshLogStore;
-use household_rs::owner_events::{OwnerEventLog, OwnerEventsBroadcaster};
+use household_rs::owner_events::{OwnerEventLog, OwnerEventsBroadcaster, log_path};
 use household_rs::pair_machine::PairMachineWindow;
 use nostr_relay_rs::nostr::Keys;
 use std::net::{IpAddr, SocketAddr};
@@ -411,6 +411,12 @@ impl Phase3RuntimeController {
             hh_id = %loaded.record.hh_id,
             m_id = %loaded.cert.m_id,
         );
+        // A household that became live in this process (fresh install →
+        // initialize → pair) never went through the boot-time adoption
+        // above, and its "Mac Host" would stay invisible until a restart.
+        if let Some(state) = self.shared_state.as_ref() {
+            adopt_seeded_mac_host(state, loaded.record.hh_id.as_str(), loaded.cert.m_id.as_str());
+        }
         Ok(())
     }
 
@@ -627,6 +633,72 @@ impl LifecycleIdentityLoad {
         household
             .set_loaded_with_owner_auth(Arc::clone(loaded), self.owner_auth.clone())
             .await;
+    }
+}
+
+/// Best-effort description of the owner-event log file, for the failure line.
+///
+/// The open error reads "bound to a different household or lifecycle
+/// generation" for a permission mismatch too, so the line has to name what was
+/// actually on disk or it explains nothing.
+fn describe_owner_event_log_file(path: &Path) -> String {
+    use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => format!(
+            "mode={:o} uid={} nlink={} len={}",
+            meta.permissions().mode() & 0o7777,
+            meta.uid(),
+            meta.nlink(),
+            meta.len(),
+        ),
+        Err(error) => format!("unavailable ({error})"),
+    }
+}
+
+/// Latch the generic fail-stop state for a terminal Phase-3 failure.
+///
+/// Mirrors the three sibling terminal Phase-3 outbox branches: persist
+/// `Recovering` and push it through the state root, so a boot that refuses
+/// every listener never leaves `ready` on disk for the next process to believe.
+fn persist_phase3_fail_stop(state_dir: &Path, lifecycle: &LifecycleWriteGuard) {
+    if let Err(state_error) = bootstrap_state::persist(state_dir, BootstrapState::Recovering) {
+        tracing::error!(
+            stage = "bootstrap.phase3_outbox_fail_stop_persist_failed",
+            error = %state_error,
+        );
+    } else if let Err(sync_error) = lifecycle.sync_state_root() {
+        tracing::error!(
+            stage = "bootstrap.phase3_outbox_fail_stop_sync_failed",
+            error = %sync_error,
+        );
+    }
+}
+
+/// Give the seeded `mac-host` row the household scope it was born without.
+///
+/// `seed_mac_host_instance` runs in `main` before any household exists, so
+/// the row is inserted with a null `household_id` and `list_for_household`
+/// keeps it invisible. Stamping must therefore happen every time a household
+/// becomes live in this process — at boot for an installed one, and again
+/// when a fresh install is initialized and paired without a restart. Until
+/// 2026-09-01 only the boot path did it, so a first-time user finished
+/// pairing and saw no "Mac Host" (and no way to open a new session) until
+/// the engine was restarted. Idempotent: only a fully unscoped row changes.
+fn adopt_seeded_mac_host(state: &SharedState, hh_id: &str, m_id: &str) {
+    match state.instance_db.stamp_mac_host_household(hh_id, m_id) {
+        Ok(true) => info!(
+            stage = "bootstrap.mac_host.scoped",
+            hh_id = %hh_id,
+            "seeded mac-host instance adopted into the household"
+        ),
+        Ok(false) => {}
+        Err(e) => tracing::warn!(
+            stage = "bootstrap.mac_host.scope_failed",
+            error = %e,
+            "could not scope the seeded mac-host instance to the household"
+        ),
     }
 }
 
@@ -1504,21 +1576,7 @@ pub async fn bootstrap_household(
     // unscoped, and reports whether it did, so a partially scoped row (which is
     // ambiguous about its owner) is left alone rather than guessed at.
     if let (Some(arc), Some(state)) = (loaded_arc.as_ref(), shared_state.as_ref()) {
-        let hh_id = arc.record.hh_id.to_string();
-        let m_id = arc.cert.m_id.to_string();
-        match state.instance_db.stamp_mac_host_household(&hh_id, &m_id) {
-            Ok(true) => info!(
-                stage = "bootstrap.mac_host.scoped",
-                hh_id = %hh_id,
-                "seeded mac-host instance adopted into the household"
-            ),
-            Ok(false) => {}
-            Err(e) => tracing::warn!(
-                stage = "bootstrap.mac_host.scope_failed",
-                error = %e,
-                "could not scope the seeded mac-host instance to the household"
-            ),
-        }
+        adopt_seeded_mac_host(state, arc.record.hh_id.as_str(), arc.cert.m_id.as_str());
     }
 
     // ── Bootstrap state machine (T007 / T011) ─────────────────────────────
@@ -1766,12 +1824,33 @@ pub async fn bootstrap_household(
         shared_state.clone(),
     );
     if let Some(loaded) = identity_load.loaded.as_ref() {
-        let Some(Ok(event_log)) = owner_event_log.as_ref() else {
-            tracing::error!(
-                stage = "phase3_runtime.startup_dependencies_unavailable",
-                "installed household cannot start without its Phase 3 runtime"
-            );
-            return;
+        let event_log = match owner_event_log.as_ref() {
+            Some(Ok(event_log)) => event_log,
+            // The open error used to be discarded without a binding, so an
+            // installed household that could not open its own owner-event log
+            // stopped here leaving no line saying why, and no listener. Bind
+            // it, name the file, and latch the same fail-stop state the other
+            // terminal Phase-3 branches persist.
+            Some(Err(error)) => {
+                let path = log_path(&state_dir);
+                tracing::error!(
+                    stage = "phase3_runtime.owner_event_log_open_failed",
+                    error = %error,
+                    path = %path.display(),
+                    log_file = %describe_owner_event_log_file(&path),
+                    "installed household cannot open its owner-event log; refusing all listeners",
+                );
+                persist_phase3_fail_stop(&state_dir, identity_load.lifecycle_guard());
+                return;
+            }
+            None => {
+                tracing::error!(
+                    stage = "phase3_runtime.startup_dependencies_unavailable",
+                    "installed household cannot start without its Phase 3 runtime"
+                );
+                persist_phase3_fail_stop(&state_dir, identity_load.lifecycle_guard());
+                return;
+            }
         };
         if let Err(error) = phase3_runtime
             .install_with_resources_under_lifecycle(
