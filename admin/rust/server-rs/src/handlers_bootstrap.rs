@@ -2995,10 +2995,14 @@ fn current_platform() -> &'static str {
     }
 }
 
-/// Detect a human-readable host label.
+/// Detect a human-readable host label — the name the iPhone shows next to
+/// "is ready to add this iPhone".
 ///
-/// - macOS: tries `sysctl -n hw.model` (e.g. "MacBookPro18,3"); on failure
-///   falls back to hostname.
+/// - macOS: the user-visible computer name (`scutil --get ComputerName`,
+///   e.g. "Living Room Mac"); on failure falls back to hostname. Until 2026-09-01
+///   this was `sysctl -n hw.model`, so the very first screen a new user saw
+///   said "Mac13,2 is ready to add this iPhone" — the hardware model, not a
+///   name anyone recognises.
 /// - Linux: tries `/sys/devices/virtual/dmi/id/product_name`; on failure
 ///   falls back to hostname.
 ///
@@ -3015,9 +3019,10 @@ pub fn detect_host_label() -> String {
 
 #[cfg(target_os = "macos")]
 fn platform_model_string() -> Option<String> {
-    // `sysctl -n hw.model` returns e.g. "MacBookPro18,3"
-    let out = std::process::Command::new("sysctl")
-        .args(["-n", "hw.model"])
+    // `scutil --get ComputerName` returns the name from System Settings ›
+    // General › About, e.g. "Living Room Mac".
+    let out = std::process::Command::new("scutil")
+        .args(["--get", "ComputerName"])
         .output()
         .ok()?;
     if out.status.success() {
