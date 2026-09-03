@@ -241,12 +241,16 @@ async fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(30);
-    let rate_limiter =
+    let mut rate_limiter =
         Limiter::new(&ratelimit_db, ratelimit_per_hour).expect("Failed to open rate limiter");
     info!(
         "Rate limiter: {} (limit={}/hr)",
         ratelimit_db, ratelimit_per_hour
     );
+    for (action, limit) in server_rs::bootstrap_pair_code_rate_limit::pair_code_action_limits() {
+        rate_limiter = rate_limiter.with_action_limit(action, limit);
+        info!("Rate limiter: action {action} capped at {limit}/hr");
+    }
 
     let flow_config = flow_config_from_env(&sqlite_db);
     let locks_dir = PathBuf::from(&flow_config.firecracker_state_dir).join("locks");
@@ -476,9 +480,11 @@ async fn main() {
             // host restart (502s) until someone manually adds/removes a
             // domain — the startup sync at boot ran BEFORE the VMs came up.
             for (instance_id, container, _, _) in &previously_active {
-                if let Err(e) =
-                    server_rs::public_sites::ensure_public_site_targets_for_instance(&st, instance_id)
-                        .await
+                if let Err(e) = server_rs::public_sites::ensure_public_site_targets_for_instance(
+                    &st,
+                    instance_id,
+                )
+                .await
                 {
                     tracing::warn!(
                         "[startup] public site target refresh failed for {container}: {e}"

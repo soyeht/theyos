@@ -384,7 +384,7 @@ fn r0a_n_ratchet_names_new_targets() {
     let ratchet_path = ["owner_mesh_", "rendezvous_codec.rs"].concat();
     let r1a7 = read(package_dir().join("tests").join(ratchet_path));
     for needle in [
-        "assert_eq!(targets.len(), 210",
+        "assert_eq!(targets.len(), 211",
         "filter(|target| target.kind == \"test\")",
         "right total by two errors that cancel: the base was 152 in the tree,",
         "name == \"caveat_narrowing\"",
@@ -395,8 +395,7 @@ fn r0a_n_ratchet_names_new_targets() {
         assert!(r1a7.contains(needle), "R1a.7 is missing `{needle}`");
     }
 
-    let roots = repository_root()
-        .join(".github/owner-present-phase0-closed-input-roots-v1.txt");
+    let roots = repository_root().join(".github/owner-present-phase0-closed-input-roots-v1.txt");
     assert!(
         roots.is_file(),
         "closed-input roots path must exist in Fatia N"
@@ -475,6 +474,11 @@ fn r0a_d2a_tests_stay_inline_and_off_the_cargo_target_ratchet() {
     // focused tests in `#[cfg(test)] mod tests`, so it contributes nothing to
     // that count; a future slice that wants an integration target has to move
     // the ratchet deliberately rather than by accident.
+    //
+    // The pair-device code slice is exactly such a deliberate move: it adds
+    // `household-rs/tests/pair_device_fingerprint.rs`, so R1a.7 now asserts
+    // 211 targets, 158 of them `test`-kind, and names that file in its own
+    // `any()` pin. Still nothing of it is D2a's.
     for absent in [
         "tests/device_cert.rs",
         "tests/device_admission.rs",
@@ -482,14 +486,14 @@ fn r0a_d2a_tests_stay_inline_and_off_the_cargo_target_ratchet() {
     ] {
         assert!(
             !package_dir().join(absent).exists(),
-            "D2a adds no Cargo test target; R1a.7 pins 210/157 and none of it \
+            "D2a adds no Cargo test target; R1a.7 pins 211/158 and none of it \
              is D2a's: {absent}"
         );
     }
 
     let ratchet_path = ["owner_mesh_", "rendezvous_codec.rs"].concat();
     let r1a7 = read(package_dir().join("tests").join(ratchet_path));
-    assert!(r1a7.contains("assert_eq!(targets.len(), 210"));
+    assert!(r1a7.contains("assert_eq!(targets.len(), 211"));
     assert!(r1a7.contains("right total by two errors that cancel: the base was 152 in the tree,"));
 
     // Coverage ratchet: counts the `#[test]` attribute itself, not any `fn`, so

@@ -155,6 +155,7 @@ fn make_fixture_no_auth(bs: BootstrapState) -> (Fixture, Router) {
         engine_port: 8091,
         tailnet_resolver: || None,
         phase3_runtime: None,
+        pair_code_rate_limiter: None,
     };
 
     let app = bootstrap_router(handler_state);
@@ -249,6 +250,7 @@ fn make_fixture(bs: BootstrapState) -> (Fixture, Router) {
         engine_port: 8091,
         tailnet_resolver: || None,
         phase3_runtime: None,
+        pair_code_rate_limiter: None,
     };
 
     let app = bootstrap_router(handler_state);

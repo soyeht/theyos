@@ -111,6 +111,7 @@ fn make_state(bs: BootstrapState, state_dir: PathBuf) -> BootstrapHandlerState {
         engine_port: 8091,
         tailnet_resolver: no_tailnet,
         phase3_runtime: None,
+        pair_code_rate_limiter: None,
     }
 }
 

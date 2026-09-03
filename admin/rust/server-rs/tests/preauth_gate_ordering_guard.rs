@@ -94,6 +94,13 @@ const EXPENSIVE_PREAUTH: &[Ordering] = &[
         expensive_work: "decrypt_from_peer",
         why: "ECDH shard decryption (decrypt_from_peer) must run only after the pairing-window state gate",
     },
+    Ordering {
+        handler: "post_bootstrap_pair_device_uri_by_code",
+        file: "handlers_bootstrap.rs",
+        cheap_gate: "check_pair_code_attempt(",
+        expensive_work: "BOOTSTRAP_MUTATION_LOCK",
+        why: "the per-peer pair-code limiter must run before the process-global mutation lock is taken, so a code-guessing flood is shed before it can queue behind (and stall) initialize / teardown / pairing",
+    },
 ];
 
 /// Cheap / boundary-gated pre-auth endpoints intentionally OUTSIDE the

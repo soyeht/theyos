@@ -46,11 +46,13 @@ use household_rs::pair_machine::PairMachineWindow;
 use household_rs::pair_window_namespace::PairWindowNamespaceV2;
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
+use subtle::ConstantTimeEq;
 use tokio::sync::RwLock;
 use tokio::time::Duration;
 use tracing::info;
 
 use crate::household_state::{HouseholdState, SharedHouseholdIdentity};
+use crate::ratelimit::Limiter;
 
 const HOUSEHOLD_LIFECYCLE_HANDLER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -216,6 +218,17 @@ pub const REACHABILITY_ECHO_PATH: &str = "/api/v1/household/reachability/echo";
 /// request and response independently of the caller.
 pub const REACHABILITY_ECHO_BYTES: usize = 32;
 
+/// Body ceiling for `POST /bootstrap/pair-device-uri/by-code`. The only legal
+/// body is a six-word BIP-39 code in canonical CBOR — the longest BIP-39
+/// English word is eight bytes, so a legitimate request is well under 100
+/// bytes. Bounding it here means an unauthenticated peer cannot make the
+/// route allocate before the peer ACL and the limiter have run.
+pub const PAIR_DEVICE_BY_CODE_BODY_BYTES: usize = 512;
+
+/// Number of words in a pair-device code — the six BIP-39 words the Mac shows
+/// and the iPhone types back. Six 11-bit indices, i.e. 66 bits of entropy.
+const PAIR_DEVICE_CODE_WORDS: usize = 6;
+
 // ── Shared state ──────────────────────────────────────────────────────────────
 
 /// State visible to all bootstrap handlers.
@@ -256,6 +269,12 @@ pub struct BootstrapHandlerState {
     /// Stable generation-bound Phase 3 router/task slot owned by the daemon.
     /// Short-lived handler tests and CLI-only routers leave this unset.
     pub phase3_runtime: Option<crate::household_bootstrap::Phase3RuntimeController>,
+    /// Durable per-peer limiter for `POST /bootstrap/pair-device-uri/by-code`
+    /// (`bootstrap_pair_code_rate_limit`). Injected only from daemon paths
+    /// that have `SharedState`; short-lived install/listener paths and
+    /// handler tests leave it `None`, and the by-code handler fails closed
+    /// (same opaque reject as a wrong code) when it is absent.
+    pub pair_code_rate_limiter: Option<Arc<Limiter>>,
 }
 
 pub type BootstrapStateArc = Arc<RwLock<BootstrapState>>;
@@ -281,6 +300,7 @@ impl BootstrapHandlerState {
             engine_port,
             tailnet_resolver: crate::tailnet_address::current_tailnet_ipv4,
             phase3_runtime: None,
+            pair_code_rate_limiter: None,
         }
     }
 
@@ -290,6 +310,12 @@ impl BootstrapHandlerState {
         runtime: crate::household_bootstrap::Phase3RuntimeController,
     ) -> Self {
         self.phase3_runtime = Some(runtime);
+        self
+    }
+
+    #[must_use]
+    pub fn with_pair_code_rate_limiter(mut self, limiter: Arc<Limiter>) -> Self {
+        self.pair_code_rate_limiter = Some(limiter);
         self
     }
 }
@@ -324,6 +350,11 @@ pub fn bootstrap_router(state: BootstrapHandlerState) -> Router {
         .route(
             "/bootstrap/pair-device-uri",
             get(get_bootstrap_pair_device_uri),
+        )
+        .route(
+            "/bootstrap/pair-device-uri/by-code",
+            post(post_bootstrap_pair_device_uri_by_code)
+                .layer(DefaultBodyLimit::max(PAIR_DEVICE_BY_CODE_BODY_BYTES)),
         )
         .route("/health", get(get_health))
         .route("/healthz", get(get_health))
@@ -1215,6 +1246,105 @@ struct PairDeviceUriResponse {
     expires_at: u64,
 }
 
+/// Body of `POST /bootstrap/pair-device-uri/by-code`: the six BIP-39 words
+/// the operator read off the Mac. `deny_unknown_fields` plus
+/// [`strict_cbor_request`] means only the exact canonical encoding of this
+/// shape is admitted — no extra keys, no re-ordered map, no trailing bytes.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PairDeviceUriByCodeRequest {
+    #[serde(rename = "v")]
+    version: u8,
+    words: Vec<String>,
+}
+
+/// The tail both pair-device-URI routes share once their gates have passed:
+/// host selection, machine-cert fingerprint, URI build, response body. One
+/// type owns all four so the GET route and the by-code route cannot answer
+/// with URIs that have drifted apart.
+///
+/// It is two steps rather than one call on purpose. [`Self::resolve`] must
+/// run *before* a route mutates the pairing window — a fingerprint failure
+/// there is a 500, and it must not leave a freshly-minted window open behind
+/// that error — while [`Self::respond`] needs the token that mutation
+/// produced. Collapsing them would silently move the fingerprint after the
+/// mint on the GET side.
+struct PairDeviceUriTail {
+    /// `ip:port` the caller can dial back on, or `None` when this Mac has no
+    /// tailnet address. Deliberately never a LAN fallback.
+    host: Option<String>,
+    m_cert_fp: [u8; 32],
+}
+
+impl PairDeviceUriTail {
+    /// The answer both routes give when [`Self::resolve`] cannot produce a
+    /// tail. It lives next to `resolve` so a fault neither route caused
+    /// cannot be told apart by which route was asked.
+    fn unavailable() -> Response {
+        cbor_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            BootstrapErrorCode::InternalError.as_str(),
+            None,
+            None,
+        )
+    }
+
+    /// Resolve the advertised host and the machine-cert fingerprint. `None`
+    /// means the caller answers [`Self::unavailable`]; `stage` names the
+    /// calling route in the failure log.
+    fn resolve(identity: &SharedHouseholdIdentity, stage: &'static str) -> Option<Self> {
+        // Same tailnet-only-or-no-fallback rule as `post_pair_device_reissue`:
+        // the URI advertises a host only when a tailnet address exists, and
+        // never falls back to a LAN address. Both callers have already
+        // established that the peer is on loopback or the tailnet, so this is
+        // the address the caller can actually dial back on.
+        let port: u16 = std::env::var("THEYOS_HOUSEHOLD_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8091);
+        let host = crate::tailnet_address::current_tailnet_ipv4().map(|ip| format!("{ip}:{port}"));
+
+        // Fingerprint the cert this identity was actually loaded and validated
+        // with. The identity is already validated, so a failure here is an
+        // internal fault, not an availability gap.
+        match household_rs::machine_cert::fingerprint(&identity.cert) {
+            Ok(m_cert_fp) => Some(Self { host, m_cert_fp }),
+            Err(e) => {
+                tracing::error!(stage, error = %e);
+                None
+            }
+        }
+    }
+
+    /// The host as it appears in the served log — never the URI itself.
+    fn host_label_for_log(&self) -> &str {
+        self.host.as_deref().unwrap_or("")
+    }
+
+    /// Build the wire response for `token`. The single construction site for
+    /// `PairDeviceUriResponse`.
+    fn respond(
+        &self,
+        identity: &SharedHouseholdIdentity,
+        token: &household_rs::pair_device::PairToken,
+    ) -> PairDeviceUriResponse {
+        PairDeviceUriResponse {
+            version: 1,
+            house_name: identity.record.name.clone(),
+            host_label: detect_host_label(),
+            hh_id: identity.record.hh_id.to_string(),
+            hh_pub: ByteBuf::from(*identity.record.hh_pub.as_bytes()),
+            pair_device_uri: token.to_uri_with_host_and_name(
+                &identity.record.hh_pub,
+                self.host.as_deref(),
+                Some(&identity.record.name),
+                &self.m_cert_fp,
+            ),
+            expires_at: token.expires_at_unix,
+        }
+    }
+}
+
 pub async fn post_pair_device_reissue(
     State(state): State<BootstrapHandlerState>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
@@ -1592,32 +1722,12 @@ pub async fn get_bootstrap_pair_device_uri(
         }
     }
 
-    // Same tailnet-only-or-no-fallback rule as `post_pair_device_reissue`:
-    // the URI advertises a host only when a tailnet address exists, and
-    // never falls back to a LAN address. Gate 1 has already established that
-    // the caller is on loopback or the tailnet, so this is the address the
-    // caller can actually dial back on.
-    let port: u16 = std::env::var("THEYOS_HOUSEHOLD_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8091);
-    let host = crate::tailnet_address::current_tailnet_ipv4().map(|ip| format!("{ip}:{port}"));
-
-    // Fingerprint before touching the window, same rationale as the reissue
-    // route: the identity is already validated, so a failure here is an
-    // internal fault, not an availability gap — and it must not leave a
+    // Host selection and the machine-cert fingerprint, resolved before the
+    // window is touched — a fingerprint failure must not leave a
     // freshly-minted window open behind an error response.
-    let m_cert_fp = match household_rs::machine_cert::fingerprint(&identity.cert) {
-        Ok(fp) => fp,
-        Err(e) => {
-            tracing::error!(stage = "pair_device.uri.m_cert_fp_failed", error = %e);
-            return cbor_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                BootstrapErrorCode::InternalError.as_str(),
-                None,
-                None,
-            );
-        }
+    let Some(tail) = PairDeviceUriTail::resolve(&identity, "pair_device.uri.m_cert_fp_failed")
+    else {
+        return PairDeviceUriTail::unavailable();
     };
 
     // Retrieve-or-mint must be one operation, not two. Reading
@@ -1641,30 +1751,286 @@ pub async fn get_bootstrap_pair_device_uri(
         }
     };
 
-    let pair_device_uri = token.to_uri_with_host_and_name(
-        &identity.record.hh_pub,
-        host.as_deref(),
-        Some(&identity.record.name),
-        &m_cert_fp,
-    );
-
     tracing::info!(
         stage = "pair_device.uri.served",
         hh_id = %identity.record.hh_id,
         expires_at_unix = token.expires_at_unix,
-        host = %host.as_deref().unwrap_or(""),
+        host = %tail.host_label_for_log(),
         minted,
     );
 
-    cbor_ok(PairDeviceUriResponse {
-        version: 1,
-        house_name: identity.record.name.clone(),
-        host_label: detect_host_label(),
-        hh_id: identity.record.hh_id.to_string(),
-        hh_pub: ByteBuf::from(*identity.record.hh_pub.as_bytes()),
-        pair_device_uri,
-        expires_at: token.expires_at_unix,
+    cbor_ok(tail.respond(&identity, &token))
+}
+
+// ── POST /bootstrap/pair-device-uri/by-code ────────────────────────────────
+
+/// The single opaque rejection of `POST /bootstrap/pair-device-uri/by-code`.
+///
+/// A wrong code, no open window, an expired window, an exhausted per-peer
+/// attempt budget and a limiter that cannot answer at all must be
+/// **byte-identical** on the wire: every one of them means "this caller does
+/// not get the URI", and telling them apart would hand a guesser an oracle
+/// for whether a window is even open. `reason` exists only for the operator
+/// reading the Mac's own log.
+fn pair_code_rejected(reason: &'static str) -> Response {
+    tracing::warn!(stage = "pair_device.code.rejected", reason);
+    cbor_error(
+        StatusCode::NOT_FOUND,
+        BootstrapErrorCode::PairCodeRejected.as_str(),
+        None,
+        None,
+    )
+}
+
+/// A body that was never a six-word code in the first place. Distinct from
+/// [`pair_code_rejected`] on purpose: a 400 here says "you sent the wrong
+/// shape", which leaks nothing about the household, while collapsing it into
+/// the opaque 404 would leave a mistyped client with no way to tell a bug
+/// from a wrong code.
+fn pair_code_invalid_request(reason: &'static str) -> Response {
+    tracing::warn!(stage = "pair_device.code.rejected", reason);
+    cbor_error(
+        StatusCode::BAD_REQUEST,
+        BootstrapErrorCode::InvalidRequest.as_str(),
+        None,
+        None,
+    )
+}
+
+/// Big-endian pack of the six 11-bit BIP-39 indices into a fixed-width
+/// buffer, so the code check is one constant-time compare over 12 bytes
+/// rather than six integer compares that stop at the first difference.
+fn pack_code_indices(indices: [u16; PAIR_DEVICE_CODE_WORDS]) -> [u8; PAIR_DEVICE_CODE_WORDS * 2] {
+    let mut packed = [0u8; PAIR_DEVICE_CODE_WORDS * 2];
+    for (chunk, index) in packed.chunks_exact_mut(2).zip(indices) {
+        chunk.copy_from_slice(&index.to_be_bytes());
+    }
+    packed
+}
+
+/// `POST /bootstrap/pair-device-uri/by-code` — the GET sibling's response,
+/// gated on the six-word pair code the Mac is showing on screen.
+///
+/// **This is not a new trust boundary.** A correct guess yields exactly the
+/// URI `GET /bootstrap/pair-device-uri` already hands any tailnet peer with
+/// no code at all; the route exists so an iPhone that cannot reach the Mac's
+/// tailnet address can still be told, by a human reading six words aloud,
+/// which household to pair with. The peer ACL is therefore the same one the
+/// GET route enforces, not a weaker one.
+///
+/// The protection is the code itself: six BIP-39 words are 66 bits, derived
+/// from `BLAKE3(hh_pub ‖ nonce)`, and they change with every pairing window.
+/// The per-peer limiter below is an abuse ceiling, not the security boundary
+/// — it stops one admitted peer from hammering the compare and the ledger
+/// behind it, and nothing more.
+///
+/// Retrieve-only, exactly like `/api/v1/household/pair-device/initiate`: it
+/// reads the window the Mac already opened and never mints. A route that
+/// minted on demand would let anyone who can reach it invalidate the operator
+/// mid-pairing, and would hand a guesser a fresh nonce per attempt.
+pub async fn post_bootstrap_pair_device_uri_by_code(
+    State(state): State<BootstrapHandlerState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    body: Bytes,
+) -> Response {
+    // Gate 1 — peer ACL, the same admission set as the GET sibling and the
+    // reachability echo: loopback or tailnet. Everyone else gets the bare
+    // 404 an unrouted path returns, so the route's existence stays invisible
+    // to the LAN and to mesh peers.
+    if !(peer.ip().is_loopback() || crate::tailnet_address::is_tailnet_ip(peer.ip())) {
+        tracing::warn!(
+            stage = "pair_device.code.rejected",
+            reason = "peer_not_admitted",
+            peer = %peer,
+        );
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    // Gate 2 — body shape. A body that is not the canonical encoding of six
+    // wordlist words was never a guess at the code, so it answers 400
+    // `invalid_request` and says so: no household state is read to decide it,
+    // and a client that mistypes its own request can tell that apart from a
+    // wrong code.
+    let Ok(req) = strict_cbor_request::<PairDeviceUriByCodeRequest>(&body) else {
+        return pair_code_invalid_request("malformed_body");
+    };
+    if req.version != 1 {
+        return pair_code_invalid_request("unsupported_version");
+    }
+    if req.words.len() != PAIR_DEVICE_CODE_WORDS {
+        return pair_code_invalid_request("wrong_word_count");
+    }
+    let mut submitted = [0u16; PAIR_DEVICE_CODE_WORDS];
+    for (slot, word) in submitted.iter_mut().zip(req.words.iter()) {
+        // Exact match only — `word_index` does not case-fold or trim, so a
+        // client that uppercases or pads is told its request is malformed
+        // rather than silently graded as a wrong code.
+        let Some(index) = household_rs::fingerprint::word_index(word) else {
+            return pair_code_invalid_request("word_off_the_list");
+        };
+        *slot = index;
+    }
+
+    // Gate 3 — per-peer attempt ceiling, before any household state is read
+    // and before this handler queues on the process-global bootstrap
+    // serialisation. A guessing flood has to be shed at the edge: let it
+    // through and it does not just burn CPU, it stalls initialize, teardown
+    // and pairing confirm behind it.
+    //
+    // Fail closed in every direction. A denial, a limiter error and a limiter
+    // that was never wired up (short-lived install/listener paths have no
+    // `SharedState`) all take the same opaque exit as a wrong code.
+    let Some(limiter) = state.pair_code_rate_limiter.clone() else {
+        return pair_code_rejected("limiter_unavailable");
+    };
+    let peer_ip = peer.ip();
+    let admitted = tokio::task::spawn_blocking(move || {
+        crate::bootstrap_pair_code_rate_limit::check_pair_code_attempt(limiter.as_ref(), peer_ip)
+            .is_allowed()
     })
+    .await;
+    if !matches!(admitted, Ok(true)) {
+        return pair_code_rejected("attempt_ceiling");
+    }
+
+    // The remaining gates read bootstrap state, identity and owner-auth, and
+    // then read the pairing window. `post_pair_device_confirm` writes owner
+    // auth, consumes the window and advances bootstrap state under
+    // `BOOTSTRAP_MUTATION_LOCK`; taking the same lock is what makes the
+    // owner-not-paired check that decides the same check that still holds
+    // when the URI is handed out.
+    let _mutation_guard = crate::bootstrap_mutation_lock::BOOTSTRAP_MUTATION_LOCK
+        .lock()
+        .await;
+
+    // Gate 4 — state gate. Only a Mac that has been named but not yet paired
+    // has a first-owner pairing URI to hand out.
+    let current_bs = *state.bootstrap.read().await;
+    if current_bs != BootstrapState::NamedAwaitingPair {
+        tracing::warn!(
+            stage = "pair_device.code.rejected",
+            reason = "wrong_state",
+            state = current_bs.as_str(),
+        );
+        return cbor_error(
+            StatusCode::NOT_FOUND,
+            BootstrapErrorCode::ReissueUnavailable.as_str(),
+            None,
+            Some(current_bs.as_str()),
+        );
+    }
+
+    // Gate 5 — identity must be loaded in memory. Without it there is no
+    // `hh_pub` to derive the expected code from, so there is nothing to grade
+    // the submitted words against.
+    let Some(identity) = state.household.current().await else {
+        tracing::warn!(
+            stage = "pair_device.code.rejected",
+            reason = "identity_unavailable",
+        );
+        return cbor_error(
+            StatusCode::NOT_FOUND,
+            BootstrapErrorCode::IdentityUnavailable.as_str(),
+            None,
+            Some(current_bs.as_str()),
+        );
+    };
+
+    // Gate 6 — owner must NOT already be paired. Same in-memory + on-disk
+    // double check as the GET sibling, for the same reason: a freshly-loaded
+    // engine that has not hydrated `owner_auth` into memory yet must still
+    // fail closed, and an unreadable auth state is indistinguishable from a
+    // paired owner as far as this route is concerned.
+    if state.household.current_owner_auth().await.is_some() {
+        tracing::warn!(
+            stage = "pair_device.code.rejected",
+            reason = "owner_already_paired",
+        );
+        return cbor_error(
+            StatusCode::NOT_FOUND,
+            BootstrapErrorCode::AlreadyPaired.as_str(),
+            None,
+            None,
+        );
+    }
+    {
+        let now = crate::time_util::unix_now_secs_checked("pair_device.code.clock").unwrap_or(0);
+        let record_for_auth = identity.record.clone();
+        let state_dir_auth = state.state_dir.clone();
+        match tokio::task::spawn_blocking(move || {
+            HouseholdAuthState::load_optional(&state_dir_auth, &record_for_auth, now)
+        })
+        .await
+        {
+            Ok(Ok(None)) => {}
+            Ok(Ok(Some(_))) => {
+                tracing::warn!(
+                    stage = "pair_device.code.rejected",
+                    reason = "owner_already_paired_on_disk",
+                );
+                return cbor_error(
+                    StatusCode::NOT_FOUND,
+                    BootstrapErrorCode::AlreadyPaired.as_str(),
+                    None,
+                    None,
+                );
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(stage = "pair_device.code.owner_auth_load_failed", error = %e);
+                return cbor_error(
+                    StatusCode::NOT_FOUND,
+                    BootstrapErrorCode::AlreadyPaired.as_str(),
+                    None,
+                    None,
+                );
+            }
+            Err(e) => {
+                tracing::error!(stage = "pair_device.code.owner_auth_task_failed", error = %e);
+                return cbor_error(
+                    StatusCode::NOT_FOUND,
+                    BootstrapErrorCode::AlreadyPaired.as_str(),
+                    None,
+                    None,
+                );
+            }
+        }
+    }
+
+    // Gate 7 — retrieve only. `current_token` is the whole window API this
+    // route is allowed to touch: no `get_or_mint`, no `mint_token`. A closed
+    // or expired window is the same opaque rejection as a wrong code, so a
+    // guesser cannot use response shape to learn when to start guessing.
+    let Some(token) = state.pair_device_window.current_token().await else {
+        return pair_code_rejected("no_open_window");
+    };
+
+    // Gate 8 — the code itself, compared in constant time over a fixed 12
+    // bytes. Both sides are indices, never the words: the expected code is
+    // derived from this window's own nonce, so it changes with the window and
+    // is never stored.
+    let expected = household_rs::fingerprint::pair_device_fingerprint_indices(
+        identity.record.hh_pub.as_bytes(),
+        &token.nonce.0,
+    );
+    if !bool::from(pack_code_indices(expected).ct_eq(&pack_code_indices(submitted))) {
+        return pair_code_rejected("code_mismatch");
+    }
+
+    // Success — the same tail the GET route runs, so the two answers are the
+    // same bytes for the same state.
+    let Some(tail) = PairDeviceUriTail::resolve(&identity, "pair_device.code.m_cert_fp_failed")
+    else {
+        return PairDeviceUriTail::unavailable();
+    };
+
+    tracing::info!(
+        stage = "pair_device.code.served",
+        hh_id = %identity.record.hh_id,
+        expires_at_unix = token.expires_at_unix,
+        host = %tail.host_label_for_log(),
+    );
+
+    cbor_ok(tail.respond(&identity, &token))
 }
 
 /// atomic `check_and_persist` (burns nonce before cert/sig checks to prevent
@@ -3058,7 +3424,7 @@ mod m_cert_fp_ordering_guard {
     /// sits above the code it describes, so a plain substring search finds the
     /// comment and concludes the state transition happens first. The scan has
     /// to see what the compiler sees.
-    fn fn_body(source: &str, name: &str) -> String {
+    pub(super) fn fn_body(source: &str, name: &str) -> String {
         let needle = format!("\npub async fn {name}(");
         let start = source
             .find(&needle)
@@ -3083,7 +3449,7 @@ mod m_cert_fp_ordering_guard {
     /// A guard that takes the first of several matches silently measures
     /// whichever one happens to come first, which is how an anchor drifts onto
     /// the wrong statement without anyone noticing.
-    fn unique_offset(body: &str, needle: &str, ctx: &str) -> usize {
+    pub(super) fn unique_offset(body: &str, needle: &str, ctx: &str) -> usize {
         let count = body.matches(needle).count();
         assert_eq!(
             count, 1,
@@ -3558,6 +3924,11 @@ mod tests {
     use serde_json::Value;
     use tower::ServiceExt;
 
+    // Source-scan helpers shared with the fingerprint-ordering guard above,
+    // so both sets of guards see the source the same way (comments stripped,
+    // anchors asserted unique).
+    use super::m_cert_fp_ordering_guard::{fn_body, unique_offset};
+
     /// The `/bootstrap/status` body MUST carry `guest_image_failure_code` when
     /// the guest image last failed — this is the contract iOS/Mac consume.
     #[test]
@@ -3627,6 +3998,7 @@ mod tests {
             engine_port: 8091,
             tailnet_resolver: || None,
             phase3_runtime: None,
+            pair_code_rate_limiter: None,
         }
     }
 
@@ -4006,6 +4378,7 @@ mod tests {
             engine_port: 8091,
             tailnet_resolver: || None,
             phase3_runtime: None,
+            pair_code_rate_limiter: None,
         };
         (state, td)
     }
@@ -4744,5 +5117,659 @@ mod tests {
         assert!(body.pair_device_uri.contains("&house_name="));
         let token = window.current_token().await.unwrap();
         assert_eq!(token.expires_at_unix, body.expires_at);
+    }
+
+    // ── POST /bootstrap/pair-device-uri/by-code ─────────────────────────
+
+    /// `make_state_with_identity` plus a per-peer limiter. An absent limiter
+    /// fails closed by design, so any test that expects to reach a gate past
+    /// the limiter has to wire one up.
+    fn make_by_code_state(bs: BootstrapState) -> (BootstrapHandlerState, tempfile::TempDir) {
+        by_code_state_with_limit(bs, 1_000)
+    }
+
+    fn by_code_state_with_limit(
+        bs: BootstrapState,
+        per_hour: i64,
+    ) -> (BootstrapHandlerState, tempfile::TempDir) {
+        let (state, td) = make_state_with_identity(bs);
+        let limiter = Limiter::new(":memory:", per_hour).expect("in-memory limiter");
+        (state.with_pair_code_rate_limiter(Arc::new(limiter)), td)
+    }
+
+    fn by_code_body(version: u8, words: &[&str]) -> Vec<u8> {
+        #[derive(serde::Serialize)]
+        struct CodeBody<'a> {
+            #[serde(rename = "v")]
+            v: u8,
+            words: &'a [&'a str],
+        }
+        household_rs::cbor::to_canonical_vec(&CodeBody { v: version, words }).expect("encode code")
+    }
+
+    fn by_code_request_from(peer: SocketAddr, body: Vec<u8>) -> Request<Body> {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/bootstrap/pair-device-uri/by-code")
+            .body(Body::from(body))
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(peer));
+        request
+    }
+
+    fn by_code_request(body: Vec<u8>) -> Request<Body> {
+        by_code_request_from(tailnet_peer(), body)
+    }
+
+    /// The six words the Mac is showing for `state`'s currently open window.
+    async fn open_window_code(state: &BootstrapHandlerState) -> [&'static str; 6] {
+        let identity = state.household.current().await.expect("identity loaded");
+        let token = state
+            .pair_device_window
+            .current_token()
+            .await
+            .expect("window open");
+        household_rs::fingerprint::pair_device_fingerprint_words(
+            identity.record.hh_pub.as_bytes(),
+            &token.nonce.0,
+        )
+    }
+
+    /// A code that is guaranteed *not* to be `right`: same shape, six real
+    /// wordlist entries, one word deliberately different. Derived rather than
+    /// hard-coded so the test can never accidentally submit the real code.
+    fn wrong_code(right: &[&'static str; 6]) -> [&'static str; 6] {
+        let mut wrong = *right;
+        wrong[0] = if right[0] == "abandon" {
+            "ability"
+        } else {
+            "abandon"
+        };
+        assert_ne!(&wrong, right);
+        wrong
+    }
+
+    /// A syntactically valid code used where the words can never be graded
+    /// (no window, expired window) — six real wordlist entries.
+    const ANY_VALID_CODE: [&str; 6] = ["abandon", "ability", "able", "about", "above", "absent"];
+
+    async fn body_bytes(response: Response) -> Vec<u8> {
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec()
+    }
+
+    #[tokio::test]
+    async fn pair_device_uri_by_code_admits_loopback_and_tailnet_peers() {
+        // Same admission set as the GET sibling — the by-code route is a
+        // second door onto the same URI, not a wider one.
+        for peer in [
+            SocketAddr::from(([127, 0, 0, 1], 41234)),
+            tailnet_peer(),
+            SocketAddr::from((
+                "fd7a:115c:a1e0::1".parse::<std::net::Ipv6Addr>().unwrap(),
+                41234,
+            )),
+        ] {
+            let (state, _td) = make_by_code_state(BootstrapState::NamedAwaitingPair);
+            state
+                .pair_device_window
+                .mint_token(Duration::from_secs(300), None)
+                .await
+                .expect("pre-mint");
+            let code = open_window_code(&state).await;
+            let app = bootstrap_router(state);
+            let resp = app
+                .oneshot(by_code_request_from(peer, by_code_body(1, &code)))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), HStatus::OK, "peer {peer} must be admitted");
+        }
+    }
+
+    #[tokio::test]
+    async fn pair_device_uri_by_code_rejects_lan_and_mesh_peers() {
+        // Even holding the correct code, a LAN or mesh peer gets the bare 404
+        // an unrouted path returns: the ACL runs before the code is graded.
+        for peer in [
+            SocketAddr::from(([192, 168, 1, 50], 41234)),
+            SocketAddr::from(([10, 0, 0, 7], 41234)),
+            SocketAddr::from(([10, 44, 1, 5], 41234)),
+        ] {
+            let (state, _td) = make_by_code_state(BootstrapState::NamedAwaitingPair);
+            state
+                .pair_device_window
+                .mint_token(Duration::from_secs(300), None)
+                .await
+                .expect("pre-mint");
+            let code = open_window_code(&state).await;
+            let app = bootstrap_router(state);
+            let resp = app
+                .oneshot(by_code_request_from(peer, by_code_body(1, &code)))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                HStatus::NOT_FOUND,
+                "peer {peer} must be refused"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pair_device_uri_by_code_rejected_peer_leaks_no_body() {
+        let (state, _td) = make_by_code_state(BootstrapState::NamedAwaitingPair);
+        let app = bootstrap_router(state);
+        let resp = app
+            .oneshot(by_code_request_from(
+                SocketAddr::from(([192, 168, 1, 50], 41234)),
+                by_code_body(1, &ANY_VALID_CODE),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HStatus::NOT_FOUND);
+        assert!(
+            body_bytes(resp).await.is_empty(),
+            "a refused peer must not learn the route exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn pair_device_uri_by_code_state_gate_rejects_non_named_awaiting_pair() {
+        for bs in [
+            BootstrapState::Uninitialized,
+            BootstrapState::ReadyForNaming,
+            BootstrapState::Ready,
+            BootstrapState::Recovering,
+        ] {
+            let (state, _td) = make_by_code_state(bs);
+            let app = bootstrap_router(state);
+            let resp = app
+                .oneshot(by_code_request(by_code_body(1, &ANY_VALID_CODE)))
+                .await
+                .unwrap();
+            let (status, body) = decode_cbor_error(resp).await;
+            assert_eq!(status, HStatus::NOT_FOUND, "state={bs:?}");
+            assert_eq!(body.error, "reissue_unavailable", "state={bs:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pair_device_uri_by_code_identity_unavailable_when_no_identity_loaded() {
+        let (state, _td) = make_by_code_state(BootstrapState::NamedAwaitingPair);
+        let state = BootstrapHandlerState {
+            household: HouseholdState::empty(),
+            ..state
+        };
+        let app = bootstrap_router(state);
+        let resp = app
+            .oneshot(by_code_request(by_code_body(1, &ANY_VALID_CODE)))
+            .await
+            .unwrap();
+        let (status, body) = decode_cbor_error(resp).await;
+        assert_eq!(status, HStatus::NOT_FOUND);
+        assert_eq!(body.error, "identity_unavailable");
+    }
+
+    #[tokio::test]
+    async fn pair_device_uri_by_code_already_paired_when_owner_auth_present() {
+        let (state, td) = make_by_code_state(BootstrapState::NamedAwaitingPair);
+        state
+            .pair_device_window
+            .mint_token(Duration::from_secs(300), None)
+            .await
+            .expect("pre-mint");
+        let code = open_window_code(&state).await;
+        let identity = state.household.current().await.unwrap();
+        let owner_auth = real_owner_auth(&identity, Some(td.path()));
+        let household =
+            HouseholdState::loaded_with_owner_auth(Arc::clone(&identity), Some(owner_auth));
+        let state = BootstrapHandlerState { household, ..state };
+        let app = bootstrap_router(state);
+        // Even the *correct* code does not reopen a household that is paired.
+        let resp = app
+            .oneshot(by_code_request(by_code_body(1, &code)))
+            .await
+            .unwrap();
+        let (status, body) = decode_cbor_error(resp).await;
+        assert_eq!(status, HStatus::NOT_FOUND);
+        assert_eq!(body.error, "already_paired");
+    }
+
+    #[tokio::test]
+    async fn pair_device_uri_by_code_already_paired_via_on_disk_guard_only() {
+        // Owner-auth persisted but not hydrated into memory — the defensive
+        // on-disk load must still fail closed.
+        let (state, td) = make_by_code_state(BootstrapState::NamedAwaitingPair);
+        state
+            .pair_device_window
+            .mint_token(Duration::from_secs(300), None)
+            .await
+            .expect("pre-mint");
+        let code = open_window_code(&state).await;
+        let identity = state.household.current().await.unwrap();
+        let _ = real_owner_auth(&identity, Some(td.path())); // persisted, not in memory
+        let app = bootstrap_router(state);
+        let resp = app
+            .oneshot(by_code_request(by_code_body(1, &code)))
+            .await
+            .unwrap();
+        let (status, body) = decode_cbor_error(resp).await;
+        assert_eq!(status, HStatus::NOT_FOUND);
+        assert_eq!(body.error, "already_paired");
+    }
+
+    #[tokio::test]
+    async fn pair_device_uri_by_code_malformed_bodies_are_invalid_request() {
+        // A body that was never a six-word code is a plain 400 that says so.
+        // Collapsing these into the opaque 404 would leave a client unable to
+        // tell its own encoding bug from a wrong code.
+        #[derive(serde::Serialize)]
+        struct ExtraField<'a> {
+            #[serde(rename = "v")]
+            v: u8,
+            words: &'a [&'a str],
+            extra: u8,
+        }
+
+        let five: Vec<&str> = ANY_VALID_CODE[..5].to_vec();
+        let mut off_list = ANY_VALID_CODE;
+        off_list[3] = "notabip39word";
+        let mut uppercase = ANY_VALID_CODE;
+        uppercase[2] = "Able";
+        let mut padded = ANY_VALID_CODE;
+        padded[1] = "ability ";
+
+        let bodies: Vec<(&str, Vec<u8>)> = vec![
+            ("not cbor at all", vec![0xff, 0xff, 0xff, 0xff]),
+            ("wrong version", by_code_body(2, &ANY_VALID_CODE)),
+            ("five words", by_code_body(1, &five)),
+            ("seven words", by_code_body(1, &["abandon"; 7])),
+            ("word off the wordlist", by_code_body(1, &off_list)),
+            ("uppercase word", by_code_body(1, &uppercase)),
+            ("trailing space", by_code_body(1, &padded)),
+            ("trailing bytes after the item", {
+                let mut padded = by_code_body(1, &ANY_VALID_CODE);
+                padded.push(0x00);
+                padded
+            }),
+            (
+                "unknown field",
+                household_rs::cbor::to_canonical_vec(&ExtraField {
+                    v: 1,
+                    words: &ANY_VALID_CODE,
+                    extra: 7,
+                })
+                .expect("encode"),
+            ),
+        ];
+
+        for (label, body) in bodies {
+            let (state, _td) = make_by_code_state(BootstrapState::NamedAwaitingPair);
+            state
+                .pair_device_window
+                .mint_token(Duration::from_secs(300), None)
+                .await
+                .expect("pre-mint");
+            let app = bootstrap_router(state);
+            let resp = app.oneshot(by_code_request(body)).await.unwrap();
+            let (status, decoded) = decode_cbor_error(resp).await;
+            assert_eq!(status, HStatus::BAD_REQUEST, "{label}");
+            assert_eq!(decoded.error, "invalid_request", "{label}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pair_device_uri_by_code_wrong_words_never_touch_the_window() {
+        // The whole point of retrieve-only: a guess must not mint, must not
+        // replace, and must not disturb the snapshot the daemon would reload.
+        let (state, _td) = make_by_code_state(BootstrapState::NamedAwaitingPair);
+        state
+            .pair_device_window
+            .mint_token(Duration::from_secs(300), None)
+            .await
+            .expect("pre-mint");
+        let code = open_window_code(&state).await;
+        let window = Arc::clone(&state.pair_device_window);
+        let nonce_before = window.current_token().await.unwrap().nonce.as_b64();
+        let snapshot_before = window.read_persisted_snapshot().expect("read snapshot");
+        assert!(
+            snapshot_before.is_some(),
+            "precondition: the open window is persisted"
+        );
+
+        let app = bootstrap_router(state);
+        let resp = app
+            .oneshot(by_code_request(by_code_body(1, &wrong_code(&code))))
+            .await
+            .unwrap();
+        let (status, body) = decode_cbor_error(resp).await;
+        assert_eq!(status, HStatus::NOT_FOUND);
+        assert_eq!(body.error, "pair_code_rejected");
+
+        assert_eq!(
+            window.current_token().await.unwrap().nonce.as_b64(),
+            nonce_before,
+            "a wrong code must not re-mint the window"
+        );
+        assert_eq!(
+            window.read_persisted_snapshot().expect("read snapshot"),
+            snapshot_before,
+            "a wrong code must not rewrite the persisted snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn pair_device_uri_by_code_missing_expired_and_wrong_are_byte_identical() {
+        // No window, an expired window and a wrong code are the same answer
+        // on the wire. Anything else is an oracle for whether the Mac is
+        // currently showing a code at all.
+        let (no_window, _td_a) = make_by_code_state(BootstrapState::NamedAwaitingPair);
+        let closed_window = Arc::clone(&no_window.pair_device_window);
+        assert!(
+            closed_window.current_token().await.is_none(),
+            "precondition: no window"
+        );
+        let missing = body_bytes(
+            bootstrap_router(no_window)
+                .oneshot(by_code_request(by_code_body(1, &ANY_VALID_CODE)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(
+            closed_window.current_token().await.is_none(),
+            "a rejected attempt against a closed window must not open one"
+        );
+
+        let (expired_state, _td_b) = make_by_code_state(BootstrapState::NamedAwaitingPair);
+        expired_state
+            .pair_device_window
+            .mint_token(Duration::from_secs(0), None)
+            .await
+            .expect("mint already-expired token");
+        assert!(
+            expired_state
+                .pair_device_window
+                .current_token()
+                .await
+                .is_none(),
+            "precondition: the window expired on mint"
+        );
+        let expired = body_bytes(
+            bootstrap_router(expired_state)
+                .oneshot(by_code_request(by_code_body(1, &ANY_VALID_CODE)))
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        let (open_state, _td_c) = make_by_code_state(BootstrapState::NamedAwaitingPair);
+        open_state
+            .pair_device_window
+            .mint_token(Duration::from_secs(300), None)
+            .await
+            .expect("pre-mint");
+        let code = open_window_code(&open_state).await;
+        let mismatch = body_bytes(
+            bootstrap_router(open_state)
+                .oneshot(by_code_request(by_code_body(1, &wrong_code(&code))))
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        assert!(!mismatch.is_empty());
+        assert_eq!(missing, mismatch, "no window must look like a wrong code");
+        assert_eq!(
+            expired, mismatch,
+            "an expired window must look like a wrong code"
+        );
+    }
+
+    #[tokio::test]
+    async fn pair_device_uri_by_code_matching_words_return_the_get_route_response() {
+        // The success path is the GET route's answer, byte for byte, for the
+        // same state — that is what the shared tail exists to guarantee.
+        let (state, _td) = make_by_code_state(BootstrapState::NamedAwaitingPair);
+        state
+            .pair_device_window
+            .mint_token(Duration::from_secs(300), None)
+            .await
+            .expect("pre-mint");
+        let code = open_window_code(&state).await;
+        let window = Arc::clone(&state.pair_device_window);
+        let nonce_before = window.current_token().await.unwrap().nonce.as_b64();
+
+        let get_response = bootstrap_router(state.clone())
+            .oneshot(pair_device_uri_request())
+            .await
+            .unwrap();
+        assert_eq!(get_response.status(), HStatus::OK);
+        let get_bytes = body_bytes(get_response).await;
+
+        let by_code_response = bootstrap_router(state)
+            .oneshot(by_code_request(by_code_body(1, &code)))
+            .await
+            .unwrap();
+        assert_eq!(by_code_response.status(), HStatus::OK);
+        let by_code_bytes = body_bytes(by_code_response).await;
+
+        assert_eq!(
+            by_code_bytes, get_bytes,
+            "the by-code answer must be the GET answer, byte for byte"
+        );
+        let decoded: PairDeviceUriResponseForTest =
+            household_rs::cbor::from_canonical_slice(&by_code_bytes).expect("CBOR decode");
+        assert!(
+            decoded
+                .pair_device_uri
+                .contains(&format!("&nonce={nonce_before}")),
+            "must echo the open window's nonce: {}",
+            decoded.pair_device_uri
+        );
+        assert_eq!(
+            window.current_token().await.unwrap().nonce.as_b64(),
+            nonce_before,
+            "a correct code must not re-mint the window either"
+        );
+    }
+
+    #[tokio::test]
+    async fn pair_device_uri_by_code_rate_limited_is_the_same_opaque_404() {
+        // Limit 1/h: the first attempt is graded, the second is shed. The shed
+        // one must be indistinguishable from a wrong code.
+        let (state, _td) = by_code_state_with_limit(BootstrapState::NamedAwaitingPair, 1);
+        state
+            .pair_device_window
+            .mint_token(Duration::from_secs(300), None)
+            .await
+            .expect("pre-mint");
+        let code = open_window_code(&state).await;
+
+        let first = bootstrap_router(state.clone())
+            .oneshot(by_code_request(by_code_body(1, &code)))
+            .await
+            .unwrap();
+        assert_eq!(
+            first.status(),
+            HStatus::OK,
+            "the first attempt is inside the ceiling"
+        );
+
+        let second = bootstrap_router(state.clone())
+            .oneshot(by_code_request(by_code_body(1, &code)))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), HStatus::NOT_FOUND);
+        let limited = body_bytes(second).await;
+
+        let mismatch = body_bytes(
+            bootstrap_router(state)
+                .oneshot(by_code_request(by_code_body(1, &wrong_code(&code))))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            limited, mismatch,
+            "a rate-limited attempt must look like a wrong code"
+        );
+    }
+
+    #[tokio::test]
+    async fn pair_device_uri_by_code_limiter_error_and_absence_fail_closed() {
+        // A limiter that cannot answer is not a reason to answer anyway.
+        let (state, td) = make_state_with_identity(BootstrapState::NamedAwaitingPair);
+        state
+            .pair_device_window
+            .mint_token(Duration::from_secs(300), None)
+            .await
+            .expect("pre-mint");
+        let code = open_window_code(&state).await;
+
+        // Reference answer: a wrong code against a working limiter.
+        let working = state
+            .clone()
+            .with_pair_code_rate_limiter(Arc::new(Limiter::new(":memory:", 1_000).unwrap()));
+        let mismatch = body_bytes(
+            bootstrap_router(working)
+                .oneshot(by_code_request(by_code_body(1, &wrong_code(&code))))
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        // A limiter whose ledger has been pulled out from under it: `check`
+        // returns Err, which must reject rather than fall open.
+        let db_path = td.path().join("pair-code-ratelimit.db");
+        let broken = Limiter::new(db_path.to_str().unwrap(), 1_000).expect("limiter");
+        core_rs::db::open_wal(&db_path)
+            .expect("second connection")
+            .execute_batch("DROP TABLE rate_limits;")
+            .expect("drop ledger");
+        let broken_state = state.clone().with_pair_code_rate_limiter(Arc::new(broken));
+        let errored = bootstrap_router(broken_state)
+            .oneshot(by_code_request(by_code_body(1, &code)))
+            .await
+            .unwrap();
+        assert_eq!(errored.status(), HStatus::NOT_FOUND);
+        assert_eq!(
+            body_bytes(errored).await,
+            mismatch,
+            "a limiter error must look like a wrong code, not like success"
+        );
+
+        // No limiter wired at all (short-lived install/listener paths).
+        assert!(state.pair_code_rate_limiter.is_none());
+        let absent = bootstrap_router(state)
+            .oneshot(by_code_request(by_code_body(1, &code)))
+            .await
+            .unwrap();
+        assert_eq!(absent.status(), HStatus::NOT_FOUND);
+        assert_eq!(
+            body_bytes(absent).await,
+            mismatch,
+            "an unwired limiter must fail closed too"
+        );
+    }
+
+    // ── by-code source guards ───────────────────────────────────────────
+
+    /// Retrieve-only is a property of the code, not of the current test suite:
+    /// a mint here would let anyone who can reach the route invalidate the
+    /// operator's live window, and would hand a guesser a fresh nonce (and a
+    /// fresh expected code) on every attempt.
+    #[test]
+    fn pair_device_uri_by_code_never_mints_a_window() {
+        let body = fn_body(
+            include_str!("handlers_bootstrap.rs"),
+            "post_bootstrap_pair_device_uri_by_code",
+        );
+        for minting in ["get_or_mint", "mint_token"] {
+            assert!(
+                !body.contains(minting),
+                "the by-code handler must never call `{minting}` — it is retrieve-only"
+            );
+        }
+        assert!(
+            body.contains("current_token()"),
+            "the by-code handler reads the window via current_token()"
+        );
+    }
+
+    /// The limiter is the cheap gate. If it drifts below the owner-auth disk
+    /// read, a guessing flood buys a filesystem round trip per attempt before
+    /// anything sheds it.
+    #[test]
+    fn pair_device_uri_by_code_rate_limits_before_the_owner_auth_disk_read() {
+        let body = fn_body(
+            include_str!("handlers_bootstrap.rs"),
+            "post_bootstrap_pair_device_uri_by_code",
+        );
+        let limiter = unique_offset(&body, "check_pair_code_attempt(", "by_code");
+        let disk = unique_offset(&body, "load_optional", "by_code");
+        assert!(
+            limiter < disk,
+            "the per-peer limiter must run before the on-disk owner-auth read"
+        );
+        let lock = unique_offset(&body, "BOOTSTRAP_MUTATION_LOCK", "by_code");
+        assert!(
+            limiter < lock,
+            "the per-peer limiter must run before the process-global mutation lock"
+        );
+    }
+
+    /// The code comparison decides whether a caller gets the household. A
+    /// byte-by-byte `==` would leak the length of the correct prefix through
+    /// timing; the fixed-width constant-time compare is the point.
+    #[test]
+    fn pair_device_uri_by_code_compares_the_code_in_constant_time() {
+        let body = fn_body(
+            include_str!("handlers_bootstrap.rs"),
+            "post_bootstrap_pair_device_uri_by_code",
+        );
+        assert!(
+            body.contains(".ct_eq("),
+            "the submitted code must be compared with subtle's ct_eq"
+        );
+        assert!(
+            !body.contains("== expected") && !body.contains("expected =="),
+            "no short-circuiting equality on the expected code"
+        );
+    }
+
+    /// Every `pair_device.code.*` log line, wherever it lives in this module,
+    /// must be free of the code words and of the URI (nonce included). The
+    /// Mac's log is readable by anything that can read the disk.
+    #[test]
+    fn pair_device_uri_by_code_logs_carry_neither_the_words_nor_the_uri() {
+        let source = include_str!("handlers_bootstrap.rs");
+        let production = source
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("production half");
+        let banned = ["words", "nonce", "uri", "hh_pub", "m_cert_fp", "submitted"];
+        let mut checked = 0;
+        for (at, _) in production.match_indices("tracing::") {
+            let rest = &production[at..];
+            let end = rest.find(");").map_or(rest.len(), |e| e + 2);
+            let call = &rest[..end];
+            if !call.contains("stage = \"pair_device.code.") {
+                continue;
+            }
+            checked += 1;
+            for needle in banned {
+                assert!(
+                    !call.contains(needle),
+                    "a pair_device.code log line names `{needle}`:\n{call}"
+                );
+            }
+        }
+        assert!(
+            checked >= 3,
+            "expected the by-code log sites to be found, saw {checked}"
+        );
     }
 }

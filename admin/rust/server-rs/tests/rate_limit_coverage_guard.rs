@@ -56,6 +56,17 @@ fn literal_in_call(window: &str, marker: &str) -> Option<String> {
     Some(args[q1 + 1..q1 + 1 + q2].to_string())
 }
 
+/// End of the 200-byte scan window starting at `at`, clamped down to a char
+/// boundary so a window that would otherwise cut through a multi-byte
+/// character (e.g. the `─` rules in section banners) cannot panic the scan.
+fn window_end(source: &str, at: usize) -> usize {
+    let mut end = (at + 200).min(source.len());
+    while !source.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
 /// Literal rate-limit actions handed to the limiter in `source`, whether passed
 /// directly via `rate_limiter ... .check(..., "ACTION")` or through the P7-C
 /// helper `actor_action_allowed(..., "ACTION")`. Window-scans (robust to
@@ -68,7 +79,7 @@ fn limiter_action_literals(source: &str) -> Vec<String> {
     while let Some(idx) = source[from..].find("rate_limiter") {
         let at = from + idx;
         from = at + "rate_limiter".len();
-        let window = &source[at..(at + 200).min(source.len())];
+        let window = &source[at..window_end(source, at)];
         if let Some(action) = literal_in_call(window, ".check(") {
             actions.push(action);
         }
@@ -77,7 +88,7 @@ fn limiter_action_literals(source: &str) -> Vec<String> {
     while let Some(idx) = source[from..].find("actor_action_allowed(") {
         let at = from + idx;
         from = at + "actor_action_allowed(".len();
-        let window = &source[at..(at + 200).min(source.len())];
+        let window = &source[at..window_end(source, at)];
         if let Some(action) = literal_in_call(window, "actor_action_allowed(") {
             actions.push(action);
         }
@@ -140,6 +151,17 @@ const COVERAGE: &[(&str, &str, Class)] = &[
         "handle_household_uninstall_claw",
         "handlers_household_claws.rs",
         Class::RateLimited("claw_uninstall"),
+    ),
+    // --- Rate-limited per peer address (pair-code verify; fail-closed adapter) ---
+    (
+        "check_pair_code_attempt",
+        "bootstrap_pair_code_rate_limit.rs",
+        Class::RateLimited("pair_code_verify_peer"),
+    ),
+    (
+        "post_bootstrap_pair_device_uri_by_code",
+        "handlers_bootstrap.rs",
+        Class::RateLimitedViaInheritance("check_pair_code_attempt"),
     ),
     // --- owner-PoP gated, currently NOT rate-limited (limiter candidates) ---
     (
@@ -266,6 +288,10 @@ fn limiter_check_sites_are_exactly_the_classified_set() {
     expected.insert(
         "owner_webauthn_recovery_consume_rate_limit.rs".to_string(),
         vec!["owner_webauthn_recovery_consume".to_string()],
+    );
+    expected.insert(
+        "bootstrap_pair_code_rate_limit.rs".to_string(),
+        vec!["pair_code_verify_peer".to_string()],
     );
 
     assert_eq!(

@@ -83,6 +83,7 @@ fn make_bootstrap_state(bs: BootstrapState, state_dir: PathBuf) -> BootstrapHand
         engine_port: 8091,
         tailnet_resolver: || None,
         phase3_runtime: None,
+        pair_code_rate_limiter: None,
     }
 }
 
@@ -268,6 +269,7 @@ async fn scenario_b_full_happy_path() {
         engine_port: 8091,
         tailnet_resolver: || None,
         phase3_runtime: None,
+        pair_code_rate_limiter: None,
     };
     let (status, body) = {
         let app = bootstrap_router(state.clone());
@@ -455,6 +457,7 @@ async fn scenario_b_second_claim_after_initialize_returns_409() {
         engine_port: 8091,
         tailnet_resolver: || None,
         phase3_runtime: None,
+        pair_code_rate_limiter: None,
     };
 
     // Claim and initialize to advance state.

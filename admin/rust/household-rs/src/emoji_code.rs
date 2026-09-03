@@ -4,7 +4,8 @@
 //! ## Algorithm (cross-language invariant — Swift implementation MUST match byte-for-byte)
 //!
 //! 1. Compute `digest = BLAKE3-256(m_pub_sec1 ‖ nonce ‖ hostname_utf8)`.
-//! 2. Extract six 11-bit indices using the same bit-extraction as `fingerprint.rs`:
+//! 2. Extract six 11-bit indices with `fingerprint::extract_indices` (shared, not
+//!    duplicated, so the two derivations cannot drift):
 //!    - Each index `i ∈ [0, 2047]` selects one entry from
 //!      `emoji-security-code-wordlist.csv`.
 //! 3. Return the six emoji characters (Unicode scalars from the CSV).
@@ -14,6 +15,8 @@
 //! `specs/005-soyeht-onboarding/contracts/emoji-security-code-wordlist.csv`
 //! is embedded at compile time via `include_str!`. Any deviation between
 //! the Rust parse and the CSV file is a test failure.
+
+use crate::fingerprint::extract_indices;
 
 // The CSV is embedded at compile time so the mapping is always in sync with
 // the contract file — no runtime I/O needed. `build.rs` resolves the
@@ -53,23 +56,6 @@ fn emoji_table() -> &'static Vec<(String, String)> {
     EMOJI_TABLE.get_or_init(build_emoji_table)
 }
 
-/// Extract six 11-bit indices from the first 9 bytes of a 32-byte digest.
-///
-/// Identical to `fingerprint::extract_indices` — shares the bit-extraction
-/// logic so both fingerprint (BIP-39 words) and emoji code (emoji) use the
-/// same derivation step.
-#[must_use]
-fn extract_11bit_indices(digest: &[u8; 32]) -> [u16; 6] {
-    let b = |i: usize| u16::from(digest[i]);
-    let i0 = (b(0) << 3) | (b(1) >> 5);
-    let i1 = ((b(1) & 0x1f) << 6) | (b(2) >> 2);
-    let i2 = ((b(2) & 0x03) << 9) | (b(3) << 1) | (b(4) >> 7);
-    let i3 = ((b(4) & 0x7f) << 4) | (b(5) >> 4);
-    let i4 = ((b(5) & 0x0f) << 7) | (b(6) >> 1);
-    let i5 = ((b(6) & 0x01) << 10) | (b(7) << 2) | (b(8) >> 6);
-    [i0, i1, i2, i3, i4, i5]
-}
-
 /// Derive the 6-emoji security code for a `(m_pub, nonce, hostname)` triple.
 ///
 /// **Cross-language contract**: the Swift implementation in `SoyehtCore` MUST
@@ -94,7 +80,7 @@ pub fn derive_emoji_code(m_pub_sec1: &[u8; 33], nonce: &[u8; 32], hostname: &str
         *hasher.finalize().as_bytes()
     };
 
-    let indices = extract_11bit_indices(&digest);
+    let indices = extract_indices(&digest);
     let table = emoji_table();
     std::array::from_fn(|i| table[indices[i] as usize].0.clone())
 }
@@ -161,7 +147,7 @@ mod tests {
 
     #[test]
     fn indices_within_range() {
-        // Feed many distinct digests through extract_11bit_indices and verify all
+        // Feed many distinct digests through extract_indices and verify all
         // indices are in [0, 2047].
         for seed in 0u8..=255 {
             let digest: [u8; 32] = {
@@ -174,7 +160,7 @@ mod tests {
                 }
                 d
             };
-            for idx in extract_11bit_indices(&digest) {
+            for idx in extract_indices(&digest) {
                 assert!(idx < 2048, "index {idx} out of range for seed {seed}");
             }
         }

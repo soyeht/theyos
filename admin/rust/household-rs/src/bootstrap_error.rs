@@ -77,6 +77,11 @@ pub enum BootstrapErrorCode {
     /// kept here because the iPhone's `BootstrapStatusClient` retries on it and
     /// `BootstrapState` renders copy for it. Legacy / iOS-facing.
     EngineInitializing,
+    /// The pair-device code did not verify: wrong words, no open window, an
+    /// expired window, or the per-peer attempt ceiling was reached. One opaque
+    /// 404 for all of them by design — the caller learns nothing beyond "type
+    /// the six words on the Mac's screen again".
+    PairCodeRejected,
     /// Unrecognized / future code (fail-soft catch-all).
     #[serde(other)]
     Unknown,
@@ -113,6 +118,7 @@ impl BootstrapErrorCode {
             Self::InvitationNotFound => "invitation_not_found",
             Self::AcceptHouseholdNotPending => "accept_household_not_pending",
             Self::EngineInitializing => "engine_initializing",
+            Self::PairCodeRejected => "pair_code_rejected",
             Self::Unknown => "unknown",
         }
     }
@@ -145,12 +151,13 @@ impl BootstrapErrorCode {
             "invitation_not_found" => Self::InvitationNotFound,
             "accept_household_not_pending" => Self::AcceptHouseholdNotPending,
             "engine_initializing" => Self::EngineInitializing,
+            "pair_code_rejected" => Self::PairCodeRejected,
             _ => Self::Unknown,
         }
     }
 
     /// Every concrete (non-`Unknown`) code, for exhaustiveness tests + fixtures.
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 25] = [
         Self::InvalidCbor,
         Self::InvalidRequest,
         Self::InvalidName,
@@ -175,6 +182,7 @@ impl BootstrapErrorCode {
         Self::InvitationNotFound,
         Self::AcceptHouseholdNotPending,
         Self::EngineInitializing,
+        Self::PairCodeRejected,
     ];
 }
 
@@ -250,10 +258,11 @@ mod tests {
                 | BootstrapErrorCode::InvitationExpiredOrSpent
                 | BootstrapErrorCode::InvitationNotFound
                 | BootstrapErrorCode::AcceptHouseholdNotPending
-                | BootstrapErrorCode::EngineInitializing => {}
+                | BootstrapErrorCode::EngineInitializing
+                | BootstrapErrorCode::PairCodeRejected => {}
                 BootstrapErrorCode::Unknown => panic!("ALL must not contain Unknown"),
             }
         }
-        assert_eq!(BootstrapErrorCode::ALL.len(), 24);
+        assert_eq!(BootstrapErrorCode::ALL.len(), 25);
     }
 }

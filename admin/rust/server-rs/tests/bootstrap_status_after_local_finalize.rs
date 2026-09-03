@@ -120,6 +120,7 @@ fn make_bootstrap_handler_state(
         engine_port: 8091,
         tailnet_resolver: no_tailnet,
         phase3_runtime: None,
+        pair_code_rate_limiter: None,
     }
 }
 
