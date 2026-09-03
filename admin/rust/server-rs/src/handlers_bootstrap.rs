@@ -26,6 +26,7 @@ use axum::{
     routing::{get, post},
 };
 
+use crate::bootstrap_pair_code_rate_limit::PairCodeRateLimiter;
 use crate::setup_invitation::SetupInvitationCache;
 use household_rs::HouseholdAuthState;
 use household_rs::MachineCert;
@@ -274,7 +275,7 @@ pub struct BootstrapHandlerState {
     /// that have `SharedState`; short-lived install/listener paths and
     /// handler tests leave it `None`, and the by-code handler fails closed
     /// (same opaque reject as a wrong code) when it is absent.
-    pub pair_code_rate_limiter: Option<Arc<Limiter>>,
+    pub pair_code_rate_limiter: Option<Arc<PairCodeRateLimiter>>,
 }
 
 pub type BootstrapStateArc = Arc<RwLock<BootstrapState>>;
@@ -315,7 +316,9 @@ impl BootstrapHandlerState {
 
     #[must_use]
     pub fn with_pair_code_rate_limiter(mut self, limiter: Arc<Limiter>) -> Self {
-        self.pair_code_rate_limiter = Some(limiter);
+        // The ledger comes in; what the state holds is the ledger plus its
+        // in-process shed gate, one per engine.
+        self.pair_code_rate_limiter = Some(Arc::new(PairCodeRateLimiter::new(limiter)));
         self
     }
 }

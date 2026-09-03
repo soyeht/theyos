@@ -13,7 +13,11 @@
 //! `admin/rust/household-rs/tests/data/pair_device_fingerprint_vectors.json`.
 //! The iSoyehtTerm Swift test target derives the same pairs through
 //! `OperatorFingerprint.derive(machinePublicKey:pairingNonce:wordlist:)`
-//! and asserts byte-equal output. Each entry exposes BOTH the `indices`
+//! and asserts byte-equal output, in
+//! `Packages/SoyehtCore/Tests/SoyehtCoreTests/PairDeviceFingerprintVectorsTests.swift`.
+//! That sentence was aspirational when this file was written — no Swift
+//! test read these vectors, so the contract was locked on one side only.
+//! It is named here so the claim stays checkable. Each entry exposes BOTH the `indices`
 //! array and the `words` array so each side of the cross-repo gate can
 //! pick the shape that matches its existing assertion conventions
 //! without re-deriving anything.

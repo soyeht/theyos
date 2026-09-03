@@ -468,7 +468,15 @@ fn r1a7_enumerates_linked_targets_and_proves_zero_production_callers() {
     // `[[test]]`-kind target, no bin, no example. Re-measured on this tree:
     // the enumerator reported `left: 211, right: 210` before this line moved,
     // and the named `any()` below pins that the +1 is that file.
-    assert_eq!(targets.len(), 211, "Cargo target inventory changed");
+    //
+    // 211 + 1: `household-rs/tests/emoji_code_vectors.rs`, golden vectors for
+    // `derive_emoji_code`. It exists because that function shares
+    // `fingerprint::extract_indices` with the six-word pair-device code and
+    // had no pinned output of its own, so an edit made for BIP-39 reasons
+    // would have changed the emoji a person compares across two screens with
+    // nothing going red. One auto-discovered `[[test]]`-kind target; the
+    // named `any()` below pins that the +1 is that file.
+    assert_eq!(targets.len(), 212, "Cargo target inventory changed");
     assert_eq!(
         targets.iter().filter(|target| target.kind == "bin").count(),
         // 50 + 2: both of `nat-probe-rs`'s entries are bin-kind. The test and
@@ -494,7 +502,9 @@ fn r1a7_enumerates_linked_targets_and_proves_zero_production_callers() {
         // 157 + 1: `pair_device_fingerprint.rs` (see the total assert's own
         // comment above) is a `[[test]]`-kind target — `bin`/`example` below
         // are unaffected.
-        158
+        //
+        // 158 + 1: `emoji_code_vectors.rs`, likewise `[[test]]`-kind.
+        159
     );
     assert_eq!(
         targets
@@ -533,6 +543,12 @@ fn r1a7_enumerates_linked_targets_and_proves_zero_production_callers() {
             && target.kind == "test"
             && target.name == "pair_device_fingerprint"
             && target.path == "household-rs/tests/pair_device_fingerprint.rs"
+    }));
+    assert!(targets.iter().any(|target| {
+        target.package == "household-rs"
+            && target.kind == "test"
+            && target.name == "emoji_code_vectors"
+            && target.path == "household-rs/tests/emoji_code_vectors.rs"
     }));
     assert!(targets.iter().any(|target| {
         target.package == "m1-household-mesh-smoke-rs"
