@@ -63,6 +63,7 @@ fn bootstrap_app(
         engine_port: 8091,
         tailnet_resolver: || None,
         phase3_runtime: None,
+        pair_code_rate_limiter: None,
     };
     bootstrap_router(state)
 }

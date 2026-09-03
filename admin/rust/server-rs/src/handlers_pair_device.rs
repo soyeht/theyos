@@ -16,7 +16,7 @@
 
 use axum::{
     Json,
-    extract::{State, rejection::JsonRejection},
+    extract::{ConnectInfo, State, rejection::JsonRejection},
     http::StatusCode,
     response::{IntoResponse, Response},
 };
@@ -32,6 +32,7 @@ use household_rs::{HouseholdAuthState, P256Signature};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::io;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -152,7 +153,28 @@ where
 /// Retrieve-only: returns the current pair URI when the window is open.
 /// Returns 404 (route-absent semantics) when the window is closed or
 /// identity has not loaded yet.
-pub async fn initiate(State(state): State<PairDeviceState>) -> Response {
+pub async fn initiate(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(state): State<PairDeviceState>,
+) -> Response {
+    // Gate 1 — peer ACL, the same admission set `GET /bootstrap/pair-device-uri`
+    // enforces, and for the same reason: the response body is the complete
+    // first-owner pairing URI, nonce included, so whoever can call this route
+    // can claim the household. Retrieve-only is not an ACL — it stops a peer
+    // from *replacing* the operator's token, not from *reading* it — and the
+    // `named_awaiting_pair` exposure policy grants `InterfaceClass::Mesh`
+    // while the LAN listener is only unbound on the next reconciliation tick,
+    // so bind-time exposure is not a substitute for an admission check either.
+    // Everyone outside loopback-or-tailnet gets the bare 404 an unrouted path
+    // returns, which is what every other failure mode here already answers.
+    if !(peer.ip().is_loopback() || crate::tailnet_address::is_tailnet_ip(peer.ip())) {
+        tracing::warn!(
+            stage = "pair_device.initiate.rejected",
+            reason = "peer_not_admitted",
+            peer = %peer,
+        );
+        return StatusCode::NOT_FOUND.into_response();
+    }
     let Some(identity) = state.household.current().await else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -566,6 +588,66 @@ mod tests {
 
         let lifecycle = HouseholdLifecycleLock::open_verified(state.path()).expect("reopen");
         lifecycle.lock_exclusive().expect("lock after publication");
+    }
+
+    fn acl_state(dir: &Path, name: &str) -> PairDeviceState {
+        let identity = bootstrap_named(dir, name);
+        PairDeviceState {
+            window: Arc::new(PairDeviceWindow::new()),
+            household: HouseholdState::loaded(Arc::new(identity)),
+            state_dir: dir.to_path_buf(),
+        }
+    }
+
+    /// Mirrors `pair_device_uri_rejects_lan_and_mesh_peers` on the bootstrap
+    /// side: this route hands out the same nonce-bearing URI, so it admits the
+    /// same peers and no others. LAN and mesh addresses must be
+    /// indistinguishable from an unrouted path — bare 404, empty body.
+    #[tokio::test]
+    async fn initiate_rejects_lan_and_mesh_peers() {
+        let dir = tempfile::tempdir().expect("state dir");
+        let state = acl_state(dir.path(), "Initiate ACL Home");
+        state
+            .window
+            .mint_token(Duration::from_secs(300), None)
+            .await
+            .expect("mint");
+
+        for peer in [
+            SocketAddr::from(([192, 168, 1, 50], 41234)),
+            SocketAddr::from(([10, 0, 0, 7], 41234)),
+            SocketAddr::from(([10, 44, 1, 5], 41234)),
+        ] {
+            let response = initiate(ConnectInfo(peer), State(state.clone())).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "peer {peer} must be refused"
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            assert!(
+                bytes.is_empty(),
+                "a refused peer must not learn the route exists: {bytes:?}"
+            );
+        }
+
+        for peer in [
+            SocketAddr::from(([127, 0, 0, 1], 41234)),
+            SocketAddr::from(([100, 101, 102, 103], 41234)),
+            SocketAddr::from((
+                "fd7a:115c:a1e0::1".parse::<std::net::Ipv6Addr>().unwrap(),
+                41234,
+            )),
+        ] {
+            let response = initiate(ConnectInfo(peer), State(state.clone())).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "peer {peer} is admitted and the window is open"
+            );
+        }
     }
 
     #[test]

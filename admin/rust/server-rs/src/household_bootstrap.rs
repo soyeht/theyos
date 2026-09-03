@@ -415,7 +415,11 @@ impl Phase3RuntimeController {
         // initialize → pair) never went through the boot-time adoption
         // above, and its "Mac Host" would stay invisible until a restart.
         if let Some(state) = self.shared_state.as_ref() {
-            adopt_seeded_mac_host(state, loaded.record.hh_id.as_str(), loaded.cert.m_id.as_str());
+            adopt_seeded_mac_host(
+                state,
+                loaded.record.hh_id.as_str(),
+                loaded.cert.m_id.as_str(),
+            );
         }
         Ok(())
     }
@@ -1952,7 +1956,7 @@ pub async fn bootstrap_household(
     // ── Bootstrap router (T008 / T009 / T010 / T011) ─────────────────────
     // ── Bootstrap router (T008 / T009 / T010 / T011) ─────────────────────
     // Always live — even on a cold, uninitialized engine.
-    let bootstrap_handler_state = BootstrapHandlerState::new(
+    let mut bootstrap_handler_state = BootstrapHandlerState::new(
         Arc::clone(&bootstrap_state_arc),
         identity_state.clone(),
         state_dir.clone(),
@@ -1961,6 +1965,12 @@ pub async fn bootstrap_household(
         port,
     )
     .with_phase3_runtime(phase3_runtime.clone());
+    // The pair-code limiter is durable `SharedState` plumbing; bring-up paths
+    // without it leave the field `None` and the by-code route fails closed.
+    if let Some(state) = shared_state.as_ref() {
+        bootstrap_handler_state =
+            bootstrap_handler_state.with_pair_code_rate_limiter(Arc::clone(&state.rate_limiter));
+    }
     if matches!(
         initial_bootstrap_state,
         BootstrapState::Uninitialized | BootstrapState::ReadyForNaming

@@ -1,0 +1,93 @@
+{
+  "_comment": "Golden vectors for derive_emoji_code. Regenerate only deliberately: this code is compared by a person across two devices, and it shares extract_indices with the six-word pair-device code.",
+  "vectors": [
+    {
+      "emoji": [
+        "◴",
+        "🌈",
+        "🚢",
+        "💓",
+        "😑",
+        "↭"
+      ],
+      "hostname": ""
+    },
+    {
+      "emoji": [
+        "┌",
+        "➯",
+        "🖪",
+        "◱",
+        "❫",
+        "🐳"
+      ],
+      "hostname": "a"
+    },
+    {
+      "emoji": [
+        "🌂",
+        "🐯",
+        "🚒",
+        "🚨",
+        "🆗",
+        "✫"
+      ],
+      "hostname": "mac-alpha"
+    },
+    {
+      "emoji": [
+        "⛖",
+        "╳",
+        "🏄",
+        "⛗",
+        "✺",
+        "▿"
+      ],
+      "hostname": "mac-alpha.local"
+    },
+    {
+      "emoji": [
+        "⛶",
+        "┼",
+        "😢",
+        "🗼",
+        "╊",
+        "╊"
+      ],
+      "hostname": "MAC-ALPHA"
+    },
+    {
+      "emoji": [
+        "🐡",
+        "⇾",
+        "♎",
+        "♩",
+        "🍬",
+        "●"
+      ],
+      "hostname": "a-very-long-host-name-that-keeps-going-and-going"
+    },
+    {
+      "emoji": [
+        "🕵",
+        "⛝",
+        "🕓",
+        "⌅",
+        "🍊",
+        "▨"
+      ],
+      "hostname": "café"
+    },
+    {
+      "emoji": [
+        "😻",
+        "🖟",
+        "💆",
+        "⍽",
+        "🍧",
+        "⎤"
+      ],
+      "hostname": "mac-beta"
+    }
+  ]
+}

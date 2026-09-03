@@ -1,0 +1,322 @@
+[
+  {
+    "hh_pub_hex": "028d6be6db443be9a78a7e43b2177d9b983a19a3a4709294368c7497f6bae6906e",
+    "indices": [
+      1988,
+      1329,
+      634,
+      567,
+      249,
+      930
+    ],
+    "nonce_hex": "4f450980185dc406ec814c72a8b88bf89b74a8516a89391beaa27e740c9fcb53",
+    "words": [
+      "weasel",
+      "plate",
+      "exercise",
+      "eight",
+      "busy",
+      "inmate"
+    ]
+  },
+  {
+    "hh_pub_hex": "033208f24ed96b2277755001cf034c5aa1adfcadf07595627e231901c0b5e4347e",
+    "indices": [
+      26,
+      715,
+      655,
+      1171,
+      410,
+      1373
+    ],
+    "nonce_hex": "6177c46d8a9d88b36aaef028e598036a5e858ae4ec44830430138721eacf75f1",
+    "words": [
+      "addict",
+      "floor",
+      "faint",
+      "mystery",
+      "crew",
+      "produce"
+    ]
+  },
+  {
+    "hh_pub_hex": "028ff8d0b104eac6742645931e1d0636c48f403dd38e2abc6b926503991037ac28",
+    "indices": [
+      420,
+      1062,
+      1475,
+      1419,
+      1581,
+      1164
+    ],
+    "nonce_hex": "f08c08e53240c4d8f98887a8199b1512582a887d2d9c154dfa8b6f2b4be7a2bd",
+    "words": [
+      "cruel",
+      "luggage",
+      "reveal",
+      "ramp",
+      "shield",
+      "muscle"
+    ]
+  },
+  {
+    "hh_pub_hex": "036805786c2383e9b3d4841824466a68f31c2263d18d7a9382c52ad0f4e1109c6a",
+    "indices": [
+      2027,
+      188,
+      49,
+      424,
+      1158,
+      1795
+    ],
+    "nonce_hex": "11a533c1054400c5f72fda39b5d0c94b8f4f88f387e9018d0dd3d9b104f59297",
+    "words": [
+      "word",
+      "bleak",
+      "alert",
+      "crush",
+      "move",
+      "there"
+    ]
+  },
+  {
+    "hh_pub_hex": "034d8dcfdfe52aee058ffe5755f5900069becbcbbd9ed7a1fa0d1c286a29f74cb5",
+    "indices": [
+      295,
+      396,
+      973,
+      59,
+      1473,
+      1002
+    ],
+    "nonce_hex": "5bffc738091da008856dd0ea6490c0228abe37d0e22ff6abe11911ca678088b1",
+    "words": [
+      "ceiling",
+      "cover",
+      "keen",
+      "alter",
+      "return",
+      "later"
+    ]
+  },
+  {
+    "hh_pub_hex": "02c01762243abd2e164fabf584f5c1510840b27de76fb5c18f0b75e5e10e06118f",
+    "indices": [
+      313,
+      189,
+      607,
+      858,
+      2010,
+      924
+    ],
+    "nonce_hex": "778dc56c408fe6cd4a887579fc0885706c90624cc340239ae1861881e24826d3",
+    "words": [
+      "cheese",
+      "bless",
+      "episode",
+      "hero",
+      "win",
+      "inform"
+    ]
+  },
+  {
+    "hh_pub_hex": "02e1ed6c9268190ec190369e7c1a45e24ba1bb2b4699f4c9b3ca42427757fc5bdd",
+    "indices": [
+      909,
+      1211,
+      650,
+      1455,
+      489,
+      609
+    ],
+    "nonce_hex": "941c5e060895ca50b557a3e839ba49dfdfae618b90e895dfd2160be9fd777638",
+    "words": [
+      "immune",
+      "number",
+      "eyebrow",
+      "remove",
+      "diamond",
+      "equip"
+    ]
+  },
+  {
+    "hh_pub_hex": "03639844732fbf220b9e70da416866585ace4485e36133daf28a4c1ac8c423e8fc",
+    "indices": [
+      1165,
+      1076,
+      175,
+      672,
+      1457,
+      1986
+    ],
+    "nonce_hex": "de3eaefded75d0ca55b349f84fa6c5338b754919d288f179350b39da3ff3d123",
+    "words": [
+      "museum",
+      "make",
+      "bicycle",
+      "favorite",
+      "renew",
+      "weapon"
+    ]
+  },
+  {
+    "hh_pub_hex": "03cefa56558d827b8a8b5c3436879210237c8ee4e62661f971ea76c157debbc4fb",
+    "indices": [
+      1417,
+      1633,
+      65,
+      1766,
+      529,
+      797
+    ],
+    "nonce_hex": "21935be1f319f5e811de3cf71b0fe87a279a4f540b2586ca11c613046279ddc7",
+    "words": [
+      "raise",
+      "slow",
+      "amused",
+      "system",
+      "drama",
+      "glove"
+    ]
+  },
+  {
+    "hh_pub_hex": "03e208fb29677e6f9745d28e1cf659fc1485f4c7e54995f5f8678203161bc74655",
+    "indices": [
+      1453,
+      1670,
+      1706,
+      506,
+      1261,
+      213
+    ],
+    "nonce_hex": "7213b2f62bfeed5a47e2fd8d1fe8f44ced3d4c25a8f4f908898387569eb9fcce",
+    "words": [
+      "remember",
+      "speak",
+      "stem",
+      "dismiss",
+      "oval",
+      "boy"
+    ]
+  },
+  {
+    "hh_pub_hex": "0259e9d89c7f1134cb6a5edee99761b301e14df87217da84853139ac1ac5854b0b",
+    "indices": [
+      1693,
+      1063,
+      1770,
+      828,
+      65,
+      1426
+    ],
+    "nonce_hex": "9aa38904bd7a9dd647af8f3048fdf536921faf4d61cf920b90def5cd7cf09848",
+    "words": [
+      "squirrel",
+      "lumber",
+      "tail",
+      "guide",
+      "amused",
+      "rather"
+    ]
+  },
+  {
+    "hh_pub_hex": "02182722f5e11047a886289f465825d07374e23a411dc88c709ea5a8cb31497787",
+    "indices": [
+      167,
+      308,
+      885,
+      1970,
+      458,
+      1163
+    ],
+    "nonce_hex": "677ca5f1d6c07eb1e32638f9b134efc8cf4e790aab9cc0c0cbda9f05d67fb9d5",
+    "words": [
+      "belt",
+      "charge",
+      "huge",
+      "wagon",
+      "deer",
+      "multiply"
+    ]
+  },
+  {
+    "hh_pub_hex": "03d1632ddbcba4438baaecc3394acc18690789c342d7254a3292b9968bf90f22de",
+    "indices": [
+      1415,
+      737,
+      225,
+      1331,
+      1005,
+      1493
+    ],
+    "nonce_hex": "2679125424a034f7af98d793aaad7fad38ffaea1942d4324d5d19bb6afcb5123",
+    "words": [
+      "rail",
+      "found",
+      "bring",
+      "please",
+      "laundry",
+      "rival"
+    ]
+  },
+  {
+    "hh_pub_hex": "0242e8c7ad027b67fb9ff491c97ecb0115faa36abdad472e7514281fe9a72266bf",
+    "indices": [
+      1033,
+      1398,
+      1969,
+      1066,
+      1504,
+      636
+    ],
+    "nonce_hex": "ebee22369d901799466f5d8a1179bd7aa3fa5ba1687102bd4a97eae509e27899",
+    "words": [
+      "license",
+      "put",
+      "wage",
+      "luxury",
+      "rose",
+      "exhibit"
+    ]
+  },
+  {
+    "hh_pub_hex": "02ddefc850bac893ed065e2cf733ad847ff304155aa2da9513af8563cfadaacec6",
+    "indices": [
+      648,
+      210,
+      1132,
+      1340,
+      1765,
+      227
+    ],
+    "nonce_hex": "3e941b00a676bd4f3fdfd55edc6dc2892ce77e5c6c541d24fc88c426b2fa1881",
+    "words": [
+      "extra",
+      "bottom",
+      "mirror",
+      "pole",
+      "syrup",
+      "broccoli"
+    ]
+  },
+  {
+    "hh_pub_hex": "02f1451d569f2eb9002a21f88b3514bd6ee23bda8a48b4b7ebf09a695c3783da17",
+    "indices": [
+      1746,
+      398,
+      1075,
+      1868,
+      1716,
+      957
+    ],
+    "nonce_hex": "c979cc08acb21e2832f06501b6279677a8f5db18cb0cce1b3dd51be3f9580d28",
+    "words": [
+      "surge",
+      "crack",
+      "major",
+      "trumpet",
+      "story",
+      "jeans"
+    ]
+  }
+]

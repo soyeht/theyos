@@ -176,6 +176,7 @@ fn make_app(fix: &Fixture) -> Router {
         engine_port: 8091,
         tailnet_resolver: || None,
         phase3_runtime: None,
+        pair_code_rate_limiter: None,
     };
     bootstrap_router(handler_state)
 }

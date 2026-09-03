@@ -461,7 +461,22 @@ fn r1a7_enumerates_linked_targets_and_proves_zero_production_callers() {
     // `autobins = false`, which would change the crate's manifest to make a
     // number in this file smaller; the assertions below name both entries
     // instead, so the pair is pinned rather than merely counted.
-    assert_eq!(targets.len(), 210, "Cargo target inventory changed");
+    //
+    // 210 + 1. Derived, not bumped: the pair-device code slice adds
+    // `household-rs/tests/pair_device_fingerprint.rs`, the fixture round-trip
+    // for `fingerprint::pair_device_fingerprint_words` — one auto-discovered
+    // `[[test]]`-kind target, no bin, no example. Re-measured on this tree:
+    // the enumerator reported `left: 211, right: 210` before this line moved,
+    // and the named `any()` below pins that the +1 is that file.
+    //
+    // 211 + 1: `household-rs/tests/emoji_code_vectors.rs`, golden vectors for
+    // `derive_emoji_code`. It exists because that function shares
+    // `fingerprint::extract_indices` with the six-word pair-device code and
+    // had no pinned output of its own, so an edit made for BIP-39 reasons
+    // would have changed the emoji a person compares across two screens with
+    // nothing going red. One auto-discovered `[[test]]`-kind target; the
+    // named `any()` below pins that the +1 is that file.
+    assert_eq!(targets.len(), 212, "Cargo target inventory changed");
     assert_eq!(
         targets.iter().filter(|target| target.kind == "bin").count(),
         // 50 + 2: both of `nat-probe-rs`'s entries are bin-kind. The test and
@@ -483,7 +498,13 @@ fn r1a7_enumerates_linked_targets_and_proves_zero_production_callers() {
         // 156 + 1: `compile_fail_channel_mapping.rs` (see the total assert's
         // own comment above) is a `[[test]]`-kind target, not `bin`/`example`
         // — those two counts below are unaffected.
-        157
+        //
+        // 157 + 1: `pair_device_fingerprint.rs` (see the total assert's own
+        // comment above) is a `[[test]]`-kind target — `bin`/`example` below
+        // are unaffected.
+        //
+        // 158 + 1: `emoji_code_vectors.rs`, likewise `[[test]]`-kind.
+        159
     );
     assert_eq!(
         targets
@@ -516,6 +537,18 @@ fn r1a7_enumerates_linked_targets_and_proves_zero_production_callers() {
             && target.kind == "test"
             && target.name == "m2a_shared_claw_control_plane_contract"
             && target.path == "server-rs/tests/m2a_shared_claw_control_plane_contract.rs"
+    }));
+    assert!(targets.iter().any(|target| {
+        target.package == "household-rs"
+            && target.kind == "test"
+            && target.name == "pair_device_fingerprint"
+            && target.path == "household-rs/tests/pair_device_fingerprint.rs"
+    }));
+    assert!(targets.iter().any(|target| {
+        target.package == "household-rs"
+            && target.kind == "test"
+            && target.name == "emoji_code_vectors"
+            && target.path == "household-rs/tests/emoji_code_vectors.rs"
     }));
     assert!(targets.iter().any(|target| {
         target.package == "m1-household-mesh-smoke-rs"

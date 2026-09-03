@@ -15,6 +15,7 @@ pub mod bonjour_impl_mdns_sd;
 pub mod bonjour_publisher;
 pub mod bonjour_trust;
 pub mod bootstrap_mutation_lock;
+pub mod bootstrap_pair_code_rate_limit;
 pub mod capacity;
 pub mod claw_share_app_descriptor;
 pub mod claw_share_data_tunnel_listener;
