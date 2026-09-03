@@ -5200,6 +5200,25 @@ mod tests {
             .to_vec()
     }
 
+    /// Everything a client can observe about a rejection: status, every header
+    /// (sorted, so ordering is not the assertion), and body.
+    ///
+    /// `body_bytes` alone was not enough. "Byte-identical" tests written on it
+    /// compared only bodies, so returning `410 Gone` for an expired window, or
+    /// attaching `Retry-After` on the shed path, kept every test green while
+    /// handing a guesser the "is a window open right now" oracle the design
+    /// exists to deny.
+    async fn observable_parts(response: Response) -> (HStatus, Vec<(String, Vec<u8>)>, Vec<u8>) {
+        let status = response.status();
+        let mut headers: Vec<(String, Vec<u8>)> = response
+            .headers()
+            .iter()
+            .map(|(name, value)| (name.as_str().to_owned(), value.as_bytes().to_vec()))
+            .collect();
+        headers.sort();
+        (status, headers, body_bytes(response).await)
+    }
+
     #[tokio::test]
     async fn pair_device_uri_by_code_admits_loopback_and_tailnet_peers() {
         // Same admission set as the GET sibling — the by-code route is a
@@ -5471,7 +5490,7 @@ mod tests {
             closed_window.current_token().await.is_none(),
             "precondition: no window"
         );
-        let missing = body_bytes(
+        let missing = observable_parts(
             bootstrap_router(no_window)
                 .oneshot(by_code_request(by_code_body(1, &ANY_VALID_CODE)))
                 .await
@@ -5497,7 +5516,7 @@ mod tests {
                 .is_none(),
             "precondition: the window expired on mint"
         );
-        let expired = body_bytes(
+        let expired = observable_parts(
             bootstrap_router(expired_state)
                 .oneshot(by_code_request(by_code_body(1, &ANY_VALID_CODE)))
                 .await
@@ -5512,7 +5531,7 @@ mod tests {
             .await
             .expect("pre-mint");
         let code = open_window_code(&open_state).await;
-        let mismatch = body_bytes(
+        let mismatch = observable_parts(
             bootstrap_router(open_state)
                 .oneshot(by_code_request(by_code_body(1, &wrong_code(&code))))
                 .await
@@ -5520,7 +5539,8 @@ mod tests {
         )
         .await;
 
-        assert!(!mismatch.is_empty());
+        assert_eq!(mismatch.0, HStatus::NOT_FOUND, "and all three are 404");
+        assert!(!mismatch.2.is_empty());
         assert_eq!(missing, mismatch, "no window must look like a wrong code");
         assert_eq!(
             expired, mismatch,
@@ -5602,19 +5622,36 @@ mod tests {
             .oneshot(by_code_request(by_code_body(1, &code)))
             .await
             .unwrap();
-        assert_eq!(second.status(), HStatus::NOT_FOUND);
-        let limited = body_bytes(second).await;
+        let limited = observable_parts(second).await;
+        assert_eq!(limited.0, HStatus::NOT_FOUND);
 
-        let mismatch = body_bytes(
-            bootstrap_router(state)
-                .oneshot(by_code_request(by_code_body(1, &wrong_code(&code))))
+        // The reference has to be a REAL wrong-code rejection. Asking `state`
+        // for it would spend a third attempt against the same 1/h bucket and
+        // be shed too — the assertion would then compare a shed response with
+        // another shed response, which is to say a value with itself, and any
+        // divergence between the two paths would be invisible.
+        let (graded_state, _td_b) = by_code_state_with_limit(BootstrapState::NamedAwaitingPair, 60);
+        graded_state
+            .pair_device_window
+            .mint_token(Duration::from_secs(300), None)
+            .await
+            .expect("pre-mint");
+        let graded_code = open_window_code(&graded_state).await;
+        let mismatch = observable_parts(
+            bootstrap_router(graded_state)
+                .oneshot(by_code_request(by_code_body(1, &wrong_code(&graded_code))))
                 .await
                 .unwrap(),
         )
         .await;
         assert_eq!(
+            mismatch.0,
+            HStatus::NOT_FOUND,
+            "precondition: the reference is a graded wrong code, not a shed one"
+        );
+        assert_eq!(
             limited, mismatch,
-            "a rate-limited attempt must look like a wrong code"
+            "a rate-limited attempt must look like a wrong code — status, headers and body"
         );
     }
 
