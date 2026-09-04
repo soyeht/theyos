@@ -39,8 +39,13 @@ fn household_listener_filters_binds_through_exposure_policy() {
         "\nasync fn sync_exposure_policy",
     );
     assert!(
-        sync_body.contains("HouseholdExposurePolicy::allowed_targets"),
+        sync_body.contains("HouseholdExposurePolicy::allowed_targets_with"),
         "listener target sync must filter enumerate_bind_targets() through HouseholdExposurePolicy"
+    );
+    assert!(
+        sync_body.contains("pairing_window,"),
+        "listener target sync must pass the pair-device window position it was given, \
+         not re-derive one: the policy is pure and the window is the caller's fact"
     );
 
     let spawn_body = slice_between(
@@ -63,8 +68,13 @@ fn bonjour_publishers_filter_targets_through_exposure_policy() {
         "\n    // Spawn a task",
     );
     assert!(
-        household_publish_body.contains("HouseholdExposurePolicy::bonjour_targets"),
+        household_publish_body.contains("HouseholdExposurePolicy::bonjour_targets_with"),
         "household Bonjour publisher must filter targets through the Bonjour exposure policy"
+    );
+    assert!(
+        household_publish_body.contains("PairingWindow::observe(pair_device_window.as_ref())"),
+        "the household beacon must advertise at the same window position the listener \
+         bound at, or a Ready household binds a LAN address it never announces"
     );
 
     let candidate_publish_body = slice_between(
@@ -84,7 +94,7 @@ fn bonjour_publishers_filter_targets_through_exposure_policy() {
         "\nfn unregister_fullnames",
     );
     assert!(
-        setup_publish_body.contains("HouseholdExposurePolicy::bonjour_targets"),
+        setup_publish_body.contains("HouseholdExposurePolicy::bonjour_targets_with"),
         "setup beacon publisher must filter targets through the Bonjour exposure policy"
     );
     let setup_refresh_body = slice_between(
@@ -93,7 +103,7 @@ fn bonjour_publishers_filter_targets_through_exposure_policy() {
         "\n/// Publish `_soyeht-setup._tcp.`",
     );
     assert!(
-        setup_refresh_body.contains("HouseholdExposurePolicy::bonjour_targets"),
+        setup_refresh_body.contains("HouseholdExposurePolicy::bonjour_targets_with"),
         "setup beacon refresh must keep non-advertisable classes withdrawn"
     );
 }
@@ -318,7 +328,7 @@ fn plain_http_listener_contract_is_pinned_in_code() {
     );
 }
 
-/// The owner's LAN switch reaches the setup browser's network filter, and
+/// The pair-device window reaches the setup browser's network filter, and
 /// nothing else about when that browser runs.
 ///
 /// MEASURED by reading both consumers of the cache the browser fills:
@@ -333,14 +343,16 @@ fn plain_http_listener_contract_is_pinned_in_code() {
 /// The half that is real: `BrowserConfig::default()` hard-codes
 /// `include_local_network = false`, which drops a LAN-only iPhone beacon as
 /// `setup_browser.suppressed reason=non_tailnet`. That flag, and only that
-/// flag, follows the switch. Source-level because spawning a real mDNS browser
-/// in a test would need the host's multicast, which CI does not have.
+/// flag, follows the exposure rule -- and it follows it by ASKING THE POLICY,
+/// `allows_with(state, Lan, window)`, rather than by a second copy of the rule
+/// written at the spawn site. Source-level because spawning a real mDNS
+/// browser in a test would need the host's multicast, which CI does not have.
 #[test]
-fn setup_invitation_browser_ties_only_its_network_filter_to_the_owner_switch() {
+fn setup_invitation_browser_ties_only_its_network_filter_to_the_exposure_policy() {
     let source = read_src("household_bootstrap.rs");
     let spawn_body = slice_between(
         &source,
-        "let lan_pairing = household_listener::LanPairing::from_env();",
+        "let pairing_window =\n        household_listener::PairingWindow::observe(pair_device_window.as_ref()).await;",
         "let bootstrap_rt =",
     );
 
@@ -350,57 +362,49 @@ fn setup_invitation_browser_ties_only_its_network_filter_to_the_owner_switch() {
              BootstrapState::Uninitialized | BootstrapState::ReadyForNaming\n    )"
         ),
         "the spawn must stay keyed to the states whose routes can consume the \
-         cache; widening it on the switch spawns a browser that feeds nothing"
+         cache; widening it spawns a browser that feeds nothing"
     );
     assert!(
-        !spawn_body.contains("lan_pairing.is_open()\n        || matches!("),
-        "the switch must not decide WHETHER the browser runs -- both cache \
-         consumers 409 outside Uninitialized|ReadyForNaming"
-    );
-    assert!(
-        spawn_body.contains("include_local_network: lan_pairing.is_open()"),
-        "the browser must be built with include_local_network tied to the \
-         switch, or a LAN-only iPhone beacon is dropped as non_tailnet"
+        spawn_body.contains("household_listener::HouseholdExposurePolicy::allows_with(")
+            && spawn_body.contains("household_listener::InterfaceClass::Lan,")
+            && spawn_body.contains("include_local_network,"),
+        "the browser's network filter must be derived from the one exposure policy, \
+         so \"visible on the local network in exactly two situations\" has exactly one \
+         implementation"
     );
     assert!(
         !spawn_body.contains("BrowserConfig::default()"),
-        "the config must be derived from the switch, not from the default that \
+        "the config must be derived from the policy, not from the default that \
          hard-codes include_local_network = false"
     );
 }
 
-/// The switch is one name, read in one place.
+/// The environment switch is gone, and did not leave a second way in.
 ///
-/// `SOYEHT_SETUP_INVITATION_ALLOW_LAN` is exported by some Mac launchd
-/// plists and read NOWHERE in this repo — an operator who set it got silence.
-/// This pins that the replacement did not repeat that: the new name exists,
-/// and the dead one is still not wired to anything.
+/// `THEYOS_HOUSEHOLD_LAN_PAIRING` briefly existed on this branch as an owner
+/// opt-in. It was REPLACED by the pair-device window, not kept alongside it:
+/// two ways to put a Ready household on the Wi-Fi means the answer to "is it
+/// visible right now" depends on which one you read.
+///
+/// `SOYEHT_SETUP_INVITATION_ALLOW_LAN` is the older ghost -- exported by some
+/// Mac launchd plists and read NOWHERE in this repo, so an operator who set it
+/// got silence. Neither name may become an environment read again.
 #[test]
-fn the_lan_pairing_switch_has_exactly_one_name_and_one_reader() {
-    let listener = read_src("household_listener.rs");
-    assert!(
-        listener.contains(r#"const LAN_PAIRING_ENV: &str = "THEYOS_HOUSEHOLD_LAN_PAIRING";"#),
-        "the owner switch must keep its declared name"
-    );
-    assert_eq!(
-        listener
-            .matches("std::env::var_os(LAN_PAIRING_ENV)")
-            .count(),
-        1,
-        "the switch must be read from the environment in exactly one place, inside \
-         the OnceLock that freezes it for the life of the process"
-    );
-
-    // The dead name may be NAMED in prose — `household_listener.rs` explains
-    // why it was not reused — but must never become an environment read again.
+fn local_network_exposure_has_no_environment_switch() {
     for file in [
         "household_listener.rs",
         "household_bootstrap.rs",
         "bonjour_browser.rs",
         "bonjour_trust.rs",
+        "setup_beacon.rs",
+        "bonjour_publisher.rs",
         "main.rs",
     ] {
         let body = read_src(file);
+        assert!(
+            !body.contains("THEYOS_HOUSEHOLD_LAN_PAIRING"),
+            "src/{file} must not reintroduce the deleted LAN-pairing switch"
+        );
         for read in [
             r#"var_os("SOYEHT_SETUP_INVITATION_ALLOW_LAN")"#,
             r#"var("SOYEHT_SETUP_INVITATION_ALLOW_LAN")"#,
@@ -410,5 +414,23 @@ fn the_lan_pairing_switch_has_exactly_one_name_and_one_reader() {
                 "src/{file} must not revive the dead LaunchAgent variable as a switch"
             );
         }
+    }
+
+    // The policy stays pure: no clock, no store, no environment inside the
+    // decision. `PairingWindow::observe` is the ONE reader of the live window,
+    // and it lives outside `HouseholdExposurePolicy`.
+    let listener = read_src("household_listener.rs");
+    let policy = slice_between(
+        &listener,
+        "impl HouseholdExposurePolicy {",
+        "\n/// The one Product A IPv4 allocation",
+    );
+    for forbidden in ["std::env::", "Instant::now", "SystemTime", ".await"] {
+        assert!(
+            !policy.contains(forbidden),
+            "HouseholdExposurePolicy must stay a pure function of \
+             (state, class, window); `{forbidden}` makes it answerable only from a \
+             running process"
+        );
     }
 }

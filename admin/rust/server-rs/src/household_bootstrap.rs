@@ -380,9 +380,9 @@ impl Phase3RuntimeController {
                     macos_local_app_profile_for_state_dir(&state_dir),
                 ),
             );
-            let runtime = owner_webauthn_runtime
-                .as_ref()
-                .ok_or_else(|| "owner passkey runtime missing for macOS local listener".to_string())?;
+            let runtime = owner_webauthn_runtime.as_ref().ok_or_else(|| {
+                "owner passkey runtime missing for macOS local listener".to_string()
+            })?;
             let state = macos_local_owner_webauthn_registration_state(
                 owner_events_state.clone(),
                 runtime,
@@ -392,8 +392,7 @@ impl Phase3RuntimeController {
                 handlers_owner_events::owner_webauthn_macos_local_registration_router(state);
             Some(
                 crate::macos_local_registration_listener::spawn_macos_local_registration_listener(
-                    &state_dir,
-                    router,
+                    &state_dir, router,
                 )
                 .map_err(|error| format!("start macOS local registration listener: {error}"))?,
             )
@@ -2091,32 +2090,47 @@ pub async fn bootstrap_household(
     // engine a running browser would fill a cache nothing can claim, which is
     // cost and log noise, not reachability.
     //
-    // What the owner's LAN switch does change here is the ONE gate that was
+    // What the two-situation rule changes here is the ONE gate that was
     // silently dropping beacons: `BrowserConfig::default()` sets
     // `include_local_network = false`, so a beacon carrying nothing but
     // `192.168.x` -- exactly what a phone with no Tailscale publishes -- was
     // discarded and logged as `setup_browser.suppressed reason=non_tailnet`
-    // (bonjour_browser.rs). With the switch closed this config is byte-for-byte
-    // the old default.
+    // (bonjour_browser.rs). A browser that cannot see the phone it is looking
+    // for is not a gate, it is a bug.
+    //
+    // The flag is derived from the SAME policy the listener binds through --
+    // `allows_with(state, Lan, window)` -- rather than from a second rule
+    // written here, so "the home is on the local network in exactly two
+    // situations" has exactly one implementation. In the two states this
+    // browser runs in, situation 1 (INSTALL) already grants LAN, so the answer
+    // is `true` in both window positions; expressing it through the policy is
+    // what keeps it true if either half of the rule ever moves.
     //
     // The reachability half of the fix is the listener bind, not this browser:
     // `HouseholdExposurePolicy` re-admits `InterfaceClass::Lan` after
-    // onboarding when the switch is open, which is what gives a LAN-only phone
-    // an address to dial for the pairing ceremony on a Ready engine.
-    let lan_pairing = household_listener::LanPairing::from_env();
+    // onboarding while a pair-device window is open, which is what gives a
+    // LAN-only phone an address to dial on a Ready engine.
+    let pairing_window =
+        household_listener::PairingWindow::observe(pair_device_window.as_ref()).await;
     if matches!(
         initial_bootstrap_state,
         BootstrapState::Uninitialized | BootstrapState::ReadyForNaming
     ) {
+        let include_local_network = household_listener::HouseholdExposurePolicy::allows_with(
+            initial_bootstrap_state,
+            household_listener::InterfaceClass::Lan,
+            pairing_window,
+        );
         info!(
             stage = "setup_browser.spawn",
-            lan_pairing = lan_pairing.as_str(),
+            pairing_window = pairing_window.as_str(),
+            include_local_network,
             bootstrap_state = initial_bootstrap_state.as_str(),
         );
         drop(bonjour_browser::spawn_setup_invitation_browser_with_cache(
             bootstrap_handler_state.setup_invitation_cache.clone(),
             BrowserConfig {
-                include_local_network: lan_pairing.is_open(),
+                include_local_network,
             },
         ));
     }
@@ -2292,12 +2306,19 @@ pub async fn bootstrap_household(
     });
 
     let bound_set = household_listener::BoundSet::default();
+    // Re-observed here rather than reusing the value taken above for the
+    // setup browser: `theyos install` can persist a live token that this
+    // process adopts during bootstrap, and the initial bind must reflect the
+    // window as it is at bind time, not as it was earlier in this function.
+    let startup_pairing_window =
+        household_listener::PairingWindow::observe(pair_device_window.as_ref()).await;
     let initial_bound = household_listener::spawn_household_listeners(
         startup,
         household_router.clone(),
         port,
         Arc::clone(&bootstrap_state_arc),
         &bound_set,
+        startup_pairing_window,
     )
     .await;
     info!(
@@ -2370,12 +2391,17 @@ pub async fn bootstrap_household(
     .await;
 
     // Periodic refresh — picks up new Tailscale / Wi-Fi addresses every 60s.
+    // It is also the reconciler for the pair-device window, which is why it
+    // now takes one: the window is what decides whether a post-onboarding
+    // household is on the local network, and this loop is the only thing that
+    // can bind or withdraw a listener while the engine runs.
     {
         let router = household_router;
         let bound = bound_set.clone();
         let bootstrap = Arc::clone(&bootstrap_state_arc);
+        let window = Arc::clone(&pair_device_window);
         tokio::spawn(async move {
-            household_listener::refresh_loop(router, port, bootstrap, bound).await;
+            household_listener::refresh_loop(router, port, bootstrap, bound, window).await;
         });
     }
 
@@ -4146,7 +4172,14 @@ mod tests {
 
     #[test]
     fn owner_webauthn_network_surface_is_closed_unless_explicitly_opened() {
-        for closed in [None, Some(""), Some("0"), Some("true"), Some("yes"), Some("on")] {
+        for closed in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("true"),
+            Some("yes"),
+            Some("on"),
+        ] {
             assert!(
                 !owner_webauthn_network_enabled_from_value(closed),
                 "{closed:?} must leave the network passkey surface closed"
