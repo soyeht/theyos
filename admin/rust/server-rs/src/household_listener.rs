@@ -5,16 +5,45 @@
 //! then narrows the live set by [`HouseholdExposurePolicy`]:
 //! - onboarding (`uninitialized`, `ready_for_naming`) allows loopback + LAN +
 //!   Tailnet so first-launch setup can work on the local network;
-//! - post-onboarding (`named_awaiting_pair`, `ready`, `recovering`) allows only
-//!   loopback + Tailnet + verified Mesh so the Ready control plane is not
-//!   exposed over LAN HTTP.
+//! - post-onboarding (`named_awaiting_pair`, `ready`, `recovering`) allows
+//!   loopback + Tailnet + verified Mesh, and admits LAN only when the owner
+//!   has opened it with `THEYOS_HOUSEHOLD_LAN_PAIRING` (see [`LanPairing`]);
+//! - an interrupted install (`pair_machine_install_restart_required`) allows
+//!   loopback + Tailnet and is reachable by no switch at all.
+//!
+//! # The post-onboarding LAN switch: closed by default, opened by the owner
+//!
+//! With the variable unset the post-onboarding class set is exactly the one
+//! that shipped -- LAN HTTP stays withdrawn, and no code path can turn it on.
+//! The switch is read once per process, so nothing widens on a timer either.
+//!
+//! Opening it exposes the household PORT, not a control plane, and that is why
+//! the owner is allowed to make this call:
+//! - every effectful household route behind the port still demands the pairing
+//!   ceremony -- a proof-of-possession signature under a device cert the owner
+//!   issued. An unpaired LAN peer that reaches the socket gets 401/403, not a
+//!   session.
+//! - the routes that hand out the first-owner pairing URI keep their OWN
+//!   loopback-or-Tailnet peer ACL (`handlers_pair_device::initiate`,
+//!   `handlers_bootstrap::get_bootstrap_pair_device_uri` and its by-code
+//!   sibling). Those gates were written because bind-time exposure was never
+//!   an admission check; they do not move with this switch.
+//! - [`HouseholdExposurePolicy::allows_terminal_attach_peer`] still answers
+//!   `false` for LAN in every state, so remote terminal attach -- the one
+//!   directly effectful surface -- gains nothing.
+//!
+//! MEASURED 2026-09-04 in `engine.log`: a Ready engine logged exactly four
+//! `bootstrap.endpoint.live` binds -- Tailnet v4/v6 plus loopback v4/v6 -- on
+//! port 8091, and no `192.168.x`. A phone with no Tailscale had no address to
+//! dial, so `Connect` failed with zero requests arriving. That is the failure
+//! this switch lets the owner clear.
 //!
 //! Refuses wildcard `0.0.0.0` / `::` per FR-008. Refreshes the active address
 //! set every 60 s and reconciles state-policy changes every 500 ms.
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use axum::{Router, http::StatusCode};
@@ -26,6 +55,7 @@ use tracing::{info, warn};
 const INTERFACE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const POLICY_SYNC_INTERVAL: Duration = Duration::from_millis(500);
 const MESH_SUBNET_ENV: &str = "THEYOS_MESH_SUBNET";
+const LAN_PAIRING_ENV: &str = "THEYOS_HOUSEHOLD_LAN_PAIRING";
 const PRODUCT_A_MESH_NETWORK: Ipv4Addr = Ipv4Addr::new(10, 44, 0, 0);
 const PRODUCT_A_MESH_PREFIX_LEN: u8 = 16;
 
@@ -57,6 +87,83 @@ impl InterfaceClass {
     }
 }
 
+/// Owner opt-in that re-admits plain-LAN HTTP on the household port after
+/// onboarding, and stops the setup-invitation browser from suppressing a
+/// phone beacon that carries no Tailnet address.
+///
+/// Fail-closed in three separate ways, because this is the one knob that can
+/// widen a Ready household's exposure:
+/// - `Closed` is the `Default` and the value every unrecognised spelling
+///   parses to, so a typo in the launchd plist cannot open the port;
+/// - it is resolved from the environment exactly ONCE per process
+///   ([`LanPairing::from_env`]), so the 500 ms / 60 s reconciliation loops
+///   cannot observe it changing under a running engine;
+/// - it moves `InterfaceClass::Lan` and nothing else -- not Mesh, not the
+///   install-interrupted arm, not terminal attach.
+///
+/// The dead `SOYEHT_SETUP_INVITATION_ALLOW_LAN` name that some Mac
+/// launchd plists export was deliberately NOT reused: it is read nowhere
+/// in this repo, so an operator setting it would have got silence, and a
+/// switch that quietly does nothing is worse than no switch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LanPairing {
+    /// Post-onboarding LAN HTTP stays withdrawn. The shipped default.
+    #[default]
+    Closed,
+    /// The owner asked for it: LAN joins the post-onboarding class set.
+    Open,
+}
+
+impl LanPairing {
+    /// `1` or `true` (any ASCII case) open it, surrounding whitespace trimmed
+    /// -- the same shape `household_bootstrap::owner_webauthn_network_enabled`
+    /// already uses for this crate's other owner-authority switch. `0` and
+    /// `false` close it silently; every other non-empty value is a typo in a
+    /// hand-edited plist, so it warns and stays `Closed` rather than
+    /// half-opening a Ready household's port on a guess.
+    #[must_use]
+    fn parse(raw: Option<&str>) -> Self {
+        let Some(value) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Self::Closed;
+        };
+        if value == "1" || value.eq_ignore_ascii_case("true") {
+            return Self::Open;
+        }
+        if value == "0" || value.eq_ignore_ascii_case("false") {
+            return Self::Closed;
+        }
+        warn!(
+            env = LAN_PAIRING_ENV,
+            "unknown household LAN-pairing value; keeping post-onboarding LAN closed"
+        );
+        Self::Closed
+    }
+
+    /// The process-wide decision, resolved on first call and frozen after.
+    #[must_use]
+    pub fn from_env() -> Self {
+        static RESOLVED: OnceLock<LanPairing> = OnceLock::new();
+        *RESOLVED.get_or_init(|| {
+            let raw = std::env::var_os(LAN_PAIRING_ENV);
+            Self::parse(raw.as_deref().and_then(std::ffi::OsStr::to_str))
+        })
+    }
+
+    #[must_use]
+    pub const fn is_open(self) -> bool {
+        matches!(self, Self::Open)
+    }
+
+    /// Log field value, so the engine log states the posture it came up with.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::Open => "open",
+        }
+    }
+}
+
 /// Pure transport exposure policy for household listener and Bonjour surfaces.
 ///
 /// This is intentionally independent from interface names and socket binding:
@@ -65,8 +172,23 @@ impl InterfaceClass {
 pub struct HouseholdExposurePolicy;
 
 impl HouseholdExposurePolicy {
+    /// Environment-backed entry point. The switch position comes from
+    /// [`LanPairing::from_env`], which resolves once per process, so every
+    /// caller in the reconciliation loops sees one stable answer.
     #[must_use]
     pub fn allows(state: BootstrapState, class: InterfaceClass) -> bool {
+        Self::allows_with(state, class, LanPairing::from_env())
+    }
+
+    /// The decision itself, with the owner switch passed in rather than read.
+    /// Tests drive this so neither switch position depends on the order the
+    /// process happened to touch its environment.
+    #[must_use]
+    pub fn allows_with(
+        state: BootstrapState,
+        class: InterfaceClass,
+        lan_pairing: LanPairing,
+    ) -> bool {
         match state {
             BootstrapState::Uninitialized | BootstrapState::ReadyForNaming => matches!(
                 class,
@@ -90,17 +212,27 @@ impl HouseholdExposurePolicy {
             // Rule, so the next variant does not repeat this: entering
             // `PairMachineInstallRestartRequired` must never widen the exposed
             // class set relative to any legal predecessor.
+            //
+            // `lan_pairing` deliberately does not reach this arm. With the
+            // switch open the predecessor sets become {Loopback, Lan,
+            // Tailscale} and {Loopback, Lan, Tailscale, Mesh}, whose
+            // intersection grows to include Lan -- so this arm stays a strict
+            // subset either way and the rule above holds in both positions.
+            // An interrupted install is a recovery step, not a household the
+            // owner is currently choosing to pair over the LAN.
             BootstrapState::PairMachineInstallRestartRequired => {
                 matches!(class, InterfaceClass::Loopback | InterfaceClass::Tailscale)
             }
             BootstrapState::NamedAwaitingPair
             | BootstrapState::Ready
-            | BootstrapState::Recovering => {
-                matches!(
-                    class,
-                    InterfaceClass::Loopback | InterfaceClass::Tailscale | InterfaceClass::Mesh
-                )
-            }
+            | BootstrapState::Recovering => match class {
+                InterfaceClass::Loopback | InterfaceClass::Tailscale | InterfaceClass::Mesh => true,
+                // The ONLY class the owner switch can move, and only here.
+                // `Closed` reproduces the shipped set exactly; `Open` is what
+                // gives a phone with no Tailnet address something to dial for
+                // the pairing ceremony.
+                InterfaceClass::Lan => lan_pairing.is_open(),
+            },
         }
     }
 
@@ -108,6 +240,11 @@ impl HouseholdExposurePolicy {
     /// so a Mesh peer is stricter than a listener bind: it is admitted only
     /// after the household is fully `Ready`. Loopback and Tailnet retain the
     /// existing exposure policy for their class.
+    ///
+    /// LAN answers `false` in every state and is NOT wired to
+    /// [`LanPairing`]: opening the port for the pairing ceremony is a
+    /// different decision from letting a LAN peer drive somebody's terminal,
+    /// and only the first one was asked for.
     #[must_use]
     pub fn allows_terminal_attach_peer(state: BootstrapState, class: InterfaceClass) -> bool {
         match class {
@@ -122,9 +259,20 @@ impl HouseholdExposurePolicy {
         state: BootstrapState,
         targets: impl IntoIterator<Item = (IpAddr, InterfaceClass)>,
     ) -> Vec<(IpAddr, InterfaceClass)> {
+        Self::allowed_targets_with(state, targets, LanPairing::from_env())
+    }
+
+    /// [`Self::allowed_targets`] with the owner switch supplied, so a test can
+    /// assert the bind set for both positions in one process.
+    #[must_use]
+    pub fn allowed_targets_with(
+        state: BootstrapState,
+        targets: impl IntoIterator<Item = (IpAddr, InterfaceClass)>,
+        lan_pairing: LanPairing,
+    ) -> Vec<(IpAddr, InterfaceClass)> {
         targets
             .into_iter()
-            .filter(|(_, class)| Self::allows(state, *class))
+            .filter(|(_, class)| Self::allows_with(state, *class, lan_pairing))
             .collect()
     }
 
@@ -135,7 +283,17 @@ impl HouseholdExposurePolicy {
         state: BootstrapState,
         targets: impl IntoIterator<Item = (IpAddr, InterfaceClass)>,
     ) -> Vec<(IpAddr, InterfaceClass)> {
-        Self::allowed_targets(state, targets)
+        Self::bonjour_targets_with(state, targets, LanPairing::from_env())
+    }
+
+    /// [`Self::bonjour_targets`] with the owner switch supplied.
+    #[must_use]
+    pub fn bonjour_targets_with(
+        state: BootstrapState,
+        targets: impl IntoIterator<Item = (IpAddr, InterfaceClass)>,
+        lan_pairing: LanPairing,
+    ) -> Vec<(IpAddr, InterfaceClass)> {
+        Self::allowed_targets_with(state, targets, lan_pairing)
             .into_iter()
             .filter(|(_, class)| class.is_bonjour_advertisable())
             .collect()
@@ -1771,16 +1929,27 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn exposure_policy_ready_excludes_lan_and_keeps_loopback_tailnet_mesh() {
-        let targets = vec![
+    /// One Ready host with one address of every class, so the two switch
+    /// positions can be compared on identical input.
+    fn one_target_per_class() -> Vec<(IpAddr, InterfaceClass)> {
+        vec![
             (IpAddr::V4(Ipv4Addr::LOCALHOST), InterfaceClass::Loopback),
             ("192.0.2.10".parse().unwrap(), InterfaceClass::Lan),
             ("100.64.0.10".parse().unwrap(), InterfaceClass::Tailscale),
             ("10.77.0.10".parse().unwrap(), InterfaceClass::Mesh),
-        ];
+        ]
+    }
 
-        let allowed = HouseholdExposurePolicy::allowed_targets(BootstrapState::Ready, targets);
+    #[test]
+    fn exposure_policy_ready_excludes_lan_and_keeps_loopback_tailnet_mesh() {
+        // Switch CLOSED -- the shipped set. Passed explicitly rather than read
+        // from the process environment so this stays the same assertion no
+        // matter what the test runner exports.
+        let allowed = HouseholdExposurePolicy::allowed_targets_with(
+            BootstrapState::Ready,
+            one_target_per_class(),
+            LanPairing::Closed,
+        );
         assert_eq!(
             allowed,
             vec![
@@ -1789,6 +1958,120 @@ mod tests {
                 ("10.77.0.10".parse().unwrap(), InterfaceClass::Mesh),
             ]
         );
+    }
+
+    #[test]
+    fn exposure_policy_ready_binds_lan_when_the_owner_opened_it() {
+        let allowed = HouseholdExposurePolicy::allowed_targets_with(
+            BootstrapState::Ready,
+            one_target_per_class(),
+            LanPairing::Open,
+        );
+        assert_eq!(
+            allowed,
+            one_target_per_class(),
+            "an opened switch must add the LAN address to the bind set and \
+             change nothing else about it"
+        );
+    }
+
+    #[test]
+    fn lan_is_the_only_class_the_owner_switch_moves() {
+        // Every state x every class, both positions. Anything that differs
+        // other than post-onboarding LAN is the switch reaching further than
+        // it was asked to.
+        let states = [
+            BootstrapState::Uninitialized,
+            BootstrapState::ReadyForNaming,
+            BootstrapState::NamedAwaitingPair,
+            BootstrapState::PairMachineInstallRestartRequired,
+            BootstrapState::Ready,
+            BootstrapState::Recovering,
+        ];
+        let classes = [
+            InterfaceClass::Loopback,
+            InterfaceClass::Lan,
+            InterfaceClass::Tailscale,
+            InterfaceClass::Mesh,
+        ];
+        for state in states {
+            for class in classes {
+                let closed = HouseholdExposurePolicy::allows_with(state, class, LanPairing::Closed);
+                let open = HouseholdExposurePolicy::allows_with(state, class, LanPairing::Open);
+                let post_onboarding_lan = class == InterfaceClass::Lan
+                    && matches!(
+                        state,
+                        BootstrapState::NamedAwaitingPair
+                            | BootstrapState::Ready
+                            | BootstrapState::Recovering
+                    );
+                if post_onboarding_lan {
+                    assert!(
+                        !closed,
+                        "{state:?}/Lan must be denied while the switch is closed"
+                    );
+                    assert!(
+                        open,
+                        "{state:?}/Lan must be admitted once the owner opens it"
+                    );
+                } else {
+                    assert_eq!(
+                        closed, open,
+                        "{state:?}/{class:?} moved with the LAN switch; the switch may \
+                         only move post-onboarding LAN"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_unset_or_misspelled_switch_stays_closed() {
+        assert_eq!(LanPairing::default(), LanPairing::Closed);
+        assert_eq!(LanPairing::parse(None), LanPairing::Closed);
+        // The plist writes this by hand, so the two documented spellings must
+        // survive a stray space and a stray capital.
+        for raw in ["1", " 1 ", "true", "TRUE", "True", " true\n"] {
+            assert_eq!(
+                LanPairing::parse(Some(raw)),
+                LanPairing::Open,
+                "{raw:?} is one of the accepted spellings"
+            );
+        }
+        // A near-miss must fail closed rather than half-open a Ready
+        // household's port. `yes`/`on`/`enabled` are the plausible typos; they
+        // read as consent and must not be honoured as it.
+        for raw in [
+            "", " ", "0", "false", "FALSE", "yes", "on", "enabled", "truthy", "-1",
+        ] {
+            assert_eq!(
+                LanPairing::parse(Some(raw)),
+                LanPairing::Closed,
+                "{raw:?} must not open post-onboarding LAN"
+            );
+        }
+    }
+
+    #[test]
+    fn opening_lan_pairing_does_not_open_remote_terminal_attach() {
+        // The switch is about reaching the pairing ceremony, not about driving
+        // somebody's terminal. `allows_terminal_attach_peer` takes no switch
+        // argument at all, and this pins that it stays that way.
+        for state in [
+            BootstrapState::Ready,
+            BootstrapState::NamedAwaitingPair,
+            BootstrapState::Recovering,
+        ] {
+            assert!(
+                !HouseholdExposurePolicy::allows_terminal_attach_peer(state, InterfaceClass::Lan),
+                "{state:?} must not accept a LAN terminal attach"
+            );
+            assert!(
+                HouseholdExposurePolicy::allows_with(state, InterfaceClass::Lan, LanPairing::Open),
+                "control: the same state DOES bind LAN with the switch open, so the \
+                 assertion above is about attach and not about LAN being dead"
+            );
+        }
     }
 
     #[test]
@@ -1825,8 +2108,27 @@ mod tests {
         ];
 
         assert_eq!(
-            HouseholdExposurePolicy::bonjour_targets(BootstrapState::Ready, ready_targets),
+            HouseholdExposurePolicy::bonjour_targets_with(
+                BootstrapState::Ready,
+                ready_targets.clone(),
+                LanPairing::Closed
+            ),
             vec![("100.64.0.10".parse().unwrap(), InterfaceClass::Tailscale)]
+        );
+
+        // Opening the switch adds the LAN address to the Ready beacon -- that
+        // is the point, the phone has to find the Mac by mDNS -- and STILL
+        // withholds Mesh, whose /32 must never leave through a LAN multicast.
+        assert_eq!(
+            HouseholdExposurePolicy::bonjour_targets_with(
+                BootstrapState::Ready,
+                ready_targets,
+                LanPairing::Open
+            ),
+            vec![
+                ("192.168.1.2".parse().unwrap(), InterfaceClass::Lan),
+                ("100.64.0.10".parse().unwrap(), InterfaceClass::Tailscale),
+            ]
         );
 
         let onboarding_targets = vec![
@@ -1873,16 +2175,26 @@ mod tests {
             BootstrapState::NamedAwaitingPair,
             BootstrapState::Recovering,
         ] {
-            assert!(!HouseholdExposurePolicy::allows(state, InterfaceClass::Lan));
-            assert!(HouseholdExposurePolicy::allows(
+            assert!(!HouseholdExposurePolicy::allows_with(
                 state,
-                InterfaceClass::Loopback
+                InterfaceClass::Lan,
+                LanPairing::Closed
             ));
-            assert!(HouseholdExposurePolicy::allows(
+            assert!(HouseholdExposurePolicy::allows_with(
                 state,
-                InterfaceClass::Tailscale
+                InterfaceClass::Loopback,
+                LanPairing::Closed
             ));
-            assert!(HouseholdExposurePolicy::allows(state, InterfaceClass::Mesh));
+            assert!(HouseholdExposurePolicy::allows_with(
+                state,
+                InterfaceClass::Tailscale,
+                LanPairing::Closed
+            ));
+            assert!(HouseholdExposurePolicy::allows_with(
+                state,
+                InterfaceClass::Mesh,
+                LanPairing::Closed
+            ));
         }
     }
 

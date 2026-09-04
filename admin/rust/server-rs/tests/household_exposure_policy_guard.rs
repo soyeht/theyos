@@ -317,3 +317,85 @@ fn plain_http_listener_contract_is_pinned_in_code() {
         "bootstrap/status no-auth posture must stay documented in handlers_bootstrap.rs"
     );
 }
+
+/// The owner's LAN opt-in has to clear BOTH gates that hide a LAN-only phone
+/// beacon, or it clears neither.
+///
+/// The setup-invitation browser is the only thing that turns a phone's
+/// `_soyeht-setup._tcp.` announcement into a claimable cache entry. Before the
+/// switch it was spawned only while the engine was still uninitialized, and
+/// always with `BrowserConfig::default()` (`include_local_network = false`,
+/// which logs `setup_browser.suppressed reason=non_tailnet`). Fixing one and
+/// not the other leaves the owner with a browser that runs and drops
+/// everything, or a browser that would accept the beacon and is not running.
+/// Source-level because spawning a real mDNS browser in a test would need the
+/// host's multicast, which CI does not have.
+#[test]
+fn setup_invitation_browser_follows_the_owner_lan_switch_on_both_gates() {
+    let source = read_src("household_bootstrap.rs");
+    let spawn_body = slice_between(
+        &source,
+        "let lan_pairing = household_listener::LanPairing::from_env();",
+        "let bootstrap_rt =",
+    );
+
+    assert!(
+        spawn_body.contains("lan_pairing.is_open()\n        || matches!("),
+        "gate 1: an opened switch must spawn the setup browser regardless of the \
+         initial bootstrap state, so an already-Ready engine still browses"
+    );
+    assert!(
+        spawn_body.contains("include_local_network: lan_pairing.is_open()"),
+        "gate 2: the browser must be built with include_local_network tied to the \
+         same switch, or a LAN-only iPhone beacon is dropped as non_tailnet"
+    );
+    assert!(
+        !spawn_body.contains("BrowserConfig::default()"),
+        "the config must be derived from the switch, not from the default that \
+         hard-codes include_local_network = false"
+    );
+}
+
+/// The switch is one name, read in one place.
+///
+/// `SOYEHT_SETUP_INVITATION_ALLOW_LAN` is exported by some Mac launchd
+/// plists and read NOWHERE in this repo — an operator who set it got silence.
+/// This pins that the replacement did not repeat that: the new name exists,
+/// and the dead one is still not wired to anything.
+#[test]
+fn the_lan_pairing_switch_has_exactly_one_name_and_one_reader() {
+    let listener = read_src("household_listener.rs");
+    assert!(
+        listener.contains(r#"const LAN_PAIRING_ENV: &str = "THEYOS_HOUSEHOLD_LAN_PAIRING";"#),
+        "the owner switch must keep its declared name"
+    );
+    assert_eq!(
+        listener
+            .matches("std::env::var_os(LAN_PAIRING_ENV)")
+            .count(),
+        1,
+        "the switch must be read from the environment in exactly one place, inside \
+         the OnceLock that freezes it for the life of the process"
+    );
+
+    // The dead name may be NAMED in prose — `household_listener.rs` explains
+    // why it was not reused — but must never become an environment read again.
+    for file in [
+        "household_listener.rs",
+        "household_bootstrap.rs",
+        "bonjour_browser.rs",
+        "bonjour_trust.rs",
+        "main.rs",
+    ] {
+        let body = read_src(file);
+        for read in [
+            r#"var_os("SOYEHT_SETUP_INVITATION_ALLOW_LAN")"#,
+            r#"var("SOYEHT_SETUP_INVITATION_ALLOW_LAN")"#,
+        ] {
+            assert!(
+                !body.contains(read),
+                "src/{file} must not revive the dead LaunchAgent variable as a switch"
+            );
+        }
+    }
+}

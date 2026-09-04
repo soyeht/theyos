@@ -112,7 +112,17 @@ async fn main() {
     }
 
     let cfg = config::Config::from_env();
-    info!("Starting server-rs on {}", cfg.addr);
+    // The version is on this line because it was NOT anywhere in the log: on
+    // 2026-09-04 the running engine's version had to be inferred from the
+    // mtime of the installed binary. The household LAN-pairing posture rides
+    // along on the same line -- it is resolved once here, at bootstrap, so the
+    // log always states which of the two exposure policies came up.
+    info!(
+        "Starting server-rs {} on {} (household_lan_pairing={})",
+        env!("CARGO_PKG_VERSION"),
+        cfg.addr,
+        server_rs::household_listener::LanPairing::from_env().as_str(),
+    );
     info!("Serving SPA from {:?}", cfg.web_dir);
 
     // ─── Household identity (Phase 1) — separate listener, deferred ──

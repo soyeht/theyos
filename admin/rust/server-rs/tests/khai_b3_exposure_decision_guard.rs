@@ -57,6 +57,17 @@
 //! The executed half is the half that decides whether widening exists; the
 //! read half only establishes reachability, from two explicit call sites.
 //!
+//! # Addendum (2026-09-04): the owner LAN switch
+//!
+//! `allows` grew an owner opt-in (`THEYOS_HOUSEHOLD_LAN_PAIRING`, see
+//! `LanPairing`) that admits `Lan` in the three post-onboarding states. The
+//! pinned table below is therefore a function of state x class x SWITCH, and
+//! every test here runs both positions: the closed column is the table that
+//! shipped, byte for byte, and the open column is the only widening the owner
+//! can ask for. `PairMachineInstallRestartRequired` is unreachable by the
+//! switch in either column, which is what keeps the never-widens rule true on
+//! both.
+//!
 //! # Declared severity limit
 //!
 //! `classify_local_address` returns `InterfaceClass::Mesh` only when
@@ -68,7 +79,7 @@
 //! Product A / nvpn into this delivery.
 
 use household_rs::bootstrap_state::BootstrapState;
-use server_rs::household_listener::{HouseholdExposurePolicy, InterfaceClass};
+use server_rs::household_listener::{HouseholdExposurePolicy, InterfaceClass, LanPairing};
 
 const ALL_CLASSES: [InterfaceClass; 4] = [
     InterfaceClass::Loopback,
@@ -94,6 +105,10 @@ const LEGAL_PREDECESSORS_OF_INSTALL_RESTART: [BootstrapState; 3] = [
     BootstrapState::NamedAwaitingPair,
 ];
 
+/// Both positions of the owner LAN switch, so every table below is asserted
+/// twice rather than once against whatever the environment happens to say.
+const BOTH_SWITCH_POSITIONS: [LanPairing; 2] = [LanPairing::Closed, LanPairing::Open];
+
 /// The decided policy, exhaustive by construction.
 ///
 /// Adding a `BootstrapState` variant makes THIS FUNCTION fail to compile
@@ -101,60 +116,139 @@ const LEGAL_PREDECESSORS_OF_INSTALL_RESTART: [BootstrapState; 3] = [
 /// or-pattern somewhere else — which is exactly how this defect arrived.
 /// Deliberately a `match` with no wildcard: `matches!`, `==` and `if let` are
 /// not exhaustiveness-checked.
-fn expected_exposure(state: BootstrapState, class: InterfaceClass) -> bool {
+fn expected_exposure(state: BootstrapState, class: InterfaceClass, lan: LanPairing) -> bool {
     match state {
         // Onboarding: LAN allowed so first-launch setup works locally; no Mesh
-        // (no trust established yet).
+        // (no trust established yet). The owner switch is irrelevant here —
+        // LAN is already on.
         BootstrapState::Uninitialized | BootstrapState::ReadyForNaming => matches!(
             class,
             InterfaceClass::Loopback | InterfaceClass::Lan | InterfaceClass::Tailscale
         ),
-        // Post-onboarding: no LAN HTTP, Mesh permitted.
+        // Post-onboarding: Mesh permitted, and LAN HTTP only if the owner
+        // opened it. `LanPairing::Closed` is the shipped default and the value
+        // every unrecognised spelling parses to.
         BootstrapState::NamedAwaitingPair | BootstrapState::Ready | BootstrapState::Recovering => {
-            matches!(
-                class,
-                InterfaceClass::Loopback | InterfaceClass::Tailscale | InterfaceClass::Mesh
-            )
+            match class {
+                InterfaceClass::Loopback | InterfaceClass::Tailscale | InterfaceClass::Mesh => true,
+                InterfaceClass::Lan => lan.is_open(),
+            }
         }
         // Interrupted install: the intersection of every legal predecessor.
-        // Written literally rather than inherited from any other arm.
+        // Written literally rather than inherited from any other arm, and
+        // deliberately not reachable by the owner switch.
         BootstrapState::PairMachineInstallRestartRequired => {
             matches!(class, InterfaceClass::Loopback | InterfaceClass::Tailscale)
         }
     }
 }
 
-fn allowed_classes(state: BootstrapState) -> Vec<InterfaceClass> {
+fn allowed_classes(state: BootstrapState, lan: LanPairing) -> Vec<InterfaceClass> {
     ALL_CLASSES
         .into_iter()
-        .filter(|class| HouseholdExposurePolicy::allows(state, *class))
+        .filter(|class| HouseholdExposurePolicy::allows_with(state, *class, lan))
         .collect()
 }
 
 #[test]
 fn install_restart_required_exposure_is_pinned_not_inherited() {
-    for class in ALL_CLASSES {
-        assert_eq!(
-            HouseholdExposurePolicy::allows(
-                BootstrapState::PairMachineInstallRestartRequired,
-                class
-            ),
-            expected_exposure(BootstrapState::PairMachineInstallRestartRequired, class),
-            "exposure for PairMachineInstallRestartRequired/{class:?} is not what this \
-             guard pins; the or-pattern arm decided it without an assertion"
-        );
+    for lan in BOTH_SWITCH_POSITIONS {
+        for class in ALL_CLASSES {
+            assert_eq!(
+                HouseholdExposurePolicy::allows_with(
+                    BootstrapState::PairMachineInstallRestartRequired,
+                    class,
+                    lan
+                ),
+                expected_exposure(
+                    BootstrapState::PairMachineInstallRestartRequired,
+                    class,
+                    lan
+                ),
+                "exposure for PairMachineInstallRestartRequired/{class:?} at \
+                 lan_pairing={lan:?} is not what this guard pins; the or-pattern arm \
+                 decided it without an assertion"
+            );
+        }
     }
 }
 
 #[test]
 fn every_bootstrap_state_exposure_is_pinned() {
+    for lan in BOTH_SWITCH_POSITIONS {
+        for state in ALL_STATES {
+            for class in ALL_CLASSES {
+                assert_eq!(
+                    HouseholdExposurePolicy::allows_with(state, class, lan),
+                    expected_exposure(state, class, lan),
+                    "exposure drifted for {state:?}/{class:?} at lan_pairing={lan:?}"
+                );
+            }
+        }
+    }
+}
+
+/// The default this repo ships is the closed column, and the env-backed
+/// `allows` is nothing but `allows_with` under the resolved switch.
+///
+/// Two claims in one test because they fail together: if `allows` ever grew a
+/// second input, or if `LanPairing::default()` moved, the shipped posture
+/// would stop being the table above without any arm changing.
+#[test]
+fn the_shipped_default_is_the_closed_column() {
+    assert_eq!(
+        LanPairing::default(),
+        LanPairing::Closed,
+        "an engine with no THEYOS_HOUSEHOLD_LAN_PAIRING set must expose exactly what \
+         it exposed before the switch existed"
+    );
+    let resolved = LanPairing::from_env();
     for state in ALL_STATES {
         for class in ALL_CLASSES {
             assert_eq!(
                 HouseholdExposurePolicy::allows(state, class),
-                expected_exposure(state, class),
-                "exposure drifted for {state:?}/{class:?}"
+                expected_exposure(state, class, resolved),
+                "env-backed allows() disagrees with the pinned table for \
+                 {state:?}/{class:?} at the resolved switch {resolved:?}"
             );
+        }
+    }
+}
+
+/// The switch may move post-onboarding LAN and nothing else.
+///
+/// Stated as a difference between the two columns rather than as a list of
+/// allowed cells, so a future arm that consults `lan_pairing` for some other
+/// class fails here instead of quietly shipping.
+#[test]
+fn the_owner_switch_moves_only_post_onboarding_lan() {
+    for state in ALL_STATES {
+        for class in ALL_CLASSES {
+            let closed = HouseholdExposurePolicy::allows_with(state, class, LanPairing::Closed);
+            let open = HouseholdExposurePolicy::allows_with(state, class, LanPairing::Open);
+            let post_onboarding_lan = class == InterfaceClass::Lan
+                && matches!(
+                    state,
+                    BootstrapState::NamedAwaitingPair
+                        | BootstrapState::Ready
+                        | BootstrapState::Recovering
+                );
+            if post_onboarding_lan {
+                assert!(
+                    !closed,
+                    "{state:?}/Lan must be denied while the switch is closed"
+                );
+                assert!(
+                    open,
+                    "{state:?}/Lan must be admitted once the owner opens it"
+                );
+            } else {
+                assert_eq!(
+                    closed, open,
+                    "{state:?}/{class:?} moved with the owner LAN switch; the switch is \
+                     scoped to post-onboarding LAN and must reach nothing else"
+                );
+            }
         }
     }
 }
@@ -186,21 +280,26 @@ fn legal_predecessors_list_matches_the_transition_table() {
 /// A reexec/install-restart is a recovery step, not a promotion.
 #[test]
 fn entering_install_restart_required_never_widens_the_exposed_class_set() {
-    let after = allowed_classes(BootstrapState::PairMachineInstallRestartRequired);
-    for before in LEGAL_PREDECESSORS_OF_INSTALL_RESTART {
-        let had = allowed_classes(before);
-        let gained: Vec<_> = after
-            .iter()
-            .filter(|class| !had.contains(class))
-            .copied()
-            .collect();
-        assert!(
-            gained.is_empty(),
-            "{before:?} -> PairMachineInstallRestartRequired GAINS {gained:?}: \
-             refresh_loop re-derives bind targets from this same policy on a timer, \
-             so the household becomes reachable on a class it was not reachable on \
-             before, without the router ever being restarted"
-        );
+    // Asserted in BOTH switch positions: opening LAN adds `Lan` to two of the
+    // three predecessor sets, so the intersection this arm must stay inside
+    // GROWS. The arm itself does not, which is the whole point.
+    for lan in BOTH_SWITCH_POSITIONS {
+        let after = allowed_classes(BootstrapState::PairMachineInstallRestartRequired, lan);
+        for before in LEGAL_PREDECESSORS_OF_INSTALL_RESTART {
+            let had = allowed_classes(before, lan);
+            let gained: Vec<_> = after
+                .iter()
+                .filter(|class| !had.contains(class))
+                .copied()
+                .collect();
+            assert!(
+                gained.is_empty(),
+                "{before:?} -> PairMachineInstallRestartRequired GAINS {gained:?} at \
+                 lan_pairing={lan:?}: refresh_loop re-derives bind targets from this \
+                 same policy on a timer, so the household becomes reachable on a class \
+                 it was not reachable on before, without the router ever being restarted"
+            );
+        }
     }
 }
 
@@ -211,11 +310,15 @@ fn install_restart_required_is_distinguishable_from_ready() {
     let pmirr = BootstrapState::PairMachineInstallRestartRequired;
 
     assert!(
-        !HouseholdExposurePolicy::allows(pmirr, InterfaceClass::Mesh),
+        !HouseholdExposurePolicy::allows_with(pmirr, InterfaceClass::Mesh, LanPairing::Closed),
         "an interrupted install must not be bindable on Mesh"
     );
     assert!(
-        HouseholdExposurePolicy::allows(BootstrapState::Ready, InterfaceClass::Mesh),
+        HouseholdExposurePolicy::allows_with(
+            BootstrapState::Ready,
+            InterfaceClass::Mesh,
+            LanPairing::Closed
+        ),
         "control: a fully Ready household IS bindable on Mesh, so the assertion above \
          is about the state and not about Mesh being denied globally"
     );
@@ -237,9 +340,13 @@ fn install_restart_required_is_distinguishable_from_ready() {
         "control for the attach assertion"
     );
 
-    // It must not inherit onboarding's LAN either.
-    assert!(
-        !HouseholdExposurePolicy::allows(pmirr, InterfaceClass::Lan),
-        "an interrupted install must not expose LAN HTTP"
-    );
+    // It must not inherit onboarding's LAN either, in either switch position.
+    // An interrupted install is a recovery step; the owner opting into LAN
+    // pairing for a working household says nothing about a broken one.
+    for lan in BOTH_SWITCH_POSITIONS {
+        assert!(
+            !HouseholdExposurePolicy::allows_with(pmirr, InterfaceClass::Lan, lan),
+            "an interrupted install must not expose LAN HTTP at lan_pairing={lan:?}"
+        );
+    }
 }

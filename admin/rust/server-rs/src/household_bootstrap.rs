@@ -2081,13 +2081,36 @@ pub async fn bootstrap_household(
         bootstrap_handler_state =
             bootstrap_handler_state.with_pair_code_rate_limiter(Arc::clone(&state.rate_limiter));
     }
-    if matches!(
-        initial_bootstrap_state,
-        BootstrapState::Uninitialized | BootstrapState::ReadyForNaming
-    ) {
+    // The setup-invitation browser is what turns a phone's
+    // `_soyeht-setup._tcp.` beacon into a cache entry that
+    // `POST /bootstrap/claim-setup-invitation` can claim. Two things stop it
+    // from ever seeing a LAN-only phone, and the owner's LAN opt-in has to
+    // clear BOTH:
+    //   1. it is spawned only while the engine is still uninitialized, so an
+    //      already-Ready engine has no browser running at all; and
+    //   2. `BrowserConfig::default()` has `include_local_network = false`, so
+    //      a beacon carrying nothing but `192.168.x` is dropped and logged as
+    //      `setup_browser.suppressed reason=non_tailnet` (bonjour_browser.rs).
+    // A phone without Tailscale publishes exactly that beacon, which is why
+    // pairing produced no requests at all. With the switch closed this branch
+    // and this config are unchanged.
+    let lan_pairing = household_listener::LanPairing::from_env();
+    if lan_pairing.is_open()
+        || matches!(
+            initial_bootstrap_state,
+            BootstrapState::Uninitialized | BootstrapState::ReadyForNaming
+        )
+    {
+        info!(
+            stage = "setup_browser.spawn",
+            lan_pairing = lan_pairing.as_str(),
+            bootstrap_state = initial_bootstrap_state.as_str(),
+        );
         drop(bonjour_browser::spawn_setup_invitation_browser_with_cache(
             bootstrap_handler_state.setup_invitation_cache.clone(),
-            BrowserConfig::default(),
+            BrowserConfig {
+                include_local_network: lan_pairing.is_open(),
+            },
         ));
     }
     let bootstrap_rt = crate::handlers_bootstrap::bootstrap_router(bootstrap_handler_state);
