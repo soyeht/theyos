@@ -15,6 +15,30 @@ fn src_dir() -> PathBuf {
     crate_dir().join("src")
 }
 
+/// Every `.rs` file under `src/`, recursively. The exposure claims are about
+/// the crate, not about whichever files a change happened to open.
+fn rust_sources_under_src() -> Vec<std::path::PathBuf> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) => panic!("read_dir {}: {e}", dir.display()),
+        };
+        for entry in entries {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&src_dir(), &mut out);
+    out.sort();
+    assert!(out.len() > 20, "src/ walk found only {} files", out.len());
+    out
+}
+
 fn read_src(file: &str) -> String {
     fs::read_to_string(src_dir().join(file)).unwrap_or_else(|e| panic!("read src/{file}: {e}"))
 }
@@ -391,16 +415,16 @@ fn setup_invitation_browser_ties_only_its_network_filter_to_the_exposure_policy(
 /// got silence. Neither name may become an environment read again.
 #[test]
 fn local_network_exposure_has_no_environment_switch() {
-    for file in [
-        "household_listener.rs",
-        "household_bootstrap.rs",
-        "bonjour_browser.rs",
-        "bonjour_trust.rs",
-        "setup_beacon.rs",
-        "bonjour_publisher.rs",
-        "main.rs",
-    ] {
-        let body = read_src(file);
+    // Every file under src/, not a list of the seven that happened to be
+    // touched: the claim is that no environment variable decides local-network
+    // exposure anywhere, and a list can only ever prove it about itself.
+    for path in rust_sources_under_src() {
+        let file = path
+            .strip_prefix(src_dir())
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        let body = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {file}: {e}"));
         assert!(
             !body.contains("THEYOS_HOUSEHOLD_LAN_PAIRING"),
             "src/{file} must not reintroduce the deleted LAN-pairing switch"

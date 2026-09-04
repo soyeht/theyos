@@ -65,16 +65,18 @@
 //! - OPEN: `mint_token` / `get_or_mint` send `PairDeviceWindowState::Open`;
 //!   the subscription arm wakes and [`sync_interface_targets`] binds the LAN
 //!   addresses immediately -- no timer is waited on, the delay is the bind
-//!   itself. If that send never arrives (a lagged subscriber, or a token
-//!   adopted from a persisted snapshot at startup rather than minted) the
-//!   500 ms tick observes the same open window. Worst case: 500 ms.
+//!   itself. If that send never arrives -- a lagged subscriber drops
+//!   messages, and a process that came up while a window was already open
+//!   was never sent one -- the 500 ms tick observes the same open window and
+//!   binds, because the widening asks whether the LAN is bound rather than
+//!   whether the position just changed. Worst case: 500 ms.
 //! - CLOSED or EXPIRED: consume and close send `Closed`, and the window's own
 //!   TTL task (`PairDeviceWindow::spawn_ttl_cleanup`) sends `Closed` when the
 //!   token expires; the subscription arm withdraws the LAN listener at once.
 //!   Independently, [`PairingWindow::observe`] reports `Closed` for an expired
-//!   token because `PairToken::is_expired` is checked on every read, so the
-//!   500 ms tick withdraws it even in a process where no TTL task is running.
-//!   Worst case: 500 ms, and no restart.
+//!   token because `PairToken::is_expired` is checked on every read, and
+//!   narrowing runs on every pass rather than on an edge, so the 500 ms tick
+//!   withdraws it even if no event arrives. Worst case: 500 ms, no restart.
 //!
 //! The 60 s interface refresh is not part of either bound; it exists to pick
 //! up a Tailscale or Wi-Fi address that appeared later, and it re-reads the
@@ -124,8 +126,12 @@
 //!   compared in constant time against the token
 //!   `POST .../device-pairing/request` minted for that `request_id`, with a
 //!   wrong or unknown token collapsing to the same 404
-//!   `device_pairing_request_not_found`. So the caller must already hold the
-//!   token it was handed -- but once the owner approves, this anonymous GET is
+//!   `device_pairing_request_not_found`. Holding that token is the whole
+//!   gate, and it is weaker than "the requester was handed it": the request
+//!   half dedupes pending records by `d_pub`
+//!   (`handlers_device_pairing.rs`, `insert_pending`), so anyone who can
+//!   present a pending device's public key is handed that record's existing
+//!   `request_id` and token back. Once the owner approves, this anonymous GET is
 //!   what returns `hh_id`, `p_id` and the issued `person_cert_cbor` /
 //!   `device_cert_cbor`. It is the delivery half of the ceremony, and it is
 //!   reachable over LAN whenever the request half is.
@@ -1280,7 +1286,19 @@ async fn reconcile_pairing_window(
             source,
         );
     }
-    if observed.is_open() && previous != observed {
+    // Not an edge. `previous` starts at the loop's own initial reading, so a
+    // process that came up while a window was already open would compare Open
+    // to Open, skip the widening, and never bind the LAN address the window
+    // exists to expose — the engine restarting mid-window is exactly when
+    // someone is standing there with a phone. Widen whenever the window is
+    // open and the LAN is not bound yet; the enumeration is the expensive
+    // half, so `already_bound_lan` keeps the steady state free.
+    let already_bound_lan = bound
+        .snapshot_targets()
+        .await
+        .iter()
+        .any(|(_, class)| *class == InterfaceClass::Lan);
+    if observed.is_open() && !already_bound_lan {
         let live = sync_interface_targets(
             router,
             port,
@@ -1309,9 +1327,9 @@ async fn reconcile_pairing_window(
 /// by two independent paths that cover each other:
 /// - the window's broadcast subscription, so "Add iPhone" binds the LAN
 ///   addresses at once rather than after a tick; and
-/// - the 500 ms policy tick, which re-reads the window, so an expiry that
-///   emits nothing (a token adopted from a persisted snapshot, whose TTL task
-///   belongs to the process that minted it) still withdraws the listener.
+/// - the 500 ms policy tick, which re-reads the live window, so a dropped or
+///   never-sent event -- a lagged subscriber, or a process that started with
+///   the window already open -- still reaches the right exposure.
 ///
 /// Worst case either way is one 500 ms tick, and the typical open is the
 /// broadcast, i.e. the bind itself.
@@ -2374,16 +2392,20 @@ mod tests {
         );
     }
 
-    /// Terminal attach stays denied on LAN in EVERY state and in BOTH window
-    /// positions.
+    /// Terminal attach stays denied on LAN in every state, and the pairing
+    /// window cannot reach that decision.
     ///
     /// Binding the port so a phone can be added is a different decision from
     /// letting a LAN peer drive somebody's terminal, and only the first one
-    /// was asked for. `allows_terminal_attach_peer` takes no window argument
-    /// at all; the loop over both positions is what makes "the window cannot
-    /// reach this" an executed claim rather than a reading of the signature.
+    /// was asked for. `allows_terminal_attach_peer` takes no window argument,
+    /// so the window's inability to move it is a fact of the signature —
+    /// an earlier version of this test looped over both positions calling a
+    /// function that ignores them, which reads as evidence and is not. What
+    /// IS evidence lives below: the controls prove LAN is alive exactly where
+    /// the rule says, so the denials above are about attach and not about a
+    /// dead class.
     #[test]
-    fn terminal_attach_is_denied_on_lan_in_every_state_and_window_position() {
+    fn terminal_attach_is_denied_on_lan_in_every_state() {
         let states = [
             BootstrapState::Uninitialized,
             BootstrapState::ReadyForNaming,
@@ -2397,16 +2419,6 @@ mod tests {
                 !HouseholdExposurePolicy::allows_terminal_attach_peer(state, InterfaceClass::Lan),
                 "{state:?} must not accept a LAN terminal attach"
             );
-            for window in [PairingWindow::Closed, PairingWindow::Open] {
-                assert!(
-                    !HouseholdExposurePolicy::allows_terminal_attach_peer(
-                        state,
-                        InterfaceClass::Lan
-                    ),
-                    "{state:?} must not accept a LAN terminal attach at \
-                     pairing_window={window:?}"
-                );
-            }
         }
         // Controls, so the assertions above are about attach and not about LAN
         // being dead everywhere: the install states bind LAN regardless, and
