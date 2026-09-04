@@ -534,12 +534,14 @@ impl OwnerEventsRouterState {
         self
     }
 
-    /// Attach an RP that another router already holds.
+    /// Attach an RP that another router state already holds.
     ///
-    /// The challenge store lives inside `OwnerWebauthnRp`, so the routers that
-    /// must be able to finish each other's registrations have to be handed the
-    /// same `Arc`; [`Self::with_owner_webauthn_rp`] would give each of them a
-    /// store of its own.
+    /// This exists so one `OwnerWebauthnRp` per household generation can reach
+    /// several router states. It is not a correctness requirement for finishing
+    /// a ceremony started elsewhere: the network enrollment routes and the
+    /// macOS UDS local routes are disjoint and use disjoint challenge kinds, so
+    /// no registration crosses them. See `OwnerWebauthnRuntime` in
+    /// `household_bootstrap.rs`, which is the only production caller.
     #[must_use]
     pub fn with_owner_webauthn_rp_shared(mut self, rp: Arc<Mutex<OwnerWebauthnRp>>) -> Self {
         self.owner_webauthn_rp = Some(rp);
