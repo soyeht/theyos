@@ -2081,26 +2081,33 @@ pub async fn bootstrap_household(
         bootstrap_handler_state =
             bootstrap_handler_state.with_pair_code_rate_limiter(Arc::clone(&state.rate_limiter));
     }
-    // The setup-invitation browser is what turns a phone's
-    // `_soyeht-setup._tcp.` beacon into a cache entry that
-    // `POST /bootstrap/claim-setup-invitation` can claim. Two things stop it
-    // from ever seeing a LAN-only phone, and the owner's LAN opt-in has to
-    // clear BOTH:
-    //   1. it is spawned only while the engine is still uninitialized, so an
-    //      already-Ready engine has no browser running at all; and
-    //   2. `BrowserConfig::default()` has `include_local_network = false`, so
-    //      a beacon carrying nothing but `192.168.x` is dropped and logged as
-    //      `setup_browser.suppressed reason=non_tailnet` (bonjour_browser.rs).
-    // A phone without Tailscale publishes exactly that beacon, which is why
-    // pairing produced no requests at all. With the switch closed this branch
-    // and this config are unchanged.
+    // The setup-invitation browser turns a phone's `_soyeht-setup._tcp.`
+    // beacon into a cache entry. Only two routes ever read that cache, and
+    // both refuse outside onboarding: `POST /bootstrap/claim-setup-invitation`
+    // answers 409 `already_initialized` unless the engine is `Uninitialized`
+    // (handlers_bootstrap.rs, "1. State gate"), and `POST
+    // /bootstrap/accept-household` answers 409 unless it is `Uninitialized` or
+    // `ReadyForNaming`. So the spawn stays tied to those states: on a Ready
+    // engine a running browser would fill a cache nothing can claim, which is
+    // cost and log noise, not reachability.
+    //
+    // What the owner's LAN switch does change here is the ONE gate that was
+    // silently dropping beacons: `BrowserConfig::default()` sets
+    // `include_local_network = false`, so a beacon carrying nothing but
+    // `192.168.x` -- exactly what a phone with no Tailscale publishes -- was
+    // discarded and logged as `setup_browser.suppressed reason=non_tailnet`
+    // (bonjour_browser.rs). With the switch closed this config is byte-for-byte
+    // the old default.
+    //
+    // The reachability half of the fix is the listener bind, not this browser:
+    // `HouseholdExposurePolicy` re-admits `InterfaceClass::Lan` after
+    // onboarding when the switch is open, which is what gives a LAN-only phone
+    // an address to dial for the pairing ceremony on a Ready engine.
     let lan_pairing = household_listener::LanPairing::from_env();
-    if lan_pairing.is_open()
-        || matches!(
-            initial_bootstrap_state,
-            BootstrapState::Uninitialized | BootstrapState::ReadyForNaming
-        )
-    {
+    if matches!(
+        initial_bootstrap_state,
+        BootstrapState::Uninitialized | BootstrapState::ReadyForNaming
+    ) {
         info!(
             stage = "setup_browser.spawn",
             lan_pairing = lan_pairing.as_str(),

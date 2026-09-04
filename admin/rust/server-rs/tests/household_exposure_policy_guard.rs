@@ -318,20 +318,25 @@ fn plain_http_listener_contract_is_pinned_in_code() {
     );
 }
 
-/// The owner's LAN opt-in has to clear BOTH gates that hide a LAN-only phone
-/// beacon, or it clears neither.
+/// The owner's LAN switch reaches the setup browser's network filter, and
+/// nothing else about when that browser runs.
 ///
-/// The setup-invitation browser is the only thing that turns a phone's
-/// `_soyeht-setup._tcp.` announcement into a claimable cache entry. Before the
-/// switch it was spawned only while the engine was still uninitialized, and
-/// always with `BrowserConfig::default()` (`include_local_network = false`,
-/// which logs `setup_browser.suppressed reason=non_tailnet`). Fixing one and
-/// not the other leaves the owner with a browser that runs and drops
-/// everything, or a browser that would accept the beacon and is not running.
-/// Source-level because spawning a real mDNS browser in a test would need the
-/// host's multicast, which CI does not have.
+/// MEASURED by reading both consumers of the cache the browser fills:
+/// `POST /bootstrap/claim-setup-invitation` returns 409 `already_initialized`
+/// unless the engine is `Uninitialized`, and `POST /bootstrap/accept-household`
+/// returns 409 unless it is `Uninitialized` or `ReadyForNaming`
+/// (`handlers_bootstrap.rs`). So spawning the browser in any other state feeds
+/// a cache no route can read -- an earlier revision of this change did exactly
+/// that and called it a second gate. The spawn therefore stays keyed to the
+/// two onboarding states.
+///
+/// The half that is real: `BrowserConfig::default()` hard-codes
+/// `include_local_network = false`, which drops a LAN-only iPhone beacon as
+/// `setup_browser.suppressed reason=non_tailnet`. That flag, and only that
+/// flag, follows the switch. Source-level because spawning a real mDNS browser
+/// in a test would need the host's multicast, which CI does not have.
 #[test]
-fn setup_invitation_browser_follows_the_owner_lan_switch_on_both_gates() {
+fn setup_invitation_browser_ties_only_its_network_filter_to_the_owner_switch() {
     let source = read_src("household_bootstrap.rs");
     let spawn_body = slice_between(
         &source,
@@ -340,14 +345,22 @@ fn setup_invitation_browser_follows_the_owner_lan_switch_on_both_gates() {
     );
 
     assert!(
-        spawn_body.contains("lan_pairing.is_open()\n        || matches!("),
-        "gate 1: an opened switch must spawn the setup browser regardless of the \
-         initial bootstrap state, so an already-Ready engine still browses"
+        spawn_body.contains(
+            "if matches!(\n        initial_bootstrap_state,\n        \
+             BootstrapState::Uninitialized | BootstrapState::ReadyForNaming\n    )"
+        ),
+        "the spawn must stay keyed to the states whose routes can consume the \
+         cache; widening it on the switch spawns a browser that feeds nothing"
+    );
+    assert!(
+        !spawn_body.contains("lan_pairing.is_open()\n        || matches!("),
+        "the switch must not decide WHETHER the browser runs -- both cache \
+         consumers 409 outside Uninitialized|ReadyForNaming"
     );
     assert!(
         spawn_body.contains("include_local_network: lan_pairing.is_open()"),
-        "gate 2: the browser must be built with include_local_network tied to the \
-         same switch, or a LAN-only iPhone beacon is dropped as non_tailnet"
+        "the browser must be built with include_local_network tied to the \
+         switch, or a LAN-only iPhone beacon is dropped as non_tailnet"
     );
     assert!(
         !spawn_body.contains("BrowserConfig::default()"),

@@ -17,20 +17,74 @@
 //! that shipped -- LAN HTTP stays withdrawn, and no code path can turn it on.
 //! The switch is read once per process, so nothing widens on a timer either.
 //!
-//! Opening it exposes the household PORT, not a control plane, and that is why
-//! the owner is allowed to make this call:
-//! - every effectful household route behind the port still demands the pairing
-//!   ceremony -- a proof-of-possession signature under a device cert the owner
-//!   issued. An unpaired LAN peer that reaches the socket gets 401/403, not a
-//!   session.
+//! ## What an unpaired LAN peer actually gets when the switch is open
+//!
+//! Read handler by handler on 2026-09-04, over every router merged onto the
+//! household port in `household_bootstrap::bootstrap_household`. An earlier
+//! version of this comment claimed such a peer "gets 401/403, not a session".
+//! The second half is true; the first half was wrong, and a reviewer measured
+//! the counter-example. Four surfaces answer 200 with no credential at all:
+//!
+//! - `GET /api/v1/household/identity` (`handlers_household::get_identity`) has
+//!   no auth extractor and no peer ACL. On a Ready engine it returns 200 with
+//!   `hh_id`, `hh_pub_b64` -- the household's public key -- the household
+//!   NAME, and `created_at`. Opening the switch publishes that to anyone on
+//!   the Wi-Fi. It is public-key material and a label, not authority: nothing
+//!   in the pairing ceremony treats knowledge of them as proof of anything.
+//!   But it is a real disclosure and the owner is choosing it.
+//! - `GET /bootstrap/status` is documented "No auth required" and returns 200
+//!   with `hh_id`, the engine version, the platform, uptime, `device_count`,
+//!   the guest-image phase, and `host_label` -- the human-readable Mac name.
+//! - `GET /health` and `GET /healthz` return 200 with the engine version and
+//!   platform.
+//! - `POST /api/v1/household/device-pairing/request`
+//!   (`handlers_device_pairing::device_pairing_request_handler`) takes no `PoP`
+//!   and no peer ACL: a LAN peer can enqueue a pending pairing request, which
+//!   appends a `DevicePairRequest` owner event and so raises the approval
+//!   prompt on the owner's devices. The store caps it (429
+//!   `device_pairing_request_limit`) and the token it returns is inert until
+//!   the owner approves, so this is a prompt an unpaired peer can raise, not
+//!   access it can take. That prompt IS the ceremony the switch exists for.
+//!
+//! Two more answer without a peer ACL but demand a secret the owner minted:
+//! `POST /api/v1/household/pair-device/confirm` needs the nonce from the
+//! pairing URI plus a signature over it, and `POST /api/v1/claw-share/claim`
+//! is deliberately anonymous but verifies an owner-signed invite
+//! (`engine_handle_claim`; failures are 401 `signature_rejected`).
+//!
+//! Everything else on the port stays shut to a LAN peer, and none of it moves
+//! with this switch:
 //! - the routes that hand out the first-owner pairing URI keep their OWN
-//!   loopback-or-Tailnet peer ACL (`handlers_pair_device::initiate`,
+//!   loopback-or-Tailnet peer ACL and answer a bare 404 to a LAN peer:
+//!   `handlers_pair_device::initiate`,
 //!   `handlers_bootstrap::get_bootstrap_pair_device_uri` and its by-code
-//!   sibling). Those gates were written because bind-time exposure was never
-//!   an admission check; they do not move with this switch.
+//!   sibling. Those gates were written because bind-time exposure was never an
+//!   admission check.
+//! - `post_reachability_echo` answers 403 outside loopback-or-Tailnet;
+//!   `POST /bootstrap/pair-machine/local/stage` and `/bootstrap/pair-device/
+//!   reissue` are loopback-only; `/pair-machine/anchor-handoff` is
+//!   Tailnet-only; the `claw-share/relay-offer/*` trio is loopback-only.
+//! - `POST /bootstrap/claim-setup-invitation` answers 409 unless the engine is
+//!   `Uninitialized`; `/bootstrap/accept-household` and `/bootstrap/initialize`
+//!   answer 409 outside `Uninitialized`/`ReadyForNaming`. The
+//!   `/pair-machine/local/{seed,anchor,finalize}` trio answers 401 unless the
+//!   pair-machine window is open AND the caller presents the QR-only nonce or
+//!   `anchor_secret`; `anchor` and `finalize` additionally re-check
+//!   `bootstrap_allows_local_pair_machine`. So a Ready engine hands a LAN peer
+//!   nothing here.
+//! - every effectful household route -- claws, instances, terminals,
+//!   workspaces, machines, roster, snapshot, owner-events, owner-webauthn,
+//!   guest-image -- runs `household_auth::authorize_request` and answers 401
+//!   without a proof-of-possession signature under a device cert the owner
+//!   issued. `POST /bootstrap/teardown` has no peer ACL but needs a P-256
+//!   signature bound to this engine's own `hh_id`/`m_id`.
 //! - [`HouseholdExposurePolicy::allows_terminal_attach_peer`] still answers
 //!   `false` for LAN in every state, so remote terminal attach -- the one
 //!   directly effectful surface -- gains nothing.
+//!
+//! Net: opening the switch does not hand a LAN peer a session. It does publish
+//! the household id, household public key, household name and Mac label to the
+//! local network, and lets an unpaired peer raise a pairing prompt.
 //!
 //! MEASURED 2026-09-04 in `engine.log`: a Ready engine logged exactly four
 //! `bootstrap.endpoint.live` binds -- Tailnet v4/v6 plus loopback v4/v6 -- on
@@ -1044,12 +1098,29 @@ async fn sync_interface_targets(
 }
 
 async fn sync_exposure_policy(bootstrap: &Arc<RwLock<BootstrapState>>, bound: &BoundSet) {
+    sync_exposure_policy_with(bootstrap, bound, LanPairing::from_env()).await;
+}
+
+/// [`sync_exposure_policy`] with the owner switch supplied instead of read.
+///
+/// Splitting it is not decoration: this reconciler is the thing that WITHDRAWS
+/// a listener, so its behaviour has to be pinned in both switch positions, and
+/// a test that sets the process environment cannot do that -- `from_env` is a
+/// `OnceLock`, so whichever position the first test observes is the only one
+/// the rest of the suite can ever see.
+async fn sync_exposure_policy_with(
+    bootstrap: &Arc<RwLock<BootstrapState>>,
+    bound: &BoundSet,
+    lan_pairing: LanPairing,
+) {
     let state = bootstrap_state(bootstrap).await;
     let disallowed: Vec<IpAddr> = bound
         .snapshot_targets()
         .await
         .into_iter()
-        .filter_map(|(ip, class)| (!HouseholdExposurePolicy::allows(state, class)).then_some(ip))
+        .filter_map(|(ip, class)| {
+            (!HouseholdExposurePolicy::allows_with(state, class, lan_pairing)).then_some(ip)
+        })
         .collect();
     for ip in disallowed {
         shutdown_bound_target(bound, ip, "bootstrap_state_policy").await;
@@ -1284,10 +1355,24 @@ mod tests {
         )
     }
 
+    /// Ready-state bind targets with the owner switch pinned CLOSED.
+    ///
+    /// Every caller below is a mesh-exposure test asserting that a LAN fact
+    /// never reaches a Ready bind -- `absent_mesh_configuration_is_inert_and_
+    /// keeps_lan_out_of_ready`, `inactive_verified_mesh_fact_never_falls_back_
+    /// to_lan_or_bonjour`, and the reconciliation-plan cases. That claim is
+    /// about the default the engine ships, so the switch has to be supplied,
+    /// not read: `LanPairing::from_env` is a process-wide `OnceLock`, so an
+    /// env-backed helper answers whatever the first test in the binary froze,
+    /// and the suite passed only with the variable unset. Ready-with-the-
+    /// switch-open is pinned separately by
+    /// `lan_is_the_only_class_the_owner_switch_moves` and by the Bonjour half
+    /// of `bonjour_omits_mesh_even_when_the_listener_allows_it`.
     fn ready_targets(context: &HouseholdListenerContext) -> Vec<(IpAddr, InterfaceClass)> {
-        HouseholdExposurePolicy::allowed_targets(
+        HouseholdExposurePolicy::allowed_targets_with(
             BootstrapState::Ready,
             enumerate_bind_targets_with_context(context),
+            LanPairing::Closed,
         )
     }
 
@@ -1588,9 +1673,13 @@ mod tests {
         );
         assert_lan_request_is_403_before_effect(&context);
         assert!(
-            HouseholdExposurePolicy::bonjour_targets(BootstrapState::Ready, live)
-                .iter()
-                .all(|(_, class)| *class != InterfaceClass::Mesh)
+            HouseholdExposurePolicy::bonjour_targets_with(
+                BootstrapState::Ready,
+                live,
+                LanPairing::Closed
+            )
+            .iter()
+            .all(|(_, class)| *class != InterfaceClass::Mesh)
         );
     }
 
@@ -2198,31 +2287,79 @@ mod tests {
         }
     }
 
+    /// The 500 ms reconciler withdraws a Ready LAN listener with the switch
+    /// closed, and keeps it with the switch open.
+    ///
+    /// Both positions, because this is the loop that decides whether an
+    /// already-bound LAN socket survives: a version of this test that read the
+    /// process environment could only ever exercise whichever position the
+    /// `OnceLock` happened to freeze, and passed with the switch off while the
+    /// switch being on is the whole point of the change.
     #[tokio::test]
-    async fn exposure_policy_sync_shutdowns_disallowed_lan_listener() {
-        let bound = BoundSet::default();
+    async fn exposure_policy_sync_withdraws_ready_lan_listener_only_while_the_switch_is_closed() {
         let lan_ip: IpAddr = "192.0.2.10".parse().unwrap();
         let tailnet_ip: IpAddr = "100.64.0.10".parse().unwrap();
-        let (lan_shutdown, lan_rx) = oneshot::channel();
-        let (tailnet_shutdown, _tailnet_rx) = oneshot::channel();
-        bound
-            .insert(lan_ip, InterfaceClass::Lan, lan_shutdown)
-            .await;
-        bound
-            .insert(tailnet_ip, InterfaceClass::Tailscale, tailnet_shutdown)
-            .await;
 
-        let bootstrap = Arc::new(RwLock::new(BootstrapState::Ready));
-        sync_exposure_policy(&bootstrap, &bound).await;
+        // Closed -- the shipped default: LAN loses its listener, Tailnet keeps
+        // its own, and the LAN task is told to stop rather than merely dropped
+        // from the bookkeeping.
+        {
+            let bound = BoundSet::default();
+            let (lan_shutdown, lan_rx) = oneshot::channel();
+            let (tailnet_shutdown, _tailnet_rx) = oneshot::channel();
+            bound
+                .insert(lan_ip, InterfaceClass::Lan, lan_shutdown)
+                .await;
+            bound
+                .insert(tailnet_ip, InterfaceClass::Tailscale, tailnet_shutdown)
+                .await;
 
-        assert_eq!(
-            bound.snapshot_targets().await,
-            vec![(tailnet_ip, InterfaceClass::Tailscale)]
-        );
-        tokio::time::timeout(Duration::from_secs(1), lan_rx)
-            .await
-            .expect("LAN listener shutdown signal should be sent")
-            .expect("LAN listener shutdown sender should not be dropped before send");
+            let bootstrap = Arc::new(RwLock::new(BootstrapState::Ready));
+            sync_exposure_policy_with(&bootstrap, &bound, LanPairing::Closed).await;
+
+            assert_eq!(
+                bound.snapshot_targets().await,
+                vec![(tailnet_ip, InterfaceClass::Tailscale)]
+            );
+            tokio::time::timeout(Duration::from_secs(1), lan_rx)
+                .await
+                .expect("LAN listener shutdown signal should be sent")
+                .expect("LAN listener shutdown sender should not be dropped before send");
+        }
+
+        // Open -- the owner asked for it: the reconciler must leave the LAN
+        // listener alone, or the switch would be undone within 500 ms of the
+        // bind that honoured it.
+        {
+            let bound = BoundSet::default();
+            let (lan_shutdown, mut lan_rx) = oneshot::channel();
+            let (tailnet_shutdown, _tailnet_rx) = oneshot::channel();
+            bound
+                .insert(lan_ip, InterfaceClass::Lan, lan_shutdown)
+                .await;
+            bound
+                .insert(tailnet_ip, InterfaceClass::Tailscale, tailnet_shutdown)
+                .await;
+
+            let bootstrap = Arc::new(RwLock::new(BootstrapState::Ready));
+            sync_exposure_policy_with(&bootstrap, &bound, LanPairing::Open).await;
+
+            // Sorted: `BoundSet` is a `HashMap`, so iteration order is not a
+            // property this test is allowed to assert.
+            let mut surviving = bound.snapshot_targets().await;
+            surviving.sort_by_key(|(ip, _)| *ip);
+            assert_eq!(
+                surviving,
+                vec![
+                    (tailnet_ip, InterfaceClass::Tailscale),
+                    (lan_ip, InterfaceClass::Lan),
+                ]
+            );
+            assert!(
+                matches!(lan_rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+                "an opened switch must not send the LAN listener a shutdown"
+            );
+        }
     }
 
     #[test]
