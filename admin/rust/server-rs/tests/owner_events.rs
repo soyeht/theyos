@@ -5394,13 +5394,65 @@ fn owner_webauthn_registration_local_source_guards_fail_closed_boundary() {
     assert!(router_source.contains("DesignatedRequirementMacosLocalCallerAuth::new"));
     assert!(router_source.contains("macos_local_app_profile_for_state_dir(&state_dir)"));
     assert!(router_source.contains("macos_local_owner_webauthn_registration_state("));
-    assert!(
-        router_source.contains(".with_owner_webauthn_rp(owner_webauthn_local_registration_rp()?")
-    );
-    assert!(router_source.contains(
-        ".with_owner_webauthn_anchor(owner_webauthn_local_registration_anchor_store(state_dir))"
-    ));
     assert!(router_source.contains(".with_macos_local_caller_auth(verifier)"));
+
+    // The RP and the anchor now reach both routers, but only ever as the one
+    // instance `OwnerWebauthnRuntime` holds: the challenge store lives inside
+    // the RP, so a second instance would make a registration started on the
+    // TCP router unfinishable on the UDS one.
+    let runtime_wiring = source_segment(
+        router_source,
+        "struct OwnerWebauthnRuntime {",
+        "fn owner_webauthn_rp_from_env(",
+    );
+    assert!(runtime_wiring.contains("rp: Arc<tokio::sync::Mutex<LocalOwnerWebauthnRp>>"));
+    assert!(runtime_wiring.contains(".with_owner_webauthn_rp_shared(Arc::clone(&self.rp))"));
+    assert!(runtime_wiring.contains(".with_owner_webauthn_anchor(Arc::clone(&self.anchor))"));
+    let router_production = router_source
+        .split("#[cfg(test)]\nmod tests")
+        .next()
+        .expect("household_bootstrap.rs has production code before its test module");
+    assert!(!router_production.contains(".with_owner_webauthn_rp("));
+
+    // The macOS UDS router keeps the SecCode check; the network router never
+    // gets it, because a phone has no code signature to present.
+    let macos_state = source_segment(
+        router_source,
+        "fn macos_local_owner_webauthn_registration_state(",
+        "fn claw_share_log_path(",
+    );
+    assert!(macos_state.contains("runtime.apply(state).with_macos_local_caller_auth(verifier)"));
+
+    // Network exposure is a switch of its own, closed unless the value is
+    // exactly `1`, and it must not be folded into the approval rollout: an
+    // operator turning approvals on must not silently open enrollment.
+    assert!(router_source.contains("THEYOS_OWNER_WEBAUTHN_NETWORK"));
+    let network_gate = source_segment(
+        router_source,
+        "fn owner_webauthn_network_enabled_from_value(",
+        "fn owner_webauthn_registration_anchor_store(",
+    );
+    assert!(network_gate.contains("Some(\"1\") => true"));
+    assert!(network_gate.contains("None | Some(\"0\") => false"));
+    assert!(network_gate.contains(
+        "unknown owner-webauthn network value; keeping the network surface closed"
+    ));
+    assert!(!network_gate.contains("OWNER_AUTH_V2_ROLLOUT"));
+    let network_wiring = source_segment(
+        router_source,
+        "let owner_webauthn_network = owner_webauthn_network_enabled();",
+        "let router = phase3_router(",
+    );
+    assert!(network_wiring.contains("if owner_webauthn_network {"));
+    assert!(network_wiring.contains("owner_events_state = runtime.apply(owner_events_state)"));
+
+    // RP identity is configurable, and unset still resolves to the placeholder
+    // the cross-language vectors pin.
+    assert!(router_source.contains("THEYOS_OWNER_WEBAUTHN_RP_ID"));
+    assert!(router_source.contains("THEYOS_OWNER_WEBAUTHN_RP_ORIGIN"));
+    assert!(router_source.contains(
+        "pub const DEFAULT_OWNER_WEBAUTHN_RP_ID: &str = \"household.example.test\";"
+    ));
     assert!(router_source.contains("fn macos_local_app_profile_for_state_dir"));
     assert!(router_source.contains("MacosLocalAppProfile::Production"));
     assert!(router_source.contains("MacosLocalAppProfile::Development"));

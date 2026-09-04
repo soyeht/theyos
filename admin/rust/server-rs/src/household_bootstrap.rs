@@ -341,6 +341,30 @@ impl Phase3RuntimeController {
             owner_events_state = owner_events_state
                 .with_recovery_consume_rate_limiter(Arc::clone(&state.rate_limiter));
         }
+        // One RP/anchor per generation, shared by both routers. The macOS UDS
+        // router always needs it; the TCP router only gets it when the operator
+        // opened THEYOS_OWNER_WEBAUTHN_NETWORK, which is what keeps the
+        // phone-reachable enrollment surface closed by default.
+        let owner_webauthn_network = owner_webauthn_network_enabled();
+        let owner_webauthn_runtime = if cfg!(target_os = "macos") || owner_webauthn_network {
+            Some(
+                OwnerWebauthnRuntime::build(&self.state_dir)
+                    .map_err(|error| format!("build owner passkey registration state: {error}"))?,
+            )
+        } else {
+            None
+        };
+        if owner_webauthn_network {
+            let runtime = owner_webauthn_runtime
+                .as_ref()
+                .ok_or_else(|| "owner passkey runtime missing for network router".to_string())?;
+            owner_events_state = runtime.apply(owner_events_state);
+            tracing::info!(
+                stage = "owner_webauthn.network_surface_open",
+                env = OWNER_WEBAUTHN_NETWORK_ENV,
+                "owner passkey enrollment is reachable over the network router"
+            );
+        }
         let router = phase3_router(
             pair_machine_state.clone(),
             owner_events_state.clone(),
@@ -356,28 +380,23 @@ impl Phase3RuntimeController {
                     macos_local_app_profile_for_state_dir(&state_dir),
                 ),
             );
-            match macos_local_owner_webauthn_registration_state(
+            let runtime = owner_webauthn_runtime
+                .as_ref()
+                .ok_or_else(|| "owner passkey runtime missing for macOS local listener".to_string())?;
+            let state = macos_local_owner_webauthn_registration_state(
                 owner_events_state.clone(),
-                &state_dir,
+                runtime,
                 verifier,
-            ) {
-                Ok(state) => {
-                    let router =
-                        handlers_owner_events::owner_webauthn_macos_local_registration_router(
-                            state,
-                        );
-                    Some(
-                        crate::macos_local_registration_listener::spawn_macos_local_registration_listener(
-                            &state_dir,
-                            router,
-                        )
-                        .map_err(|error| format!("start macOS local registration listener: {error}"))?,
-                    )
-                }
-                Err(error) => {
-                    return Err(format!("build macOS local registration state: {error}"));
-                }
-            }
+            );
+            let router =
+                handlers_owner_events::owner_webauthn_macos_local_registration_router(state);
+            Some(
+                crate::macos_local_registration_listener::spawn_macos_local_registration_listener(
+                    &state_dir,
+                    router,
+                )
+                .map_err(|error| format!("start macOS local registration listener: {error}"))?,
+            )
         };
 
         // Spawn tasks only after every fallible resource in the bundle has
@@ -1072,24 +1091,118 @@ fn macos_local_app_profile_for_state_dir(
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
 type LocalOwnerWebauthnRp = household_rs::owner_webauthn::OwnerWebauthnRp;
 
-#[cfg(any(target_os = "macos", test))]
-fn owner_webauthn_local_registration_rp() -> Result<LocalOwnerWebauthnRp, String> {
-    let origin = webauthn_rs::prelude::Url::parse("https://household.example.test")
-        .map_err(|e| e.to_string())?;
+/// Relying-party ID for owner passkey enrollment. Unset keeps the placeholder,
+/// so an engine that is not configured behaves exactly as before this switch
+/// existed.
+pub const OWNER_WEBAUTHN_RP_ID_ENV: &str = "THEYOS_OWNER_WEBAUTHN_RP_ID";
+/// Relying-party origin that must accompany [`OWNER_WEBAUTHN_RP_ID_ENV`].
+pub const OWNER_WEBAUTHN_RP_ORIGIN_ENV: &str = "THEYOS_OWNER_WEBAUTHN_RP_ORIGIN";
+/// Opens owner passkey enrollment on the TCP router. Only the literal `1`
+/// opens it; anything else (including an unparseable value) stays closed.
+pub const OWNER_WEBAUTHN_NETWORK_ENV: &str = "THEYOS_OWNER_WEBAUTHN_NETWORK";
+
+/// `household-rs` requires the RP ID to be a domain the tenant controls, not a
+/// domain shared across households (`owner_webauthn.rs`, `OwnerWebauthnConfig::new`):
+/// every credential minted under an RP ID is usable by whoever serves that
+/// domain's `webauthn` association file, so one shared domain would make one
+/// operator the relying party for the whole fleet. These placeholders resolve
+/// to nothing, which is why the passkey surface stays unreachable until a
+/// deployment names its own domain.
+pub const DEFAULT_OWNER_WEBAUTHN_RP_ID: &str = "household.example.test";
+const DEFAULT_OWNER_WEBAUTHN_RP_ORIGIN: &str = "https://household.example.test";
+const OWNER_WEBAUTHN_RP_NAME: &str = "Soyeht";
+
+/// The RP built once per household generation, plus the keystore the anchor
+/// verifier reads.
+///
+/// One instance, shared: `OwnerWebauthnRp` owns the in-memory challenge store,
+/// so a second instance would give the TCP router and the macOS UDS router a
+/// challenge store each, and a registration started on one would fail on the
+/// other as an unknown challenge. Cloning the `Arc` is what keeps the two
+/// routers on the same store.
+#[derive(Clone)]
+struct OwnerWebauthnRuntime {
+    rp: Arc<tokio::sync::Mutex<LocalOwnerWebauthnRp>>,
+    anchor: Arc<dyn keystore_rs::KeystoreBackend>,
+}
+
+impl OwnerWebauthnRuntime {
+    fn build(state_dir: &Path) -> Result<Self, String> {
+        Ok(Self {
+            rp: Arc::new(tokio::sync::Mutex::new(owner_webauthn_rp_from_env()?)),
+            anchor: owner_webauthn_registration_anchor_store(state_dir),
+        })
+    }
+
+    fn apply(
+        &self,
+        state: handlers_owner_events::OwnerEventsRouterState,
+    ) -> handlers_owner_events::OwnerEventsRouterState {
+        state
+            .with_owner_webauthn_rp_shared(Arc::clone(&self.rp))
+            .with_owner_webauthn_anchor(Arc::clone(&self.anchor))
+    }
+}
+
+fn owner_webauthn_rp_from_env() -> Result<LocalOwnerWebauthnRp, String> {
+    owner_webauthn_rp_from_values(
+        non_empty_env(OWNER_WEBAUTHN_RP_ID_ENV).as_deref(),
+        non_empty_env(OWNER_WEBAUTHN_RP_ORIGIN_ENV).as_deref(),
+    )
+}
+
+fn owner_webauthn_rp_from_values(
+    rp_id: Option<&str>,
+    rp_origin: Option<&str>,
+) -> Result<LocalOwnerWebauthnRp, String> {
+    let rp_id = rp_id.unwrap_or(DEFAULT_OWNER_WEBAUTHN_RP_ID);
+    let rp_origin = rp_origin.unwrap_or(DEFAULT_OWNER_WEBAUTHN_RP_ORIGIN);
+    let origin = webauthn_rs::prelude::Url::parse(rp_origin).map_err(|e| e.to_string())?;
     let config = household_rs::owner_webauthn::OwnerWebauthnConfig::new(
-        "household.example.test",
+        rp_id,
         origin,
-        "Soyeht",
+        OWNER_WEBAUTHN_RP_NAME,
     )
     .map_err(|e| e.to_string())?;
     household_rs::owner_webauthn::OwnerWebauthnRp::new(config).map_err(|e| e.to_string())
 }
 
-#[cfg(any(target_os = "macos", test))]
-fn owner_webauthn_local_registration_anchor_store(
+fn non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Whether the TCP (phone-reachable) router gets the passkey RP and anchor.
+///
+/// Closed unless the value is exactly `1`: the surface mints owner authority,
+/// so an operator typo must leave it shut rather than half-open.
+#[must_use]
+fn owner_webauthn_network_enabled() -> bool {
+    owner_webauthn_network_enabled_from_value(
+        std::env::var(OWNER_WEBAUTHN_NETWORK_ENV).ok().as_deref(),
+    )
+}
+
+#[must_use]
+fn owner_webauthn_network_enabled_from_value(raw: Option<&str>) -> bool {
+    match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        Some("1") => true,
+        None | Some("0") => false,
+        Some(_) => {
+            tracing::warn!(
+                env = OWNER_WEBAUTHN_NETWORK_ENV,
+                "unknown owner-webauthn network value; keeping the network surface closed"
+            );
+            false
+        }
+    }
+}
+
+fn owner_webauthn_registration_anchor_store(
     state_dir: &Path,
 ) -> Arc<dyn keystore_rs::KeystoreBackend> {
     Arc::new(keystore_rs::FileKeystore::new(
@@ -1101,13 +1214,10 @@ fn owner_webauthn_local_registration_anchor_store(
 #[cfg(any(target_os = "macos", test))]
 fn macos_local_owner_webauthn_registration_state(
     state: handlers_owner_events::OwnerEventsRouterState,
-    state_dir: &Path,
+    runtime: &OwnerWebauthnRuntime,
     verifier: Arc<dyn crate::macos_local_caller_auth::MacosLocalCallerAuth>,
-) -> Result<handlers_owner_events::OwnerEventsRouterState, String> {
-    Ok(state
-        .with_owner_webauthn_rp(owner_webauthn_local_registration_rp()?)
-        .with_owner_webauthn_anchor(owner_webauthn_local_registration_anchor_store(state_dir))
-        .with_macos_local_caller_auth(verifier))
+) -> handlers_owner_events::OwnerEventsRouterState {
+    runtime.apply(state).with_macos_local_caller_auth(verifier)
 }
 
 fn claw_share_log_path(state_dir: &Path) -> PathBuf {
@@ -2779,6 +2889,10 @@ mod tests {
             "spawn_owner_timeout_watchdog(",
             "spawn_macos_local_registration_listener(",
             "spawn_bonjour_browser(",
+            "OwnerWebauthnRuntime::build(",
+            ".with_owner_webauthn_rp_shared(",
+            ".with_owner_webauthn_anchor(",
+            "let owner_webauthn_network = owner_webauthn_network_enabled();",
         ] {
             assert_eq!(
                 production.matches(symbol).count(),
@@ -2786,6 +2900,12 @@ mod tests {
                 "Phase 3 resource/route must have one production owner: {symbol}"
             );
         }
+        // Building a second RP is how the two routers would silently end up
+        // with a challenge store each.
+        assert!(
+            !production.contains(".with_owner_webauthn_rp("),
+            "owner passkey RP must reach both routers as one shared instance"
+        );
     }
 
     #[tokio::test]
@@ -3886,7 +4006,7 @@ mod tests {
     }
 
     #[test]
-    fn macos_local_registration_state_wires_runtime_webauthn_dependencies() {
+    fn owner_webauthn_registration_state_shares_one_rp_across_both_routers() {
         let td = tempfile::tempdir().unwrap();
         let identity = household_rs::bootstrap_or_load(
             td.path(),
@@ -3920,22 +4040,90 @@ mod tests {
         let verifier: Arc<dyn crate::macos_local_caller_auth::MacosLocalCallerAuth> =
             Arc::new(crate::macos_local_caller_auth::FailClosedMacosLocalCallerAuth);
 
-        let state =
-            macos_local_owner_webauthn_registration_state(state, td.path(), verifier).unwrap();
+        let runtime = OwnerWebauthnRuntime::build(td.path()).unwrap();
+        let network_state = runtime.apply(state.clone());
+        let local_state = macos_local_owner_webauthn_registration_state(state, &runtime, verifier);
 
-        assert!(state.macos_local_caller_auth.is_some());
-        assert!(state.owner_webauthn_anchor.is_some());
-        let rp = state
+        assert!(local_state.macos_local_caller_auth.is_some());
+        assert!(local_state.owner_webauthn_anchor.is_some());
+        assert!(network_state.owner_webauthn_anchor.is_some());
+        // The phone presents no SecCode, so the macOS caller check must not
+        // ride along onto the network router; owner Soyeht-PoP authenticates
+        // that side.
+        assert!(network_state.macos_local_caller_auth.is_none());
+        // A registration started on one router has to be finishable on the
+        // other, and the challenge store lives inside the RP: two instances
+        // would turn every cross-router finish into an unknown challenge.
+        assert!(Arc::ptr_eq(
+            local_state
+                .owner_webauthn_rp
+                .as_ref()
+                .expect("local registration runtime state wires RP"),
+            network_state
+                .owner_webauthn_rp
+                .as_ref()
+                .expect("network registration runtime state wires RP"),
+        ));
+        let rp = local_state
             .owner_webauthn_rp
             .as_ref()
             .expect("local registration runtime state wires RP")
             .try_lock()
             .expect("RP lock is uncontended in unit test");
-        assert_eq!(rp.config().rp_id(), "household.example.test");
+        assert_eq!(rp.config().rp_id(), DEFAULT_OWNER_WEBAUTHN_RP_ID);
         assert_eq!(
             rp.config().rp_origin().as_str(),
             "https://household.example.test/"
         );
+    }
+
+    #[test]
+    fn owner_webauthn_rp_defaults_to_the_placeholder_when_no_domain_is_configured() {
+        let rp = owner_webauthn_rp_from_values(None, None).unwrap();
+        assert_eq!(rp.config().rp_id(), DEFAULT_OWNER_WEBAUTHN_RP_ID);
+        assert_eq!(
+            rp.config().rp_origin().as_str(),
+            "https://household.example.test/"
+        );
+    }
+
+    #[test]
+    fn owner_webauthn_rp_takes_the_configured_tenant_domain() {
+        let rp = owner_webauthn_rp_from_values(
+            Some("passkeys.example.org"),
+            Some("https://passkeys.example.org"),
+        )
+        .unwrap();
+        assert_eq!(rp.config().rp_id(), "passkeys.example.org");
+        assert_eq!(
+            rp.config().rp_origin().as_str(),
+            "https://passkeys.example.org/"
+        );
+    }
+
+    #[test]
+    fn owner_webauthn_rp_rejects_an_origin_outside_the_rp_id() {
+        // webauthn-rs refuses the pair, so a mistyped domain fails the phase-3
+        // install instead of minting credentials no origin can present.
+        assert!(
+            owner_webauthn_rp_from_values(
+                Some("passkeys.example.org"),
+                Some("https://unrelated.example.net"),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn owner_webauthn_network_surface_is_closed_unless_explicitly_opened() {
+        for closed in [None, Some(""), Some("0"), Some("true"), Some("yes"), Some("on")] {
+            assert!(
+                !owner_webauthn_network_enabled_from_value(closed),
+                "{closed:?} must leave the network passkey surface closed"
+            );
+        }
+        assert!(owner_webauthn_network_enabled_from_value(Some("1")));
+        assert!(owner_webauthn_network_enabled_from_value(Some(" 1 ")));
     }
 
     #[test]

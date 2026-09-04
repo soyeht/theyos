@@ -8,7 +8,8 @@
     "FinishRequest vectors pin Swift canonical-CBOR encode before server byte-equality checks.",
     "FinishResponse vectors pin Swift decode of the successful registration response.",
     "StatusRequest/StatusResponse vectors pin the E1 first-enrollment status endpoint.",
-    "RegistrationReject vectors pin the anti-oracle generic failure envelope."
+    "RegistrationReject vectors pin the anti-oracle generic failure envelope.",
+    "The pinned rp.id is the engine default with THEYOS_OWNER_WEBAUTHN_RP_ID unset; a deployment that names its own domain must re-pin these vectors."
   ],
   "format": {
     "base64_url_safe_data": "Base64UrlSafeData serializes as base64url text, even in CBOR; it accepts byte strings on decode but canonical re-encode emits text.",

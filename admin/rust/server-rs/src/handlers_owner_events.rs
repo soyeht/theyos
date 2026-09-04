@@ -534,6 +534,18 @@ impl OwnerEventsRouterState {
         self
     }
 
+    /// Attach an RP that another router already holds.
+    ///
+    /// The challenge store lives inside `OwnerWebauthnRp`, so the routers that
+    /// must be able to finish each other's registrations have to be handed the
+    /// same `Arc`; [`Self::with_owner_webauthn_rp`] would give each of them a
+    /// store of its own.
+    #[must_use]
+    pub fn with_owner_webauthn_rp_shared(mut self, rp: Arc<Mutex<OwnerWebauthnRp>>) -> Self {
+        self.owner_webauthn_rp = Some(rp);
+        self
+    }
+
     #[must_use]
     pub fn with_owner_webauthn_anchor(
         mut self,
