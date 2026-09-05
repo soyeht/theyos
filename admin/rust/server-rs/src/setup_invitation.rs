@@ -350,8 +350,9 @@ pub fn clear_persisted_invitation(state_dir: &Path) {
     let _ = std::fs::remove_file(path);
 }
 
-/// Validate that `src_ip` is a permitted Tailnet source for `POST /initialize`
-/// given a persisted invitation.
+/// Validate that `src_ip` may run `POST /initialize` while an invitation is
+/// pending: this Mac itself (loopback), or the invited iPhone's tailnet
+/// address.
 ///
 /// For `.local` mDNS hostnames, attempts a non-blocking live DNS resolution
 /// (via `tokio::net::lookup_host`, 3 s timeout) first. Falls back to the
@@ -362,6 +363,29 @@ pub async fn validate_initialize_source(
     invitation: &PersistedSetupInvitation,
     src_ip: IpAddr,
 ) -> Result<(), &'static str> {
+    // Loopback is this Mac talking to its own engine, and it is always
+    // allowed.
+    //
+    // MEASURED on the owner's Dev Mac 2026-09-05, with an iPhone nearby
+    // looking for it:
+    //
+    //     WARN bootstrap.initialize.rejected reason="not_tailnet" src_ip="::1"
+    //
+    // The setup screen said "I could not create your home. Turn on Tailscale
+    // to add machines to this home." — while the person was sitting at the Mac
+    // naming their home, and the Mac's own Tailscale was up. Nothing they
+    // could do would fix it: the guard wanted a TAILNET address from the
+    // caller, and the caller was the Mac's own setup window on `::1`. With the
+    // iPhone's Tailscale off, no address would ever have satisfied it, so
+    // first setup was simply impossible.
+    //
+    // This guard exists to stop a STRANGER on the network from riding a
+    // pending invitation to initialize the household. A process on this
+    // machine is not that stranger: it already runs as the person who owns the
+    // Mac, and the admin API it is talking to is bound to loopback.
+    if src_ip.is_loopback() {
+        return Ok(());
+    }
     if classify_source(src_ip) != DiscoverySource::Tailnet {
         return Err("not_tailnet");
     }
@@ -418,6 +442,71 @@ mod tests {
             ("expires_at".to_string(), "2524608000".to_string()),
             ("port".to_string(), "8123".to_string()),
         ])
+    }
+
+    fn pending_invitation(iphone_addrs: Vec<String>) -> PersistedSetupInvitation {
+        PersistedSetupInvitation {
+            version: 1,
+            token: ByteBuf::from(vec![7u8; 32]),
+            // Deliberately not `.local`, so no live DNS resolution is attempted
+            // and the test measures the guard rather than the network.
+            iphone_endpoint: "iphone.example.invalid:8123".to_string(),
+            iphone_addrs,
+            owner_display_name: "Owner".to_string(),
+            hh_id: None,
+            expires_at: 2_524_608_000,
+            iphone_apns_token: None,
+        }
+    }
+
+    /// First setup used to be impossible whenever an iPhone was nearby.
+    ///
+    /// MEASURED on the owner's Dev Mac 2026-09-05, with the phone looking for
+    /// it: `bootstrap.initialize.rejected reason="not_tailnet" src_ip="::1"`,
+    /// and the setup window said "I could not create your home. Turn on
+    /// Tailscale". The caller was the Mac's OWN setup screen on loopback, and
+    /// with the phone's Tailscale off no address could ever have satisfied the
+    /// guard.
+    #[tokio::test]
+    async fn this_mac_can_always_initialize_its_own_household() {
+        let invitation = pending_invitation(vec!["192.168.15.14".to_string()]);
+        for loopback in ["127.0.0.1", "::1"] {
+            validate_initialize_source(&invitation, loopback.parse().unwrap())
+                .await
+                .unwrap_or_else(|reason| {
+                    panic!("{loopback} must be allowed to initialize, got {reason}")
+                });
+        }
+    }
+
+    /// The guard still does its job: a stranger on the Wi-Fi cannot ride a
+    /// pending invitation to initialize the household.
+    #[tokio::test]
+    async fn a_local_network_peer_still_cannot_initialize() {
+        let invitation = pending_invitation(vec!["192.168.15.14".to_string()]);
+        assert_eq!(
+            validate_initialize_source(&invitation, "192.168.15.99".parse().unwrap()).await,
+            Err("not_tailnet")
+        );
+        // Not even the invited phone's own LAN address: this route is the
+        // tailnet one, and loopback is the exception it now names.
+        assert_eq!(
+            validate_initialize_source(&invitation, "192.168.15.14".parse().unwrap()).await,
+            Err("not_tailnet")
+        );
+    }
+
+    /// And a tailnet address that is not the invited phone's is still refused.
+    #[tokio::test]
+    async fn another_tailnet_peer_is_still_refused() {
+        let invitation = pending_invitation(vec!["100.64.10.5".to_string()]);
+        assert_eq!(
+            validate_initialize_source(&invitation, "100.64.10.9".parse().unwrap()).await,
+            Err("source_ip_mismatch")
+        );
+        validate_initialize_source(&invitation, "100.64.10.5".parse().unwrap())
+            .await
+            .expect("the invited phone's tailnet address still passes");
     }
 
     #[tokio::test]
