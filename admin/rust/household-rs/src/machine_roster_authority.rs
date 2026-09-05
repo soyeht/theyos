@@ -3211,6 +3211,14 @@ mod tests {
             0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A,
             0x0B, 0x0C,
         ];
+        // Pin every field the byte-exact vectors below depend on. The random
+        // nonce is one; `not_before` became another when minting started
+        // backdating it by a clock-skew allowance. That allowance is POLICY,
+        // and these vectors exist to pin the preimage's SHAPE — a domain
+        // separator, a key order, an encoding. Normalising it here keeps them
+        // measuring that, instead of turning every future change to the
+        // allowance into two hashes to re-record by hand.
+        cert.not_before = cert.issued_at;
         let sb = cert.signing_bytes().unwrap();
         cert.signature = root_kp.sign(&sb).unwrap();
         cert

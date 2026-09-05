@@ -109,6 +109,37 @@ struct PersonCertUnsigned {
     pub owner_provenance: Option<OwnerAuthClaimValue>,
 }
 
+/// How far before `issued_at` a freshly minted owner certificate starts being
+/// valid.
+///
+/// WHY IT IS NOT ZERO. `not_before` is whole seconds (`as_secs()` truncates),
+/// and the phone that must accept the certificate checks `now >= not_before`
+/// with no tolerance at all -- correctly, because a verifier that forgives the
+/// clock is a verifier that can be lied to. So the slack has to be given by
+/// the side that MINTS.
+///
+/// MEASURED on the owner's Dev pair, 2026-09-05, a successful pairing:
+///
+/// ```text
+/// pair.cert.validity notBefore=1788610348 issuedAt=1788610348 now=1788610348 skewMs=340
+/// pair.confirm.post  -> pair.confirm.response  191 ms
+/// ```
+///
+/// The certificate was signed and verified inside the same second with 340 ms
+/// to spare. Had the Mac signed 340 ms later in that second -- or had the
+/// phone's clock been 340 ms behind -- the phone would have read `now <
+/// not_before` and refused a certificate that had just been minted for it, and
+/// the user would have seen the catch-all "I couldn't connect this time". The
+/// whole budget is one second, the round trip already spends a fifth of it,
+/// and the two clocks are independent: that is the shape of the intermittent
+/// `certInvalid` this backlog has been chasing.
+///
+/// Sixty seconds is the usual allowance for clock skew between two machines
+/// that both run NTP. It costs nothing: a certificate that was valid one
+/// minute earlier grants no capability it does not already grant now, and
+/// `not_after` (when set) is unchanged.
+const NOT_BEFORE_CLOCK_SKEW_SECS: u64 = 60;
+
 pub struct SignOwnerOptions {
     pub hh_id: HouseholdId,
     pub p_pub: P256PublicKey,
@@ -190,7 +221,7 @@ impl PersonCert {
             p_pub: opts.p_pub,
             display_name: opts.display_name,
             caveats: caveats::owner_caveats(),
-            not_before: opts.issued_at,
+            not_before: opts.issued_at.saturating_sub(NOT_BEFORE_CLOCK_SKEW_SECS),
             not_after: None,
             nonce,
             issued_at: opts.issued_at,

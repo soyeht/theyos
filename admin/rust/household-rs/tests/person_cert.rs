@@ -439,3 +439,92 @@ fn first_owner_cert_has_no_device_cert_material() {
             .any(|k| k.contains("device") || k == "d_pub" || k == "d_id")
     );
 }
+
+/// The intermittent `certInvalid` this test exists to close.
+///
+/// `not_before` is whole seconds and the phone checks `now >= not_before` with
+/// no tolerance, so a certificate minted at `issued_at` was only acceptable to
+/// a phone whose clock had already reached that same second. MEASURED on the
+/// owner's Dev pair 2026-09-05, on a run that SUCCEEDED:
+/// `notBefore=1788610348 issuedAt=1788610348 now=1788610348 skewMs=340` — 340 ms
+/// of margin, out of a one-second budget, with a 191 ms round trip inside it.
+/// A phone a few hundred milliseconds behind the Mac refused a certificate the
+/// Mac had just minted for it.
+#[test]
+fn a_freshly_minted_owner_cert_is_accepted_by_a_phone_whose_clock_trails() {
+    let hh = P256Keypair::generate();
+    let person = P256Keypair::generate();
+    let hh_id = derive_household_id(&hh.public());
+    let issued_at = 1_788_610_348;
+    let cert = PersonCert::sign_owner(
+        &hh,
+        SignOwnerOptions {
+            hh_id: hh_id.clone(),
+            p_pub: person.public(),
+            display_name: "Owner".into(),
+            issued_at,
+        },
+    )
+    .unwrap();
+
+    // One second behind — the shape the diagnostics captured.
+    cert.verify(&hh_id, &hh.public(), issued_at - 1)
+        .expect("a phone one second behind the Mac must still pair");
+    // And the ordinary NTP allowance, which is what the constant buys.
+    cert.verify(&hh_id, &hh.public(), issued_at - 60)
+        .expect("sixty seconds of skew is the stated allowance");
+}
+
+/// The allowance is a floor, not a licence: a clock far enough behind is still
+/// refused, so the certificate cannot be replayed to a machine whose clock has
+/// been dragged backwards.
+#[test]
+fn a_clock_further_back_than_the_allowance_is_still_refused() {
+    let hh = P256Keypair::generate();
+    let person = P256Keypair::generate();
+    let hh_id = derive_household_id(&hh.public());
+    let issued_at = 1_788_610_348;
+    let cert = PersonCert::sign_owner(
+        &hh,
+        SignOwnerOptions {
+            hh_id: hh_id.clone(),
+            p_pub: person.public(),
+            display_name: "Owner".into(),
+            issued_at,
+        },
+    )
+    .unwrap();
+
+    assert!(
+        cert.verify(&hh_id, &hh.public(), issued_at - 61).is_err(),
+        "a clock beyond the allowance must still read the cert as not yet valid"
+    );
+}
+
+/// `not_before <= issued_at` is the invariant the verifier checks first. The
+/// allowance must keep it true rather than trade one refusal for another.
+#[test]
+fn the_allowance_keeps_not_before_at_or_before_issued_at() {
+    let hh = P256Keypair::generate();
+    let person = P256Keypair::generate();
+    let hh_id = derive_household_id(&hh.public());
+    for issued_at in [0_u64, 1, 59, 60, 61, 1_788_610_348] {
+        let cert = PersonCert::sign_owner(
+            &hh,
+            SignOwnerOptions {
+                hh_id: hh_id.clone(),
+                p_pub: person.public(),
+                display_name: "Owner".into(),
+                issued_at,
+            },
+        )
+        .unwrap();
+        assert!(
+            cert.not_before <= cert.issued_at,
+            "issued_at={issued_at} produced not_before={} above issued_at",
+            cert.not_before
+        );
+        // A clock near the epoch must not wrap into the far future.
+        assert!(cert.not_before <= issued_at);
+    }
+}
