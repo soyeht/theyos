@@ -22,6 +22,7 @@ use serde_bytes::ByteBuf;
 use tokio::sync::Mutex;
 
 use crate::bonjour_trust::{DiscoverySource, classify_source};
+use crate::pairing_addresses::PairingInstallation;
 
 // ── Cache entry ───────────────────────────────────────────────────────────────
 
@@ -178,50 +179,147 @@ struct VerifyReq<'a> {
     token: &'a ByteBuf,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct VerifyResp {
     #[serde(rename = "v")]
-    #[allow(dead_code)]
     version: u8,
     token: ByteBuf,
+    installation: Option<PairingInstallation>,
+    expires_at: u64,
+    owner_display_name: Option<String>,
+    iphone_apns_token: Option<ByteBuf>,
 }
 
-/// POST to the iPhone's `/setup/verify` endpoint to confirm the token is still
-/// valid. Returns `Ok(())` on success (iPhone echoes the same token back).
-///
-/// Runs synchronously — callers must use `spawn_blocking` if calling from async.
-pub fn callback_verify_blocking(iphone_endpoint: &str, token: &[u8; 32]) -> Result<(), String> {
-    let url = format!("http://{iphone_endpoint}/setup/verify");
+pub type InvitationVerifier =
+    fn(&str, &[u8; 32], &PairingInstallation) -> Result<VerifiedInvitation, String>;
+
+pub struct VerifiedInvitation {
+    pub expires_at: u64,
+    pub owner_display_name: String,
+    pub iphone_apns_token: Option<[u8; 32]>,
+    pub lan_address: Option<IpAddr>,
+}
+
+/// Limit callbacks to nearby addresses. In particular, do not follow redirects,
+/// credentials, public DNS, alternate paths or queries supplied in an invitation.
+/// LAN admission is bound to a literal address at which the token was verified.
+fn callback_url(endpoint: &str) -> Result<(reqwest::Url, Option<IpAddr>), String> {
+    let raw = if endpoint.contains("://") {
+        endpoint.to_owned()
+    } else {
+        format!("http://{endpoint}")
+    };
+    let mut url = reqwest::Url::parse(&raw).map_err(|_| "invalid_callback_endpoint")?;
+    if url.scheme() != "http"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.path() != "/"
+        || url.port().is_none()
+    {
+        return Err("invalid_callback_endpoint".into());
+    }
+    let host = url
+        .host_str()
+        .ok_or("invalid_callback_endpoint")?
+        .trim_matches(['[', ']']);
+    let ip = host.parse::<IpAddr>().ok();
+    if let Some(ip) = ip {
+        let local = match ip {
+            IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
+            IpAddr::V6(v6) => v6.is_unique_local() || v6.is_unicast_link_local(),
+        };
+        if ip.is_loopback()
+            || ip.is_unspecified()
+            || !(local || crate::tailnet_address::is_tailnet_ip(ip))
+        {
+            return Err("invalid_callback_endpoint".into());
+        }
+    } else if !host.trim_end_matches('.').ends_with(".local") {
+        return Err("invalid_callback_endpoint".into());
+    }
+    url.set_path("/setup/verify");
+    Ok((
+        url,
+        ip.filter(|ip| !crate::tailnet_address::is_tailnet_ip(*ip)),
+    ))
+}
+
+/// Confirm both token possession and installation at the iPhone before making
+/// any claim persistent. Metadata comes from this response, not a Mac hint.
+/// Runs synchronously; async callers must use spawn_blocking.
+pub fn callback_verify_blocking(
+    iphone_endpoint: &str,
+    token: &[u8; 32],
+    expected: &PairingInstallation,
+) -> Result<VerifiedInvitation, String> {
+    let (url, lan_address) = callback_url(iphone_endpoint)?;
     let token_buf = ByteBuf::from(token.to_vec());
     let req_body = household_rs::cbor::to_canonical_vec(&VerifyReq {
         version: 1,
         token: &token_buf,
     })
-    .map_err(|e| format!("cbor encode: {e}"))?;
-
+    .map_err(|_| "verify_encode_failed")?;
     let agent = ureq::AgentBuilder::new()
+        .redirects(0)
         .timeout(Duration::from_secs(5))
         .build();
     let response = agent
-        .post(&url)
+        .post(url.as_str())
         .set("Content-Type", "application/cbor")
         .send_bytes(&req_body)
-        .map_err(|e| format!("POST {url}: {e}"))?;
-
-    if response.status() != 200 {
-        return Err(format!("iPhone verify returned HTTP {}", response.status()));
+        .map_err(|_| "verify_request_failed")?;
+    if response.status() != 200
+        || response
+            .header("Content-Type")
+            .map(|h| h.split(';').next().unwrap_or("").trim())
+            != Some("application/cbor")
+    {
+        return Err("invalid_verify_response".into());
     }
     let mut bytes = Vec::new();
     response
         .into_reader()
+        .take(65_537)
         .read_to_end(&mut bytes)
-        .map_err(|e| format!("read body: {e}"))?;
-    let resp: VerifyResp = household_rs::cbor::from_canonical_slice(&bytes)
-        .map_err(|e| format!("cbor decode: {e}"))?;
-    if resp.token.as_ref() != token.as_slice() {
-        return Err("token echoed by iPhone does not match".into());
+        .map_err(|_| "verify_read_failed")?;
+    if bytes.len() > 65_536 {
+        return Err("verify_response_too_large".into());
     }
-    Ok(())
+    decode_verified_invitation(&bytes, token, expected, lan_address)
+}
+
+pub fn decode_verified_invitation(
+    bytes: &[u8],
+    token: &[u8; 32],
+    expected: &PairingInstallation,
+    lan_address: Option<IpAddr>,
+) -> Result<VerifiedInvitation, String> {
+    let resp: VerifyResp =
+        household_rs::cbor::from_canonical_slice(bytes).map_err(|_| "invalid_verify_response")?;
+    if resp.version != 1 || resp.token.as_ref() != token.as_slice() {
+        return Err("verify_token_mismatch".into());
+    }
+    if resp.installation.as_ref() != Some(expected) {
+        return Err("profile_mismatch".into());
+    }
+    let now =
+        crate::time_util::unix_now_secs_checked("claim.verify.clock").ok_or("clock_unavailable")?;
+    if resp.expires_at <= now {
+        return Err("invitation_expired".into());
+    }
+    let iphone_apns_token = resp
+        .iphone_apns_token
+        .map(|t| <[u8; 32]>::try_from(t.as_ref()))
+        .transpose()
+        .map_err(|_| "invalid_apns_token")?;
+    Ok(VerifiedInvitation {
+        expires_at: resp.expires_at,
+        owner_display_name: resp.owner_display_name.unwrap_or_default(),
+        iphone_apns_token,
+        lan_address,
+    })
 }
 
 // ── Persistence ───────────────────────────────────────────────────────────────
@@ -243,6 +341,12 @@ pub struct PersistedSetupInvitation {
     pub expires_at: u64,
     /// Optional APNs device token (32 bytes). `None` → Bonjour-only flow.
     pub iphone_apns_token: Option<ByteBuf>,
+    #[serde(default)]
+    pub installation: Option<PairingInstallation>,
+    #[serde(default)]
+    pub accepted_at: Option<u64>,
+    #[serde(default)]
+    pub verified_lan_address: Option<IpAddr>,
 }
 
 impl std::fmt::Debug for PersistedSetupInvitation {
@@ -257,9 +361,15 @@ impl std::fmt::Debug for PersistedSetupInvitation {
             hh_id,
             expires_at,
             iphone_apns_token,
+            installation,
+            accepted_at,
+            verified_lan_address,
         } = self;
         f.debug_struct("PersistedSetupInvitation")
             .field("version", version)
+            .field("installation", installation)
+            .field("accepted_at", accepted_at)
+            .field("verified_lan_address", verified_lan_address)
             .field("token", &"[REDACTED]")
             .field("iphone_endpoint", iphone_endpoint)
             .field("iphone_addrs", iphone_addrs)
@@ -289,6 +399,17 @@ pub fn persist_invitation(
     entry: &SetupInvitationEntry,
     iphone_apns_token: Option<[u8; 32]>,
 ) -> Result<(), household_rs::StorageError> {
+    persist_verified_invitation(state_dir, entry, iphone_apns_token, None, None, None)
+}
+
+pub fn persist_verified_invitation(
+    state_dir: &Path,
+    entry: &SetupInvitationEntry,
+    iphone_apns_token: Option<[u8; 32]>,
+    installation: Option<PairingInstallation>,
+    accepted_at: Option<u64>,
+    verified_lan_address: Option<IpAddr>,
+) -> Result<(), household_rs::StorageError> {
     let path = pending_invitation_path(state_dir);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| household_rs::StorageError::Io {
@@ -310,6 +431,9 @@ pub fn persist_invitation(
         hh_id: entry.hh_id.clone(),
         expires_at: entry.expires_at,
         iphone_apns_token: iphone_apns_token.map(|t| ByteBuf::from(t.to_vec())),
+        installation,
+        accepted_at,
+        verified_lan_address,
     };
     household_rs::storage::atomic_write_cbor(&path, &persisted)
 }
@@ -350,6 +474,29 @@ pub fn clear_persisted_invitation(state_dir: &Path) {
     let _ = std::fs::remove_file(path);
 }
 
+/// The local Mac may initialize manually without an invitation token. Remote
+/// callers must prove the exact live invitation even if their source matches.
+pub fn validate_initialize_claim(
+    invitation: &PersistedSetupInvitation,
+    source: Option<IpAddr>,
+    token: Option<&[u8]>,
+    now: u64,
+) -> Result<(), &'static str> {
+    if source.is_some_and(|ip| ip.is_loopback()) && token.is_none() {
+        return Ok(());
+    }
+    if source.is_none() {
+        return Err("missing_source");
+    }
+    if invitation.expires_at <= now {
+        return Err("invitation_expired");
+    }
+    if token != Some(invitation.token.as_ref()) {
+        return Err("claim_token_mismatch");
+    }
+    Ok(())
+}
+
 /// Validate that `src_ip` may run `POST /initialize` while an invitation is
 /// pending: this Mac itself (loopback), or the invited iPhone's tailnet
 /// address.
@@ -384,6 +531,12 @@ pub async fn validate_initialize_source(
     // machine is not that stranger: it already runs as the person who owns the
     // Mac, and the admin API it is talking to is bound to loopback.
     if src_ip.is_loopback() {
+        return Ok(());
+    }
+    // Explicit LAN pairing policy: only the literal endpoint that answered
+    // this profile's token challenge can initialize over LAN. The initialize
+    // handler separately checks the claim token and invitation expiry.
+    if invitation.installation.is_some() && invitation.verified_lan_address == Some(src_ip) {
         return Ok(());
     }
     if classify_source(src_ip) != DiscoverySource::Tailnet {
@@ -432,6 +585,96 @@ pub async fn validate_initialize_source(
 mod tests {
     use super::*;
 
+    #[test]
+    fn callback_candidates_cannot_target_other_services_or_redirects() {
+        for endpoint in [
+            "http://127.0.0.1:8091",
+            "http://user:pass@192.168.1.20:8123",
+            "http://192.168.1.20:8123/other",
+            "http://192.168.1.20:8123?token=secret",
+            "https://192.168.1.20:8123",
+            "http://example.invalid:8123",
+            "http://0.0.0.0:8123",
+        ] {
+            assert!(callback_url(endpoint).is_err(), "{endpoint}");
+        }
+        let (url, lan) = callback_url("http://192.168.1.20:8123").unwrap();
+        assert_eq!(url.path(), "/setup/verify");
+        assert_eq!(lan, Some("192.168.1.20".parse().unwrap()));
+        assert!(callback_url("100.64.0.10:8123").unwrap().1.is_none());
+    }
+
+    #[test]
+    fn callback_requires_token_profile_and_live_invitation_together() {
+        let dev = PairingInstallation::new("dev".into(), 8101).unwrap();
+        let release = PairingInstallation::new("release".into(), 8091).unwrap();
+        let token = [42; 32];
+        let mut response = VerifyResp {
+            version: 1,
+            token: ByteBuf::from(token.to_vec()),
+            installation: Some(dev.clone()),
+            expires_at: 2_524_608_000,
+            owner_display_name: Some("Owner".into()),
+            iphone_apns_token: None,
+        };
+        let encode =
+            |response: &VerifyResp| household_rs::cbor::to_canonical_vec(response).unwrap();
+        assert!(decode_verified_invitation(&encode(&response), &token, &dev, None).is_ok());
+        assert!(decode_verified_invitation(&encode(&response), &[43; 32], &dev, None).is_err());
+        assert!(decode_verified_invitation(&encode(&response), &token, &release, None).is_err());
+        response.installation = None;
+        assert!(decode_verified_invitation(&encode(&response), &token, &dev, None).is_err());
+        response.installation = Some(dev.clone());
+        response.expires_at = 1;
+        assert!(decode_verified_invitation(&encode(&response), &token, &dev, None).is_err());
+    }
+
+    #[test]
+    fn remote_initialize_requires_the_live_claim_token() {
+        let invitation = pending_invitation(vec![]);
+        let peer = Some("192.168.1.20".parse().unwrap());
+        assert!(validate_initialize_claim(&invitation, peer, None, 1).is_err());
+        assert!(validate_initialize_claim(&invitation, peer, Some(&[8; 32]), 1).is_err());
+        assert!(validate_initialize_claim(&invitation, peer, Some(&[7; 32]), 1).is_ok());
+        assert!(
+            validate_initialize_claim(&invitation, peer, Some(&[7; 32]), invitation.expires_at)
+                .is_err()
+        );
+        assert!(validate_initialize_claim(&invitation, None, Some(&[7; 32]), 1).is_err());
+        assert!(
+            validate_initialize_claim(&invitation, Some("::1".parse().unwrap()), None, 1).is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn lan_admission_is_limited_to_the_profile_verified_callback_address() {
+        let mut invitation = pending_invitation(vec!["192.168.1.20".into(), "192.168.1.21".into()]);
+        let source = "192.168.1.20".parse().unwrap();
+        assert!(
+            validate_initialize_source(&invitation, source)
+                .await
+                .is_err()
+        );
+        invitation.installation = PairingInstallation::new("dev".into(), 8101);
+        invitation.verified_lan_address = Some(source);
+        assert!(
+            validate_initialize_source(&invitation, source)
+                .await
+                .is_ok()
+        );
+        assert!(
+            validate_initialize_source(&invitation, "192.168.1.21".parse().unwrap())
+                .await
+                .is_err()
+        );
+        invitation.installation = None;
+        assert!(
+            validate_initialize_source(&invitation, source)
+                .await
+                .is_err()
+        );
+    }
+
     fn setup_txt(token: [u8; 32]) -> HashMap<String, String> {
         HashMap::from([
             ("v".to_string(), "1".to_string()),
@@ -456,6 +699,9 @@ mod tests {
             hh_id: None,
             expires_at: 2_524_608_000,
             iphone_apns_token: None,
+            installation: None,
+            accepted_at: None,
+            verified_lan_address: None,
         }
     }
 

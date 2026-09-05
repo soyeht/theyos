@@ -36,9 +36,6 @@ fn make_state_dir() -> PathBuf {
     dir
 }
 
-fn no_tailnet() -> Option<std::net::Ipv4Addr> {
-    None
-}
 
 fn make_state(bs: BootstrapState) -> BootstrapHandlerState {
     BootstrapHandlerState {
@@ -51,8 +48,8 @@ fn make_state(bs: BootstrapState) -> BootstrapHandlerState {
         ),
         started_at: Instant::now(),
         setup_invitation_cache: server_rs::setup_invitation::new_cache(),
-        engine_port: 8091,
-        tailnet_resolver: no_tailnet,
+        installation: server_rs::pairing_addresses::PairingInstallation::new("release".into(), 8091),
+        invitation_verifier: server_rs::setup_invitation::callback_verify_blocking,
         phase3_runtime: None,
         pair_code_rate_limiter: None,
     }

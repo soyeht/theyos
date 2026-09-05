@@ -142,8 +142,8 @@ async fn measured_initialize_once(sample: usize) -> std::time::Duration {
         pair_device_window,
         pair_machine_window: Arc::new(PairMachineWindow::new_in_memory()),
         setup_invitation_cache: crate::setup_invitation::new_cache(),
-        engine_port: 8091,
-        tailnet_resolver: || None,
+        installation: crate::pairing_addresses::PairingInstallation::new("release".into(), 8091),
+        invitation_verifier: crate::setup_invitation::callback_verify_blocking,
         phase3_runtime: None,
         pair_code_rate_limiter: None,
     };
@@ -217,8 +217,8 @@ async fn first_owner_loopback_http_smoke_has_liveness_before_and_after() {
         pair_device_window,
         pair_machine_window: Arc::new(PairMachineWindow::new_in_memory()),
         setup_invitation_cache: crate::setup_invitation::new_cache(),
-        engine_port: 8091,
-        tailnet_resolver: || None,
+        installation: crate::pairing_addresses::PairingInstallation::new("release".into(), 8091),
+        invitation_verifier: crate::setup_invitation::callback_verify_blocking,
         phase3_runtime: None,
         pair_code_rate_limiter: None,
     };
@@ -316,8 +316,8 @@ async fn first_owner_initialize_rebinds_and_persists_one_recoverable_attempt() {
         pair_device_window: Arc::clone(&pair_device_window),
         pair_machine_window: Arc::new(PairMachineWindow::new_in_memory()),
         setup_invitation_cache: crate::setup_invitation::new_cache(),
-        engine_port: 8091,
-        tailnet_resolver: || None,
+        installation: crate::pairing_addresses::PairingInstallation::new("release".into(), 8091),
+        invitation_verifier: crate::setup_invitation::callback_verify_blocking,
         phase3_runtime: None,
         pair_code_rate_limiter: None,
     };
@@ -590,4 +590,19 @@ fn public_attempt_matcher_accepts_one_valid_case_and_rejects_each_divergence() {
             "pair attempt drift"
         ]
     );
+}
+
+#[test]
+fn household_bootstrap_does_not_select_addresses_from_administrative_or_interface_helpers() {
+    let source = include_str!("handlers_bootstrap.rs");
+    for forbidden in [
+        "best_qr_host",
+        "current_tailnet_ipv4",
+        "build_mac_engine_url",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "household bootstrap depends on {forbidden}"
+        );
+    }
 }

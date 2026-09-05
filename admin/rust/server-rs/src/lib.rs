@@ -126,6 +126,7 @@ pub mod household_attach_token;
 pub mod household_auth;
 pub mod household_bootstrap;
 pub mod household_listener;
+pub mod pairing_addresses;
 pub mod household_state;
 pub mod install_cli;
 pub mod install_worker;

@@ -252,7 +252,7 @@ use household_rs::bootstrap_state::BootstrapState;
 use household_rs::pair_device::{PairDeviceWindow, PairDeviceWindowState};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast::error::RecvError;
-use tokio::sync::{Mutex, RwLock, oneshot};
+use tokio::sync::{RwLock, oneshot};
 use tracing::{info, warn};
 
 use crate::local_network_visibility::{LocalNetworkVisibility, LocalNetworkVisibilityState};
@@ -1005,39 +1005,76 @@ async fn bind_concrete(addr: SocketAddr) -> Result<TcpListener, std::io::Error> 
 struct BoundTarget {
     class: InterfaceClass,
     shutdown: oneshot::Sender<()>,
+    registration: Arc<()>,
 }
 
 #[derive(Clone, Default)]
 pub struct BoundSet {
-    inner: Arc<Mutex<HashMap<IpAddr, BoundTarget>>>,
+    // Never held across IO/await. A synchronous guard lets task cancellation
+    // remove its registration in Drop, including panic/abort paths.
+    inner: Arc<std::sync::Mutex<HashMap<IpAddr, BoundTarget>>>,
 }
 
 impl BoundSet {
-    /// Snapshot of currently bound addresses paired with the interface
-    /// class enumerator's classification at the moment of binding.
-    pub async fn snapshot(&self) -> Vec<IpAddr> {
-        self.inner.lock().await.keys().copied().collect()
-    }
-
-    /// Snapshot of currently bound addresses with their interface classes.
-    pub async fn snapshot_targets(&self) -> Vec<(IpAddr, InterfaceClass)> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<IpAddr, BoundTarget>> {
         self.inner
             .lock()
-            .await
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub async fn snapshot(&self) -> Vec<IpAddr> {
+        self.lock().keys().copied().collect()
+    }
+
+    pub async fn snapshot_targets(&self) -> Vec<(IpAddr, InterfaceClass)> {
+        self.lock()
             .iter()
             .map(|(ip, target)| (*ip, target.class))
             .collect()
     }
 
-    async fn insert(&self, ip: IpAddr, class: InterfaceClass, shutdown: oneshot::Sender<()>) {
-        self.inner
-            .lock()
-            .await
-            .insert(ip, BoundTarget { class, shutdown });
+    async fn insert(
+        &self,
+        ip: IpAddr,
+        class: InterfaceClass,
+        shutdown: oneshot::Sender<()>,
+    ) -> Arc<()> {
+        let registration = Arc::new(());
+        self.lock().insert(
+            ip,
+            BoundTarget {
+                class,
+                shutdown,
+                registration: Arc::clone(&registration),
+            },
+        );
+        registration
     }
 
     async fn remove(&self, ip: IpAddr) -> Option<BoundTarget> {
-        self.inner.lock().await.remove(&ip)
+        self.lock().remove(&ip)
+    }
+
+    fn remove_registration(&self, ip: IpAddr, registration: &Arc<()>) {
+        let mut targets = self.lock();
+        if targets
+            .get(&ip)
+            .is_some_and(|target| Arc::ptr_eq(&target.registration, registration))
+        {
+            targets.remove(&ip);
+        }
+    }
+}
+
+struct ListenerRegistration {
+    bound: BoundSet,
+    ip: IpAddr,
+    identity: Arc<()>,
+}
+
+impl Drop for ListenerRegistration {
+    fn drop(&mut self) {
+        self.bound.remove_registration(self.ip, &self.identity);
     }
 }
 
@@ -1046,8 +1083,10 @@ fn spawn_listener_task(
     listener: TcpListener,
     addr: SocketAddr,
     shutdown_rx: oneshot::Receiver<()>,
+    registration: ListenerRegistration,
 ) {
     tokio::spawn(async move {
+        let _registration = registration;
         let shutdown = async move {
             let _ = shutdown_rx.await;
         };
@@ -1055,11 +1094,7 @@ fn spawn_listener_task(
             .with_graceful_shutdown(shutdown)
             .await
         {
-            warn!(
-                stage = "household_listener.serve_failed",
-                address = %addr,
-                error = %e,
-            );
+            warn!(stage = "household_listener.serve_failed", address = %addr, error = %e);
         }
     });
 }
@@ -1083,8 +1118,13 @@ async fn bind_allowed_target(
                 source,
             );
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
-            bound.insert(ip, class, shutdown_tx).await;
-            spawn_listener_task(router.clone(), listener, addr, shutdown_rx);
+            let identity = bound.insert(ip, class, shutdown_tx).await;
+            let registration = ListenerRegistration {
+                bound: bound.clone(),
+                ip,
+                identity,
+            };
+            spawn_listener_task(router.clone(), listener, addr, shutdown_rx, registration);
             Some((ip, class))
         }
         Err(e) => {
@@ -2825,6 +2865,85 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn failed_socket_bind_never_enters_the_listener_snapshot() {
+        let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = occupied.local_addr().unwrap();
+        let bound = BoundSet::default();
+        let result = bind_allowed_target(
+            &Router::new(),
+            addr.port(),
+            &bound,
+            addr.ip(),
+            InterfaceClass::Loopback,
+            "test",
+        )
+        .await;
+        assert!(result.is_none());
+        assert!(bound.snapshot().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn finished_server_task_withdraws_its_listener_without_reconciliation() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let bound = BoundSet::default();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        // Keep a separate registry sender alive so only the server task's
+        // registration guard can remove the advertised entry.
+        let (registry_tx, _registry_rx) = oneshot::channel();
+        let identity = bound
+            .insert(addr.ip(), InterfaceClass::Loopback, registry_tx)
+            .await;
+        let registration = ListenerRegistration {
+            bound: bound.clone(),
+            ip: addr.ip(),
+            identity,
+        };
+        spawn_listener_task(Router::new(), listener, addr, shutdown_rx, registration);
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !bound.snapshot().await.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("finished task remained advertised");
+    }
+
+    #[tokio::test]
+    async fn listener_lifetime_removes_its_advertised_address() {
+        let bound = BoundSet::default();
+        let ip = "192.168.1.2".parse().unwrap();
+        let (shutdown, _rx) = oneshot::channel();
+        let identity = bound.insert(ip, InterfaceClass::Lan, shutdown).await;
+        let registration = ListenerRegistration {
+            bound: bound.clone(),
+            ip,
+            identity,
+        };
+        assert_eq!(bound.snapshot().await, vec![ip]);
+        drop(registration);
+        assert!(bound.snapshot().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn old_listener_cannot_remove_a_replacement_at_the_same_address() {
+        let bound = BoundSet::default();
+        let ip = "192.168.1.2".parse().unwrap();
+        let (old_shutdown, _old_rx) = oneshot::channel();
+        let identity = bound.insert(ip, InterfaceClass::Lan, old_shutdown).await;
+        let old = ListenerRegistration {
+            bound: bound.clone(),
+            ip,
+            identity,
+        };
+        let (new_shutdown, _new_rx) = oneshot::channel();
+        bound.insert(ip, InterfaceClass::Lan, new_shutdown).await;
+        drop(old);
+        assert_eq!(bound.snapshot().await, vec![ip]);
+    }
+
     #[test]
     fn mesh_and_tailscale_bind_through_the_same_router_path() {
         let source = include_str!("household_listener.rs");
@@ -2837,7 +2956,9 @@ mod tests {
         let bind_body = &source[bind_start..bind_end];
 
         assert!(
-            bind_body.contains("spawn_listener_task(router.clone(), listener, addr, shutdown_rx)"),
+            bind_body.contains(
+                "spawn_listener_task(router.clone(), listener, addr, shutdown_rx, registration)"
+            ),
             "every allowed interface class must receive the caller's shared router"
         );
         assert!(

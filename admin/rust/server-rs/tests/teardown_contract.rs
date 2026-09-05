@@ -152,8 +152,8 @@ fn make_fixture_no_auth(bs: BootstrapState) -> (Fixture, Router) {
         ),
         started_at: Instant::now(),
         setup_invitation_cache: server_rs::setup_invitation::new_cache(),
-        engine_port: 8091,
-        tailnet_resolver: || None,
+        installation: server_rs::pairing_addresses::PairingInstallation::new("release".into(), 8091),
+        invitation_verifier: server_rs::setup_invitation::callback_verify_blocking,
         phase3_runtime: None,
         pair_code_rate_limiter: None,
     };
@@ -247,8 +247,8 @@ fn make_fixture(bs: BootstrapState) -> (Fixture, Router) {
         ),
         started_at: Instant::now(),
         setup_invitation_cache: server_rs::setup_invitation::new_cache(),
-        engine_port: 8091,
-        tailnet_resolver: || None,
+        installation: server_rs::pairing_addresses::PairingInstallation::new("release".into(), 8091),
+        invitation_verifier: server_rs::setup_invitation::callback_verify_blocking,
         phase3_runtime: None,
         pair_code_rate_limiter: None,
     };

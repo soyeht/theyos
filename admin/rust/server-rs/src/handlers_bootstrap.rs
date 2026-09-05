@@ -258,15 +258,10 @@ pub struct BootstrapHandlerState {
     /// iPhones (scenario B `AirDrop` flow). Populated by the Bonjour browser task;
     /// consumed by `POST /bootstrap/claim-setup-invitation` (T053).
     pub setup_invitation_cache: SetupInvitationCache,
-    /// The TCP port the engine binds household endpoints on. Used to build
-    /// the `mac_engine_url` advertised in the setup-invitation claim ACK so
-    /// the iPhone can reach `POST /bootstrap/initialize` over Tailnet.
-    pub engine_port: u16,
-    /// Function that returns the engine's local Tailnet IPv4 when one is
-    /// available. Defaults to `tailnet_address::current_tailnet_ipv4` which
-    /// walks `getifaddrs(3)`. Tests inject a deterministic resolver so they
-    /// don't depend on whether the test host is on a Tailnet.
-    pub tailnet_resolver: crate::tailnet_address::TailnetResolver,
+    /// Explicit installation identity and callback transport for claims.
+    /// Tests replace the transport, never the address-selection policy.
+    pub installation: Option<crate::pairing_addresses::PairingInstallation>,
+    pub invitation_verifier: crate::setup_invitation::InvitationVerifier,
     /// Stable generation-bound Phase 3 router/task slot owned by the daemon.
     /// Short-lived handler tests and CLI-only routers leave this unset.
     pub phase3_runtime: Option<crate::household_bootstrap::Phase3RuntimeController>,
@@ -298,8 +293,8 @@ impl BootstrapHandlerState {
             pair_machine_window,
             started_at: Instant::now(),
             setup_invitation_cache: crate::setup_invitation::new_cache(),
-            engine_port,
-            tailnet_resolver: crate::tailnet_address::current_tailnet_ipv4,
+            installation: crate::pairing_addresses::PairingInstallation::configured(engine_port),
+            invitation_verifier: crate::setup_invitation::callback_verify_blocking,
             phase3_runtime: None,
             pair_code_rate_limiter: None,
         }
@@ -375,6 +370,7 @@ struct InitializeRequest {
     #[serde(rename = "v")]
     version: u8,
     name: String,
+    claim_token: Option<ByteBuf>,
 }
 
 #[derive(Serialize)]
@@ -503,24 +499,19 @@ struct ClaimSetupInvitationRequest {
     #[serde(rename = "v")]
     version: u8,
     token: serde_bytes::ByteBuf,
-    iphone_apns_token: Option<serde_bytes::ByteBuf>,
+    installation: Option<crate::pairing_addresses::PairingInstallation>,
+    iphone_endpoint: Option<String>,
 }
 
 #[derive(Serialize)]
 struct ClaimSetupInvitationAck {
     #[serde(rename = "v")]
     version: u8,
+    accepted_at: u64,
+    installation: crate::pairing_addresses::PairingInstallation,
     iphone_endpoint: String,
     owner_display_name: String,
     hh_id: Option<String>,
-    /// `http://<engine-tailnet-ipv4>:<engine-port>` when the engine has a
-    /// Tailscale CGNAT address available. Omitted when no Tailnet address is
-    /// found — the caller (Soyeht.app) keeps whatever URL it would otherwise
-    /// derive from local discovery. Surfacing the Tailnet URL here lets the
-    /// iPhone reach `POST /bootstrap/initialize` over Tailnet, which is
-    /// required to survive the `tailnet_required` source-IP guard.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    mac_engine_url: Option<String>,
 }
 
 fn claim_cbor_error(status: StatusCode, error: &str) -> Response {
@@ -755,32 +746,22 @@ pub async fn post_reachability_echo(
 ///
 /// Contract: `specs/005-soyeht-onboarding/contracts/setup-invitation.md`
 ///
-/// No auth required. Token must match a Bonjour-discovered `_soyeht-setup._tcp.`
-/// advertisement, not be expired, and survive a callback ping to the iPhone.
+/// Loopback only. The Mac supplies a discovered callback candidate; the
+/// engine verifies the live token and matching installation with the iPhone.
 pub async fn post_claim_setup_invitation(
     State(state): State<BootstrapHandlerState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     body: Bytes,
 ) -> Response {
     use crate::setup_invitation::{
-        cache_purge_expired, cache_reinsert_if_absent, cache_take, callback_verify_blocking,
-        persist_invitation,
+        SetupInvitationEntry, load_persisted_invitation, persist_verified_invitation,
     };
 
-    // 1. State gate — must be uninitialized.
-    {
-        let current = state.bootstrap.read().await;
-        if !matches!(
-            *current,
-            household_rs::bootstrap_state::BootstrapState::Uninitialized
-        ) {
-            return claim_cbor_error(
-                StatusCode::CONFLICT,
-                BootstrapErrorCode::AlreadyInitialized.as_str(),
-            );
-        }
+    // This operation belongs to the Mac UI talking to its own engine. Nearby
+    // network clients must use the invitation ceremony, not select callbacks.
+    if !peer.ip().is_loopback() {
+        return StatusCode::NOT_FOUND.into_response();
     }
-
-    // 2. Decode CBOR.
     let req: ClaimSetupInvitationRequest = match household_rs::cbor::from_canonical_slice(&body) {
         Ok(r) => r,
         Err(_) => {
@@ -790,115 +771,182 @@ pub async fn post_claim_setup_invitation(
             );
         }
     };
-    if req.version != 1 {
-        return claim_cbor_error(
-            StatusCode::BAD_REQUEST,
-            BootstrapErrorCode::InvalidRequest.as_str(),
-        );
+    let Some(installation) = state.installation.clone() else {
+        return claim_cbor_error(StatusCode::SERVICE_UNAVAILABLE, "profile_missing");
+    };
+    if req.installation.as_ref() != Some(&installation) {
+        return claim_cbor_error(StatusCode::CONFLICT, "profile_mismatch");
     }
-
-    // 3. Token shape check — exactly 32 bytes.
     let Ok(token): Result<[u8; 32], _> = req.token.as_ref().try_into() else {
         return claim_cbor_error(
             StatusCode::BAD_REQUEST,
             BootstrapErrorCode::InvalidRequest.as_str(),
         );
     };
-
-    // 4. Atomic cache take — removes the entry in one lock acquire so concurrent
-    //    callers with the same token get None immediately (closes replay window).
-    //    Look up before purging so expired entries return 404 not 401.
-    let now = crate::time_util::unix_now_secs_checked("claim_setup_invitation.clock").unwrap_or(0);
-    let Some(entry) = cache_take(&state.setup_invitation_cache, &token).await else {
-        tracing::warn!(
-            stage = "claim_setup_invitation.rejected",
-            reason = "token_not_in_cache",
+    if req.version != 1 {
+        return claim_cbor_error(
+            StatusCode::BAD_REQUEST,
+            BootstrapErrorCode::InvalidRequest.as_str(),
         );
+    }
+    let fresh = |state| {
+        matches!(
+            state,
+            household_rs::bootstrap_state::BootstrapState::Uninitialized
+                | household_rs::bootstrap_state::BootstrapState::ReadyForNaming
+        )
+    };
+    if !fresh(*state.bootstrap.read().await) {
+        return claim_cbor_error(
+            StatusCode::CONFLICT,
+            BootstrapErrorCode::AlreadyInitialized.as_str(),
+        );
+    }
+
+    // A GUI discovery hit is a valid source of a callback candidate. It does
+    // not need to race the engine's independent Bonjour cache. Possession and
+    // profile are verified below before any state change.
+    let cached = state
+        .setup_invitation_cache
+        .lock()
+        .await
+        .get(&token)
+        .cloned();
+    if req.iphone_endpoint.is_none() {
+        if let Some(entry) = cached.as_ref() {
+            let Some(now) = crate::time_util::unix_now_secs_checked("claim.cache.clock") else {
+                return claim_cbor_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    BootstrapErrorCode::InternalError.as_str(),
+                );
+            };
+            if entry.expires_at <= now {
+                return claim_cbor_error(
+                    StatusCode::NOT_FOUND,
+                    BootstrapErrorCode::InvitationExpired.as_str(),
+                );
+            }
+        }
+    }
+    let endpoint = req
+        .iphone_endpoint
+        .or_else(|| cached.as_ref().map(|e| e.iphone_endpoint.clone()));
+    let Some(endpoint) = endpoint else {
         return claim_cbor_error(
             StatusCode::UNAUTHORIZED,
             BootstrapErrorCode::InvitationNotRecognized.as_str(),
         );
     };
+    let verify_endpoint = endpoint.clone();
+    let verify_installation = installation.clone();
+    let verifier = state.invitation_verifier;
+    let verified = match tokio::task::spawn_blocking(move || {
+        verifier(&verify_endpoint, &token, &verify_installation)
+    })
+    .await
+    {
+        Ok(Ok(verified)) => verified,
+        result => {
+            let reason = match result {
+                Ok(Err(reason)) => reason,
+                _ => "verify_task_failed".into(),
+            };
+            tracing::warn!(stage = "claim_setup_invitation.rejected", reason);
+            return claim_cbor_error(
+                StatusCode::UNAUTHORIZED,
+                BootstrapErrorCode::InvitationNotRecognized.as_str(),
+            );
+        }
+    };
+    let mut addresses = cached
+        .as_ref()
+        .map(|e| e.iphone_addrs.clone())
+        .unwrap_or_default();
+    let url = reqwest::Url::parse(&endpoint)
+        .or_else(|_| reqwest::Url::parse(&format!("http://{endpoint}")));
+    if let Some(ip) = url.ok().and_then(|u| {
+        u.host_str()
+            .and_then(|h| h.trim_matches(['[', ']']).parse::<std::net::IpAddr>().ok())
+    }) {
+        addresses = vec![ip];
+    }
+    let entry = SetupInvitationEntry {
+        token,
+        iphone_endpoint: endpoint,
+        iphone_addrs: addresses,
+        owner_display_name: verified.owner_display_name,
+        hh_id: cached.and_then(|e| e.hh_id),
+        expires_at: verified.expires_at,
+    };
 
-    // 5. TTL check — distinct error from "not found". Entry already removed; don't re-insert.
-    if now >= entry.expires_at {
-        tracing::warn!(
-            stage = "claim_setup_invitation.rejected",
-            reason = "token_expired",
-            expires_at = entry.expires_at,
+    // Network work is finished. Check and commit under the same lifecycle
+    // synchronization used by initialize/teardown; two invitations cannot
+    // silently overwrite each other, and a retry keeps its original receipt.
+    let _mutation_guard = crate::bootstrap_mutation_lock::BOOTSTRAP_MUTATION_LOCK
+        .lock()
+        .await;
+    if !fresh(*state.bootstrap.read().await) {
+        return claim_cbor_error(
+            StatusCode::CONFLICT,
+            BootstrapErrorCode::AlreadyInitialized.as_str(),
         );
+    }
+    let Some(now) = crate::time_util::unix_now_secs_checked("claim_setup_invitation.clock") else {
+        return claim_cbor_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            BootstrapErrorCode::InternalError.as_str(),
+        );
+    };
+    if entry.expires_at <= now {
         return claim_cbor_error(
             StatusCode::NOT_FOUND,
             BootstrapErrorCode::InvitationExpired.as_str(),
         );
     }
-
-    // Opportunistic cleanup of other expired entries; does not affect this request.
-    cache_purge_expired(&state.setup_invitation_cache, now).await;
-
-    // 6. Callback verify — blocking HTTP to iPhone. Re-insert on failure so the
-    //    client can retry (transient network error, not a replay attack).
-    let iphone_endpoint = entry.iphone_endpoint.clone();
-    let token_for_verify = token;
-    if let Err(e) = tokio::task::spawn_blocking(move || {
-        callback_verify_blocking(&iphone_endpoint, &token_for_verify)
-    })
-    .await
-    .unwrap_or_else(|e| Err(format!("task failed: {e}")))
-    {
-        tracing::warn!(
-            stage = "claim_setup_invitation.rejected",
-            reason = "callback_verify_failed",
-            error = %e,
-        );
-        cache_reinsert_if_absent(&state.setup_invitation_cache, entry).await;
-        return claim_cbor_error(
-            StatusCode::UNAUTHORIZED,
-            BootstrapErrorCode::InvitationNotRecognized.as_str(),
-        );
+    let pending = match load_persisted_invitation(&state.state_dir) {
+        Ok(pending) => pending,
+        Err(_) => {
+            return claim_cbor_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                BootstrapErrorCode::InternalError.as_str(),
+            );
+        }
+    };
+    let mut accepted_at = now;
+    if let Some(pending) = pending.filter(|p| p.expires_at > now) {
+        if pending.token.as_ref() != token.as_slice()
+            || pending.installation.as_ref() != Some(&installation)
+        {
+            return claim_cbor_error(StatusCode::CONFLICT, "invitation_already_claimed");
+        }
+        accepted_at = pending.accepted_at.unwrap_or(now);
     }
-
-    // 7. Persist invitation to disk. Re-insert on failure (disk error is transient).
-    let apns_token: Option<[u8; 32]> = req
-        .iphone_apns_token
-        .as_ref()
-        .and_then(|t| t.as_ref().try_into().ok());
-    if let Err(e) = persist_invitation(&state.state_dir, &entry, apns_token) {
-        tracing::error!(
-            stage = "claim_setup_invitation.persist_failed",
-            error = %e,
-        );
-        cache_reinsert_if_absent(&state.setup_invitation_cache, entry).await;
+    if let Err(error) = persist_verified_invitation(
+        &state.state_dir,
+        &entry,
+        verified.iphone_apns_token,
+        Some(installation.clone()),
+        Some(accepted_at),
+        verified.lan_address,
+    ) {
+        tracing::error!(stage = "claim_setup_invitation.persist_failed", %error);
         return claim_cbor_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             BootstrapErrorCode::InternalError.as_str(),
         );
     }
-
-    // Entry already removed by cache_take; no separate remove needed.
-
-    // Resolve the engine's OWN Tailnet IPv4 so the ACK steers the iPhone to
-    // a URL whose source IP will pass the `tailnet_required` guard on
-    // `POST /bootstrap/initialize`. Falls back to omitting the field when
-    // no Tailnet address is available — the caller keeps whatever URL it
-    // would otherwise derive from local discovery.
-    let (mac_engine_url, mac_engine_url_source) =
-        crate::tailnet_address::build_mac_engine_url(state.engine_port, state.tailnet_resolver);
-
     tracing::info!(
         stage = "claim_setup_invitation.accepted",
-        iphone_endpoint = %entry.iphone_endpoint,
-        has_apns_token = apns_token.is_some(),
-        mac_engine_url = mac_engine_url.as_deref().unwrap_or(""),
-        mac_engine_url_source = mac_engine_url_source.as_str(),
+        profile = installation.profile,
+        accepted_at
     );
-
     cbor_ok(ClaimSetupInvitationAck {
         version: 1,
+        accepted_at,
+        installation,
         iphone_endpoint: entry.iphone_endpoint,
         owner_display_name: entry.owner_display_name,
         hh_id: entry.hh_id,
-        mac_engine_url,
     })
 }
 
@@ -1275,9 +1323,6 @@ struct PairDeviceUriByCodeRequest {
 /// produced. Collapsing them would silently move the fingerprint after the
 /// mint on the GET side.
 struct PairDeviceUriTail {
-    /// `ip:port` the caller can dial back on, or `None` when this Mac has no
-    /// tailnet address. Deliberately never a LAN fallback.
-    host: Option<String>,
     m_cert_fp: [u8; 32],
 }
 
@@ -1294,36 +1339,22 @@ impl PairDeviceUriTail {
         )
     }
 
-    /// Resolve the advertised host and the machine-cert fingerprint. `None`
+    /// Resolve the machine-cert fingerprint before mutating the window. `None`
     /// means the caller answers [`Self::unavailable`]; `stage` names the
     /// calling route in the failure log.
     fn resolve(identity: &SharedHouseholdIdentity, stage: &'static str) -> Option<Self> {
-        // Same tailnet-only-or-no-fallback rule as `post_pair_device_reissue`:
-        // the URI advertises a host only when a tailnet address exists, and
-        // never falls back to a LAN address. Both callers have already
-        // established that the peer is on loopback or the tailnet, so this is
-        // the address the caller can actually dial back on.
-        let port: u16 = std::env::var("THEYOS_HOUSEHOLD_PORT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(8091);
-        let host = crate::tailnet_address::current_tailnet_ipv4().map(|ip| format!("{ip}:{port}"));
-
+        // Routing is selected from /bootstrap/pairing-addresses by the
+        // recipient's shared policy. This type only renders proof material.
         // Fingerprint the cert this identity was actually loaded and validated
         // with. The identity is already validated, so a failure here is an
         // internal fault, not an availability gap.
         match household_rs::machine_cert::fingerprint(&identity.cert) {
-            Ok(m_cert_fp) => Some(Self { host, m_cert_fp }),
+            Ok(m_cert_fp) => Some(Self { m_cert_fp }),
             Err(e) => {
                 tracing::error!(stage, error = %e);
                 None
             }
         }
-    }
-
-    /// The host as it appears in the served log — never the URI itself.
-    fn host_label_for_log(&self) -> &str {
-        self.host.as_deref().unwrap_or("")
     }
 
     /// Build the wire response for `token`. The single construction site for
@@ -1341,7 +1372,7 @@ impl PairDeviceUriTail {
             hh_pub: ByteBuf::from(*identity.record.hh_pub.as_bytes()),
             pair_device_uri: token.to_uri_with_host_and_name(
                 &identity.record.hh_pub,
-                self.host.as_deref(),
+                None,
                 Some(&identity.record.name),
                 &self.m_cert_fp,
             ),
@@ -1494,32 +1525,8 @@ pub async fn post_pair_device_reissue(
         );
     }
 
-    // Tailnet-only, or no fallback at all.
-    //
-    // The reason this comment used to give is no longer true and must not be
-    // repeated: it said `HouseholdExposurePolicy` never grants
-    // `InterfaceClass::Lan` in `named_awaiting_pair`, so a `host=` LAN
-    // fallback would name an address nothing is listening on. Since the
-    // pair-device window became the second situation that opens LAN
-    // (`household_listener.rs`), that is false in the very case this route
-    // creates: Gate 5 above only runs when the window is CLOSED, and the mint
-    // at the end of this function OPENS one, after which the reconciler binds
-    // the LAN addresses.
-    //
-    // The rule stands on its own footing instead. This route is reachable
-    // only from loopback (Gate 1), so its caller is the Mac itself, and the
-    // URI it renders is meant to travel to a phone over the tailnet. Baking a
-    // `192.168.x` literal into that URI pins the ceremony to one link the
-    // phone may not be on and that changes when the Wi-Fi does. The CLI's
-    // `--reissue-pair-qr`/first-install path is deliberately LAN-first for the
-    // opposite reason: it renders a QR a human scans while standing next to
-    // the machine, with Tailscale possibly not installed yet.
-    let port: u16 = std::env::var("THEYOS_HOUSEHOLD_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8091);
-    let host = crate::tailnet_address::current_tailnet_ipv4().map(|ip| format!("{ip}:{port}"));
-
+    // Render proof material only. The client combines it with the engine's
+    // actual listener snapshot before presenting a link or QR.
     // Mint on the SHARED Arc for liveness (so the daemon's /pair-device/*
     // routes serve the same nonce), then render via the extracted URI path
     // — same TTL clamp as the CLI `--reissue-pair-qr` flow.
@@ -1562,7 +1569,7 @@ pub async fn post_pair_device_reissue(
     };
     let pair_qr_uri = token.to_uri_with_host_and_name(
         &identity.record.hh_pub,
-        host.as_deref(),
+        None,
         Some(&identity.record.name),
         &m_cert_fp,
     );
@@ -1573,7 +1580,6 @@ pub async fn post_pair_device_reissue(
         hh_id = %identity.record.hh_id,
         ttl_secs = ttl.as_secs(),
         expires_at_unix = token.expires_at_unix,
-        host = %host.as_deref().unwrap_or(""),
     );
 
     cbor_ok(ReissueResponse {
@@ -1776,7 +1782,6 @@ pub async fn get_bootstrap_pair_device_uri(
         stage = "pair_device.uri.served",
         hh_id = %identity.record.hh_id,
         expires_at_unix = token.expires_at_unix,
-        host = %tail.host_label_for_log(),
         minted,
     );
 
@@ -2048,7 +2053,6 @@ pub async fn post_bootstrap_pair_device_uri_by_code(
         stage = "pair_device.code.served",
         hh_id = %identity.record.hh_id,
         expires_at_unix = token.expires_at_unix,
-        host = %tail.host_label_for_log(),
     );
 
     cbor_ok(tail.respond(&identity, &token))
@@ -3058,14 +3062,18 @@ pub async fn post_accept_household_confirm(
 /// All other states → 409. On success, state advances to `named_awaiting_pair`
 /// and the pair-device window opens for the first owner-pairing QR.
 ///
-/// T054: When a setup invitation is pending, the source IP MUST be the
-/// iPhone's Tailnet address. 403 with `{v:1, error:"tailnet_required"}` otherwise.
+/// Pending invitations bind remote initialization to a live token and the
+/// invited phone's tailnet address or profile-verified LAN callback address.
 pub async fn post_initialize(
     State(state): State<BootstrapHandlerState>,
     req: axum::extract::Request,
 ) -> Response {
     let t0 = Instant::now();
 
+    let source_ip = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip());
     // T054: Source IP guard when a setup invitation is pending.
     // Check before reading the body to return the error early.
     if let Ok(Some(invitation)) =
@@ -3149,6 +3157,59 @@ pub async fn post_initialize(
     let _mutation_guard = crate::bootstrap_mutation_lock::BOOTSTRAP_MUTATION_LOCK
         .lock()
         .await;
+
+    // The Swift client has always sent claim_token. It must be consumed,
+    // checked against the current invitation and bounded by its expiry.
+    // Source-address evidence alone is not proof of an invitation.
+    match crate::setup_invitation::load_persisted_invitation(&state.state_dir) {
+        Ok(Some(invitation)) => {
+            let Some(now) = crate::time_util::unix_now_secs_checked("initialize.claim.clock")
+            else {
+                return claim_cbor_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    BootstrapErrorCode::InternalError.as_str(),
+                );
+            };
+            if let Err(reason) = crate::setup_invitation::validate_initialize_claim(
+                &invitation,
+                source_ip,
+                req.claim_token.as_ref().map(|token| token.as_ref()),
+                now,
+            ) {
+                tracing::warn!(stage = "bootstrap.initialize.rejected", reason);
+                return claim_cbor_error(
+                    StatusCode::FORBIDDEN,
+                    BootstrapErrorCode::InvitationNotRecognized.as_str(),
+                );
+            }
+            // Repeat source admission after acquiring the mutation lock: a
+            // different invitation may have been committed since the precheck.
+            if let Some(ip) = source_ip {
+                if crate::setup_invitation::validate_initialize_source(&invitation, ip)
+                    .await
+                    .is_err()
+                {
+                    return claim_cbor_error(
+                        StatusCode::FORBIDDEN,
+                        BootstrapErrorCode::InvitationNotRecognized.as_str(),
+                    );
+                }
+            }
+        }
+        Ok(None) if req.claim_token.is_none() => {}
+        Ok(None) => {
+            return claim_cbor_error(
+                StatusCode::FORBIDDEN,
+                BootstrapErrorCode::InvitationNotRecognized.as_str(),
+            );
+        }
+        Err(_) => {
+            return claim_cbor_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                BootstrapErrorCode::InternalError.as_str(),
+            );
+        }
+    }
 
     // 3. Authoritative state gate. Keep the check, identity write, bootstrap
     // state persist, in-memory update, and first pairing token mint inside the
@@ -4016,8 +4077,11 @@ mod tests {
             pair_machine_window: Arc::new(PairMachineWindow::new_in_memory()),
             started_at: Instant::now(),
             setup_invitation_cache: crate::setup_invitation::new_cache(),
-            engine_port: 8091,
-            tailnet_resolver: || None,
+            installation: crate::pairing_addresses::PairingInstallation::new(
+                "release".into(),
+                8091,
+            ),
+            invitation_verifier: crate::setup_invitation::callback_verify_blocking,
             phase3_runtime: None,
             pair_code_rate_limiter: None,
         }
@@ -4396,8 +4460,11 @@ mod tests {
             pair_machine_window: Arc::new(PairMachineWindow::new_in_memory()),
             started_at: Instant::now(),
             setup_invitation_cache: crate::setup_invitation::new_cache(),
-            engine_port: 8091,
-            tailnet_resolver: || None,
+            installation: crate::pairing_addresses::PairingInstallation::new(
+                "release".into(),
+                8091,
+            ),
+            invitation_verifier: crate::setup_invitation::callback_verify_blocking,
             phase3_runtime: None,
             pair_code_rate_limiter: None,
         };

@@ -2218,6 +2218,14 @@ pub async fn bootstrap_household(
             },
         ));
     }
+    let bound_set = household_listener::BoundSet::default();
+    let pairing_addresses_rt = crate::pairing_addresses::router(
+        crate::pairing_addresses::PairingAddressesState::new(
+            bound_set.clone(), Arc::clone(&bootstrap_state_arc), identity_state.clone(),
+            Arc::clone(&pair_device_window), Arc::clone(&local_network_visibility),
+            bootstrap_handler_state.installation.clone(),
+        ),
+    );
     let bootstrap_rt = crate::handlers_bootstrap::bootstrap_router(bootstrap_handler_state);
 
     // Household-namespaced Claw Store router. Wraps the shared handlers
@@ -2378,6 +2386,7 @@ pub async fn bootstrap_household(
         .merge(roster_router) // B0a machine roster currency
         .merge(bootstrap_rt)
         .merge(local_network_visibility_rt)
+        .merge(pairing_addresses_rt)
         .merge(pre_household_rt)
         .merge(guest_image_router)
         .merge(claw_share_router);
@@ -2390,7 +2399,7 @@ pub async fn bootstrap_household(
         async move { phase3_fallback.route_or_reject(request).await }
     });
 
-    let bound_set = household_listener::BoundSet::default();
+
     // Re-observed here rather than reusing the value taken above for the
     // setup browser: `theyos install` can persist a live token that this
     // process adopts during bootstrap, and the initial bind must reflect the
