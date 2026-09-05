@@ -304,6 +304,7 @@ pub async fn publish_household_bonjour(
     params: PublishParams,
     pair_device_window: Arc<PairDeviceWindow>,
     pair_machine_window: Arc<PairMachineWindow>,
+    visibility: Arc<crate::local_network_visibility::LocalNetworkVisibility>,
     targets: Vec<(IpAddr, InterfaceClass)>,
     exposure_state: BootstrapState,
 ) -> Result<HouseholdBonjour, backend::BackendError> {
@@ -323,7 +324,14 @@ pub async fn publish_household_bonjour(
     // startup is missing from this beacon for the same reason -- and the
     // pairing URI carries an explicit host, so the ceremony does not depend on
     // this record existing.
-    let pairing_window = PairingWindow::observe(pair_device_window.as_ref()).await;
+    //
+    // In practice this reads `Closed` for the visibility half every time: the
+    // "Add iPhone" sheet declaration lives in memory, so a process that just
+    // started has none. It is passed anyway because the alternative is a call
+    // site that consults one of the two facts, which is exactly the shape of
+    // the bug that made a Ready household invisible in the first place.
+    let pairing_window =
+        PairingWindow::observe(pair_device_window.as_ref(), visibility.as_ref()).await;
     let mut bound = 0usize;
     let targets =
         HouseholdExposurePolicy::bonjour_targets_with(exposure_state, targets, pairing_window);

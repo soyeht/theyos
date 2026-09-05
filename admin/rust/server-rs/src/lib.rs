@@ -132,6 +132,7 @@ pub mod install_worker;
 pub mod instance_create;
 pub mod jobs_worker;
 pub mod lease_reaper;
+pub mod local_network_visibility;
 pub mod macos_local_caller_auth;
 pub mod macos_local_registration_listener;
 pub mod mobile_api_routes;

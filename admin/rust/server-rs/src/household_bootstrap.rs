@@ -2110,8 +2110,25 @@ pub async fn bootstrap_household(
     // `HouseholdExposurePolicy` re-admits `InterfaceClass::Lan` after
     // onboarding while a pair-device window is open, which is what gives a
     // LAN-only phone an address to dial on a Ready engine.
-    let pairing_window =
-        household_listener::PairingWindow::observe(pair_device_window.as_ref()).await;
+
+    // The Mac's "I am showing an Add iPhone sheet" fact, and the routes that
+    // set and clear it. ONE instance: the same `Arc` reaches the routes, the
+    // listener reconciler and the Bonjour publish, so what the Mac says and
+    // what the exposure policy reads cannot drift. It holds no token and no
+    // identity, which is why it is its own small router rather than another
+    // field on `BootstrapHandlerState` -- see `local_network_visibility`.
+    let local_network_visibility =
+        Arc::new(crate::local_network_visibility::LocalNetworkVisibility::new());
+    let local_network_visibility_rt =
+        crate::local_network_visibility::local_network_visibility_router(Arc::clone(
+            &local_network_visibility,
+        ));
+
+    let pairing_window = household_listener::PairingWindow::observe(
+        pair_device_window.as_ref(),
+        local_network_visibility.as_ref(),
+    )
+    .await;
     if matches!(
         initial_bootstrap_state,
         BootstrapState::Uninitialized | BootstrapState::ReadyForNaming
@@ -2293,6 +2310,7 @@ pub async fn bootstrap_household(
         .merge(machines_router) // R101
         .merge(roster_router) // B0a machine roster currency
         .merge(bootstrap_rt)
+        .merge(local_network_visibility_rt)
         .merge(pre_household_rt)
         .merge(guest_image_router)
         .merge(claw_share_router);
@@ -2310,8 +2328,11 @@ pub async fn bootstrap_household(
     // setup browser: `theyos install` can persist a live token that this
     // process adopts during bootstrap, and the initial bind must reflect the
     // window as it is at bind time, not as it was earlier in this function.
-    let startup_pairing_window =
-        household_listener::PairingWindow::observe(pair_device_window.as_ref()).await;
+    let startup_pairing_window = household_listener::PairingWindow::observe(
+        pair_device_window.as_ref(),
+        local_network_visibility.as_ref(),
+    )
+    .await;
     let initial_bound = household_listener::spawn_household_listeners(
         startup,
         household_router.clone(),
@@ -2400,8 +2421,10 @@ pub async fn bootstrap_household(
         let bound = bound_set.clone();
         let bootstrap = Arc::clone(&bootstrap_state_arc);
         let window = Arc::clone(&pair_device_window);
+        let visibility = Arc::clone(&local_network_visibility);
         tokio::spawn(async move {
-            household_listener::refresh_loop(router, port, bootstrap, bound, window).await;
+            household_listener::refresh_loop(router, port, bootstrap, bound, window, visibility)
+                .await;
         });
     }
 
@@ -2415,6 +2438,7 @@ pub async fn bootstrap_household(
             Arc::clone(loaded),
             Arc::clone(&pair_device_window),
             Arc::clone(&pair_machine_window),
+            Arc::clone(&local_network_visibility),
             initial_bound,
             port,
         )
@@ -2423,6 +2447,7 @@ pub async fn bootstrap_household(
         let deps = HouseholdIdentityWatcherDeps {
             pair_device_window: Arc::clone(&pair_device_window),
             pair_machine_window: Arc::clone(&pair_machine_window),
+            local_network_visibility: Arc::clone(&local_network_visibility),
             targets: initial_bound,
             port,
             claw_share: Some(claw_share_runtime),
@@ -2475,6 +2500,7 @@ async fn publish_household_bonjour_for_identity(
     loaded: Arc<household_rs::LoadedIdentity>,
     pair_device_window: Arc<household_rs::pair_device::PairDeviceWindow>,
     pair_machine_window: Arc<household_rs::pair_machine::PairMachineWindow>,
+    local_network_visibility: Arc<crate::local_network_visibility::LocalNetworkVisibility>,
     targets: Vec<(IpAddr, InterfaceClass)>,
     port: u16,
 ) {
@@ -2514,6 +2540,7 @@ async fn publish_household_bonjour_for_identity(
         params,
         pair_device_window,
         pair_machine_window,
+        local_network_visibility,
         targets,
         bootstrap_state,
     )
@@ -2536,6 +2563,10 @@ async fn publish_household_bonjour_for_identity(
 struct HouseholdIdentityWatcherDeps {
     pair_device_window: Arc<household_rs::pair_device::PairDeviceWindow>,
     pair_machine_window: Arc<household_rs::pair_machine::PairMachineWindow>,
+    /// The shared "Add iPhone sheet is open" fact. Carried so a Bonjour
+    /// publish that happens after a hot-load observes the same two facts the
+    /// listener binds on, rather than only the token half.
+    local_network_visibility: Arc<crate::local_network_visibility::LocalNetworkVisibility>,
     targets: Vec<(IpAddr, InterfaceClass)>,
     port: u16,
     claw_share: Option<ClawShareRuntimeHandles>,
@@ -2572,6 +2603,7 @@ fn spawn_household_identity_watcher_with_interval(
     let HouseholdIdentityWatcherDeps {
         pair_device_window,
         pair_machine_window,
+        local_network_visibility,
         targets,
         port,
         claw_share,
@@ -2594,6 +2626,7 @@ fn spawn_household_identity_watcher_with_interval(
                     Arc::clone(&loaded),
                     Arc::clone(&pair_device_window),
                     Arc::clone(&pair_machine_window),
+                    Arc::clone(&local_network_visibility),
                     targets.clone(),
                     port,
                 )
@@ -2666,6 +2699,7 @@ fn spawn_household_identity_watcher_with_interval(
                         loaded,
                         Arc::clone(&pair_device_window),
                         Arc::clone(&pair_machine_window),
+                        Arc::clone(&local_network_visibility),
                         targets,
                         port,
                     )
@@ -4432,6 +4466,9 @@ mod tests {
             HouseholdIdentityWatcherDeps {
                 pair_device_window,
                 pair_machine_window,
+                local_network_visibility: Arc::new(
+                    crate::local_network_visibility::LocalNetworkVisibility::new(),
+                ),
                 targets: Vec::new(),
                 port: 8091,
                 claw_share: None,

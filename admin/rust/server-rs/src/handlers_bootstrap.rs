@@ -539,7 +539,9 @@ fn claim_cbor_error(status: StatusCode, error: &str) -> Response {
     (status, headers, bytes).into_response()
 }
 
-fn cbor_ok(body: impl serde::Serialize) -> Response {
+/// `pub(crate)` so `local_network_visibility` answers in the same wire format
+/// as its `/bootstrap/*` siblings rather than growing a second one.
+pub(crate) fn cbor_ok(body: impl serde::Serialize) -> Response {
     match household_rs::cbor::to_canonical_vec(&body) {
         Ok(bytes) => {
             let mut headers = HeaderMap::new();

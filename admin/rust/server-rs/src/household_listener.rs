@@ -14,12 +14,27 @@
 //!    `ready_for_naming`): loopback + LAN + Tailnet, so first-launch setup
 //!    works on the Wi-Fi with no tailnet at all. This is the arm that already
 //!    shipped and it is unchanged.
-//! 2. ADD IPHONE -- a pair-device window is open ([`PairingWindow::Open`]):
+//! 2. ADD IPHONE -- an "Add iPhone" window is open ([`PairingWindow::Open`]):
 //!    `named_awaiting_pair` / `ready` / `recovering` admit LAN on top of
 //!    loopback + Tailnet + verified Mesh, for as long as that window lasts.
 //!    Before this existed a `ready` household never bound a LAN address, so a
 //!    phone with no Tailscale had nothing to dial and could not be added at
 //!    all.
+//!
+//! Situation 2 is the OR of two facts, because the ceremony has two shapes and
+//! only one of them mints a token:
+//!
+//! - a `PairDeviceWindow` is open -- the engine minted the offer, so an open
+//!   token IS the statement that somebody is adding a phone; and
+//! - the Mac declared an "Add iPhone" sheet open
+//!   ([`crate::local_network_visibility`]) -- the Mac minted the offer itself
+//!   (`MacPairingAdvertisement`), so the engine holds no token to read and has
+//!   to be TOLD. That route takes no token, mints nothing, and is loopback-only.
+//!
+//! Either fact opens the same [`PairingWindow::Open`] position, and both have
+//! to be shut for LAN to be withdrawn. Keeping them as one position rather than
+//! two policy arms is deliberate: "is the home visible right now" must have one
+//! answer, not one per mechanism.
 //!
 //! Outside those two, post-onboarding exposure is loopback + Tailnet +
 //! verified Mesh and nothing else -- byte for byte what a closed window and a
@@ -27,56 +42,70 @@
 //! (`pair_machine_install_restart_required`) gets loopback + Tailnet in BOTH
 //! window positions and is reachable by neither situation.
 //!
-//! The window is [`household_rs::pair_device::PairDeviceWindow`], the same
+//! The token half is [`household_rs::pair_device::PairDeviceWindow`], the same
 //! object the Bonjour TXT records already follow. It carries a TTL, and it
 //! closes when the phone consumes it, when the owner closes it, or when that
 //! TTL runs out.
 //!
-//! Who opens it, read on 2026-09-05 rather than assumed:
+//! Who opens the token half, read on 2026-09-05 rather than assumed:
 //! - `handlers_bootstrap::get_bootstrap_pair_device_uri` (`GET
 //!   /bootstrap/pair-device-uri`) -- `get_or_mint`, so it opens a window or
-//!   renews the one already open. This is the Mac's "Add iPhone" route.
+//!   renews the one already open. This is the FIRST-OWNER route.
 //! - `handlers_bootstrap::post_pair_device_reissue` and `post_initialize`, and
 //!   `install_cli::mint_pair_device_uri` on the install path.
 //! - NOT the by-code sibling (`POST /bootstrap/pair-device-uri/by-code`) and
 //!   NOT `handlers_pair_device::initiate`: both are retrieve-only by design,
 //!   so that a guesser cannot force a fresh nonce per attempt.
 //!
-//! MEASURED, and the reason situation 2 is currently narrower in practice than
-//! in principle: every one of those minting routes gates on
+//! MEASURED against the Dev engine on 2026-09-05, and the reason the second
+//! fact had to exist: every one of those minting routes gates on
 //! `BootstrapState::NamedAwaitingPair` (Gate 2 of the URI route, Gate 2 of
-//! reissue) or on the install states. Nothing in this repo opens a pair-device
-//! window while the household is `Ready`, so today the open column is
-//! reachable in `named_awaiting_pair` and not in `ready`. The policy below is
-//! written for the rule, not for that gap: the day a Ready engine can open a
-//! window, LAN follows it with no further change here.
+//! reissue) or on the install states. On a household that is already set up,
+//! the Mac's "Add iPhone" sheet asked `GET /bootstrap/pair-device-uri` and got
+//! `404` with `device_count=1` -- the first-owner answer. So NOTHING opened an
+//! engine-side window, the policy saw `Closed`, and the LAN never bound: a
+//! phone with no Tailscale had no address to dial. That gap is what
+//! [`crate::local_network_visibility`] closes, and it closes it WITHOUT
+//! minting: `POST /bootstrap/pair-device/reissue` would have minted a second
+//! token and made the six words on the Mac's screen disagree with the ones the
+//! phone expects.
 //!
-//! [`HouseholdExposurePolicy`] never reads that object, a clock or a store:
+//! [`HouseholdExposurePolicy`] never reads either object, a clock or a store:
 //! the window position arrives as an argument ([`PairingWindow`]). That purity
 //! is why every cell of the exposure table is pinned by test in BOTH positions
 //! rather than in whichever one the process happened to be in.
 //!
 //! ## How the listener learns the window opened or closed
 //!
-//! [`refresh_loop`] owns the reconciliation. It holds the window's broadcast
-//! subscription AND re-reads the window on its 500 ms tick, so neither
-//! direction depends on a single mechanism:
+//! [`refresh_loop`] owns the reconciliation. It holds BOTH facts' broadcast
+//! subscriptions AND re-reads both on its 500 ms tick, so neither direction
+//! depends on a single mechanism:
 //!
-//! - OPEN: `mint_token` / `get_or_mint` send `PairDeviceWindowState::Open`;
-//!   the subscription arm wakes and [`sync_interface_targets`] binds the LAN
-//!   addresses immediately -- no timer is waited on, the delay is the bind
-//!   itself. If that send never arrives -- a lagged subscriber drops
-//!   messages, and a process that came up while a window was already open
-//!   was never sent one -- the 500 ms tick observes the same open window and
-//!   binds, because the widening asks whether the LAN is bound rather than
-//!   whether the position just changed. Worst case: 500 ms.
-//! - CLOSED or EXPIRED: consume and close send `Closed`, and the window's own
-//!   TTL task (`PairDeviceWindow::spawn_ttl_cleanup`) sends `Closed` when the
-//!   token expires; the subscription arm withdraws the LAN listener at once.
-//!   Independently, [`PairingWindow::observe`] reports `Closed` for an expired
-//!   token because `PairToken::is_expired` is checked on every read, and
-//!   narrowing runs on every pass rather than on an edge, so the 500 ms tick
-//!   withdraws it even if no event arrives. Worst case: 500 ms, no restart.
+//! - OPEN: `mint_token` / `get_or_mint` send `PairDeviceWindowState::Open`,
+//!   and `POST /bootstrap/local-network-visibility/open` sends
+//!   `LocalNetworkVisibilityState::Open`; either subscription arm wakes and
+//!   [`sync_interface_targets`] binds the LAN addresses immediately -- no
+//!   timer is waited on, the delay is the bind itself. If that send never
+//!   arrives -- a lagged subscriber drops messages, and a process that came up
+//!   while a window was already open was never sent one -- the 500 ms tick
+//!   observes the same open position and binds, because the widening asks
+//!   whether the LAN is bound rather than whether the position just changed.
+//!   Worst case: 500 ms.
+//! - CLOSED: consume and close send `PairDeviceWindowState::Closed`, and
+//!   `POST /bootstrap/local-network-visibility/close` sends
+//!   `LocalNetworkVisibilityState::Closed`; the subscription arm withdraws the
+//!   LAN listener at once. The explicit close is why the visibility route has
+//!   one at all: the sheet closing is a real event, and waiting out a TTL
+//!   would leave the LAN bound for minutes after the person is done.
+//! - EXPIRED: the pair-device window's own TTL task
+//!   (`PairDeviceWindow::spawn_ttl_cleanup`) sends `Closed` when the token
+//!   expires. [`crate::local_network_visibility::LocalNetworkVisibility`]
+//!   deliberately runs NO such task, so its expiry emits no event. Neither
+//!   needs one: [`PairingWindow::observe`] reports `Closed` for an expired
+//!   token (`PairToken::is_expired` is checked on every read) and for an
+//!   expired visibility grant (its deadline is compared on every read), and
+//!   narrowing runs on every pass rather than on an edge. The stated bound for
+//!   expiry in either fact is one 500 ms tick, no restart.
 //!
 //! The 60 s interface refresh is not part of either bound; it exists to pick
 //! up a Tailscale or Wi-Fi address that appeared later, and it re-reads the
@@ -149,6 +178,19 @@
 //!   reissue` are loopback-only; `/pair-machine/anchor-handoff` is
 //!   Tailnet-only; the `claw-share/relay-offer/*` trio is loopback-only
 //!   (`relay_offer_peer_allowed`).
+//! - `POST /bootstrap/local-network-visibility/open` and `.../close`
+//!   (`crate::local_network_visibility`) -- the route that opens situation 2
+//!   for a Mac that minted its own offer. Listed here because this audit is a
+//!   complete map of the port and not a list of the scary entries, and this
+//!   one is on the port whenever the household router is: it is
+//!   LOOPBACK-ONLY, so it is NOT LAN-reachable at all, and a LAN peer gets the
+//!   bare 404 a missing route gives (same hiding contract as `stage` and
+//!   `reissue`). It carries no token, reads no identity, has no bootstrap-state
+//!   gate, and its whole effect is to set or clear one deadline that this
+//!   module's policy then interprets. The consequence to read off it is the
+//!   FIRST half of this audit: for the life of that deadline, a
+//!   post-onboarding household hands a LAN peer everything listed above as
+//!   reachable while the window is open.
 //! - `POST /bootstrap/claim-setup-invitation` answers 409 unless the engine is
 //!   `Uninitialized`; `/bootstrap/accept-household` and `/bootstrap/initialize`
 //!   answer 409 outside `Uninitialized`/`ReadyForNaming`. The
@@ -183,11 +225,12 @@
 //!   attach -- the one directly effectful surface -- gains nothing from an open
 //!   window.
 //!
-//! Net, stated plainly: an open pair-device window does not hand a LAN peer a
-//! session. It does publish the household id, household public key, household
-//! name and Mac label to the local network for the life of the window, lets an
-//! unpaired peer raise a pairing prompt, and -- once the owner approves that
-//! prompt -- lets the holder of the returned token collect its certificates.
+//! Net, stated plainly: an open "Add iPhone" window -- by either fact -- does
+//! not hand a LAN peer a session. It does publish the household id, household
+//! public key, household name and Mac label to the local network for the life
+//! of the window, lets an unpaired peer raise a pairing prompt, and -- once the
+//! owner approves that prompt -- lets the holder of the returned token collect
+//! its certificates.
 //!
 //! MEASURED 2026-09-04 in `engine.log`: a Ready engine logged exactly four
 //! `bootstrap.endpoint.live` binds -- Tailnet v4/v6 plus loopback v4/v6 -- on
@@ -211,6 +254,8 @@ use tokio::net::TcpListener;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{Mutex, RwLock, oneshot};
 use tracing::{info, warn};
+
+use crate::local_network_visibility::{LocalNetworkVisibility, LocalNetworkVisibilityState};
 
 const INTERFACE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const POLICY_SYNC_INTERVAL: Duration = Duration::from_millis(500);
@@ -249,15 +294,21 @@ impl InterfaceClass {
 /// Situation 2 of the two-situation rule, as a value.
 ///
 /// The `Open` position is not an operator setting and not an environment
-/// variable: it is the observed state of the household's
-/// [`PairDeviceWindow`] -- the same window the pairing URI, the pair code and
-/// the Bonjour TXT records already run on. "Add iPhone" mints it, consuming
-/// or closing it ends it, and its TTL ends it unattended.
+/// variable. It is the OR of two observed facts:
+///
+/// - the household's [`PairDeviceWindow`] is open -- the same window the
+///   pairing URI, the pair code and the Bonjour TXT records already run on.
+///   The engine minted the offer, consuming or closing it ends it, and its TTL
+///   ends it unattended; and
+/// - the Mac declared an "Add iPhone" sheet open
+///   ([`LocalNetworkVisibility`]). Used when the Mac minted the offer itself,
+///   so the engine holds no token to read. It ends on an explicit close or on
+///   its own deadline.
 ///
 /// It is a plain `Copy` enum on purpose. [`HouseholdExposurePolicy`] must be
 /// answerable from a test with no clock, no filesystem and no tokio runtime,
-/// so the only thing that ever reads the live window is
-/// [`PairingWindow::observe`], at the two reconciliation sites that own the
+/// so the only thing that ever reads the live facts is
+/// [`PairingWindow::observe`], at the reconciliation sites that own the
 /// listener. Everything downstream of that takes the answer as an argument.
 ///
 /// `Closed` is the `Default`, so a caller that has no window to consult --
@@ -274,16 +325,26 @@ pub enum PairingWindow {
 }
 
 impl PairingWindow {
-    /// Read the live window.
+    /// Read both live facts.
     ///
-    /// `PairDeviceWindow::is_open` already answers `false` for a token whose
-    /// TTL has passed (`PairToken::is_expired` is checked on every read), so
-    /// this is expiry-aware without a separate timer: a reconciler that calls
-    /// it on a tick withdraws an expired window's LAN listener even in a
-    /// process where the window's own TTL task never ran -- for instance one
-    /// that adopted a persisted snapshot at startup instead of minting.
-    pub async fn observe(window: &PairDeviceWindow) -> Self {
-        if window.is_open().await {
+    /// One function taking both rather than one per fact, and no single-fact
+    /// sibling: a call site that consults only the token half would answer
+    /// `Closed` on a Ready household whose owner is standing there with the
+    /// sheet open -- which is precisely the bug this branch exists to fix. The
+    /// signature is what stops that from being reintroduced quietly.
+    ///
+    /// Expiry-aware in both halves without a timer of its own.
+    /// `PairDeviceWindow::is_open` answers `false` for a token whose TTL has
+    /// passed (`PairToken::is_expired` is checked on every read), and
+    /// `LocalNetworkVisibility::is_open` compares its deadline on every read.
+    /// So a reconciler that calls this on a tick withdraws an expired window's
+    /// LAN listener even in a process where no TTL task ever ran -- for
+    /// instance one that adopted a persisted snapshot at startup instead of
+    /// minting.
+    pub async fn observe(window: &PairDeviceWindow, visibility: &LocalNetworkVisibility) -> Self {
+        // Short-circuit is fine and deliberate: both are cheap lock reads, and
+        // either fact alone is enough to be in situation 2.
+        if window.is_open().await || visibility.is_open().await {
             Self::Open
         } else {
             Self::Closed
@@ -1269,6 +1330,12 @@ pub async fn spawn_household_listeners(
 ///
 /// Returns the position it observed, so the caller can carry it to the next
 /// pass and to the 60 s interface refresh.
+// Eight arguments, and deliberately eight: four are the listener being
+// reconciled (router, port, bootstrap, bound), two are the facts situation 2 is
+// the OR of, one is the position carried from the last pass and one names the
+// caller in the log. Folding them into a context struct would read better and
+// would hide which of them the source-level guard below actually checks.
+#[allow(clippy::too_many_arguments)]
 async fn reconcile_pairing_window(
     router: &Router,
     port: u16,
@@ -1276,9 +1343,10 @@ async fn reconcile_pairing_window(
     bound: &BoundSet,
     previous: PairingWindow,
     window: &PairDeviceWindow,
+    visibility: &LocalNetworkVisibility,
     source: &'static str,
 ) -> PairingWindow {
-    let observed = PairingWindow::observe(window).await;
+    let observed = PairingWindow::observe(window, visibility).await;
     if observed != previous {
         info!(
             stage = "household_listener.pairing_window",
@@ -1304,7 +1372,7 @@ async fn reconcile_pairing_window(
             port,
             bootstrap,
             bound,
-            "pair_device_window_open",
+            "add_iphone_window_open",
             observed,
         )
         .await;
@@ -1323,13 +1391,16 @@ async fn reconcile_pairing_window(
 /// dropped from the bound set so the Bonjour publisher stops advertising
 /// them on the next state event.
 ///
-/// It is also the single place that reacts to the pair-device window moving,
-/// by two independent paths that cover each other:
-/// - the window's broadcast subscription, so "Add iPhone" binds the LAN
+/// It is also the single place that reacts to the "Add iPhone" window moving,
+/// by paths that cover each other:
+/// - the pair-device window's broadcast subscription and the local-network
+///   visibility broadcast subscription, so either way of opening binds the LAN
 ///   addresses at once rather than after a tick; and
-/// - the 500 ms policy tick, which re-reads the live window, so a dropped or
+/// - the 500 ms policy tick, which re-reads BOTH live facts, so a dropped or
 ///   never-sent event -- a lagged subscriber, or a process that started with
-///   the window already open -- still reaches the right exposure.
+///   the window already open -- still reaches the right exposure. It is also
+///   the only thing that withdraws an expired visibility grant, which by
+///   design emits no event.
 ///
 /// Worst case either way is one 500 ms tick, and the typical open is the
 /// broadcast, i.e. the bind itself.
@@ -1339,27 +1410,30 @@ pub async fn refresh_loop(
     bootstrap: Arc<RwLock<BootstrapState>>,
     bound: BoundSet,
     pair_device_window: Arc<PairDeviceWindow>,
+    visibility: Arc<LocalNetworkVisibility>,
 ) {
     let mut refresh = tokio::time::interval(INTERFACE_REFRESH_INTERVAL);
     refresh.tick().await; // skip the immediate first tick
     let mut policy_sync = tokio::time::interval(POLICY_SYNC_INTERVAL);
     policy_sync.tick().await; // skip the immediate first tick
     let mut window_events = pair_device_window.subscribe();
+    let mut visibility_events = visibility.subscribe();
     // Whatever the window says right now, not an assumption that it is shut:
     // `theyos install` can persist a live token that this process adopted at
     // startup.
-    let mut observed = PairingWindow::observe(&pair_device_window).await;
+    let mut observed = PairingWindow::observe(&pair_device_window, &visibility).await;
     // The loop holds an `Arc` to the window, so the broadcast sender outlives
     // it and `RecvError::Closed` is unreachable in production. Guard the arm
     // anyway: a closed `broadcast::Receiver` returns immediately forever, and
     // a select arm that always completes is a busy loop, not a lost feature.
     let mut window_events_live = true;
+    let mut visibility_events_live = true;
     loop {
         tokio::select! {
             _ = refresh.tick() => {
                 // Re-read rather than trust `observed`: this arm ENUMERATES
                 // and binds, so it must not widen on a stale position.
-                observed = PairingWindow::observe(&pair_device_window).await;
+                observed = PairingWindow::observe(&pair_device_window, &visibility).await;
                 let live = sync_interface_targets(
                     &router, port, &bootstrap, &bound, "refresh", observed,
                 ).await;
@@ -1371,7 +1445,8 @@ pub async fn refresh_loop(
             }
             _ = policy_sync.tick() => {
                 observed = reconcile_pairing_window(
-                    &router, port, &bootstrap, &bound, observed, &pair_device_window, "tick",
+                    &router, port, &bootstrap, &bound, observed,
+                    &pair_device_window, &visibility, "tick",
                 ).await;
             }
             event = window_events.recv(), if window_events_live => {
@@ -1398,7 +1473,36 @@ pub async fn refresh_loop(
                     }
                 }
                 observed = reconcile_pairing_window(
-                    &router, port, &bootstrap, &bound, observed, &pair_device_window, "window_event",
+                    &router, port, &bootstrap, &bound, observed,
+                    &pair_device_window, &visibility, "window_event",
+                ).await;
+            }
+            event = visibility_events.recv(), if visibility_events_live => {
+                match event {
+                    // Same rule as the pair-device arm: the payload is a
+                    // notification that something moved, and the position that
+                    // decides exposure is read back under the visibility's own
+                    // lock, deadline included.
+                    Ok(LocalNetworkVisibilityState::Open | LocalNetworkVisibilityState::Closed) => {}
+                    Err(RecvError::Lagged(skipped)) => {
+                        warn!(
+                            stage = "household_listener.local_network_visibility_lagged",
+                            skipped,
+                            "local-network visibility updates were dropped; reconciling from the live fact"
+                        );
+                    }
+                    Err(RecvError::Closed) => {
+                        visibility_events_live = false;
+                        warn!(
+                            stage = "household_listener.local_network_visibility_channel_closed",
+                            "falling back to the 500 ms tick for Add-iPhone sheet changes"
+                        );
+                        continue;
+                    }
+                }
+                observed = reconcile_pairing_window(
+                    &router, port, &bootstrap, &bound, observed,
+                    &pair_device_window, &visibility, "visibility_event",
                 ).await;
             }
         }
@@ -2353,8 +2457,9 @@ mod tests {
     #[tokio::test]
     async fn an_expired_pairing_window_stops_granting_lan() {
         let window = PairDeviceWindow::new();
+        let shut = LocalNetworkVisibility::new();
         assert_eq!(
-            PairingWindow::observe(&window).await,
+            PairingWindow::observe(&window, &shut).await,
             PairingWindow::Closed,
             "a fresh window is shut"
         );
@@ -2363,7 +2468,7 @@ mod tests {
             .mint_token(Duration::from_secs(300), None)
             .await
             .expect("mint a live pairing window");
-        let open = PairingWindow::observe(&window).await;
+        let open = PairingWindow::observe(&window, &shut).await;
         assert_eq!(open, PairingWindow::Open);
         assert!(
             HouseholdExposurePolicy::allows_with(BootstrapState::Ready, InterfaceClass::Lan, open),
@@ -2376,7 +2481,7 @@ mod tests {
             .mint_token(Duration::from_secs(0), None)
             .await
             .expect("mint an already-expired pairing window");
-        let expired = PairingWindow::observe(&window).await;
+        let expired = PairingWindow::observe(&window, &shut).await;
         assert_eq!(
             expired,
             PairingWindow::Closed,
@@ -2389,6 +2494,196 @@ mod tests {
                 expired
             ),
             "LAN must be withdrawn the moment the window stops being open"
+        );
+    }
+
+    /// The half this branch adds: a Ready household with NO pair-device token
+    /// reaches situation 2 because the Mac said it is showing an "Add iPhone"
+    /// sheet.
+    ///
+    /// This is the measured gap as a test. The Mac mints its own offer
+    /// (`MacPairingAdvertisement`), so the engine's `PairDeviceWindow` stays
+    /// shut for the whole ceremony; before the visibility fact existed,
+    /// `observe` answered `Closed` here and a Ready engine bound no LAN
+    /// address at all.
+    #[tokio::test]
+    async fn the_add_iphone_sheet_opens_situation_two_with_no_token_minted() {
+        let window = PairDeviceWindow::new();
+        let visibility = LocalNetworkVisibility::new();
+
+        assert_eq!(
+            PairingWindow::observe(&window, &visibility).await,
+            PairingWindow::Closed,
+            "nothing is open yet"
+        );
+
+        visibility.open(Duration::from_secs(300)).await;
+        let open = PairingWindow::observe(&window, &visibility).await;
+        assert_eq!(open, PairingWindow::Open);
+        assert!(
+            window.current_token().await.is_none(),
+            "the visibility fact must reach situation 2 without a token existing"
+        );
+        assert_eq!(
+            HouseholdExposurePolicy::allowed_targets_with(
+                BootstrapState::Ready,
+                one_target_per_class(),
+                open,
+            ),
+            one_target_per_class(),
+            "opening the sheet must put the LAN address in a Ready bind set"
+        );
+
+        // Closing is explicit, and it withdraws.
+        visibility.close().await;
+        let closed = PairingWindow::observe(&window, &visibility).await;
+        assert_eq!(closed, PairingWindow::Closed);
+        assert!(
+            !HouseholdExposurePolicy::allows_with(
+                BootstrapState::Ready,
+                InterfaceClass::Lan,
+                closed
+            ),
+            "the sheet closing must withdraw LAN, not wait out a TTL"
+        );
+    }
+
+    /// An expired sheet declaration withdraws LAN with no task having run.
+    ///
+    /// `LocalNetworkVisibility` deliberately spawns no TTL cleanup, so this is
+    /// the whole of its expiry story: the deadline is compared on every read,
+    /// and the reconciler's 500 ms tick is what turns that into a withdrawn
+    /// listener.
+    #[tokio::test]
+    async fn an_expired_add_iphone_sheet_stops_granting_lan() {
+        let window = PairDeviceWindow::new();
+        let visibility = LocalNetworkVisibility::new();
+        // Zero TTL: the deadline is `now`, and `is_open` is `now < deadline`.
+        visibility.open(Duration::ZERO).await;
+
+        let expired = PairingWindow::observe(&window, &visibility).await;
+        assert_eq!(expired, PairingWindow::Closed);
+        assert!(
+            !HouseholdExposurePolicy::allows_with(
+                BootstrapState::Ready,
+                InterfaceClass::Lan,
+                expired
+            ),
+            "an expired sheet declaration must not keep a Ready household on the Wi-Fi"
+        );
+    }
+
+    /// Either fact alone reaches situation 2, and BOTH have to be shut before
+    /// LAN is withdrawn.
+    ///
+    /// The failure this pins is the tempting simplification: a reconciler that
+    /// withdrew on "the token closed" would cut the LAN out from under an
+    /// owner whose sheet is still open, and vice versa.
+    #[tokio::test]
+    async fn either_fact_opens_situation_two_and_both_must_shut_to_close_it() {
+        let window = PairDeviceWindow::new();
+        let visibility = LocalNetworkVisibility::new();
+
+        window
+            .mint_token(Duration::from_secs(300), None)
+            .await
+            .expect("mint");
+        visibility.open(Duration::from_secs(300)).await;
+        assert_eq!(
+            PairingWindow::observe(&window, &visibility).await,
+            PairingWindow::Open
+        );
+
+        // Token gone, sheet still up.
+        window.close().await.expect("close the token window");
+        assert_eq!(
+            PairingWindow::observe(&window, &visibility).await,
+            PairingWindow::Open,
+            "the sheet is still open; LAN must not be withdrawn under it"
+        );
+
+        // Sheet gone too.
+        visibility.close().await;
+        assert_eq!(
+            PairingWindow::observe(&window, &visibility).await,
+            PairingWindow::Closed
+        );
+    }
+
+    /// The install states do not depend on either fact.
+    ///
+    /// Situation 1 grants LAN on its own, so opening or closing the sheet must
+    /// not change what a household being installed exposes -- in particular,
+    /// the new route must never be able to NARROW an install.
+    #[tokio::test]
+    async fn the_install_states_are_unaffected_by_the_add_iphone_sheet() {
+        let window = PairDeviceWindow::new();
+        let visibility = LocalNetworkVisibility::new();
+
+        for state in [
+            BootstrapState::Uninitialized,
+            BootstrapState::ReadyForNaming,
+        ] {
+            let shut = PairingWindow::observe(&window, &visibility).await;
+            visibility.open(Duration::from_secs(300)).await;
+            let open = PairingWindow::observe(&window, &visibility).await;
+            visibility.close().await;
+            assert_eq!(shut, PairingWindow::Closed);
+            assert_eq!(open, PairingWindow::Open);
+
+            for class in [
+                InterfaceClass::Loopback,
+                InterfaceClass::Lan,
+                InterfaceClass::Tailscale,
+                InterfaceClass::Mesh,
+            ] {
+                assert_eq!(
+                    HouseholdExposurePolicy::allows_with(state, class, shut),
+                    HouseholdExposurePolicy::allows_with(state, class, open),
+                    "{state:?}/{class:?} must not move with the Add iPhone sheet"
+                );
+            }
+        }
+
+        // And the interrupted install, which is the arm that must never widen:
+        // it ignores the window in both positions.
+        for class in [
+            InterfaceClass::Loopback,
+            InterfaceClass::Lan,
+            InterfaceClass::Tailscale,
+            InterfaceClass::Mesh,
+        ] {
+            assert_eq!(
+                HouseholdExposurePolicy::allows_with(
+                    BootstrapState::PairMachineInstallRestartRequired,
+                    class,
+                    PairingWindow::Open,
+                ),
+                matches!(class, InterfaceClass::Loopback | InterfaceClass::Tailscale),
+                "an interrupted install must expose loopback + tailnet whatever the sheet says"
+            );
+        }
+    }
+
+    /// Opening twice does not stack: one close still shuts it.
+    #[tokio::test]
+    async fn opening_the_sheet_twice_does_not_stack() {
+        let window = PairDeviceWindow::new();
+        let visibility = LocalNetworkVisibility::new();
+
+        visibility.open(Duration::from_secs(300)).await;
+        visibility.open(Duration::from_secs(300)).await;
+        assert_eq!(
+            PairingWindow::observe(&window, &visibility).await,
+            PairingWindow::Open
+        );
+
+        visibility.close().await;
+        assert_eq!(
+            PairingWindow::observe(&window, &visibility).await,
+            PairingWindow::Closed,
+            "two opens and one close must leave the home invisible, or the LAN \
+             stays bound after the person is done"
         );
     }
 
@@ -2654,6 +2949,58 @@ mod tests {
         }
     }
 
+    /// The reconciler that owns an already-bound socket, driven by the real
+    /// visibility object rather than by a hand-written `PairingWindow`.
+    ///
+    /// This is the "closing withdraws it" claim at the level where it is a
+    /// listener and not a boolean: the LAN task is told to stop, and the
+    /// Tailnet one is not.
+    #[tokio::test]
+    async fn closing_the_add_iphone_sheet_withdraws_the_bound_lan_listener() {
+        let lan_ip: IpAddr = "192.0.2.10".parse().unwrap();
+        let tailnet_ip: IpAddr = "100.64.0.10".parse().unwrap();
+        let window = PairDeviceWindow::new();
+        let visibility = LocalNetworkVisibility::new();
+
+        let bound = BoundSet::default();
+        let (lan_shutdown, lan_rx) = oneshot::channel();
+        let (tailnet_shutdown, _tailnet_rx) = oneshot::channel();
+        bound
+            .insert(lan_ip, InterfaceClass::Lan, lan_shutdown)
+            .await;
+        bound
+            .insert(tailnet_ip, InterfaceClass::Tailscale, tailnet_shutdown)
+            .await;
+        let bootstrap = Arc::new(RwLock::new(BootstrapState::Ready));
+
+        // Sheet open: the reconciler must leave the LAN listener alone.
+        visibility.open(Duration::from_secs(300)).await;
+        let open = PairingWindow::observe(&window, &visibility).await;
+        sync_exposure_policy_with(&bootstrap, &bound, open).await;
+        let mut surviving = bound.snapshot_targets().await;
+        surviving.sort_by_key(|(ip, _)| *ip);
+        assert_eq!(
+            surviving,
+            vec![
+                (tailnet_ip, InterfaceClass::Tailscale),
+                (lan_ip, InterfaceClass::Lan),
+            ]
+        );
+
+        // Sheet closed: the LAN task is told to stop, the Tailnet one is not.
+        visibility.close().await;
+        let closed = PairingWindow::observe(&window, &visibility).await;
+        sync_exposure_policy_with(&bootstrap, &bound, closed).await;
+        assert_eq!(
+            bound.snapshot_targets().await,
+            vec![(tailnet_ip, InterfaceClass::Tailscale)]
+        );
+        tokio::time::timeout(Duration::from_secs(1), lan_rx)
+            .await
+            .expect("LAN listener shutdown signal should be sent")
+            .expect("LAN listener shutdown sender should not be dropped before send");
+    }
+
     #[test]
     fn listener_entry_points_route_enumeration_through_policy() {
         let source = include_str!("household_listener.rs");
@@ -2682,14 +3029,15 @@ mod tests {
         );
     }
 
-    /// The listener reacts to the window by BOTH paths, not by one.
+    /// The listener reacts to BOTH facts by BOTH paths, not by one.
     ///
     /// A real end-to-end test here would need a bound socket and a wall-clock
-    /// wait, so this is source-level -- but it is source-level about the two
+    /// wait, so this is source-level -- but it is source-level about the
     /// things that make the delay bound true, and each is load-bearing on its
-    /// own: drop the subscription and "Add iPhone" waits up to 500 ms; drop
-    /// the re-read on the tick and a token whose TTL task lives in another
-    /// process never withdraws its LAN listener at all.
+    /// own: drop either subscription and that way of tapping "Add iPhone"
+    /// waits up to 500 ms; drop the re-read on the tick and a token whose TTL
+    /// task lives in another process -- or a visibility grant, which has no TTL
+    /// task at all -- never withdraws its LAN listener.
     #[test]
     fn the_refresh_loop_reacts_to_the_pairing_window_by_event_and_by_tick() {
         let source = include_str!("household_listener.rs");
@@ -2707,8 +3055,18 @@ mod tests {
              waits for the next 500 ms tick"
         );
         assert!(
+            body.contains("visibility.subscribe()"),
+            "refresh_loop must subscribe to the Add-iPhone sheet declaration too, \
+             or the Mac-minted-offer half of situation 2 waits for a tick"
+        );
+        assert!(
             body.contains("event = window_events.recv(), if window_events_live"),
             "the window subscription must be a select arm, and must be disarmed \
+             once closed rather than spinning"
+        );
+        assert!(
+            body.contains("event = visibility_events.recv(), if visibility_events_live"),
+            "the visibility subscription must be a select arm, and must be disarmed \
              once closed rather than spinning"
         );
         assert!(
@@ -2718,10 +3076,10 @@ mod tests {
              that emits no event never withdraws the LAN listener"
         );
         assert!(
-            body.matches("PairingWindow::observe(&pair_device_window)")
+            body.matches("PairingWindow::observe(&pair_device_window, &visibility)")
                 .count()
                 >= 2,
-            "the loop must re-read the window rather than trust a cached position: \
+            "the loop must re-read BOTH facts rather than trust a cached position: \
              once at startup, and again on the enumerating 60 s refresh"
         );
 
@@ -2739,6 +3097,11 @@ mod tests {
             "narrowing must run on every pass, not only on an observed edge: a \
              window that expired must lose its listener even if this pass cannot \
              tell that anything changed"
+        );
+        assert!(
+            reconcile.contains("PairingWindow::observe(window, visibility).await"),
+            "the reconciler must read both facts under their own locks; reading \
+             only the token half is the bug this branch fixes"
         );
     }
 

@@ -96,9 +96,11 @@ fn bonjour_publishers_filter_targets_through_exposure_policy() {
         "household Bonjour publisher must filter targets through the Bonjour exposure policy"
     );
     assert!(
-        household_publish_body.contains("PairingWindow::observe(pair_device_window.as_ref())"),
+        household_publish_body
+            .contains("PairingWindow::observe(pair_device_window.as_ref(), visibility.as_ref())"),
         "the household beacon must advertise at the same window position the listener \
-         bound at, or a Ready household binds a LAN address it never announces"
+         bound at -- BOTH facts, not just the token half -- or a Ready household binds \
+         a LAN address it never announces"
     );
 
     let candidate_publish_body = slice_between(
@@ -376,7 +378,7 @@ fn setup_invitation_browser_ties_only_its_network_filter_to_the_exposure_policy(
     let source = read_src("household_bootstrap.rs");
     let spawn_body = slice_between(
         &source,
-        "let pairing_window =\n        household_listener::PairingWindow::observe(pair_device_window.as_ref()).await;",
+        "let pairing_window = household_listener::PairingWindow::observe(",
         "let bootstrap_rt =",
     );
 
