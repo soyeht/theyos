@@ -48,7 +48,7 @@ use tracing::{info, warn};
 use crate::bonjour_impl_dns_sd as backend;
 #[cfg(not(target_os = "macos"))]
 use crate::bonjour_impl_mdns_sd as backend;
-use crate::household_listener::{HouseholdExposurePolicy, InterfaceClass};
+use crate::household_listener::{HouseholdExposurePolicy, InterfaceClass, PairingWindow};
 
 /// Service type per FR-017.
 const SERVICE_TYPE: &str = "_soyeht-household._tcp.local.";
@@ -304,14 +304,37 @@ pub async fn publish_household_bonjour(
     params: PublishParams,
     pair_device_window: Arc<PairDeviceWindow>,
     pair_machine_window: Arc<PairMachineWindow>,
+    visibility: Arc<crate::local_network_visibility::LocalNetworkVisibility>,
     targets: Vec<(IpAddr, InterfaceClass)>,
     exposure_state: BootstrapState,
 ) -> Result<HouseholdBonjour, backend::BackendError> {
     let daemon = backend::PublisherHandle::new()?;
     let fullnames: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
+    // The beacon advertises what the listener bound, so it has to be filtered
+    // by the same rule and at the same window position: with a window open,
+    // the Ready beacon carries the LAN address, which is how a phone with no
+    // tailnet finds this Mac by mDNS at all.
+    //
+    // Scope, stated because it is easy to over-read: this address set is fixed
+    // at publish time. A window opened LATER widens the listener within one
+    // reconciliation pass (`household_listener::refresh_loop`) but does not
+    // add a record here until the next publish. That staleness is not new and
+    // is not window-specific -- a Tailscale interface that appears after
+    // startup is missing from this beacon for the same reason -- and the
+    // pairing URI carries an explicit host, so the ceremony does not depend on
+    // this record existing.
+    //
+    // In practice this reads `Closed` for the visibility half every time: the
+    // "Add iPhone" sheet declaration lives in memory, so a process that just
+    // started has none. It is passed anyway because the alternative is a call
+    // site that consults one of the two facts, which is exactly the shape of
+    // the bug that made a Ready household invisible in the first place.
+    let pairing_window =
+        PairingWindow::observe(pair_device_window.as_ref(), visibility.as_ref()).await;
     let mut bound = 0usize;
-    let targets = HouseholdExposurePolicy::bonjour_targets(exposure_state, targets);
+    let targets =
+        HouseholdExposurePolicy::bonjour_targets_with(exposure_state, targets, pairing_window);
 
     // Advertise an address we actually bound.
     //

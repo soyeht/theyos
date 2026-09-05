@@ -341,9 +341,44 @@ impl Phase3RuntimeController {
             owner_events_state = owner_events_state
                 .with_recovery_consume_rate_limiter(Arc::clone(&state.rate_limiter));
         }
+        // One RP/anchor per generation. The macOS UDS router always needs it;
+        // over the network it reaches ONLY the three enrollment routes, and
+        // only when the operator opened THEYOS_OWNER_WEBAUTHN_NETWORK.
+        //
+        // The scoping is the point, not a nicety. `owner_webauthn_anchor` and
+        // `owner_webauthn_rp` are read far outside enrollment
+        // (`handlers_owner_events.rs`):
+        //  - `pair_machine_owner_webauthn_policy_snapshot` returns
+        //    `anchor_invalid()` when the anchor is `None`. Under
+        //    `THEYOS_OWNER_AUTH_V2_ROLLOUT=reviewed-core-v2` that is the
+        //    difference between `RejectFailClosed` and `LegacyV1` on
+        //    `/owner-events/{cursor}/approve` — i.e. whether machine approval
+        //    is refused outright or accepted with a legacy body.
+        //  - `/owner-webauthn/revoke/{start,finish}` and
+        //    `/owner-webauthn/add-credential/{start,finish}` reject on
+        //    `rp_unavailable` / `missing_anchor_verifier` today; both fields on
+        //    the shared state would let them run.
+        // Handing the RP/anchor to the one state behind every owner-events
+        // route would therefore change machine-approval enforcement and open
+        // four surfaces this switch never promised.
+        let owner_webauthn_network = owner_webauthn_network_enabled();
+        let owner_webauthn_runtime = if cfg!(target_os = "macos") || owner_webauthn_network {
+            Some(
+                OwnerWebauthnRuntime::build(&self.state_dir)
+                    .map_err(|error| format!("build owner passkey registration state: {error}"))?,
+            )
+        } else {
+            None
+        };
+        let owner_webauthn_enrollment_state = owner_webauthn_enrollment_router_state(
+            &owner_events_state,
+            owner_webauthn_runtime.as_ref(),
+            owner_webauthn_network,
+        )?;
         let router = phase3_router(
             pair_machine_state.clone(),
             owner_events_state.clone(),
+            owner_webauthn_enrollment_state,
             self.household.clone(),
             Arc::clone(&event_log),
             self.state_dir.clone(),
@@ -356,28 +391,22 @@ impl Phase3RuntimeController {
                     macos_local_app_profile_for_state_dir(&state_dir),
                 ),
             );
-            match macos_local_owner_webauthn_registration_state(
+            let runtime = owner_webauthn_runtime.as_ref().ok_or_else(|| {
+                "owner passkey runtime missing for macOS local listener".to_string()
+            })?;
+            let state = macos_local_owner_webauthn_registration_state(
                 owner_events_state.clone(),
-                &state_dir,
+                runtime,
                 verifier,
-            ) {
-                Ok(state) => {
-                    let router =
-                        handlers_owner_events::owner_webauthn_macos_local_registration_router(
-                            state,
-                        );
-                    Some(
-                        crate::macos_local_registration_listener::spawn_macos_local_registration_listener(
-                            &state_dir,
-                            router,
-                        )
-                        .map_err(|error| format!("start macOS local registration listener: {error}"))?,
-                    )
-                }
-                Err(error) => {
-                    return Err(format!("build macOS local registration state: {error}"));
-                }
-            }
+            );
+            let router =
+                handlers_owner_events::owner_webauthn_macos_local_registration_router(state);
+            Some(
+                crate::macos_local_registration_listener::spawn_macos_local_registration_listener(
+                    &state_dir, router,
+                )
+                .map_err(|error| format!("start macOS local registration listener: {error}"))?,
+            )
         };
 
         // Spawn tasks only after every fallible resource in the bundle has
@@ -438,9 +467,19 @@ impl Phase3RuntimeController {
     }
 }
 
+/// Build the Phase-3 surface.
+///
+/// `owner_webauthn_enrollment_state` is the state for the three
+/// `owner-webauthn/registration/*` routes and nothing else. It is a separate
+/// parameter so that the passkey RP and anchor can reach enrollment without
+/// reaching `/owner-events/{cursor}/approve`, `/owner-webauthn/revoke/*` or
+/// `/owner-webauthn/add-credential/*`, all of which branch on the same two
+/// fields — see the wiring comment in `install_with_resources_under_lifecycle`.
+/// Pass `owner_events_state` here to leave enrollment exactly as it was.
 fn phase3_router(
     pair_machine_state: handlers_pair_machine::PairMachineRouterState,
     owner_events_state: handlers_owner_events::OwnerEventsRouterState,
+    owner_webauthn_enrollment_state: handlers_owner_events::OwnerEventsRouterState,
     household: HouseholdState,
     event_log: Arc<OwnerEventLog>,
     state_dir: PathBuf,
@@ -467,24 +506,6 @@ fn phase3_router(
                 .route(
                     "/api/v1/household/owner-device/push-token",
                     axum::routing::post(handlers_owner_events::push_token_register_handler),
-                )
-                .route(
-                    "/api/v1/household/owner-webauthn/registration/start",
-                    axum::routing::post(
-                        handlers_owner_events::owner_webauthn_registration_start_handler,
-                    ),
-                )
-                .route(
-                    "/api/v1/household/owner-webauthn/registration/finish",
-                    axum::routing::post(
-                        handlers_owner_events::owner_webauthn_registration_finish_handler,
-                    ),
-                )
-                .route(
-                    "/api/v1/household/owner-webauthn/registration/status",
-                    axum::routing::post(
-                        handlers_owner_events::owner_webauthn_registration_status_handler,
-                    ),
                 )
                 .route(
                     handlers_owner_events::SECURE_UPGRADE_APP_ATTEST_START_PATH,
@@ -585,6 +606,31 @@ fn phase3_router(
                     axum::routing::get(handlers_device_pairing::device_pairing_poll_handler),
                 )
                 .with_state(owner_events_state),
+        )
+        // Owner passkey enrollment, and only enrollment, carries
+        // `owner_webauthn_enrollment_state`. Adding a route here hands it the
+        // RP and the anchor whenever THEYOS_OWNER_WEBAUTHN_NETWORK is open.
+        .merge(
+            axum::Router::new()
+                .route(
+                    "/api/v1/household/owner-webauthn/registration/start",
+                    axum::routing::post(
+                        handlers_owner_events::owner_webauthn_registration_start_handler,
+                    ),
+                )
+                .route(
+                    "/api/v1/household/owner-webauthn/registration/finish",
+                    axum::routing::post(
+                        handlers_owner_events::owner_webauthn_registration_finish_handler,
+                    ),
+                )
+                .route(
+                    "/api/v1/household/owner-webauthn/registration/status",
+                    axum::routing::post(
+                        handlers_owner_events::owner_webauthn_registration_status_handler,
+                    ),
+                )
+                .with_state(owner_webauthn_enrollment_state),
         )
         .merge(sign_machine_cert_router);
     #[cfg(test)]
@@ -1072,24 +1118,132 @@ fn macos_local_app_profile_for_state_dir(
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
 type LocalOwnerWebauthnRp = household_rs::owner_webauthn::OwnerWebauthnRp;
 
-#[cfg(any(target_os = "macos", test))]
-fn owner_webauthn_local_registration_rp() -> Result<LocalOwnerWebauthnRp, String> {
-    let origin = webauthn_rs::prelude::Url::parse("https://household.example.test")
-        .map_err(|e| e.to_string())?;
+/// Relying-party ID for owner passkey enrollment. Unset keeps the placeholder,
+/// so an engine that is not configured behaves exactly as before this switch
+/// existed.
+pub const OWNER_WEBAUTHN_RP_ID_ENV: &str = "THEYOS_OWNER_WEBAUTHN_RP_ID";
+/// Relying-party origin that must accompany [`OWNER_WEBAUTHN_RP_ID_ENV`].
+pub const OWNER_WEBAUTHN_RP_ORIGIN_ENV: &str = "THEYOS_OWNER_WEBAUTHN_RP_ORIGIN";
+/// Opens owner passkey enrollment on the TCP router. Only the literal `1`
+/// opens it; anything else (including an unparseable value) stays closed.
+pub const OWNER_WEBAUTHN_NETWORK_ENV: &str = "THEYOS_OWNER_WEBAUTHN_NETWORK";
+
+/// `household-rs` requires the RP ID to be a domain the tenant controls, not a
+/// domain shared across households (`owner_webauthn.rs`, `OwnerWebauthnConfig::new`):
+/// every credential minted under an RP ID is usable by whoever serves that
+/// domain's `webauthn` association file, so one shared domain would make one
+/// operator the relying party for the whole fleet. These placeholders resolve
+/// to nothing, which is why the passkey surface stays unreachable until a
+/// deployment names its own domain.
+pub const DEFAULT_OWNER_WEBAUTHN_RP_ID: &str = "household.example.test";
+const DEFAULT_OWNER_WEBAUTHN_RP_ORIGIN: &str = "https://household.example.test";
+const OWNER_WEBAUTHN_RP_NAME: &str = "Soyeht";
+
+/// The RP built once per household generation, plus the keystore the anchor
+/// verifier reads.
+///
+/// Sharing one instance is NOT what makes a ceremony work, and an earlier
+/// version of this comment claimed it was. The two routers never touch the
+/// same ceremony: the network side serves the three
+/// `owner-webauthn/registration` paths and the macOS UDS side serves the three
+/// `registration.local` ones (the source guard in `tests/owner_events.rs`
+/// forbids spelling the local path here, which is how the network router is
+/// kept off it). The challenge kinds are disjoint too.
+/// `start_registration` stores under the registration kind while
+/// `start_macos_local_attested_registration_from` stores under the
+/// local-attested kind, which `finish_registration` cannot consume
+/// (`household-rs/src/owner_webauthn.rs`); its matching
+/// `finish_macos_local_attested_registration` has no caller in server-rs at all
+/// (`owner_webauthn_registration_local_finish_handler` rejects before it).
+///
+/// It is one instance because a household generation has exactly one
+/// relying-party identity and one anchor file. Building a second would repeat
+/// the same fallible construction over the same inputs and leave two challenge
+/// stores, two TTL clocks and two `Mutex`es to reason about, for no ceremony
+/// that needs them.
+#[derive(Clone)]
+struct OwnerWebauthnRuntime {
+    rp: Arc<tokio::sync::Mutex<LocalOwnerWebauthnRp>>,
+    anchor: Arc<dyn keystore_rs::KeystoreBackend>,
+}
+
+impl OwnerWebauthnRuntime {
+    fn build(state_dir: &Path) -> Result<Self, String> {
+        Ok(Self {
+            rp: Arc::new(tokio::sync::Mutex::new(owner_webauthn_rp_from_env()?)),
+            anchor: owner_webauthn_registration_anchor_store(state_dir),
+        })
+    }
+
+    fn apply(
+        &self,
+        state: handlers_owner_events::OwnerEventsRouterState,
+    ) -> handlers_owner_events::OwnerEventsRouterState {
+        state
+            .with_owner_webauthn_rp_shared(Arc::clone(&self.rp))
+            .with_owner_webauthn_anchor(Arc::clone(&self.anchor))
+    }
+}
+
+fn owner_webauthn_rp_from_env() -> Result<LocalOwnerWebauthnRp, String> {
+    owner_webauthn_rp_from_values(
+        non_empty_env(OWNER_WEBAUTHN_RP_ID_ENV).as_deref(),
+        non_empty_env(OWNER_WEBAUTHN_RP_ORIGIN_ENV).as_deref(),
+    )
+}
+
+fn owner_webauthn_rp_from_values(
+    rp_id: Option<&str>,
+    rp_origin: Option<&str>,
+) -> Result<LocalOwnerWebauthnRp, String> {
+    let rp_id = rp_id.unwrap_or(DEFAULT_OWNER_WEBAUTHN_RP_ID);
+    let rp_origin = rp_origin.unwrap_or(DEFAULT_OWNER_WEBAUTHN_RP_ORIGIN);
+    let origin = webauthn_rs::prelude::Url::parse(rp_origin).map_err(|e| e.to_string())?;
     let config = household_rs::owner_webauthn::OwnerWebauthnConfig::new(
-        "household.example.test",
+        rp_id,
         origin,
-        "Soyeht",
+        OWNER_WEBAUTHN_RP_NAME,
     )
     .map_err(|e| e.to_string())?;
     household_rs::owner_webauthn::OwnerWebauthnRp::new(config).map_err(|e| e.to_string())
 }
 
-#[cfg(any(target_os = "macos", test))]
-fn owner_webauthn_local_registration_anchor_store(
+fn non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Whether the TCP (phone-reachable) router gets the passkey RP and anchor.
+///
+/// Closed unless the value is exactly `1`: the surface mints owner authority,
+/// so an operator typo must leave it shut rather than half-open.
+#[must_use]
+fn owner_webauthn_network_enabled() -> bool {
+    owner_webauthn_network_enabled_from_value(
+        std::env::var(OWNER_WEBAUTHN_NETWORK_ENV).ok().as_deref(),
+    )
+}
+
+#[must_use]
+fn owner_webauthn_network_enabled_from_value(raw: Option<&str>) -> bool {
+    match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        Some("1") => true,
+        None | Some("0") => false,
+        Some(_) => {
+            tracing::warn!(
+                env = OWNER_WEBAUTHN_NETWORK_ENV,
+                "unknown owner-webauthn network value; keeping the network surface closed"
+            );
+            false
+        }
+    }
+}
+
+fn owner_webauthn_registration_anchor_store(
     state_dir: &Path,
 ) -> Arc<dyn keystore_rs::KeystoreBackend> {
     Arc::new(keystore_rs::FileKeystore::new(
@@ -1098,16 +1252,38 @@ fn owner_webauthn_local_registration_anchor_store(
     ))
 }
 
+/// The state for the three network `owner-webauthn/registration/*` routes.
+///
+/// `base` is returned untouched unless the operator opened
+/// `THEYOS_OWNER_WEBAUTHN_NETWORK`, and `base` itself is never modified: the
+/// caller keeps handing that same value to every other owner-events route, so
+/// machine approval, revoke and add-credential stay on the behaviour they had
+/// before this switch existed.
+fn owner_webauthn_enrollment_router_state(
+    base: &handlers_owner_events::OwnerEventsRouterState,
+    runtime: Option<&OwnerWebauthnRuntime>,
+    network_open: bool,
+) -> Result<handlers_owner_events::OwnerEventsRouterState, String> {
+    if !network_open {
+        return Ok(base.clone());
+    }
+    let runtime =
+        runtime.ok_or_else(|| "owner passkey runtime missing for network router".to_string())?;
+    tracing::info!(
+        stage = "owner_webauthn.network_surface_open",
+        env = OWNER_WEBAUTHN_NETWORK_ENV,
+        "owner passkey enrollment is reachable over the network router"
+    );
+    Ok(runtime.apply(base.clone()))
+}
+
 #[cfg(any(target_os = "macos", test))]
 fn macos_local_owner_webauthn_registration_state(
     state: handlers_owner_events::OwnerEventsRouterState,
-    state_dir: &Path,
+    runtime: &OwnerWebauthnRuntime,
     verifier: Arc<dyn crate::macos_local_caller_auth::MacosLocalCallerAuth>,
-) -> Result<handlers_owner_events::OwnerEventsRouterState, String> {
-    Ok(state
-        .with_owner_webauthn_rp(owner_webauthn_local_registration_rp()?)
-        .with_owner_webauthn_anchor(owner_webauthn_local_registration_anchor_store(state_dir))
-        .with_macos_local_caller_auth(verifier))
+) -> handlers_owner_events::OwnerEventsRouterState {
+    runtime.apply(state).with_macos_local_caller_auth(verifier)
 }
 
 fn claw_share_log_path(state_dir: &Path) -> PathBuf {
@@ -1971,13 +2147,75 @@ pub async fn bootstrap_household(
         bootstrap_handler_state =
             bootstrap_handler_state.with_pair_code_rate_limiter(Arc::clone(&state.rate_limiter));
     }
+    // The setup-invitation browser turns a phone's `_soyeht-setup._tcp.`
+    // beacon into a cache entry. Only two routes ever read that cache, and
+    // both refuse outside onboarding: `POST /bootstrap/claim-setup-invitation`
+    // answers 409 `already_initialized` unless the engine is `Uninitialized`
+    // (handlers_bootstrap.rs, "1. State gate"), and `POST
+    // /bootstrap/accept-household` answers 409 unless it is `Uninitialized` or
+    // `ReadyForNaming`. So the spawn stays tied to those states: on a Ready
+    // engine a running browser would fill a cache nothing can claim, which is
+    // cost and log noise, not reachability.
+    //
+    // What the two-situation rule changes here is the ONE gate that was
+    // silently dropping beacons: `BrowserConfig::default()` sets
+    // `include_local_network = false`, so a beacon carrying nothing but
+    // `192.168.x` -- exactly what a phone with no Tailscale publishes -- was
+    // discarded and logged as `setup_browser.suppressed reason=non_tailnet`
+    // (bonjour_browser.rs). A browser that cannot see the phone it is looking
+    // for is not a gate, it is a bug.
+    //
+    // The flag is derived from the SAME policy the listener binds through --
+    // `allows_with(state, Lan, window)` -- rather than from a second rule
+    // written here, so "the home is on the local network in exactly two
+    // situations" has exactly one implementation. In the two states this
+    // browser runs in, situation 1 (INSTALL) already grants LAN, so the answer
+    // is `true` in both window positions; expressing it through the policy is
+    // what keeps it true if either half of the rule ever moves.
+    //
+    // The reachability half of the fix is the listener bind, not this browser:
+    // `HouseholdExposurePolicy` re-admits `InterfaceClass::Lan` after
+    // onboarding while a pair-device window is open, which is what gives a
+    // LAN-only phone an address to dial on a Ready engine.
+
+    // The Mac's "I am showing an Add iPhone sheet" fact, and the routes that
+    // set and clear it. ONE instance: the same `Arc` reaches the routes, the
+    // listener reconciler and the Bonjour publish, so what the Mac says and
+    // what the exposure policy reads cannot drift. It holds no token and no
+    // identity, which is why it is its own small router rather than another
+    // field on `BootstrapHandlerState` -- see `local_network_visibility`.
+    let local_network_visibility =
+        Arc::new(crate::local_network_visibility::LocalNetworkVisibility::new());
+    let local_network_visibility_rt =
+        crate::local_network_visibility::local_network_visibility_router(Arc::clone(
+            &local_network_visibility,
+        ));
+
+    let pairing_window = household_listener::PairingWindow::observe(
+        pair_device_window.as_ref(),
+        local_network_visibility.as_ref(),
+    )
+    .await;
     if matches!(
         initial_bootstrap_state,
         BootstrapState::Uninitialized | BootstrapState::ReadyForNaming
     ) {
+        let include_local_network = household_listener::HouseholdExposurePolicy::allows_with(
+            initial_bootstrap_state,
+            household_listener::InterfaceClass::Lan,
+            pairing_window,
+        );
+        info!(
+            stage = "setup_browser.spawn",
+            pairing_window = pairing_window.as_str(),
+            include_local_network,
+            bootstrap_state = initial_bootstrap_state.as_str(),
+        );
         drop(bonjour_browser::spawn_setup_invitation_browser_with_cache(
             bootstrap_handler_state.setup_invitation_cache.clone(),
-            BrowserConfig::default(),
+            BrowserConfig {
+                include_local_network,
+            },
         ));
     }
     let bootstrap_rt = crate::handlers_bootstrap::bootstrap_router(bootstrap_handler_state);
@@ -2139,6 +2377,7 @@ pub async fn bootstrap_household(
         .merge(machines_router) // R101
         .merge(roster_router) // B0a machine roster currency
         .merge(bootstrap_rt)
+        .merge(local_network_visibility_rt)
         .merge(pre_household_rt)
         .merge(guest_image_router)
         .merge(claw_share_router);
@@ -2152,12 +2391,22 @@ pub async fn bootstrap_household(
     });
 
     let bound_set = household_listener::BoundSet::default();
+    // Re-observed here rather than reusing the value taken above for the
+    // setup browser: `theyos install` can persist a live token that this
+    // process adopts during bootstrap, and the initial bind must reflect the
+    // window as it is at bind time, not as it was earlier in this function.
+    let startup_pairing_window = household_listener::PairingWindow::observe(
+        pair_device_window.as_ref(),
+        local_network_visibility.as_ref(),
+    )
+    .await;
     let initial_bound = household_listener::spawn_household_listeners(
         startup,
         household_router.clone(),
         port,
         Arc::clone(&bootstrap_state_arc),
         &bound_set,
+        startup_pairing_window,
     )
     .await;
     info!(
@@ -2230,12 +2479,19 @@ pub async fn bootstrap_household(
     .await;
 
     // Periodic refresh — picks up new Tailscale / Wi-Fi addresses every 60s.
+    // It is also the reconciler for the pair-device window, which is why it
+    // now takes one: the window is what decides whether a post-onboarding
+    // household is on the local network, and this loop is the only thing that
+    // can bind or withdraw a listener while the engine runs.
     {
         let router = household_router;
         let bound = bound_set.clone();
         let bootstrap = Arc::clone(&bootstrap_state_arc);
+        let window = Arc::clone(&pair_device_window);
+        let visibility = Arc::clone(&local_network_visibility);
         tokio::spawn(async move {
-            household_listener::refresh_loop(router, port, bootstrap, bound).await;
+            household_listener::refresh_loop(router, port, bootstrap, bound, window, visibility)
+                .await;
         });
     }
 
@@ -2249,6 +2505,7 @@ pub async fn bootstrap_household(
             Arc::clone(loaded),
             Arc::clone(&pair_device_window),
             Arc::clone(&pair_machine_window),
+            Arc::clone(&local_network_visibility),
             initial_bound,
             port,
         )
@@ -2257,6 +2514,7 @@ pub async fn bootstrap_household(
         let deps = HouseholdIdentityWatcherDeps {
             pair_device_window: Arc::clone(&pair_device_window),
             pair_machine_window: Arc::clone(&pair_machine_window),
+            local_network_visibility: Arc::clone(&local_network_visibility),
             targets: initial_bound,
             port,
             claw_share: Some(claw_share_runtime),
@@ -2309,6 +2567,7 @@ async fn publish_household_bonjour_for_identity(
     loaded: Arc<household_rs::LoadedIdentity>,
     pair_device_window: Arc<household_rs::pair_device::PairDeviceWindow>,
     pair_machine_window: Arc<household_rs::pair_machine::PairMachineWindow>,
+    local_network_visibility: Arc<crate::local_network_visibility::LocalNetworkVisibility>,
     targets: Vec<(IpAddr, InterfaceClass)>,
     port: u16,
 ) {
@@ -2348,6 +2607,7 @@ async fn publish_household_bonjour_for_identity(
         params,
         pair_device_window,
         pair_machine_window,
+        local_network_visibility,
         targets,
         bootstrap_state,
     )
@@ -2370,6 +2630,10 @@ async fn publish_household_bonjour_for_identity(
 struct HouseholdIdentityWatcherDeps {
     pair_device_window: Arc<household_rs::pair_device::PairDeviceWindow>,
     pair_machine_window: Arc<household_rs::pair_machine::PairMachineWindow>,
+    /// The shared "Add iPhone sheet is open" fact. Carried so a Bonjour
+    /// publish that happens after a hot-load observes the same two facts the
+    /// listener binds on, rather than only the token half.
+    local_network_visibility: Arc<crate::local_network_visibility::LocalNetworkVisibility>,
     targets: Vec<(IpAddr, InterfaceClass)>,
     port: u16,
     claw_share: Option<ClawShareRuntimeHandles>,
@@ -2406,6 +2670,7 @@ fn spawn_household_identity_watcher_with_interval(
     let HouseholdIdentityWatcherDeps {
         pair_device_window,
         pair_machine_window,
+        local_network_visibility,
         targets,
         port,
         claw_share,
@@ -2428,6 +2693,7 @@ fn spawn_household_identity_watcher_with_interval(
                     Arc::clone(&loaded),
                     Arc::clone(&pair_device_window),
                     Arc::clone(&pair_machine_window),
+                    Arc::clone(&local_network_visibility),
                     targets.clone(),
                     port,
                 )
@@ -2500,6 +2766,7 @@ fn spawn_household_identity_watcher_with_interval(
                         loaded,
                         Arc::clone(&pair_device_window),
                         Arc::clone(&pair_machine_window),
+                        Arc::clone(&local_network_visibility),
                         targets,
                         port,
                     )
@@ -2779,6 +3046,10 @@ mod tests {
             "spawn_owner_timeout_watchdog(",
             "spawn_macos_local_registration_listener(",
             "spawn_bonjour_browser(",
+            "OwnerWebauthnRuntime::build(",
+            ".with_owner_webauthn_rp_shared(",
+            ".with_owner_webauthn_anchor(",
+            "let owner_webauthn_network = owner_webauthn_network_enabled();",
         ] {
             assert_eq!(
                 production.matches(symbol).count(),
@@ -2786,6 +3057,12 @@ mod tests {
                 "Phase 3 resource/route must have one production owner: {symbol}"
             );
         }
+        // Building a second RP is how the two routers would silently end up
+        // with a challenge store each.
+        assert!(
+            !production.contains(".with_owner_webauthn_rp("),
+            "owner passkey RP must reach both routers as one shared instance"
+        );
     }
 
     #[tokio::test]
@@ -3886,7 +4163,7 @@ mod tests {
     }
 
     #[test]
-    fn macos_local_registration_state_wires_runtime_webauthn_dependencies() {
+    fn owner_webauthn_registration_state_shares_one_rp_across_both_routers() {
         let td = tempfile::tempdir().unwrap();
         let identity = household_rs::bootstrap_or_load(
             td.path(),
@@ -3920,22 +4197,452 @@ mod tests {
         let verifier: Arc<dyn crate::macos_local_caller_auth::MacosLocalCallerAuth> =
             Arc::new(crate::macos_local_caller_auth::FailClosedMacosLocalCallerAuth);
 
-        let state =
-            macos_local_owner_webauthn_registration_state(state, td.path(), verifier).unwrap();
+        let runtime = OwnerWebauthnRuntime::build(td.path()).unwrap();
+        let network_state = runtime.apply(state.clone());
+        let local_state = macos_local_owner_webauthn_registration_state(state, &runtime, verifier);
 
-        assert!(state.macos_local_caller_auth.is_some());
-        assert!(state.owner_webauthn_anchor.is_some());
-        let rp = state
+        assert!(local_state.macos_local_caller_auth.is_some());
+        assert!(local_state.owner_webauthn_anchor.is_some());
+        assert!(network_state.owner_webauthn_anchor.is_some());
+        // The phone presents no SecCode, so the macOS caller check must not
+        // ride along onto the network router; owner Soyeht-PoP authenticates
+        // that side.
+        assert!(network_state.macos_local_caller_auth.is_none());
+        // One RP per generation reaches both states. This is a
+        // build-it-once invariant, NOT a cross-router ceremony requirement:
+        // the two routers serve disjoint paths and disjoint challenge kinds,
+        // so no registration is ever started on one and finished on the other
+        // (see `OwnerWebauthnRuntime`).
+        assert!(Arc::ptr_eq(
+            local_state
+                .owner_webauthn_rp
+                .as_ref()
+                .expect("local registration runtime state wires RP"),
+            network_state
+                .owner_webauthn_rp
+                .as_ref()
+                .expect("network registration runtime state wires RP"),
+        ));
+        let rp = local_state
             .owner_webauthn_rp
             .as_ref()
             .expect("local registration runtime state wires RP")
             .try_lock()
             .expect("RP lock is uncontended in unit test");
-        assert_eq!(rp.config().rp_id(), "household.example.test");
+        assert_eq!(rp.config().rp_id(), DEFAULT_OWNER_WEBAUTHN_RP_ID);
         assert_eq!(
             rp.config().rp_origin().as_str(),
             "https://household.example.test/"
         );
+    }
+
+    /// A `tracing` sink for the tests below.
+    ///
+    /// The owner-events handlers are deliberately anti-oracle: every rejection
+    /// is the same generic 401, and the reason exists only as a `tracing` field.
+    /// Reading that field is the only way to tell WHICH gate a request hit, so
+    /// these tests capture the log instead of guessing from the status code.
+    #[derive(Clone)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn new() -> Self {
+            Self(Arc::new(std::sync::Mutex::new(Vec::new())))
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Dispatch one request through `router` on this thread, with `logs`
+    /// installed as the thread-local subscriber for the whole poll.
+    fn dispatch_capturing_logs(
+        router: axum::Router,
+        request: Request<axum::body::Body>,
+        logs: &CapturedLogs,
+    ) -> axum::response::Response {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move { router.oneshot(request).await.unwrap() })
+        })
+    }
+
+    struct OwnerWebauthnScopeFixture {
+        _td: tempfile::TempDir,
+        household: HouseholdState,
+        event_log: Arc<OwnerEventLog>,
+        broadcaster: OwnerEventsBroadcaster,
+        window: Arc<PairMachineWindow>,
+        state_dir: PathBuf,
+        person: P256Keypair,
+    }
+
+    impl OwnerWebauthnScopeFixture {
+        fn new() -> Self {
+            let td = tempfile::tempdir().unwrap();
+            let identity = household_rs::bootstrap_or_load(
+                td.path(),
+                household_rs::BootstrapOpts {
+                    household_name: "Owner Webauthn Scope".into(),
+                    hostname_label: Some("owner-webauthn-scope".into()),
+                },
+                household_rs::KeyBackingPolicy::ForceSoftware,
+            )
+            .unwrap();
+            let lifecycle = HouseholdLifecycleLock::open_verified(td.path()).unwrap();
+            let lifecycle_guard = lifecycle.lock_exclusive().unwrap();
+            let broadcaster = OwnerEventsBroadcaster::new();
+            let event_log = OwnerEventLog::open_with_broadcaster_under_lifecycle(
+                &lifecycle_guard,
+                td.path().to_path_buf(),
+                identity.record.hh_id.as_str(),
+                broadcaster.clone(),
+            )
+            .unwrap();
+            drop(lifecycle_guard);
+
+            let person = P256Keypair::generate();
+            let cert = household_rs::PersonCert::sign_owner(
+                identity
+                    .hh_priv
+                    .as_deref()
+                    .expect("hh_priv present in single-machine household"),
+                SignOwnerOptions {
+                    hh_id: identity.record.hh_id.clone(),
+                    p_pub: person.public(),
+                    display_name: "Owner".into(),
+                    // Backdated: `PersonCert::verify` refuses a cert whose
+                    // `not_before` is still in the future, and the household
+                    // record is created inside this same second.
+                    issued_at: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs()
+                        .saturating_sub(60),
+                },
+            )
+            .unwrap();
+            let owner_auth = household_rs::HouseholdAuthState::new(&identity.record, cert);
+            let household = HouseholdState::empty();
+            let state_dir = td.path().to_path_buf();
+            let window = Arc::new(PairMachineWindow::new_in_memory());
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(
+                    household
+                        .set_loaded_with_owner_auth(Arc::new(identity), Some(Arc::new(owner_auth))),
+                );
+            Self {
+                _td: td,
+                household,
+                event_log,
+                broadcaster,
+                window,
+                state_dir,
+                person,
+            }
+        }
+
+        /// The state every owner-events route except enrollment is given, under
+        /// the reviewed-core-v2 approval rollout.
+        fn base_state(&self) -> handlers_owner_events::OwnerEventsRouterState {
+            handlers_owner_events::OwnerEventsRouterState::new(
+                self.household.clone(),
+                Arc::clone(&self.window),
+                Arc::clone(&self.event_log),
+                self.broadcaster.clone(),
+                self.state_dir.clone(),
+                household_rs::KeyBackingPolicy::ForceSoftware,
+            )
+            .with_owner_approval_policy(
+                handlers_owner_events::owner_approval_policy_from_rollout_value(Some(
+                    handlers_owner_events::OWNER_AUTH_V2_REVIEWED_CORE_ROLLOUT,
+                )),
+            )
+        }
+
+        fn phase3_router_with(
+            &self,
+            base: handlers_owner_events::OwnerEventsRouterState,
+            enrollment: handlers_owner_events::OwnerEventsRouterState,
+        ) -> axum::Router {
+            phase3_router(
+                handlers_pair_machine::PairMachineRouterState {
+                    window: Arc::clone(&self.window),
+                    household: self.household.clone(),
+                    event_log: Arc::clone(&self.event_log),
+                    event_broadcaster: self.broadcaster.clone(),
+                    state_dir: self.state_dir.clone(),
+                },
+                base,
+                enrollment,
+                self.household.clone(),
+                Arc::clone(&self.event_log),
+                self.state_dir.clone(),
+            )
+        }
+
+        fn owner_pop_request(
+            &self,
+            method: &str,
+            uri: &str,
+            body: Vec<u8>,
+        ) -> Request<axum::body::Body> {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let signing = RequestSigningContext::new(method, uri, now, &body);
+            let signature = self
+                .person
+                .sign(&signing.canonical_bytes().unwrap())
+                .unwrap();
+            let authorization = format!(
+                "Soyeht-PoP v1:{}:{}:{}",
+                household_rs::derive_person_id(&self.person.public()).0,
+                now,
+                B64URL.encode(signature.as_bytes())
+            );
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(axum::http::header::AUTHORIZATION, authorization)
+                .header(axum::http::header::CONTENT_TYPE, "application/cbor")
+                .body(axum::body::Body::from(body))
+                .unwrap()
+        }
+    }
+
+    #[derive(Serialize)]
+    struct TestVersionOnlyRequest {
+        #[serde(rename = "v")]
+        version: u8,
+    }
+
+    #[test]
+    fn owner_webauthn_network_switch_unset_hands_phase3_no_rp_and_no_anchor() {
+        let td = tempfile::tempdir().unwrap();
+        let fixture = OwnerWebauthnScopeFixture::new();
+        let base = fixture.base_state();
+        let runtime = OwnerWebauthnRuntime::build(td.path()).unwrap();
+
+        // Closed switch: the enrollment state IS the base state, so both
+        // arguments phase3_router receives are RP-less and anchor-less. This is
+        // the "byte-for-byte what shipped" claim, asserted rather than
+        // described.
+        let closed = owner_webauthn_enrollment_router_state(&base, Some(&runtime), false).unwrap();
+        assert!(closed.owner_webauthn_rp.is_none());
+        assert!(closed.owner_webauthn_anchor.is_none());
+        assert!(base.owner_webauthn_rp.is_none());
+        assert!(base.owner_webauthn_anchor.is_none());
+
+        // Open switch: only the enrollment state gains them; `base`, which the
+        // caller keeps handing to every other owner-events route, is untouched.
+        let open = owner_webauthn_enrollment_router_state(&base, Some(&runtime), true).unwrap();
+        assert!(open.owner_webauthn_rp.is_some());
+        assert!(open.owner_webauthn_anchor.is_some());
+        assert!(base.owner_webauthn_rp.is_none());
+        assert!(base.owner_webauthn_anchor.is_none());
+    }
+
+    #[test]
+    fn open_owner_webauthn_network_switch_leaves_pair_machine_approval_fail_closed() {
+        let td = tempfile::tempdir().unwrap();
+        let fixture = OwnerWebauthnScopeFixture::new();
+        let base = fixture.base_state();
+        let runtime = OwnerWebauthnRuntime::build(td.path()).unwrap();
+        let enrollment =
+            owner_webauthn_enrollment_router_state(&base, Some(&runtime), true).unwrap();
+        let router = fixture.phase3_router_with(base, enrollment);
+
+        // The enrollment surface really is open: with the RP and the anchor in
+        // reach, a never-enrolled owner gets a registration challenge back.
+        // Without this the assertion below would pass vacuously.
+        let start_uri = "/api/v1/household/owner-webauthn/registration/start";
+        let start_body =
+            household_rs::cbor::to_canonical_vec(&TestVersionOnlyRequest { version: 1 }).unwrap();
+        let start_logs = CapturedLogs::new();
+        let started = dispatch_capturing_logs(
+            router.clone(),
+            fixture.owner_pop_request("POST", start_uri, start_body),
+            &start_logs,
+        );
+        assert_eq!(
+            started.status(),
+            StatusCode::OK,
+            "enrollment must be reachable with the switch open; log: {}",
+            start_logs.text()
+        );
+
+        // Same router, same open switch: machine approval must still see NO
+        // anchor. `pair_machine_owner_webauthn_policy_snapshot` returns
+        // `anchor_invalid()` without one, which under reviewed-core-v2 is
+        // `RejectFailClosed` — the handler rejects on
+        // `owner_webauthn_trust_not_satisfied` before ever reading the body.
+        // Hand the anchor to this route instead and the trust state becomes
+        // `NeverEnrolled`, the mode becomes `LegacyV1`, and this same empty
+        // body would be rejected as `cbor_decode` — a legacy approval body
+        // would be ACCEPTED. Every rejection here is the same generic 401, so
+        // the reason field is the only thing that tells the two apart.
+        let approve_logs = CapturedLogs::new();
+        let approved = dispatch_capturing_logs(
+            router,
+            fixture.owner_pop_request(
+                "POST",
+                "/api/v1/household/owner-events/1/approve",
+                Vec::new(),
+            ),
+            &approve_logs,
+        );
+        assert_eq!(approved.status(), StatusCode::UNAUTHORIZED);
+        let approve_log = approve_logs.text();
+        assert!(
+            approve_log.contains("reason=\"owner_webauthn_trust_not_satisfied\""),
+            "pair-machine approval must stay fail-closed with the enrollment \
+             switch open; log: {approve_log}"
+        );
+        assert!(
+            !approve_log.contains("reason=\"cbor_decode\""),
+            "an anchor on the approve route would downgrade the body mode to \
+             LegacyV1; log: {approve_log}"
+        );
+    }
+
+    #[derive(Serialize)]
+    struct TestRevokeCredentialStartRequest {
+        #[serde(rename = "v")]
+        version: u8,
+        target_credential_id: serde_bytes::ByteBuf,
+    }
+
+    #[test]
+    fn open_owner_webauthn_network_switch_leaves_revoke_and_add_credential_shut() {
+        let td = tempfile::tempdir().unwrap();
+        let fixture = OwnerWebauthnScopeFixture::new();
+        let base = fixture.base_state();
+        let runtime = OwnerWebauthnRuntime::build(td.path()).unwrap();
+        let enrollment =
+            owner_webauthn_enrollment_router_state(&base, Some(&runtime), true).unwrap();
+        let router = fixture.phase3_router_with(base, enrollment);
+
+        // These routes gate on `owner_webauthn_anchor` and `owner_webauthn_rp`,
+        // the same two fields enrollment needs. Bodies are valid and the owner
+        // PoP is real, so each request reaches the anchor check: with the anchor
+        // scoped to enrollment it stops at `missing_anchor_verifier`. Put the
+        // anchor on this state instead and the same request walks past it into
+        // `never_enrolled`, which is the credential-management surface opening.
+        let revoke_body = household_rs::cbor::to_canonical_vec(&TestRevokeCredentialStartRequest {
+            version: 1,
+            target_credential_id: serde_bytes::ByteBuf::from(vec![7_u8; 16]),
+        })
+        .unwrap();
+        let add_body =
+            household_rs::cbor::to_canonical_vec(&TestVersionOnlyRequest { version: 1 }).unwrap();
+        for (uri, body) in [
+            ("/api/v1/household/owner-webauthn/revoke/start", revoke_body),
+            (
+                "/api/v1/household/owner-webauthn/add-credential/start",
+                add_body,
+            ),
+        ] {
+            let logs = CapturedLogs::new();
+            let response = dispatch_capturing_logs(
+                router.clone(),
+                fixture.owner_pop_request("POST", uri, body),
+                &logs,
+            );
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+            let text = logs.text();
+            assert!(
+                text.contains("reason=\"missing_anchor_verifier\""),
+                "{uri} must stop at the absent anchor; log: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn owner_webauthn_rp_defaults_to_the_placeholder_when_no_domain_is_configured() {
+        let rp = owner_webauthn_rp_from_values(None, None).unwrap();
+        assert_eq!(rp.config().rp_id(), DEFAULT_OWNER_WEBAUTHN_RP_ID);
+        assert_eq!(
+            rp.config().rp_origin().as_str(),
+            "https://household.example.test/"
+        );
+    }
+
+    #[test]
+    fn owner_webauthn_rp_takes_the_configured_tenant_domain() {
+        let rp = owner_webauthn_rp_from_values(
+            Some("passkeys.example.org"),
+            Some("https://passkeys.example.org"),
+        )
+        .unwrap();
+        assert_eq!(rp.config().rp_id(), "passkeys.example.org");
+        assert_eq!(
+            rp.config().rp_origin().as_str(),
+            "https://passkeys.example.org/"
+        );
+    }
+
+    #[test]
+    fn owner_webauthn_rp_rejects_an_origin_outside_the_rp_id() {
+        // webauthn-rs refuses the pair, so a mistyped domain fails the phase-3
+        // install instead of minting credentials no origin can present.
+        assert!(
+            owner_webauthn_rp_from_values(
+                Some("passkeys.example.org"),
+                Some("https://unrelated.example.net"),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn owner_webauthn_network_surface_is_closed_unless_explicitly_opened() {
+        for closed in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("true"),
+            Some("yes"),
+            Some("on"),
+        ] {
+            assert!(
+                !owner_webauthn_network_enabled_from_value(closed),
+                "{closed:?} must leave the network passkey surface closed"
+            );
+        }
+        assert!(owner_webauthn_network_enabled_from_value(Some("1")));
+        assert!(owner_webauthn_network_enabled_from_value(Some(" 1 ")));
     }
 
     #[test]
@@ -4181,6 +4888,9 @@ mod tests {
             HouseholdIdentityWatcherDeps {
                 pair_device_window,
                 pair_machine_window,
+                local_network_visibility: Arc::new(
+                    crate::local_network_visibility::LocalNetworkVisibility::new(),
+                ),
                 targets: Vec::new(),
                 port: 8091,
                 claw_share: None,

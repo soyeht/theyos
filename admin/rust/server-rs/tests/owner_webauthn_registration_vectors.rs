@@ -114,6 +114,25 @@ fn owner_webauthn_registration_start_request_vectors_are_canonical() {
 }
 
 #[test]
+fn owner_webauthn_registration_vectors_pin_the_unconfigured_default_rp() {
+    // These vectors are cross-language evidence only while they carry the RP
+    // the engine actually serves with THEYOS_OWNER_WEBAUTHN_RP_ID unset. A
+    // deployment that names its own domain changes the wire bytes, so the
+    // fixture has to be re-pinned alongside the default rather than drifting
+    // into testing a domain nobody serves.
+    let fixture = load_fixture();
+    assert_eq!(fixture.start_responses.len(), 4);
+    for vector in &fixture.start_responses {
+        assert_eq!(
+            json_path(vector, &["options", "publicKey", "rp", "id"]),
+            server_rs::household_bootstrap::DEFAULT_OWNER_WEBAUTHN_RP_ID,
+            "{} must pin the RP id the engine serves when unconfigured",
+            vector.id,
+        );
+    }
+}
+
+#[test]
 fn owner_webauthn_registration_start_response_vectors_are_canonical() {
     let fixture = load_fixture();
     assert_eq!(

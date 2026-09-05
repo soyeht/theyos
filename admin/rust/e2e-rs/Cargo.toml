@@ -1,6 +1,6 @@
 [package]
 name = "e2e-rs"
-version = "0.1.28"
+version = "0.1.29"
 edition.workspace = true
 rust-version.workspace = true
 description = "E2E test runner for theyOS claw instances"

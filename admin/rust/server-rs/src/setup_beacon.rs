@@ -35,7 +35,7 @@ use crate::bonjour_impl_mdns_sd as backend;
 
 use crate::bonjour_browser::SOYEHT_HOUSEHOLD_SERVICE;
 use crate::handlers_bootstrap::BootstrapStateArc;
-use crate::household_listener::{BoundSet, HouseholdExposurePolicy, InterfaceClass};
+use crate::household_listener::{BoundSet, HouseholdExposurePolicy, InterfaceClass, PairingWindow};
 use household_rs::bootstrap_state::BootstrapState;
 use household_rs::pair_machine::{PairMachineState, PairMachineWindow};
 
@@ -219,6 +219,18 @@ fn should_publish(state: BootstrapState) -> bool {
     )
 }
 
+/// The setup beacon has no pair-device window to consult, and does not need
+/// one.
+///
+/// [`should_publish`] restricts it to `Uninitialized`/`ReadyForNaming`
+/// (pinned by `should_publish_states` below), and those two
+/// states are situation 1 of the two-situation rule: they grant
+/// `InterfaceClass::Lan` in BOTH window positions, so `Closed` and `Open`
+/// select the identical target set here. Written as a named constant rather
+/// than inlined so that a future call site outside those states fails review
+/// instead of quietly shipping the narrow answer.
+const SETUP_BEACON_PAIRING_WINDOW: PairingWindow = PairingWindow::Closed;
+
 // ── Publisher ─────────────────────────────────────────────────────────────────
 
 struct SetupBeaconPublishSpec<'a> {
@@ -238,7 +250,11 @@ fn publish_targets(
     source: &'static str,
 ) -> usize {
     let mut bound = 0usize;
-    let targets = HouseholdExposurePolicy::bonjour_targets(state, targets.iter().copied());
+    let targets = HouseholdExposurePolicy::bonjour_targets_with(
+        state,
+        targets.iter().copied(),
+        SETUP_BEACON_PAIRING_WINDOW,
+    );
     for (ip, class) in targets {
         if !class.is_bonjour_advertisable() || fullnames.contains_key(&ip) {
             continue;
@@ -297,7 +313,8 @@ async fn sync_bound_targets(
     spec: &SetupBeaconPublishSpec<'_>,
     state: BootstrapState,
 ) {
-    let policy_targets = HouseholdExposurePolicy::bonjour_targets(state, targets);
+    let policy_targets =
+        HouseholdExposurePolicy::bonjour_targets_with(state, targets, SETUP_BEACON_PAIRING_WINDOW);
     let live: HashSet<IpAddr> = policy_targets
         .iter()
         .filter_map(|(ip, class)| class.is_bonjour_advertisable().then_some(*ip))

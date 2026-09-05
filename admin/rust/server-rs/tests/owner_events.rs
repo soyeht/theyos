@@ -5394,13 +5394,111 @@ fn owner_webauthn_registration_local_source_guards_fail_closed_boundary() {
     assert!(router_source.contains("DesignatedRequirementMacosLocalCallerAuth::new"));
     assert!(router_source.contains("macos_local_app_profile_for_state_dir(&state_dir)"));
     assert!(router_source.contains("macos_local_owner_webauthn_registration_state("));
-    assert!(
-        router_source.contains(".with_owner_webauthn_rp(owner_webauthn_local_registration_rp()?")
-    );
-    assert!(router_source.contains(
-        ".with_owner_webauthn_anchor(owner_webauthn_local_registration_anchor_store(state_dir))"
-    ));
     assert!(router_source.contains(".with_macos_local_caller_auth(verifier)"));
+
+    // The RP and the anchor reach both the UDS state and the network
+    // enrollment state, always as the one instance `OwnerWebauthnRuntime`
+    // holds. That is a build-it-once invariant, not a cross-router ceremony
+    // requirement: the two routers serve disjoint paths and disjoint challenge
+    // kinds (see the type's doc comment).
+    let runtime_wiring = source_segment(
+        router_source,
+        "struct OwnerWebauthnRuntime {",
+        "fn owner_webauthn_rp_from_env(",
+    );
+    assert!(runtime_wiring.contains("rp: Arc<tokio::sync::Mutex<LocalOwnerWebauthnRp>>"));
+    assert!(runtime_wiring.contains(".with_owner_webauthn_rp_shared(Arc::clone(&self.rp))"));
+    assert!(runtime_wiring.contains(".with_owner_webauthn_anchor(Arc::clone(&self.anchor))"));
+    let router_production = router_source
+        .split("#[cfg(test)]\nmod tests")
+        .next()
+        .expect("household_bootstrap.rs has production code before its test module");
+    assert!(!router_production.contains(".with_owner_webauthn_rp("));
+
+    // The macOS UDS router keeps the SecCode check; the network router never
+    // gets it, because a phone has no code signature to present.
+    let macos_state = source_segment(
+        router_source,
+        "fn macos_local_owner_webauthn_registration_state(",
+        "fn claw_share_log_path(",
+    );
+    assert!(macos_state.contains("runtime.apply(state).with_macos_local_caller_auth(verifier)"));
+
+    // Network exposure is a switch of its own, closed unless the value is
+    // exactly `1`, and it must not be folded into the approval rollout: an
+    // operator turning approvals on must not silently open enrollment.
+    assert!(router_source.contains("THEYOS_OWNER_WEBAUTHN_NETWORK"));
+    let network_gate = source_segment(
+        router_source,
+        "fn owner_webauthn_network_enabled_from_value(",
+        "fn owner_webauthn_registration_anchor_store(",
+    );
+    assert!(network_gate.contains("Some(\"1\") => true"));
+    assert!(network_gate.contains("None | Some(\"0\") => false"));
+    assert!(
+        network_gate
+            .contains("unknown owner-webauthn network value; keeping the network surface closed")
+    );
+    assert!(!network_gate.contains("OWNER_AUTH_V2_ROLLOUT"));
+    // And it is scoped: the switch produces a SEPARATE state for the three
+    // enrollment routes. The state handed to every other owner-events route is
+    // never passed through `runtime.apply`, because `owner_webauthn_anchor`
+    // also decides pair-machine approval enforcement and gates
+    // revoke/add-credential. The behaviour behind these two source facts is
+    // asserted by the handler tests in `household_bootstrap.rs`:
+    // `open_owner_webauthn_network_switch_leaves_pair_machine_approval_fail_closed`
+    // and `open_owner_webauthn_network_switch_leaves_revoke_and_add_credential_shut`.
+    let network_wiring = source_segment(
+        router_source,
+        "let owner_webauthn_network = owner_webauthn_network_enabled();",
+        "let router = phase3_router(",
+    );
+    assert!(network_wiring.contains("let owner_webauthn_enrollment_state ="));
+    assert!(!network_wiring.contains("owner_events_state = runtime.apply("));
+    let enrollment_scope = source_segment(
+        router_source,
+        "fn owner_webauthn_enrollment_router_state(",
+        "fn macos_local_owner_webauthn_registration_state(",
+    );
+    assert!(enrollment_scope.contains("if !network_open {\n        return Ok(base.clone());"));
+    assert!(enrollment_scope.contains("Ok(runtime.apply(base.clone()))"));
+    // Only the three enrollment routes may carry that state.
+    assert_eq!(
+        router_source
+            .matches(".with_state(owner_webauthn_enrollment_state)")
+            .count(),
+        1,
+    );
+    let enrollment_routes = source_segment(
+        router_source,
+        "        .merge(\n            axum::Router::new()\n                .route(\n                    \"/api/v1/household/owner-webauthn/registration/start\"",
+        ".with_state(owner_webauthn_enrollment_state)",
+    );
+    // Exactly three, at the nesting depth of that merged Router: a fourth
+    // route added here would silently inherit the RP and the anchor.
+    assert_eq!(
+        enrollment_routes.matches("                .route(").count(),
+        3
+    );
+    for enrollment_path in [
+        "/api/v1/household/owner-webauthn/registration/start",
+        "/api/v1/household/owner-webauthn/registration/finish",
+        "/api/v1/household/owner-webauthn/registration/status",
+    ] {
+        assert!(
+            enrollment_routes.contains(enrollment_path),
+            "enrollment route must stay on the scoped state: {enrollment_path}"
+        );
+    }
+
+    // RP identity is configurable, and unset still resolves to the placeholder
+    // the cross-language vectors pin.
+    assert!(router_source.contains("THEYOS_OWNER_WEBAUTHN_RP_ID"));
+    assert!(router_source.contains("THEYOS_OWNER_WEBAUTHN_RP_ORIGIN"));
+    assert!(
+        router_source
+            .contains("pub const DEFAULT_OWNER_WEBAUTHN_RP_ID: &str = \"household.example.test\";")
+    );
     assert!(router_source.contains("fn macos_local_app_profile_for_state_dir"));
     assert!(router_source.contains("MacosLocalAppProfile::Production"));
     assert!(router_source.contains("MacosLocalAppProfile::Development"));

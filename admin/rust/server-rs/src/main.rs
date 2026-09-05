@@ -112,7 +112,17 @@ async fn main() {
     }
 
     let cfg = config::Config::from_env();
-    info!("Starting server-rs on {}", cfg.addr);
+    // The version is on this line because it was NOT anywhere in the log: on
+    // 2026-09-04 the running engine's version had to be inferred from the
+    // mtime of the installed binary. Local-network exposure is deliberately
+    // NOT on this line: it is no longer a process-wide posture resolved at
+    // bootstrap but a per-moment answer that follows the pair-device window,
+    // logged where it actually moves (`household_listener.pairing_window`).
+    info!(
+        "Starting server-rs {} on {}",
+        env!("CARGO_PKG_VERSION"),
+        cfg.addr,
+    );
     info!("Serving SPA from {:?}", cfg.web_dir);
 
     // ─── Household identity (Phase 1) — separate listener, deferred ──

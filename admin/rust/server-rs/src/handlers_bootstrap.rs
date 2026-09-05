@@ -539,7 +539,9 @@ fn claim_cbor_error(status: StatusCode, error: &str) -> Response {
     (status, headers, bytes).into_response()
 }
 
-fn cbor_ok(body: impl serde::Serialize) -> Response {
+/// `pub(crate)` so `local_network_visibility` answers in the same wire format
+/// as its `/bootstrap/*` siblings rather than growing a second one.
+pub(crate) fn cbor_ok(body: impl serde::Serialize) -> Response {
     match household_rs::cbor::to_canonical_vec(&body) {
         Ok(bytes) => {
             let mut headers = HeaderMap::new();
@@ -1492,14 +1494,26 @@ pub async fn post_pair_device_reissue(
         );
     }
 
-    // Gate 2 above already fixed `current_bs == NamedAwaitingPair`, and
-    // `HouseholdExposurePolicy::allows` never grants `InterfaceClass::Lan` in
-    // that state (see `household_listener.rs`) — the listener will not be
-    // bound on any LAN address while this route can even be reached. Unlike
-    // the CLI's `--reissue-pair-qr`/first-install path (which mints in states
-    // where LAN *is* allowed and is deliberately LAN-first so it works with
-    // Tailscale OFF), this route must not offer a `host=` fallback the
-    // listener has already withdrawn: Tailnet-only, or no fallback.
+    // Tailnet-only, or no fallback at all.
+    //
+    // The reason this comment used to give is no longer true and must not be
+    // repeated: it said `HouseholdExposurePolicy` never grants
+    // `InterfaceClass::Lan` in `named_awaiting_pair`, so a `host=` LAN
+    // fallback would name an address nothing is listening on. Since the
+    // pair-device window became the second situation that opens LAN
+    // (`household_listener.rs`), that is false in the very case this route
+    // creates: Gate 5 above only runs when the window is CLOSED, and the mint
+    // at the end of this function OPENS one, after which the reconciler binds
+    // the LAN addresses.
+    //
+    // The rule stands on its own footing instead. This route is reachable
+    // only from loopback (Gate 1), so its caller is the Mac itself, and the
+    // URI it renders is meant to travel to a phone over the tailnet. Baking a
+    // `192.168.x` literal into that URI pins the ceremony to one link the
+    // phone may not be on and that changes when the Wi-Fi does. The CLI's
+    // `--reissue-pair-qr`/first-install path is deliberately LAN-first for the
+    // opposite reason: it renders a QR a human scans while standing next to
+    // the machine, with Tailscale possibly not installed yet.
     let port: u16 = std::env::var("THEYOS_HOUSEHOLD_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -1595,7 +1609,7 @@ pub async fn get_bootstrap_pair_device_uri(
     // Gate 1 — peer ACL. The response body is the complete first-owner
     // pairing URI, so whoever can call this route can claim the household.
     // An earlier revision of this handler had no peer check at all, on the
-    // reasoning that `HouseholdExposurePolicy::allows` denies
+    // reasoning that `HouseholdExposurePolicy` denies
     // `InterfaceClass::Lan` in `named_awaiting_pair` and so the listener
     // could not be reached over LAN anyway. That reasoning was wrong twice:
     //
@@ -1606,9 +1620,13 @@ pub async fn get_bootstrap_pair_device_uri(
     //      which runs on a 500 ms tick, leaving a window in which the state
     //      gate below already passes while the LAN socket is still accepting.
     //
-    // Bind-time exposure is therefore not a substitute for an admission
-    // check, exactly as `HouseholdExposurePolicy::allows_terminal_attach_peer`
-    // already recognises for the other effectful route. Admit the same set
+    // Both of those were already true. A third has since joined them: with a
+    // pair-device window open, `HouseholdExposurePolicy` GRANTS `Lan` in this
+    // state on purpose, so the LAN socket is bound by design rather than by a
+    // timing gap. Bind-time exposure is therefore not a substitute for an
+    // admission check, exactly as
+    // `HouseholdExposurePolicy::allows_terminal_attach_peer` already
+    // recognises for the other effectful route. Admit the same set
     // the reachability echo admits, and give everyone else the bare 404 an
     // unrouted path would return.
     if !(peer.ip().is_loopback() || crate::tailnet_address::is_tailnet_ip(peer.ip())) {
@@ -4773,10 +4791,12 @@ mod tests {
         // caller can claim the household. Bind-time exposure does not stand
         // in for an admission check on either axis:
         //
-        //   - LAN: `HouseholdExposurePolicy::allows` denies `Lan` in
-        //     `named_awaiting_pair`, but the listener is unbound by a 500 ms
-        //     reconciliation tick, not at the state transition — so the
-        //     state gate can already pass while the LAN socket still accepts.
+        //   - LAN: `HouseholdExposurePolicy::allows_with` denies `Lan` in
+        //     `named_awaiting_pair` only while no pair-device window is open,
+        //     and even then the listener is unbound by a 500 ms reconciliation
+        //     tick rather than at the state transition — so the state gate can
+        //     pass while the LAN socket still accepts, and an open window
+        //     admits it outright.
         //   - Mesh: that same policy *grants* `Mesh` in this state, so a mesh
         //     peer reaches the route with no transition window needed at all.
         //
