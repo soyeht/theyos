@@ -105,13 +105,41 @@ async fn spawn_iphone_verify_server(valid_token: [u8; 32]) -> SocketAddr {
         "/setup/verify",
         post(move |_body: Bytes| async move {
             #[derive(Serialize)]
+            struct Installation {
+                profile: &'static str,
+                bootstrap_port: u16,
+            }
+            // `7cf140ac` made the receipt carry the installation and an
+            // expiry, and `decode_verified_invitation` refuses the response
+            // without them (`profile_mismatch` / `invitation_expired`) — the
+            // claim then answers 401 `invitation_not_recognized`. This fake
+            // phone predates that, so it was answering a receipt the engine
+            // is right to reject. It only surfaced now because the crate had
+            // stopped compiling and nobody could run these scenarios.
+            #[derive(Serialize)]
             struct VerifyResp {
                 v: u8,
                 token: ByteBuf,
+                installation: Option<Installation>,
+                expires_at: u64,
+                owner_display_name: Option<String>,
+                iphone_apns_token: Option<ByteBuf>,
             }
+            let expires_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_secs()
+                + 600;
             let bytes = household_rs::cbor::to_canonical_vec(&VerifyResp {
                 v: 1,
                 token: ByteBuf::from(valid_token.to_vec()),
+                installation: Some(Installation {
+                    profile: "release",
+                    bootstrap_port: 8091,
+                }),
+                expires_at,
+                owner_display_name: Some("Sample Owner".into()),
+                iphone_apns_token: None,
             })
             .unwrap_or_default();
             (
@@ -154,13 +182,33 @@ async fn simulate_beacon_discovered(
 
 fn cbor_claim(token: &[u8]) -> Vec<u8> {
     #[derive(Serialize)]
+    struct Installation {
+        profile: &'static str,
+        bootstrap_port: u16,
+    }
+    #[derive(Serialize)]
     struct Req<'a> {
         v: u8,
         token: &'a serde_bytes::Bytes,
+        // `7cf140ac` made the claim declare WHICH installation it is claiming
+        // for, and the engine answers 409 `profile_mismatch` when it does not
+        // match its own. That is the property that stops a Dev app from
+        // claiming a phone that a release engine is courting — measured
+        // happening on real hardware, 50 seconds apart, on 2026-09-05.
+        //
+        // It must agree with the `PairingInstallation` the harness builds into
+        // `BootstrapHandlerState` ("release", 8091). Left explicit rather than
+        // derived from the state so that a change to either side is a visible
+        // conflict here instead of two halves quietly agreeing to be wrong.
+        installation: Installation,
     }
     household_rs::cbor::to_canonical_vec(&Req {
         v: 1,
         token: serde_bytes::Bytes::new(token),
+        installation: Installation {
+            profile: "release",
+            bootstrap_port: 8091,
+        },
     })
     .unwrap()
 }
@@ -180,6 +228,18 @@ async fn post_claim(app: Router, body: Vec<u8>) -> (StatusCode, Vec<u8>) {
     let req = Request::builder()
         .method("POST")
         .uri("/bootstrap/claim-setup-invitation")
+        // Loopback, because this route is the Mac UI talking to its OWN
+        // engine and `post_claim_setup_invitation` refuses anything else. It
+        // reads the peer from `ConnectInfo`, so a request without the
+        // extension is rejected by the extractor and answered 500 — every
+        // scenario here then fails at its first step for a reason that has
+        // nothing to do with what it set out to test.
+        //
+        // The peer of `initialize` stays under `post_initialize`'s `src_ip`:
+        // that one IS the variable the hijack cases vary.
+        .extension(ConnectInfo::<SocketAddr>(
+            "127.0.0.1:41991".parse().expect("loopback literal"),
+        ))
         .header("content-type", "application/cbor")
         .body(Body::from(body))
         .unwrap();
