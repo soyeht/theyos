@@ -3,11 +3,13 @@
 
 use crate::pty::{LocalSpawnSpec, PtySession, start_supervised_session};
 use crate::segmented_log::{LogLimits, ReplayRead, SegmentedLog};
+use crate::supervisor_archives;
+use crate::supervisor_intents::IntentStore;
 use crate::supervisor_wire::{self as wire, Control, Frame, SessionInfo, SpawnRequest};
 use fs2::FileExt;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -50,8 +52,11 @@ impl Entry {
 
 struct Registry {
     sessions: HashMap<String, Arc<Entry>>,
+    // Replaced closed instances may still be draining or serving final replay.
+    // Their ownership and storage remain protected until both have finished.
+    retiring: Vec<Arc<Entry>>,
     intents: HashMap<String, (String, String)>, // intent -> (request digest, conversation)
-    persisted_intents: usize,
+    tickets: IntentStore,
 }
 
 struct Broker {
@@ -67,6 +72,9 @@ impl Drop for Broker {
     fn drop(&mut self) {
         let registry = self.registry.get_mut().unwrap_or_else(|e| e.into_inner());
         for entry in registry.sessions.values() {
+            entry.session.close();
+        }
+        for entry in &registry.retiring {
             entry.session.close();
         }
     }
@@ -118,6 +126,38 @@ fn valid_id(id: &str) -> bool {
 }
 
 impl Broker {
+    fn prune_archives(&self, registry: &mut Registry) -> Result<(), &'static str> {
+        registry.sessions.retain(|_, entry| {
+            entry.session.completion().is_none() || Arc::strong_count(entry) > 1
+        });
+        registry
+            .retiring
+            .retain(|entry| entry.session.completion().is_none() || Arc::strong_count(entry) > 1);
+        let protected = registry
+            .sessions
+            .values()
+            .chain(registry.retiring.iter())
+            .map(|entry| {
+                self.directory
+                    .join("sessions")
+                    .join(&entry.conversation_id)
+                    .join(&entry.instance_id)
+            })
+            .collect();
+        supervisor_archives::prune(
+            &self.directory.join("sessions"),
+            &protected,
+            supervisor_archives::MAX_ARCHIVED_BYTES,
+            supervisor_archives::MAX_ARCHIVED_INSTANCES,
+        )
+        .map_err(|_| "storage_unavailable")
+    }
+
+    fn maintain(&self) -> Result<(), &'static str> {
+        let mut registry = self.registry.lock().map_err(|_| "registry_unavailable")?;
+        self.prune_archives(&mut registry)
+    }
+
     fn create(&self, request: SpawnRequest) -> Result<(SessionInfo, bool), &'static str> {
         if !valid_id(&request.conversation_id)
             || Uuid::parse_str(&request.intent_id).is_err()
@@ -145,12 +185,12 @@ impl Broker {
                 .map(|entry| (entry.info(), true))
                 .ok_or("intent_consumed");
         }
-        // Reap completed registry entries before allocating more descriptors.
-        // Existing attaches own their Arc until final replay/EXIT; immutable
-        // instance logs and intent tombstones remain on disk.
         registry
-            .sessions
-            .retain(|_, entry| entry.session.completion().is_none());
+            .tickets
+            .require_issued(&request.conversation_id, &request.intent_id)?;
+        // Reclaim only completed, unobserved instances. Storage errors refuse
+        // new execution but never terminate an existing session to meet budget.
+        self.prune_archives(&mut registry)?;
         if registry
             .sessions
             .get(&request.conversation_id)
@@ -158,38 +198,12 @@ impl Broker {
         {
             return Err("session_exists");
         }
-        if registry
-            .sessions
-            .values()
-            .filter(|entry| !entry.session.is_closed())
-            .count()
-            >= MAX_SESSIONS
-        {
+        if registry.sessions.len() + registry.retiring.len() >= MAX_SESSIONS {
             return Err("session_limit");
         }
-        if registry.persisted_intents >= MAX_INTENTS {
-            return Err("intent_limit");
-        }
-        // Reserve on disk BEFORE spawn. A lost reply or supervisor restart
-        // cannot turn the same intent into a second execution. These small
-        // tombstones are not TTL-evicted; capacity refusal is explicit.
-        let mut reservation = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(self.directory.join("intents").join(&request.intent_id))
-            .map_err(|error| {
-                if error.kind() == io::ErrorKind::AlreadyExists {
-                    "intent_consumed"
-                } else {
-                    "storage_unavailable"
-                }
-            })?;
-        registry.persisted_intents += 1;
-        reservation
-            .write_all(digest.as_bytes())
-            .map_err(|_| "storage_unavailable")?;
+        registry
+            .tickets
+            .consume(&request.conversation_id, &request.intent_id)?;
         let instance_id = Uuid::new_v4().to_string();
         let path = self
             .directory
@@ -222,8 +236,29 @@ impl Broker {
         registry
             .intents
             .insert(request.intent_id, (digest, request.conversation_id.clone()));
-        registry.sessions.insert(request.conversation_id, entry);
+        if let Some(previous) = registry.sessions.insert(request.conversation_id, entry) {
+            registry.retiring.push(previous);
+        }
         Ok((info, false))
+    }
+
+    fn issue_intent(&self, conversation: &str) -> Result<String, &'static str> {
+        if !valid_id(conversation) {
+            return Err("invalid_spawn");
+        }
+        let mut registry = self.registry.lock().map_err(|_| "registry_unavailable")?;
+        let protected: HashSet<_> = registry
+            .sessions
+            .values()
+            .filter(|entry| !entry.session.is_closed())
+            .map(|entry| entry.intent_id.clone())
+            .collect();
+        // Closed entries need no in-memory digest cache: their consumed disk
+        // record (or its absence after GC) prevents every future execution.
+        registry
+            .intents
+            .retain(|intent, _| protected.contains(intent));
+        registry.tickets.issue(conversation, &protected)
     }
 
     fn lookup(&self, conversation: &str, instance: &str) -> Result<Arc<Entry>, &'static str> {
@@ -248,28 +283,9 @@ impl Broker {
                 return Err("intent_mismatch");
             }
         }
-        // Share CREATE's reservation and registry lock. Cancelling before
-        // CREATE reserves the intent permanently; cancelling afterwards only
-        // closes the process created by that intent, never its replacement.
-        let reservation = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(self.directory.join("intents").join(intent));
-        match reservation {
-            Ok(file) => {
-                if registry.persisted_intents >= MAX_INTENTS {
-                    drop(file);
-                    fs::remove_file(self.directory.join("intents").join(intent))
-                        .map_err(|_| "storage_unavailable")?;
-                    return Err("intent_limit");
-                }
-                registry.persisted_intents += 1;
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(_) => return Err("storage_unavailable"),
-        }
+        // Revoking the ticket also fences a CREATE which has not arrived.
+        // Absence never grants new execution authority.
+        registry.tickets.cancel(conversation, intent)?;
         if let Some(entry) = registry.sessions.get(conversation) {
             if entry.intent_id == intent {
                 entry.session.close();
@@ -333,9 +349,7 @@ pub async fn serve(socket: &Path, directory: &Path) -> io::Result<()> {
     }
     private_directory(&directory.join("intents"))?;
     private_directory(&directory.join("sessions"))?;
-    let persisted_intents = fs::read_dir(directory.join("intents"))?
-        .collect::<io::Result<Vec<_>>>()?
-        .len();
+    let tickets = IntentStore::open(&directory.join("intents"), MAX_INTENTS).map_err(io_error)?;
     let listener = UnixListener::bind(socket)?;
     fs::set_permissions(socket, fs::Permissions::from_mode(0o600))?;
     let owner = SocketOwner {
@@ -350,17 +364,42 @@ pub async fn serve(socket: &Path, directory: &Path) -> io::Result<()> {
         boot_id: Uuid::new_v4().to_string(),
         registry: Mutex::new(Registry {
             sessions: HashMap::new(),
+            retiring: Vec::new(),
             intents: HashMap::new(),
-            persisted_intents,
+            tickets,
         }),
     });
     let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let mut connections = tokio::task::JoinSet::new();
+    // Maintenance is serial and owned by the service task. An idle broker
+    // still collects completed logs; cancellation retains ownership until an
+    // already-running blocking pass has finished.
+    let mut maintenance = tokio::time::interval(Duration::from_secs(60));
+    maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut maintenance_job = None;
     tracing::info!("ptyd.ready");
     loop {
         let accepted = tokio::select! {
             accepted = listener.accept() => accepted,
             _ = connections.join_next(), if !connections.is_empty() => continue,
+            _ = maintenance.tick(), if maintenance_job.is_none() => {
+                let broker = Arc::clone(&broker);
+                maintenance_job = Some(tokio::task::spawn_blocking(move || broker.maintain()));
+                continue;
+            }
+            result = async {
+                match maintenance_job.as_mut() {
+                    Some(job) => job.await,
+                    None => std::future::pending().await,
+                }
+            },
+                if maintenance_job.is_some() => {
+                maintenance_job = None;
+                if !matches!(result, Ok(Ok(()))) {
+                    tracing::warn!("ptyd.archive.retention_failed");
+                }
+                continue;
+            }
         };
         let stream = match accepted {
             Ok((stream, _)) => stream,
@@ -433,6 +472,19 @@ async fn handle_connection(mut stream: UnixStream, broker: Arc<Broker>) -> io::R
             return Err(io_error("control required"));
         };
         let result = match message {
+            Control::IssueIntent { conversation_id } => {
+                let broker = Arc::clone(&broker);
+                tokio::task::spawn_blocking(move || {
+                    broker
+                        .issue_intent(&conversation_id)
+                        .map(|intent_id| Control::IntentIssued {
+                            intent_id,
+                            conversation_id,
+                        })
+                })
+                .await
+                .map_err(|_| io_error("intent worker failed"))?
+            }
             Control::Create { request } => {
                 let broker = Arc::clone(&broker);
                 tokio::task::spawn_blocking(move || broker.create(request))

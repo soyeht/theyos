@@ -144,6 +144,10 @@ fn fixture_with_supervisor(
             "/api/v1/terminals/local/{conversation_id}/intents/{intent_id}/cancel",
             axum::routing::post(server_rs::handlers_terminal::handle_local_terminal_cancel_create),
         )
+        .route(
+            "/api/v1/terminals/local/{conversation_id}/intents",
+            axum::routing::post(server_rs::handlers_terminal::handle_local_terminal_issue_intent),
+        )
         .layer(middleware::from_fn_with_state(auth, inject_auth))
         .with_state(state.clone());
 
@@ -309,9 +313,26 @@ async fn supervisor_http_contract_preserves_sessions_and_fences_stale_mutations(
     });
     let rejected = server.post("/api/v1/terminals/local").json(&body).await;
     assert_eq!(rejected.status_code(), StatusCode::PRECONDITION_FAILED);
-    body["intent_id"] = serde_json::json!("00000000-0000-4000-8000-000000000001");
+    let issued: serde_json::Value = server.post(&format!("{path}/intents")).await.json();
+    body["intent_id"] = issued["intent_id"].clone();
+    let original_intent = issued["intent_id"].as_str().unwrap().to_owned();
     let exchange = std::env::var_os("SOYEHT_TERMINAL_CONTRACT_DIR").map(std::path::PathBuf::from);
     if let Some(exchange) = &exchange {
+        // The orchestrator asks Swift to decode this actual response, then
+        // encode CREATE with the issued ticket. Neither side invents the ID.
+        std::fs::write(
+            exchange.join("issued.next"),
+            serde_json::to_vec(&issued).unwrap(),
+        )
+        .unwrap();
+        std::fs::rename(exchange.join("issued.next"), exchange.join("issued.json")).unwrap();
+        tokio::time::timeout(Duration::from_secs(900), async {
+            while !exchange.join("request.json").exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("Swift request production deadline");
         body =
             serde_json::from_slice(&std::fs::read(exchange.join("request.json")).unwrap()).unwrap();
         assert_eq!(body["conversation_id"], "supervised-pane");
@@ -420,7 +441,8 @@ async fn supervisor_http_contract_preserves_sessions_and_fences_stale_mutations(
         )
         .await;
     assert_eq!(closed.status_code(), StatusCode::NO_CONTENT);
-    body["intent_id"] = serde_json::json!("00000000-0000-4000-8000-000000000002");
+    let issued: serde_json::Value = server.post(&format!("{path}/intents")).await.json();
+    body["intent_id"] = issued["intent_id"].clone();
     let replacement: serde_json::Value = server
         .post("/api/v1/terminals/local")
         .json(&body)
@@ -437,7 +459,7 @@ async fn supervisor_http_contract_preserves_sessions_and_fences_stale_mutations(
     assert_eq!(stale.status_code(), StatusCode::PRECONDITION_FAILED);
     let stale_attach = server.get_websocket(&stream_path).await;
     assert_eq!(stale_attach.status_code(), StatusCode::PRECONDITION_FAILED);
-    let stale_cancel = format!("{path}/intents/00000000-0000-4000-8000-000000000001/cancel");
+    let stale_cancel = format!("{path}/intents/{original_intent}/cancel");
     for _ in 0..2 {
         assert_eq!(
             server.post(&stale_cancel).await.status_code(),

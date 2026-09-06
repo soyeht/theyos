@@ -127,6 +127,10 @@ pub fn compose(state: &SharedState, cfg: &Config) -> Router {
             "/terminals/local/{conversation_id}/intents/{intent_id}/cancel",
             post(handlers_terminal::handle_local_terminal_cancel_create),
         )
+        .route(
+            "/terminals/local/{conversation_id}/intents",
+            post(handlers_terminal::handle_local_terminal_issue_intent),
+        )
         .route("/auth/logout", post(auth::handle_logout))
         .route("/me", get(auth::handle_me))
         .route("/claw-types", get(handlers_misc::handle_claw_types))

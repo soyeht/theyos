@@ -862,6 +862,19 @@ pub async fn handle_local_terminal_cancel_create(
     crate::supervised_terminals::cancel_create(client, conversation_id, intent_id).await
 }
 
+/// Issue execution authority without spawning. The legacy selection is
+/// explicit; a supervisor failure never returns a legacy ticket response.
+pub async fn handle_local_terminal_issue_intent(
+    State(state): State<SharedState>,
+    _auth: AuthUser,
+    Path(conversation_id): Path<String>,
+) -> Response {
+    if let Some(client) = &state.local_pty_supervisor {
+        return crate::supervised_terminals::issue_intent(client, conversation_id).await;
+    }
+    axum::Json(serde_json::json!({"backend": "legacy", "conversation_id": conversation_id, "intent_id": null})).into_response()
+}
+
 /// Run a shell command inside a VM via `<ctl> exec <container> <cmd>`.
 /// Used by the file browser to execute Python snippets in the guest.
 async fn ssh_exec(state: &SharedState, container: &str, cmd: &str) -> Result<String, ApiError> {

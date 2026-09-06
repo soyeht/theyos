@@ -1,4 +1,4 @@
-//! PTY supervisor v1. Each connection negotiates before issuing operations.
+//! PTY supervisor v2. Each connection negotiates before issuing operations.
 //! Frames: u32 BE body length, u8 kind, u64 BE request/stream ID, payload.
 //! Control payloads are CBOR. Output payloads are u64 BE offset + raw bytes.
 
@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 pub const MAX_FRAME: usize = 1024 * 1024;
 
 #[must_use]
@@ -52,6 +52,13 @@ pub enum Control {
     },
     Create {
         request: SpawnRequest,
+    },
+    IssueIntent {
+        conversation_id: String,
+    },
+    IntentIssued {
+        intent_id: String,
+        conversation_id: String,
     },
     Get {
         conversation_id: String,

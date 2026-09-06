@@ -9,13 +9,23 @@ use tokio::net::UnixStream;
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
     #[error("PTY supervisor transport unavailable: {0}")]
-    Transport(#[from] std::io::Error),
+    Transport(std::io::Error),
     #[error("PTY supervisor rejected operation: {0}")]
     Rejected(String),
     #[error("PTY supervisor protocol mismatch")]
     Protocol,
     #[error("PTY supervisor request timed out; delivery may be uncertain")]
     Timeout,
+}
+
+impl From<std::io::Error> for ClientError {
+    fn from(error: std::io::Error) -> Self {
+        if error.kind() == std::io::ErrorKind::InvalidData {
+            Self::Protocol
+        } else {
+            Self::Transport(error)
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -55,6 +65,10 @@ impl SupervisorClient {
                         ..
                     },
             } => Ok(stream),
+            Frame::Control {
+                message: Control::Error { code },
+                ..
+            } if code == "version_mismatch" => Err(ClientError::Protocol),
             Frame::Control {
                 message: Control::Error { code },
                 ..
@@ -129,5 +143,59 @@ impl SupervisorClient {
         })
         .await
         .map_err(|_| ClientError::Timeout)?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn rejected_or_malformed_handshake_is_protocol_failure_without_retry() {
+        for malformed in [false, true] {
+            let root = tempfile::Builder::new()
+                .prefix("pty-client-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let socket = root.path().join("socket");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let server = tokio::spawn(async move {
+                let (mut peer, _) = listener.accept().await.unwrap();
+                assert!(matches!(
+                    wire::read_frame(&mut peer).await.unwrap(),
+                    Frame::Control {
+                        message: Control::Hello { .. },
+                        ..
+                    }
+                ));
+                if malformed {
+                    peer.write_all(&1_u32.to_be_bytes()).await.unwrap();
+                } else {
+                    wire::send_control(
+                        &mut peer,
+                        1,
+                        Control::Error {
+                            code: "version_mismatch".into(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+                // No command is allowed after a rejected handshake.
+                assert!(matches!(wire::read_frame(&mut peer).await,
+                    Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof));
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                        .await
+                        .is_err()
+                );
+            });
+            assert!(matches!(
+                SupervisorClient::new(socket).request(Control::List).await,
+                Err(ClientError::Protocol)
+            ));
+            server.await.unwrap();
+        }
     }
 }

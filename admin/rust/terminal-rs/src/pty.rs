@@ -994,10 +994,10 @@ fn wire_pty_session(
                         }
                         Err(e) => {
                             log_write_failed = true;
-                            // `append` rotates instead of ever returning a
-                            // cap-hit error (see `ConversationLog::append`),
-                            // so this is a genuine disk/IO failure — the
-                            // session cannot make progress.
+                            // Both log backends rotate at their retention
+                            // boundary. Failure here means the next output
+                            // cannot be recorded; do not broadcast it as if
+                            // replay could recover those bytes later.
                             tracing::error!(
                                 conv_id = %conv_id_owned,
                                 "conversation log append failed, killing session: {e}"
@@ -1009,10 +1009,10 @@ fn wire_pty_session(
                 }
             }
         }
-        // Normal exit path: reap (if `close()` didn't already take the
-        // child first — see its doc comment) + mark closed. EOF here means
-        // the kernel has confirmed no process still holds the PTY slave
-        // open, so there is nothing left to kill-escalate.
+        // Finish after EOF or an explicit log failure. On failure, close()
+        // already owns signal escalation; otherwise this path reaps the
+        // child. Publish completion only after all committed output was sent
+        // to the broadcast, so EXIT carries the exact replayable offset.
         if let Some(sess) = session_weak.upgrade() {
             let child = sess
                 .child

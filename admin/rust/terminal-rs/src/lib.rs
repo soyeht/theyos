@@ -452,7 +452,9 @@ fn append_output_lines(session: &mut Session, output: &str) {
 pub mod pty;
 pub mod segmented_log;
 pub mod supervisor;
+mod supervisor_archives;
 pub mod supervisor_client;
+mod supervisor_intents;
 pub mod supervisor_wire;
 
 // ─── Unit tests ──────────────────────────────────────────────────────────────

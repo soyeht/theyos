@@ -32,7 +32,7 @@ fn unavailable(error: ClientError) -> Response {
     let status = match code.as_str() {
         "session_not_found" => StatusCode::NOT_FOUND,
         "instance_mismatch" => StatusCode::PRECONDITION_FAILED,
-        "session_closed" | "intent_consumed" => StatusCode::GONE,
+        "session_closed" | "intent_consumed" | "intent_expired" => StatusCode::GONE,
         "intent_mismatch" | "session_exists" => StatusCode::CONFLICT,
         "session_limit" | "intent_limit" => StatusCode::TOO_MANY_REQUESTS,
         "invalid_spawn" | "invalid_size" | "input_too_large" => StatusCode::BAD_REQUEST,
@@ -109,6 +109,23 @@ pub async fn create(
             body["reconnected"] = json!(reconnected);
             session_response(&info, body)
         }
+        Ok(_) => unavailable(ClientError::Protocol),
+        Err(error) => unavailable(error),
+    }
+}
+
+pub async fn issue_intent(client: &SupervisorClient, conversation_id: String) -> Response {
+    match client
+        .request(Control::IssueIntent { conversation_id })
+        .await
+    {
+        Ok(Control::IntentIssued {
+            intent_id,
+            conversation_id,
+        }) => Json(json!({
+            "backend": "supervisor", "intent_id": intent_id, "conversation_id": conversation_id,
+        }))
+        .into_response(),
         Ok(_) => unavailable(ClientError::Protocol),
         Err(error) => unavailable(error),
     }
