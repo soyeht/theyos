@@ -34,6 +34,9 @@ use store_rs::InstanceDb;
 use terminal_rs::pty::PtyManager;
 use vmrunner_rs::VmRunner;
 
+#[path = "support/local_terminal_process_survival.rs"]
+mod process_survival;
+
 fn fake_ipc_bin() -> String {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let path = dir.path().join("fake-ipc.sh");
