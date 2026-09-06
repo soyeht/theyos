@@ -613,7 +613,8 @@ pub(crate) async fn serve_authorized_terminal_pty(
     {
         let sid = session_id.clone();
         let Some(log) = sess.log() else {
-            return ApiError::internal("legacy PTY requires legacy log".to_string()).into_response();
+            return ApiError::internal("legacy PTY requires legacy log".to_string())
+                .into_response();
         };
         let log_path = log.path().to_string_lossy().into_owned();
         let st = Arc::clone(&state);
@@ -640,6 +641,8 @@ pub(crate) async fn serve_authorized_terminal_pty(
 
 #[derive(Deserialize)]
 pub struct LocalTerminalCreateRequest {
+    #[serde(default)]
+    pub intent_id: Option<String>,
     pub conversation_id: String,
     pub argv: Vec<String>,
     #[serde(default)]
@@ -663,6 +666,9 @@ pub async fn handle_local_terminal_create(
     _auth: AuthUser,
     Json(req): Json<LocalTerminalCreateRequest>,
 ) -> Response {
+    if let Some(client) = &state.local_pty_supervisor {
+        return crate::supervised_terminals::create(client, req).await;
+    }
     if req.argv.is_empty() {
         return ApiError::bad_request("argv must not be empty").into_response();
     }
@@ -702,6 +708,9 @@ pub async fn handle_local_terminal_list(
     State(state): State<SharedState>,
     _auth: AuthUser,
 ) -> Response {
+    if let Some(client) = &state.local_pty_supervisor {
+        return crate::supervised_terminals::list(client).await;
+    }
     let pm = Arc::clone(&state.pty_mgr);
     match tokio::task::spawn_blocking(move || pm.list_local()).await {
         Ok(sessions) => {
@@ -729,6 +738,9 @@ pub async fn handle_local_terminal_list(
 
 #[derive(Deserialize)]
 pub struct LocalPtyQuery {
+    pub session_instance_id: Option<String>,
+    pub stream_protocol: Option<u16>,
+    pub next_offset: Option<u64>,
     #[serde(default)]
     cols: u16,
     #[serde(default)]
@@ -749,6 +761,30 @@ pub async fn handle_local_terminal_pty(
     Query(q): Query<LocalPtyQuery>,
     ws: WebSocketUpgrade,
 ) -> Response {
+    if let Some(client) = &state.local_pty_supervisor {
+        let attached = match crate::supervised_terminals::attach(
+            client,
+            conversation_id,
+            q.session_instance_id,
+            q.stream_protocol,
+            q.next_offset,
+        )
+        .await
+        {
+            Ok(attached) => attached,
+            Err(response) => return response,
+        };
+        let client = client.clone();
+        return ws
+            .max_message_size(64 * 1024)
+            .max_frame_size(64 * 1024)
+            .on_upgrade(move |socket| {
+                crate::supervised_terminals::bridge(socket, client, attached)
+            });
+    }
+    if q.session_instance_id.is_some() || q.stream_protocol.is_some() {
+        return crate::supervised_terminals::reject(StatusCode::CONFLICT, "local_backend_mismatch");
+    }
     let Some(sess) = state.pty_mgr.get_local(&conversation_id) else {
         return ApiError::not_found("local session not found").into_response();
     };
@@ -766,19 +802,64 @@ pub async fn handle_local_terminal_pty(
     ws.on_upgrade(move |socket| serve_pty_websocket(socket, sess, cols, rows, full_replay, ctx))
 }
 
-/// `DELETE /api/v1/terminals/local/{conversation_id}` — close a broker-owned
-/// session (kills the child, removes the conversation log).
+/// Close the named instance. Supervisor logs remain available for final replay;
+/// the explicit legacy backend retains its existing cleanup behavior.
 pub async fn handle_local_terminal_delete(
     State(state): State<SharedState>,
     _auth: AuthUser,
     Path(conversation_id): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
+    if let Some(client) = &state.local_pty_supervisor {
+        return crate::supervised_terminals::close(client, conversation_id, headers).await;
+    }
+    if headers.contains_key(axum::http::header::IF_MATCH) {
+        return crate::supervised_terminals::reject(StatusCode::CONFLICT, "local_backend_mismatch");
+    }
     let pm = Arc::clone(&state.pty_mgr);
     match tokio::task::spawn_blocking(move || pm.close_local(&conversation_id)).await {
         Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
         Ok(Err(e)) => ApiError::from(e).into_response(),
         Err(e) => ApiError::internal(e.to_string()).into_response(),
     }
+}
+
+/// Read a known session without creating one. Restoring a supervised pane
+/// must not execute its launch command again when the transport returns.
+pub async fn handle_local_terminal_get(
+    State(state): State<SharedState>,
+    _auth: AuthUser,
+    Path(conversation_id): Path<String>,
+) -> Response {
+    if let Some(client) = &state.local_pty_supervisor {
+        return crate::supervised_terminals::get(client, conversation_id).await;
+    }
+    let Some(session) = state.pty_mgr.get_local(&conversation_id) else {
+        return ApiError::not_found("local session not found").into_response();
+    };
+    Json(json!({
+        "conversation_id": conversation_id,
+        "backend": "legacy",
+        "slave_tty_path": session.slave_tty_path(),
+        "pgid": session.pgid(),
+        "pid": session.child_pid(),
+        "cwd": session.cwd().to_string_lossy(),
+        "is_connected": !session.is_closed(),
+    }))
+    .into_response()
+}
+
+/// Cancel an uncertain CREATE, including one which has not reached the broker.
+/// The intent fence prevents later execution; it does not undo earlier effects.
+pub async fn handle_local_terminal_cancel_create(
+    State(state): State<SharedState>,
+    _auth: AuthUser,
+    Path((conversation_id, intent_id)): Path<(String, String)>,
+) -> Response {
+    let Some(client) = &state.local_pty_supervisor else {
+        return crate::supervised_terminals::reject(StatusCode::CONFLICT, "local_backend_mismatch");
+    };
+    crate::supervised_terminals::cancel_create(client, conversation_id, intent_id).await
 }
 
 /// Run a shell command inside a VM via `<ctl> exec <container> <cmd>`.

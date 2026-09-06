@@ -122,6 +122,7 @@ fn fixture(conv_log_max_bytes: u64) -> (Router, SharedState) {
         rate_limiter: Arc::new(rate_limiter),
         executor: Arc::new(Mutex::new(executor)),
         pty_mgr,
+        local_pty_supervisor: None,
         vm_runner,
         mobile_tokens: Arc::new(server_rs::mobile_token::MobileTokenStore::new()),
         mobile_sessions: server_rs::mobile_token::MobileSessionDb::open(":memory:")
@@ -193,7 +194,7 @@ fn python3_path() -> String {
 async fn wait_for_log_size(state: &SharedState, conv_id: &str, expected: u64) {
     for _ in 0..300 {
         if let Some(sess) = state.pty_mgr.get_local(conv_id) {
-            if sess.log().current_size() >= expected {
+            if sess.log().expect("legacy log").current_size() >= expected {
                 return;
             }
         }
@@ -263,13 +264,21 @@ async fn heavy_output_session_survives_indefinitely_with_bounded_disk_usage() {
 
     // On-disk usage must stay bounded by the cap; logical size keeps
     // counting the full total regardless of rotation.
-    let disk_len = std::fs::metadata(sess.log().path()).unwrap().len();
+    let disk_len = std::fs::metadata(sess.log().expect("legacy log").path())
+        .unwrap()
+        .len();
     assert!(
         disk_len <= CAP,
         "on-disk size must stay bounded by the cap, got {disk_len}"
     );
-    assert_eq!(sess.log().current_size(), total_len as u64);
-    assert!(sess.log().base_offset() > 0, "rotation must have occurred");
+    assert_eq!(
+        sess.log().expect("legacy log").current_size(),
+        total_len as u64
+    );
+    assert!(
+        sess.log().expect("legacy log").base_offset() > 0,
+        "rotation must have occurred"
+    );
 
     // WS attach must not panic on the offset translation and must return a
     // byte-exact suffix of everything ever written, truncated-marked (since

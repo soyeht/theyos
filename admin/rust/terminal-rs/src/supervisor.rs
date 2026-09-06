@@ -118,7 +118,7 @@ fn valid_id(id: &str) -> bool {
 }
 
 impl Broker {
-    fn create(&self, request: SpawnRequest) -> Result<SessionInfo, &'static str> {
+    fn create(&self, request: SpawnRequest) -> Result<(SessionInfo, bool), &'static str> {
         if !valid_id(&request.conversation_id)
             || Uuid::parse_str(&request.intent_id).is_err()
             || request.argv.is_empty()
@@ -142,7 +142,7 @@ impl Broker {
                 .sessions
                 .get(conversation)
                 .filter(|entry| entry.intent_id == request.intent_id && !entry.session.is_closed())
-                .map(|entry| entry.info())
+                .map(|entry| (entry.info(), true))
                 .ok_or("intent_consumed");
         }
         // Reap completed registry entries before allocating more descriptors.
@@ -223,7 +223,7 @@ impl Broker {
             .intents
             .insert(request.intent_id, (digest, request.conversation_id.clone()));
         registry.sessions.insert(request.conversation_id, entry);
-        Ok(info)
+        Ok((info, false))
     }
 
     fn lookup(&self, conversation: &str, instance: &str) -> Result<Arc<Entry>, &'static str> {
@@ -236,6 +236,46 @@ impl Broker {
             return Err("instance_mismatch");
         }
         Ok(Arc::clone(entry))
+    }
+
+    fn cancel_create(&self, conversation: &str, intent: &str) -> Result<(), &'static str> {
+        if !valid_id(conversation) || Uuid::parse_str(intent).is_err() {
+            return Err("invalid_spawn");
+        }
+        let mut registry = self.registry.lock().map_err(|_| "registry_unavailable")?;
+        if let Some((_, owner)) = registry.intents.get(intent) {
+            if owner != conversation {
+                return Err("intent_mismatch");
+            }
+        }
+        // Share CREATE's reservation and registry lock. Cancelling before
+        // CREATE reserves the intent permanently; cancelling afterwards only
+        // closes the process created by that intent, never its replacement.
+        let reservation = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(self.directory.join("intents").join(intent));
+        match reservation {
+            Ok(file) => {
+                if registry.persisted_intents >= MAX_INTENTS {
+                    drop(file);
+                    fs::remove_file(self.directory.join("intents").join(intent))
+                        .map_err(|_| "storage_unavailable")?;
+                    return Err("intent_limit");
+                }
+                registry.persisted_intents += 1;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(_) => return Err("storage_unavailable"),
+        }
+        if let Some(entry) = registry.sessions.get(conversation) {
+            if entry.intent_id == intent {
+                entry.session.close();
+            }
+        }
+        Ok(())
     }
 
     fn close(&self, conversation: &str, instance: &str) -> Result<(), &'static str> {
@@ -398,7 +438,7 @@ async fn handle_connection(mut stream: UnixStream, broker: Arc<Broker>) -> io::R
                 tokio::task::spawn_blocking(move || broker.create(request))
                     .await
                     .map_err(|_| io_error("create worker failed"))?
-                    .map(|info| Control::Session { info })
+                    .map(|(info, reconnected)| Control::Created { info, reconnected })
             }
             Control::Get { conversation_id } => broker
                 .registry
@@ -428,6 +468,18 @@ async fn handle_connection(mut stream: UnixStream, broker: Arc<Broker>) -> io::R
             } => broker
                 .close(&conversation_id, &session_instance_id)
                 .map(|()| Control::Ok),
+            Control::CancelCreate {
+                conversation_id,
+                intent_id,
+            } => {
+                let broker = Arc::clone(&broker);
+                tokio::task::spawn_blocking(move || {
+                    broker.cancel_create(&conversation_id, &intent_id)
+                })
+                .await
+                .map_err(|_| io_error("cancel worker failed"))?
+                .map(|()| Control::Ok)
+            }
             Control::Resize {
                 conversation_id,
                 session_instance_id,

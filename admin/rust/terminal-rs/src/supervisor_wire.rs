@@ -9,6 +9,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const VERSION: u16 = 1;
 pub const MAX_FRAME: usize = 1024 * 1024;
 
+#[must_use]
+pub fn valid_instance_id(value: &str) -> bool {
+    uuid::Uuid::parse_str(value).is_ok()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SpawnRequest {
     pub intent_id: String,
@@ -55,6 +60,10 @@ pub enum Control {
     Session {
         info: SessionInfo,
     },
+    Created {
+        info: SessionInfo,
+        reconnected: bool,
+    },
     Sessions {
         sessions: Vec<SessionInfo>,
     },
@@ -83,6 +92,10 @@ pub enum Control {
     Close {
         conversation_id: String,
         session_instance_id: String,
+    },
+    CancelCreate {
+        conversation_id: String,
+        intent_id: String,
     },
     Ok,
     ReplayEnd {

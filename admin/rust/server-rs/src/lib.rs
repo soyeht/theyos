@@ -171,6 +171,7 @@ pub mod setup_invitation;
 pub mod shutdown;
 pub mod startup_wiring;
 pub mod state;
+pub mod supervised_terminals;
 pub mod tailnet_address;
 pub mod test_helpers;
 pub mod time_util;

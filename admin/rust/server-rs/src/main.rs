@@ -287,6 +287,22 @@ async fn main() {
     info!("conversation log dir: {}", conv_dir.display());
 
     let pty_mgr = Arc::new(PtyManager::new(&ssh_ctl, conv_dir));
+    let local_pty_supervisor = std::env::var_os("THEYOS_PTY_SUPERVISOR_SOCKET").map(|value| {
+        let path = PathBuf::from(value);
+        assert!(
+            path.is_absolute(),
+            "THEYOS_PTY_SUPERVISOR_SOCKET must be absolute"
+        );
+        terminal_rs::supervisor_client::SupervisorClient::new(path)
+    });
+    info!(
+        backend = if local_pty_supervisor.is_some() {
+            "supervisor"
+        } else {
+            "legacy"
+        },
+        "local_pty.backend"
+    );
     info!("PTY manager: ctl={}", ssh_ctl);
 
     let vm_runner = Arc::new(VmRunner::from_env().expect("Failed to construct VmRunner from env"));
@@ -315,6 +331,7 @@ async fn main() {
         rate_limiter: Arc::new(rate_limiter),
         executor: Arc::new(Mutex::new(executor)),
         pty_mgr,
+        local_pty_supervisor,
         vm_runner,
         mobile_tokens,
         mobile_sessions,

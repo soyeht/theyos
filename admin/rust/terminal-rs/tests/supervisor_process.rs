@@ -111,7 +111,7 @@ async fn cancelling_service_closes_workers_before_releasing_ownership() {
     )
     .await
     .unwrap();
-    let Control::Session { info } = control(&mut stream).await else {
+    let Control::Created { info, .. } = control(&mut stream).await else {
         panic!("session expected");
     };
     service.abort();
@@ -202,7 +202,7 @@ fn spawn_request() -> SpawnRequest {
 }
 
 async fn create(daemon: &Daemon, request: SpawnRequest) -> SessionInfo {
-    let Control::Session { info } = daemon.request(Control::Create { request }).await else {
+    let Control::Created { info, .. } = daemon.request(Control::Create { request }).await else {
         panic!("create failed")
     };
     info
@@ -505,6 +505,72 @@ async fn consumed_intent_survives_supervisor_restart_without_respawning() {
         .request(Control::Close {
             conversation_id: fresh.conversation_id,
             session_instance_id: fresh.session_instance_id,
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn cancellation_fences_both_create_orders_without_closing_a_replacement() {
+    let daemon = Daemon::start().await;
+    let request = spawn_request();
+    let cancel = Control::CancelCreate {
+        conversation_id: request.conversation_id.clone(),
+        intent_id: request.intent_id.clone(),
+    };
+    for _ in 0..2 {
+        assert!(matches!(daemon.request(cancel.clone()).await, Control::Ok));
+    }
+    assert!(matches!(daemon.request(Control::Create { request }).await,
+        Control::Error { code } if code == "intent_consumed"));
+    let first_request = spawn_request();
+    let first = create(&daemon, first_request.clone()).await;
+    let cancel_first = Control::CancelCreate {
+        conversation_id: first.conversation_id.clone(),
+        intent_id: first.intent_id.clone(),
+    };
+    assert!(matches!(
+        daemon.request(cancel_first.clone()).await,
+        Control::Ok
+    ));
+    assert!(
+        matches!(daemon.request(Control::Create { request: first_request }).await,
+        Control::Error { code } if code == "intent_consumed")
+    );
+    let replacement = create(&daemon, spawn_request()).await;
+    let replacement_identity = process_identity(replacement.pid);
+    // Neither a duplicate old cancellation nor one that never created a
+    // process may choose the current process merely by conversation ID.
+    for cancellation in [
+        cancel_first,
+        cancel,
+        Control::CancelCreate {
+            conversation_id: replacement.conversation_id.clone(),
+            intent_id: Uuid::new_v4().to_string(),
+        },
+    ] {
+        assert!(matches!(daemon.request(cancellation).await, Control::Ok));
+        let Control::Session { info } = daemon
+            .request(Control::Get {
+                conversation_id: replacement.conversation_id.clone(),
+            })
+            .await
+        else {
+            panic!("replacement disappeared")
+        };
+        assert!(!info.closed);
+        assert_eq!(info.session_instance_id, replacement.session_instance_id);
+        assert_eq!(process_identity(info.pid), replacement_identity);
+    }
+    assert_eq!(
+        std::fs::read_dir(daemon.state.join("intents"))
+            .unwrap()
+            .count(),
+        4
+    );
+    daemon
+        .request(Control::Close {
+            conversation_id: replacement.conversation_id,
+            session_instance_id: replacement.session_instance_id,
         })
         .await;
 }

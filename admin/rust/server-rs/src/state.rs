@@ -48,6 +48,9 @@ pub struct AppState {
     // ── Phase 3 ──────────────────────────────────────────────────────────
     /// PTY manager — real OS PTY sessions via pty-process.
     pub pty_mgr: Arc<PtyManager>,
+    /// Explicit migration backend. When configured, transport failure must
+    /// never fall back to engine-owned local PTYs. VM PTYs still use pty_mgr.
+    pub local_pty_supervisor: Option<terminal_rs::supervisor_client::SupervisorClient>,
     /// VM runner — lifecycle ops (restart, `fetch_logs`) via firecracker.
     pub vm_runner: Arc<VmRunner>,
 
