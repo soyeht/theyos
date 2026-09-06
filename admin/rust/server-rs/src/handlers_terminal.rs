@@ -612,7 +612,10 @@ pub(crate) async fn serve_authorized_terminal_pty(
     // v2: persist log_path in DB on first lazy-open so diagnostics can find it.
     {
         let sid = session_id.clone();
-        let log_path = sess.log().path().to_string_lossy().into_owned();
+        let Some(log) = sess.log() else {
+            return ApiError::internal("legacy PTY requires legacy log".to_string()).into_response();
+        };
+        let log_path = log.path().to_string_lossy().into_owned();
         let st = Arc::clone(&state);
         tokio::task::spawn_blocking(move || {
             let _ = st.instance_db.set_conversation_log_path(&sid, &log_path);
@@ -928,7 +931,9 @@ async fn serve_pty_websocket(
     let mut rx = sess.subscribe();
 
     // ── Step 2: snapshot cursor from atomic size counter ──
-    let log = sess.log();
+    let Some(log) = sess.log() else {
+        return;
+    };
     let mut cursor = log.current_size();
 
     // ── Step 3: replay_start marker ──

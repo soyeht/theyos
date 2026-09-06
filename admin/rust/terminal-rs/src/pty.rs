@@ -386,6 +386,41 @@ fn read_retrying_eintr<R: Read>(mut reader: R, buf: &mut [u8]) -> io::Result<usi
 
 // ── PtySession ────────────────────────────────────────────────────────────
 
+#[derive(Clone)]
+enum SessionLog {
+    Legacy(Arc<ConversationLog>),
+    Segmented(Arc<crate::segmented_log::SegmentedLog>),
+}
+
+impl SessionLog {
+    fn append(&self, bytes: &[u8]) -> io::Result<u64> {
+        match self {
+            Self::Legacy(log) => log.append(bytes),
+            Self::Segmented(log) => {
+                let result = log.append(bytes)?;
+                if let Some(error) = result.retention_error {
+                    tracing::warn!(%error, "ptyd.log.retention_failed");
+                }
+                Ok(result.end_offset)
+            }
+        }
+    }
+
+    fn remove(&self) {
+        if let Self::Legacy(log) = self {
+            log.remove();
+        }
+        // Supervisor logs are retained by instance; explicit archive GC owns
+        // their removal, independently of closing a PTY.
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SessionCompletion {
+    pub exit_code: Option<i32>,
+    pub log_write_failed: bool,
+}
+
 pub struct PtySession {
     /// PTY master fd — shared between writer (tokio tasks) and reader thread.
     pty: Arc<pty_process::blocking::Pty>,
@@ -394,12 +429,13 @@ pub struct PtySession {
     /// first, so exactly one of them reaps it — never both.
     child: Mutex<Option<std::process::Child>>,
     /// Append-only conversation log + size counter (source of truth).
-    log: Arc<ConversationLog>,
+    log: SessionLog,
+    completion: Mutex<Option<SessionCompletion>>,
     /// Serializes PTY writes from multiple WS clients. POSIX write atomicity
     /// is only guaranteed up to `PIPE_BUF` (512 bytes) on pipes and is NOT
     /// guaranteed on PTYs — so two clients pasting simultaneously would
     /// interleave bytes at the kernel boundary without this lock.
-    write_lock: tokio::sync::Mutex<()>,
+    write_lock: Arc<tokio::sync::Mutex<()>>,
     /// Broadcast of `(end_offset, chunk)` — subscribers use the offset to
     /// de-duplicate against the replay they already streamed from the log.
     tx: tokio::sync::broadcast::Sender<(u64, Arc<[u8]>)>,
@@ -417,6 +453,7 @@ pub struct PtySession {
     /// child's own pid — verified via syscall here rather than assumed, so
     /// it stays correct if that ever changes upstream.
     pgid: i32,
+    child_pid: u32,
     /// Working directory the child was spawned with. Resolves to the
     /// engine's own cwd at spawn time when the caller didn't specify one
     /// (guest sessions never do; local sessions do via `LocalSpawnSpec::cwd`).
@@ -435,10 +472,21 @@ impl PtySession {
         if self.closed.load(Ordering::SeqCst) {
             return Err(TerminalError::Other("pty session is closed".to_string()));
         }
-        let _guard = self.write_lock.lock().await;
-        (&*self.pty)
-            .write_all(data)
-            .map_err(|e| TerminalError::Other(e.to_string()))
+        let guard = Arc::clone(&self.write_lock).lock_owned().await;
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(TerminalError::Other("pty session is closed".to_string()));
+        }
+        let pty = Arc::clone(&self.pty);
+        let bytes = data.to_vec();
+        tokio::task::spawn_blocking(move || {
+            // Cancellation of the async caller must not release serialization
+            // while its blocking write still owns the PTY.
+            let _guard = guard;
+            (&*pty).write_all(&bytes)
+        })
+        .await
+        .map_err(|e| TerminalError::Other(e.to_string()))?
+        .map_err(|e| TerminalError::Other(e.to_string()))
     }
 
     /// Resize the PTY window and update tracked dimensions.
@@ -469,8 +517,21 @@ impl PtySession {
     /// Reference to the conversation log. Used by WS attach handler to
     /// stream replay bytes before entering the live broadcast forward loop.
     #[must_use]
-    pub fn log(&self) -> Arc<ConversationLog> {
-        Arc::clone(&self.log)
+    pub fn log(&self) -> Option<Arc<ConversationLog>> {
+        match &self.log {
+            SessionLog::Legacy(log) => Some(Arc::clone(log)),
+            SessionLog::Segmented(_) => None,
+        }
+    }
+
+    /// Present only after the reader has drained the final output. Calling
+    /// close is not itself an exit notification: more output may still arrive.
+    #[must_use]
+    pub fn completion(&self) -> Option<SessionCompletion> {
+        self.completion
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Subscribe to the live broadcast. Each message is `(end_offset, bytes)`
@@ -497,6 +558,11 @@ impl PtySession {
     #[must_use]
     pub fn pgid(&self) -> i32 {
         self.pgid
+    }
+
+    #[must_use]
+    pub fn child_pid(&self) -> u32 {
+        self.child_pid
     }
 
     /// Working directory the child was spawned with.
@@ -705,7 +771,7 @@ pub fn start_pty_session(
         pty,
         child,
         conv_id,
-        log,
+        SessionLog::Legacy(Arc::clone(log)),
         SpawnMeta {
             cols,
             rows,
@@ -792,6 +858,34 @@ pub fn start_pty_session_local(
     cols: u16,
     rows: u16,
 ) -> Result<Arc<PtySession>, TerminalError> {
+    start_local_with_log(
+        spec,
+        conv_id,
+        SessionLog::Legacy(Arc::clone(log)),
+        cols,
+        rows,
+    )
+}
+
+/// Uses the same PTY spawn, job control, drain and reap implementation as the
+/// legacy engine, with output owned exclusively by the supervisor's log.
+pub fn start_supervised_session(
+    spec: &LocalSpawnSpec,
+    conv_id: &str,
+    log: Arc<crate::segmented_log::SegmentedLog>,
+    cols: u16,
+    rows: u16,
+) -> Result<Arc<PtySession>, TerminalError> {
+    start_local_with_log(spec, conv_id, SessionLog::Segmented(log), cols, rows)
+}
+
+fn start_local_with_log(
+    spec: &LocalSpawnSpec,
+    conv_id: &str,
+    log: SessionLog,
+    cols: u16,
+    rows: u16,
+) -> Result<Arc<PtySession>, TerminalError> {
     let (program, args) = spec
         .argv
         .split_first()
@@ -854,24 +948,27 @@ fn wire_pty_session(
     pty: pty_process::blocking::Pty,
     child: std::process::Child,
     conv_id: &str,
-    log: &Arc<ConversationLog>,
+    log: SessionLog,
     meta: SpawnMeta,
 ) -> Arc<PtySession> {
     let conv_id_owned = conv_id.to_string();
     let pty = Arc::new(pty);
-    let pgid = child_pgid(child.id());
+    let child_pid = child.id();
+    let pgid = child_pgid(child_pid);
     let (tx, _) = tokio::sync::broadcast::channel::<(u64, Arc<[u8]>)>(BROADCAST_CAP);
 
     let session = Arc::new(PtySession {
         pty: Arc::clone(&pty),
         child: Mutex::new(Some(child)),
-        log: Arc::clone(log),
-        write_lock: tokio::sync::Mutex::new(()),
+        log,
+        completion: Mutex::new(None),
+        write_lock: Arc::new(tokio::sync::Mutex::new(())),
         tx,
         closed: AtomicBool::new(false),
         size: Mutex::new((meta.cols, meta.rows)),
         slave_tty_path: meta.tty_path,
         pgid,
+        child_pid,
         cwd: meta.cwd,
     });
 
@@ -879,6 +976,7 @@ fn wire_pty_session(
     let session_weak = Arc::downgrade(&session);
     std::thread::spawn(move || {
         let mut buf = [0u8; READ_CHUNK];
+        let mut log_write_failed = false;
         loop {
             // `read_retrying_eintr` absorbs EINTR internally, so any `Err`
             // observed here is a genuine fatal I/O error (never a signal
@@ -895,6 +993,7 @@ fn wire_pty_session(
                             let _ = sess.tx.send((end, chunk));
                         }
                         Err(e) => {
+                            log_write_failed = true;
                             // `append` rotates instead of ever returning a
                             // cap-hit error (see `ConversationLog::append`),
                             // so this is a genuine disk/IO failure — the
@@ -920,9 +1019,16 @@ fn wire_pty_session(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take();
-            if let Some(mut child) = child {
-                let _ = child.wait();
-            }
+            let exit_code = child
+                .and_then(|mut child| child.wait().ok())
+                .and_then(|status| status.code());
+            *sess
+                .completion
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(SessionCompletion {
+                exit_code,
+                log_write_failed,
+            });
             sess.closed.store(true, Ordering::SeqCst);
         }
     });
@@ -1804,7 +1910,9 @@ mod tests {
                 ok,
                 "append must succeed (accepting the oversized write), not error"
             ),
-            Err(_) => panic!("append() did not return within 2s — infinite loop regression"),
+            Err(error) => {
+                panic!("append() did not return within 2s — infinite loop regression: {error}")
+            }
         }
     }
 

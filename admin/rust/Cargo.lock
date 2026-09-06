@@ -5625,6 +5625,8 @@ name = "terminal-rs"
 version = "0.1.30"
 dependencies = [
  "base64 0.22.1",
+ "blake3",
+ "ciborium",
  "core-rs",
  "crc32fast",
  "fs2",
@@ -5632,11 +5634,14 @@ dependencies = [
  "pty-process",
  "rustix 1.1.4",
  "serde",
+ "serde_bytes",
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

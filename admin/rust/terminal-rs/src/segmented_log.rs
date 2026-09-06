@@ -94,7 +94,16 @@ pub struct SegmentedLog {
     limits: LogLimits,
     state: Mutex<State>,
     // Never unlink: replacing a locked inode would allow a second writer.
-    _writer_lock: File,
+    writer_lock: File,
+}
+
+impl Drop for SegmentedLog {
+    fn drop(&mut self) {
+        // Closing this descriptor alone may leave the lock held by a copy
+        // inherited during a concurrent fork/exec. Release ownership explicitly
+        // while retaining the inode, so reopening does not spuriously fail.
+        let _ = LockFileExt::unlock(&self.writer_lock);
+    }
 }
 
 fn invalid(message: &str) -> io::Error {
@@ -132,6 +141,8 @@ impl SegmentedLog {
             .recursive(true)
             .mode(0o700)
             .create(directory)?;
+        // Rust OpenOptions keeps O_CLOEXEC when adding custom O_NOFOLLOW.
+        // Both are required: spawned shells must not retain the writer lock.
         let writer_lock = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -202,7 +213,7 @@ impl SegmentedLog {
                 physical_bytes,
                 write_failed: false,
             }),
-            _writer_lock: writer_lock,
+            writer_lock,
         })
     }
 
@@ -708,5 +719,18 @@ mod tests {
         drop(log);
         let log = SegmentedLog::open(dir.path(), limits()).unwrap();
         assert_eq!(log.bounds().unwrap(), (base, end));
+    }
+
+    #[test]
+    fn dropping_writer_releases_lock_even_with_a_duplicated_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = SegmentedLog::open(dir.path(), limits()).unwrap();
+        // Models a descriptor inherited during another thread's fork/exec
+        // window. Close-on-exec does not close it until that exec happens.
+        let inherited = log.writer_lock.try_clone().unwrap();
+        drop(log);
+        let reopened = SegmentedLog::open(dir.path(), limits());
+        assert!(reopened.is_ok(), "owner drop must explicitly unlock");
+        drop(inherited);
     }
 }

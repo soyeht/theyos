@@ -17,6 +17,11 @@ base64 = { workspace = true }
 libc = { workspace = true }
 fs2 = { workspace = true }
 crc32fast = "1.5"
+ciborium = { workspace = true }
+serde_bytes = { workspace = true }
+blake3 = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
+tracing-subscriber = { workspace = true }
 # Direct dep (not just transitive via pty-process) so we can call
 # `ptsname()` (feature = "alloc", not enabled by pty-process itself) to
 # expose the PTY slave device path as session metadata (E5). Version
@@ -30,6 +35,10 @@ tempfile = { workspace = true }
 [[bin]]
 name = "terminal-ipc"
 path = "src/bin/terminal_ipc.rs"
+
+[[bin]]
+name = "soyeht-ptyd"
+path = "src/bin/soyeht_ptyd.rs"
 
 [lints]
 workspace = true
