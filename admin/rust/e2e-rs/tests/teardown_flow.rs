@@ -173,8 +173,13 @@ fn make_app(fix: &Fixture) -> Router {
         ),
         started_at: Instant::now(),
         setup_invitation_cache: server_rs::setup_invitation::new_cache(),
-        engine_port: 8091,
-        tailnet_resolver: || None,
+        // `7cf140ac` replaced the loose (port, resolver) pair with one
+        // `PairingInstallation` that carries the profile too, so a Dev engine
+        // can no longer be mistaken for a release one. These scenarios were
+        // not updated with it and the whole workspace stopped compiling its
+        // tests — found on 2026-09-06 while cutting 0.1.30.
+        installation: server_rs::pairing_addresses::PairingInstallation::new("release".into(), 8091),
+        invitation_verifier: server_rs::setup_invitation::callback_verify_blocking,
         phase3_runtime: None,
         pair_code_rate_limiter: None,
     };
