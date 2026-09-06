@@ -131,6 +131,7 @@ fn fixture_with_supervisor(
         role: store_rs::UserRole::User,
     };
     let app = Router::new()
+        .route("/api/v1/version", get(server_rs::handlers_misc::handle_version))
         .route(
             "/api/v1/terminals/local",
             get(handle_local_terminal_list).post(handle_local_terminal_create),
@@ -423,13 +424,19 @@ async fn supervisor_http_contract_preserves_sessions_and_fences_stale_mutations(
     // the independent owner remains. This is not an engine-process kill test.
     drop(server);
     drop(state);
-    let (app, _) = fixture_with_supervisor(Some(client));
+    let prior_broker_boot_id = client.status().await.unwrap().broker_boot_id;
+    let (app, _) = fixture_with_supervisor(Some(client.clone()));
     let server = TestServer::builder().http_transport().build(app).unwrap();
     let restored: serde_json::Value = server.get(path).await.json();
     assert_eq!(restored["pid"], first["pid"]);
     assert_eq!(restored["session_instance_id"], instance);
     if let Some(exchange) = exchange {
-        let result = serde_json::json!({"created": first, "restored": restored, "attached": attached, "frames": frames});
+        let engine: serde_json::Value = server.get("/api/v1/version").await.json();
+        let result = serde_json::json!({
+            "created": first, "restored": restored, "attached": attached, "frames": frames,
+            "engine": engine, "expected_artifact": server_rs::engine_artifact::current(),
+            "supervisor": client.status().await.unwrap(), "prior_broker_boot_id": prior_broker_boot_id,
+        });
         std::fs::write(
             exchange.join("response.json"),
             serde_json::to_vec(&result).unwrap(),

@@ -94,6 +94,11 @@ async fn main() {
     // install flow (bootstrap + emit pair-receiving QR) and exit. The daemon
     // is started separately by launchd/systemd without a subcommand.
     let argv: Vec<String> = std::env::args().collect();
+    if argv.len() == 2 && argv[1] == "--build-info" {
+        println!("{}", serde_json::to_string(&server_rs::engine_artifact::current())
+            .expect("engine artifact metadata must serialize"));
+        return;
+    }
     if argv.len() >= 2 && (argv[1] == "--version" || argv[1] == "-V") {
         println!("{}", env!("CARGO_PKG_VERSION"));
         std::process::exit(0);

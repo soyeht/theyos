@@ -78,6 +78,51 @@ fn spawn_daemon(socket: &Path, state: &Path) -> Child {
 }
 
 #[tokio::test]
+async fn installation_status_is_read_only_and_fails_when_daemon_is_absent() {
+    use terminal_rs::supervisor_client::SupervisorStatus;
+    let mut daemon = Daemon::start().await;
+    let session = create(&daemon, issued_request(&daemon).await).await;
+    let probe = || {
+        Command::new(env!("CARGO_BIN_EXE_soyeht-ptyd"))
+            .args(["--status", "--socket"])
+            .arg(&daemon.socket)
+            .output()
+            .unwrap()
+    };
+    let first = probe();
+    assert!(first.status.success());
+    let first: SupervisorStatus = serde_json::from_slice(&first.stdout).unwrap();
+    let second = probe();
+    assert!(second.status.success());
+    let second: SupervisorStatus = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(first.protocol_version, wire::VERSION);
+    assert_eq!(first.broker_boot_id, second.broker_boot_id);
+    assert_eq!(first.live_sessions, 1);
+    assert_eq!(second.live_sessions, 1);
+    assert!(daemon.child.try_wait().unwrap().is_none());
+    match daemon
+        .request(Control::Get {
+            conversation_id: session.conversation_id,
+        })
+        .await
+    {
+        Control::Session { info } => {
+            assert_eq!(info.session_instance_id, session.session_instance_id);
+            assert_eq!(info.pid, session.pid);
+        }
+        other => panic!("probe changed the session: {other:?}"),
+    }
+    daemon.child.kill().unwrap();
+    daemon.child.wait().unwrap();
+    let absent = probe();
+    assert!(!absent.status.success());
+    assert!(
+        absent.stdout.is_empty(),
+        "unavailable must not fabricate a zero-session status"
+    );
+}
+
+#[tokio::test]
 async fn cancelling_service_closes_workers_before_releasing_ownership() {
     let root = tempfile::Builder::new()
         .prefix("ptyd-")

@@ -74,6 +74,8 @@ pub async fn handle_version(State(state): State<SharedState>) -> Result<Json<Val
     Ok(Json(json!({
         "version": version,
         "update_available": cache.update_available,
+        "artifact": crate::engine_artifact::current(),
+        "terminal_backend": if state.local_pty_supervisor.is_some() { "supervisor" } else { "legacy" },
     })))
 }
 

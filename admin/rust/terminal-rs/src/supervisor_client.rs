@@ -33,6 +33,15 @@ pub struct SupervisorClient {
     socket: PathBuf,
 }
 
+/// Read-only installation probe. Identity and inventory come from the same
+/// connection, so a restart between two RPCs cannot combine two brokers.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct SupervisorStatus {
+    pub protocol_version: u16,
+    pub broker_boot_id: String,
+    pub live_sessions: usize,
+}
+
 pub struct AttachedStream {
     pub stream: UnixStream,
     pub info: SessionInfo,
@@ -47,6 +56,10 @@ impl SupervisorClient {
     }
 
     async fn connect(&self) -> Result<UnixStream, ClientError> {
+        self.connect_identified().await.map(|(stream, _)| stream)
+    }
+
+    async fn connect_identified(&self) -> Result<(UnixStream, String), ClientError> {
         let mut stream = UnixStream::connect(&self.socket).await?;
         wire::send_control(
             &mut stream,
@@ -62,9 +75,10 @@ impl SupervisorClient {
                 message:
                     Control::Welcome {
                         selected_version: wire::VERSION,
+                        broker_boot_id,
                         ..
                     },
-            } => Ok(stream),
+            } if wire::valid_instance_id(&broker_boot_id) => Ok((stream, broker_boot_id)),
             Frame::Control {
                 message: Control::Error { code },
                 ..
@@ -75,6 +89,31 @@ impl SupervisorClient {
             } => Err(ClientError::Rejected(code)),
             _ => Err(ClientError::Protocol),
         }
+    }
+
+    /// Never starts a daemon, emits a ticket, or changes a session.
+    pub async fn status(&self) -> Result<SupervisorStatus, ClientError> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (mut stream, broker_boot_id) = self.connect_identified().await?;
+            wire::send_control(&mut stream, 2, Control::List).await?;
+            match wire::read_frame(&mut stream).await? {
+                Frame::Control {
+                    id: 2,
+                    message: Control::Sessions { sessions },
+                } => Ok(SupervisorStatus {
+                    protocol_version: wire::VERSION,
+                    broker_boot_id,
+                    live_sessions: sessions.iter().filter(|session| !session.closed).count(),
+                }),
+                Frame::Control {
+                    id: 2,
+                    message: Control::Error { code },
+                } => Err(ClientError::Rejected(code)),
+                _ => Err(ClientError::Protocol),
+            }
+        })
+        .await
+        .map_err(|_| ClientError::Timeout)?
     }
 
     /// Exactly one attempt. In particular, WRITE must never be retried after
