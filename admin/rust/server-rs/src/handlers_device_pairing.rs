@@ -494,6 +494,14 @@ async fn device_pairing_request_inner(
         }
     }
 
+    // Correlate request and approval without logging the poll token, device
+    // key, name, or raw request identifier. Acceptance is not completed pairing.
+    tracing::info!(
+        stage = "device_pairing.request.success",
+        request_digest = %blake3::hash(request_id.as_bytes()).to_hex(),
+        deduplicated = !should_emit_event,
+        expires_at_unix = expires_at,
+    );
     Json(DevicePairingRequestResponse {
         version: 1,
         request_id,
@@ -751,7 +759,15 @@ pub async fn device_pairing_approve_handler(
         .device_pairing_store
         .approve(&request.request_id, certificate, approved, now)
     {
-        Ok(()) => Json(DevicePairingApproveResponse { version: 1 }).into_response(),
+        Ok(()) => {
+            // The store accepted the verified certificate. The phone must
+            // still retrieve, validate and persist it before pairing is done.
+            tracing::info!(
+                stage = "device_pairing.approve.success",
+                request_digest = %blake3::hash(request.request_id.as_bytes()).to_hex(),
+            );
+            Json(DevicePairingApproveResponse { version: 1 }).into_response()
+        }
         Err(DevicePairingStoreError::NotFound) => {
             sanitized_error(StatusCode::NOT_FOUND, "device_pairing_request_not_found")
         }
