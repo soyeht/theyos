@@ -2487,7 +2487,7 @@ pub async fn bootstrap_household(
             Arc::clone(&pair_device_window),
             Arc::clone(&pair_machine_window),
             Arc::clone(&local_network_visibility),
-            initial_bound,
+            bound_set.clone(),
             port,
         )
         .await;
@@ -2496,7 +2496,7 @@ pub async fn bootstrap_household(
             pair_device_window: Arc::clone(&pair_device_window),
             pair_machine_window: Arc::clone(&pair_machine_window),
             local_network_visibility: Arc::clone(&local_network_visibility),
-            targets: initial_bound,
+            targets: bound_set,
             port,
             claw_share: Some(claw_share_runtime),
             phase3_runtime: phase3_runtime.clone(),
@@ -2549,26 +2549,15 @@ async fn publish_household_bonjour_for_identity(
     pair_device_window: Arc<household_rs::pair_device::PairDeviceWindow>,
     pair_machine_window: Arc<household_rs::pair_machine::PairMachineWindow>,
     local_network_visibility: Arc<crate::local_network_visibility::LocalNetworkVisibility>,
-    targets: Vec<(IpAddr, InterfaceClass)>,
+    targets: household_listener::BoundSet,
     port: u16,
 ) {
-    if !targets
-        .iter()
-        .any(|(_, class)| *class != InterfaceClass::Loopback)
-    {
-        info!(
-            stage = "bonjour.skipped",
-            reason = "no_non_loopback_targets",
-            "household Bonjour publish skipped; no peer-reachable interface is bound"
-        );
-        return;
-    }
     let raw_hostname = gethostname::gethostname().to_string_lossy().into_owned();
     let host_label = raw_hostname.replace(['.', ' '], "-");
     // Read current bootstrap state for the TXT enrichment field.
-    let bootstrap_state = global_bootstrap_state().map_or(BootstrapState::Ready, |arc| {
-        *arc.try_read().unwrap_or_else(|_| arc.blocking_read())
-    });
+    let bootstrap_state_source = global_bootstrap_state()
+        .unwrap_or_else(|| Arc::new(tokio::sync::RwLock::new(BootstrapState::Ready)));
+    let bootstrap_state = *bootstrap_state_source.read().await;
     let bs_str = bootstrap_state.as_str().to_string();
     let params = bonjour_publisher::PublishParams {
         hh_id: loaded.record.hh_id.to_string(),
@@ -2590,7 +2579,7 @@ async fn publish_household_bonjour_for_identity(
         pair_machine_window,
         local_network_visibility,
         targets,
-        bootstrap_state,
+        bootstrap_state_source,
     )
     .await
     {
@@ -2615,7 +2604,7 @@ struct HouseholdIdentityWatcherDeps {
     /// publish that happens after a hot-load observes the same two facts the
     /// listener binds on, rather than only the token half.
     local_network_visibility: Arc<crate::local_network_visibility::LocalNetworkVisibility>,
-    targets: Vec<(IpAddr, InterfaceClass)>,
+    targets: household_listener::BoundSet,
     port: u16,
     claw_share: Option<ClawShareRuntimeHandles>,
     phase3_runtime: Phase3RuntimeController,
@@ -4881,7 +4870,7 @@ mod tests {
                 local_network_visibility: Arc::new(
                     crate::local_network_visibility::LocalNetworkVisibility::new(),
                 ),
-                targets: Vec::new(),
+                targets: household_listener::BoundSet::default(),
                 port: 8091,
                 claw_share: None,
                 phase3_runtime,
