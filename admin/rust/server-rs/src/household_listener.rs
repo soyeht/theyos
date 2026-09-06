@@ -3459,3 +3459,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "pairing_cross_repo_bridge.rs"]
+mod pairing_cross_repo_bridge;

@@ -585,28 +585,9 @@ fn phase3_router(
                     "/api/v1/household/owner-events/{cursor}/decline",
                     axum::routing::post(handlers_owner_events::owner_decline_handler),
                 )
-                .route(
-                    "/api/v1/household/device-pairing/request",
-                    axum::routing::post(handlers_device_pairing::device_pairing_request_handler),
-                )
-                .route(
-                    "/api/v1/household/device-pairing/approve",
-                    axum::routing::post(handlers_device_pairing::device_pairing_approve_handler),
-                )
-                .route(
-                    "/api/v1/household/device-pairing/requests",
-                    axum::routing::get(handlers_device_pairing::device_pairing_requests_handler),
-                )
-                .route(
-                    "/api/v1/household/device-pairing/reject",
-                    axum::routing::post(handlers_device_pairing::device_pairing_reject_handler),
-                )
-                .route(
-                    "/api/v1/household/device-pairing/{request_id}",
-                    axum::routing::get(handlers_device_pairing::device_pairing_poll_handler),
-                )
-                .with_state(owner_events_state),
+                .with_state(owner_events_state.clone()),
         )
+        .merge(handlers_device_pairing::device_pairing_router(owner_events_state))
         // Owner passkey enrollment, and only enrollment, carries
         // `owner_webauthn_enrollment_state`. Adding a route here hands it the
         // RP and the anchor whenever THEYOS_OWNER_WEBAUTHN_NETWORK is open.
@@ -2114,20 +2095,11 @@ pub async fn bootstrap_household(
             state_dir: state_dir.clone(),
         });
 
-    let pair_router = axum::Router::new()
-        .route(
-            "/api/v1/household/pair-device/initiate",
-            axum::routing::post(handlers_pair_device::initiate),
-        )
-        .route(
-            "/api/v1/household/pair-device/confirm",
-            axum::routing::post(handlers_pair_device::confirm),
-        )
-        .with_state(handlers_pair_device::PairDeviceState {
-            window: Arc::clone(&pair_device_window),
-            household: identity_state.clone(),
-            state_dir: state_dir.clone(),
-        });
+    let pair_router = handlers_pair_device::pair_device_router(handlers_pair_device::PairDeviceState {
+        window: Arc::clone(&pair_device_window),
+        household: identity_state.clone(),
+        state_dir: state_dir.clone(),
+    });
 
     // ── Bootstrap router (T008 / T009 / T010 / T011) ─────────────────────
     // ── Bootstrap router (T008 / T009 / T010 / T011) ─────────────────────
@@ -3016,6 +2988,11 @@ mod tests {
         let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
         assert_eq!(production.matches("fn phase3_router(").count(), 1);
         assert!(!production.contains("pair_machine_router"));
+        let device_routes = include_str!("handlers_device_pairing.rs");
+        assert_eq!(
+            production.matches("handlers_device_pairing::device_pairing_router(owner_events_state)").count(),
+            1
+        );
         for path in [
             "/api/v1/household/join-request",
             "/api/v1/household/owner-events",
@@ -3043,7 +3020,11 @@ mod tests {
         ] {
             let literal = format!("\"{path}\"");
             assert_eq!(
-                production.matches(&literal).count(),
+                if path.contains("/device-pairing/") {
+                    device_routes.matches(&literal).count()
+                } else {
+                    production.matches(&literal).count()
+                },
                 1,
                 "Phase 3 path must be declared only by the single factory: {path}"
             );

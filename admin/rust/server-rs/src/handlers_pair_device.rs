@@ -669,3 +669,17 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 }
+
+/// Keep the first-owner route table identical in production and contract tests.
+pub fn pair_device_router(state: PairDeviceState) -> axum::Router {
+    axum::Router::new()
+        .route(
+            "/api/v1/household/pair-device/initiate",
+            axum::routing::post(initiate),
+        )
+        .route(
+            "/api/v1/household/pair-device/confirm",
+            axum::routing::post(confirm),
+        )
+        .with_state(state)
+}

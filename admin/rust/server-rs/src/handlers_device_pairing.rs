@@ -1180,3 +1180,31 @@ mod tests {
         assert!(decode_public_key("").is_err());
     }
 }
+
+/// Pairing routes shared by production and the cross-repository contract host.
+pub fn device_pairing_router(
+    state: crate::handlers_owner_events::OwnerEventsRouterState,
+) -> axum::Router {
+    axum::Router::new()
+        .route(
+            "/api/v1/household/device-pairing/request",
+            axum::routing::post(device_pairing_request_handler),
+        )
+        .route(
+            "/api/v1/household/device-pairing/approve",
+            axum::routing::post(device_pairing_approve_handler),
+        )
+        .route(
+            "/api/v1/household/device-pairing/requests",
+            axum::routing::get(device_pairing_requests_handler),
+        )
+        .route(
+            "/api/v1/household/device-pairing/reject",
+            axum::routing::post(device_pairing_reject_handler),
+        )
+        .route(
+            "/api/v1/household/device-pairing/{request_id}",
+            axum::routing::get(device_pairing_poll_handler),
+        )
+        .with_state(state)
+}
