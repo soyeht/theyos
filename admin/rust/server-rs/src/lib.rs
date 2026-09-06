@@ -127,6 +127,7 @@ pub mod household_auth;
 pub mod household_bootstrap;
 pub mod household_listener;
 pub mod pairing_addresses;
+mod pairing_device_certificate;
 pub mod household_state;
 pub mod install_cli;
 pub mod install_worker;

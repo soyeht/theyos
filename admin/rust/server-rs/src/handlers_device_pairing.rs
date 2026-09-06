@@ -28,6 +28,8 @@ use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use serde_json::json;
 
+use crate::pairing_device_certificate::VerifiedPairingDeviceCertificate;
+
 use crate::{handlers_owner_events::OwnerEventsRouterState, household_auth, time_util};
 
 const DEVICE_PAIRING_TTL_SECS: u64 = 300;
@@ -106,6 +108,7 @@ enum DevicePairingStoreError {
     TokenMismatch,
     Expired,
     AlreadyFinalized,
+    CertificateMismatch,
 }
 
 impl Default for DevicePairingStore {
@@ -203,7 +206,7 @@ impl DevicePairingStore {
     fn approve(
         &self,
         request_id: &str,
-        device_cert_cbor: Vec<u8>,
+        certificate: VerifiedPairingDeviceCertificate,
         approved: ApprovedPairing,
         now: u64,
     ) -> Result<(), DevicePairingStoreError> {
@@ -218,9 +221,17 @@ impl DevicePairingStore {
         if record.status != DevicePairingStatus::Pending {
             return Err(DevicePairingStoreError::AlreadyFinalized);
         }
+        // Bind the verified certificate under the same lock that finalizes
+        // this request. A delayed approval cannot select a different device.
+        if certificate.device_public_key != record.d_pub
+            || certificate.device_name != record.device_name
+            || certificate.platform != record.platform
+        {
+            return Err(DevicePairingStoreError::CertificateMismatch);
+        }
         record.status = DevicePairingStatus::Approved;
         record.approved = Some(ApprovedPairing {
-            device_cert_cbor,
+            device_cert_cbor: certificate.bytes,
             ..approved
         });
         Ok(())
@@ -704,6 +715,14 @@ pub async fn device_pairing_approve_handler(
         Ok(bytes) if !bytes.is_empty() && bytes.len() <= MAX_APPROVED_CERT_BYTES => bytes,
         _ => return sanitized_error(StatusCode::BAD_REQUEST, "device_cert_invalid"),
     };
+    let certificate = match VerifiedPairingDeviceCertificate::verify(
+        device_cert_cbor,
+        &owner_auth.owner_person_cert,
+        now,
+    ) {
+        Ok(certificate) => certificate,
+        Err(()) => return sanitized_error(StatusCode::BAD_REQUEST, "device_cert_invalid"),
+    };
     let person_cert_cbor = match cbor::to_canonical_vec(&owner_auth.owner_person_cert) {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -730,7 +749,7 @@ pub async fn device_pairing_approve_handler(
     };
     match state
         .device_pairing_store
-        .approve(&request.request_id, device_cert_cbor, approved, now)
+        .approve(&request.request_id, certificate, approved, now)
     {
         Ok(()) => Json(DevicePairingApproveResponse { version: 1 }).into_response(),
         Err(DevicePairingStoreError::NotFound) => {
@@ -741,6 +760,9 @@ pub async fn device_pairing_approve_handler(
         }
         Err(DevicePairingStoreError::AlreadyFinalized) => {
             sanitized_error(StatusCode::CONFLICT, "device_pairing_request_finalized")
+        }
+        Err(DevicePairingStoreError::CertificateMismatch) => {
+            sanitized_error(StatusCode::CONFLICT, "device_cert_request_mismatch")
         }
         Err(_) => sanitized_error(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
     }
@@ -798,6 +820,8 @@ mod tests {
         DevicePairingStoreError, PendingInsert, decode_public_key, validate_device_name,
         validate_platform, validate_request_version,
     };
+
+    use crate::pairing_device_certificate::VerifiedPairingDeviceCertificate;
 
     const NOW: u64 = 1_700_000_000;
 
@@ -949,7 +973,12 @@ mod tests {
         };
 
         store
-            .approve(&request_id, vec![9, 9, 9], approved_fixture(), NOW)
+            .approve(
+                &request_id,
+                VerifiedPairingDeviceCertificate::store_fixture(vec![9, 9, 9], pubkey(1)),
+                approved_fixture(),
+                NOW,
+            )
             .expect("approve");
 
         // The device-cert bytes passed to approve override the fixture's
@@ -964,7 +993,12 @@ mod tests {
         }
 
         // A second finalize (approve or reject) must be refused.
-        let reapprove = store.approve(&request_id, vec![1], approved_fixture(), NOW);
+        let reapprove = store.approve(
+            &request_id,
+            VerifiedPairingDeviceCertificate::store_fixture(vec![1], pubkey(1)),
+            approved_fixture(),
+            NOW,
+        );
         assert_eq!(
             reapprove.unwrap_err(),
             DevicePairingStoreError::AlreadyFinalized
@@ -974,6 +1008,30 @@ mod tests {
             reject_after.unwrap_err(),
             DevicePairingStoreError::AlreadyFinalized
         );
+    }
+
+    #[test]
+    fn a_verified_certificate_for_another_request_does_not_finalize() {
+        let store = DevicePairingStore::new();
+        let PendingInsert::New {
+            request_id, token, ..
+        } = store
+            .create_or_dedupe_pending(pubkey(1), "alpha".into(), "ios".into(), NOW)
+            .unwrap()
+        else {
+            panic!("new request expected")
+        };
+        let wrong = VerifiedPairingDeviceCertificate::store_fixture(vec![9], pubkey(2));
+        assert_eq!(
+            store
+                .approve(&request_id, wrong, approved_fixture(), NOW)
+                .unwrap_err(),
+            DevicePairingStoreError::CertificateMismatch
+        );
+        assert!(matches!(
+            store.poll(&request_id, &token, NOW).unwrap(),
+            super::DevicePairingPollState::Pending
+        ));
     }
 
     #[test]
@@ -993,7 +1051,12 @@ mod tests {
         let state = store.poll(&request_id, &token, NOW).expect("poll rejected");
         assert!(matches!(state, super::DevicePairingPollState::Rejected));
 
-        let approve_after = store.approve(&request_id, vec![1], approved_fixture(), NOW);
+        let approve_after = store.approve(
+            &request_id,
+            VerifiedPairingDeviceCertificate::store_fixture(vec![1], pubkey(1)),
+            approved_fixture(),
+            NOW,
+        );
         assert_eq!(
             approve_after.unwrap_err(),
             DevicePairingStoreError::AlreadyFinalized
@@ -1014,7 +1077,12 @@ mod tests {
         // Expired records are cleaned up on access, so finalizing reports
         // the request as gone (NotFound) rather than Expired.
         let err = store
-            .approve(&request_id, vec![1], approved_fixture(), later)
+            .approve(
+                &request_id,
+                VerifiedPairingDeviceCertificate::store_fixture(vec![1], pubkey(1)),
+                approved_fixture(),
+                later,
+            )
             .expect_err("expired approve");
         assert_eq!(err, DevicePairingStoreError::NotFound);
     }
