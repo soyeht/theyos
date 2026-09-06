@@ -476,7 +476,14 @@ fn r1a7_enumerates_linked_targets_and_proves_zero_production_callers() {
     // would have changed the emoji a person compares across two screens with
     // nothing going red. One auto-discovered `[[test]]`-kind target; the
     // named `any()` below pins that the +1 is that file.
-    assert_eq!(targets.len(), 212, "Cargo target inventory changed");
+    // 212 + 1: `server-rs/tests/local_network_visibility_exposure.rs`, the
+    // exposure policy for the "Add iPhone" visibility window. It arrived with
+    // that slice and this number was NOT moved with it, so `v0.1.29` was
+    // tagged and published with this assertion already red — found on
+    // 2026-09-06 while cutting 0.1.30, by running the suite the release was
+    // about to ship. One auto-discovered `[[test]]`-kind target; the named
+    // `any()` below pins that the +1 is that file.
+    assert_eq!(targets.len(), 213, "Cargo target inventory changed");
     assert_eq!(
         targets.iter().filter(|target| target.kind == "bin").count(),
         // 50 + 2: both of `nat-probe-rs`'s entries are bin-kind. The test and
@@ -504,7 +511,11 @@ fn r1a7_enumerates_linked_targets_and_proves_zero_production_callers() {
         // are unaffected.
         //
         // 158 + 1: `emoji_code_vectors.rs`, likewise `[[test]]`-kind.
-        159
+        //
+        // 159 + 1: `local_network_visibility_exposure.rs` (see the total
+        // assert's own comment above) is `[[test]]`-kind — `bin`/`example`
+        // below are unaffected.
+        160
     );
     assert_eq!(
         targets
@@ -549,6 +560,12 @@ fn r1a7_enumerates_linked_targets_and_proves_zero_production_callers() {
             && target.kind == "test"
             && target.name == "emoji_code_vectors"
             && target.path == "household-rs/tests/emoji_code_vectors.rs"
+    }));
+    assert!(targets.iter().any(|target| {
+        target.package == "server-rs"
+            && target.kind == "test"
+            && target.name == "local_network_visibility_exposure"
+            && target.path == "server-rs/tests/local_network_visibility_exposure.rs"
     }));
     assert!(targets.iter().any(|target| {
         target.package == "m1-household-mesh-smoke-rs"
