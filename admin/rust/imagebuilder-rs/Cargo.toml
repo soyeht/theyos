@@ -1,6 +1,6 @@
 [package]
 name = "imagebuilder-rs"
-version = "0.1.29"
+version = "0.1.30"
 edition.workspace = true
 rust-version.workspace = true
 description = "Golden image check/rebuild and base snapshot management for theyOS (replaces build-golden-images.sh + rebuild-golden-images.sh)"

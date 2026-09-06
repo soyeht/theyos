@@ -21,6 +21,8 @@
 //! - 200 when invitation pending and source IP matches iPhone's Tailnet address
 //! - 200 when no invitation pending (guard not active — no `ConnectInfo` required)
 
+use server_rs::pairing_addresses::PairingInstallation;
+use std::io::Read;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -83,18 +85,29 @@ fn make_state_dir() -> PathBuf {
     dir
 }
 
-/// Default test resolver returns `None` so `mac_engine_url` is omitted
-/// from the ACK and existing assertions continue to hold.
-fn no_tailnet() -> Option<std::net::Ipv4Addr> {
-    None
+fn installation() -> PairingInstallation {
+    PairingInstallation::new("release".into(), 8091).unwrap()
 }
 
-/// Test resolver returning a privacy-safe Tailnet fixture. Matches
-/// `TailnetResolver`'s fn-pointer signature exactly, so the body is
-/// unconditionally `Some(_)`.
-#[allow(clippy::unnecessary_wraps)]
-fn fixed_tailnet_ip() -> Option<std::net::Ipv4Addr> {
-    Some(std::net::Ipv4Addr::new(100, 64, 0, 10))
+// Only transport is replaced: the response is decoded and verified by the
+// same production consumer. Production callback-address admission has its
+// own negative tests, including rejecting loopback callbacks.
+fn verify_test_iphone(
+    endpoint: &str,
+    token: &[u8; 32],
+    expected: &PairingInstallation,
+) -> Result<server_rs::setup_invitation::VerifiedInvitation, String> {
+    let response = ureq::post(&format!("http://{endpoint}/setup/verify"))
+        .timeout(std::time::Duration::from_secs(2))
+        .send_bytes(&[])
+        .map_err(|_| "callback_failed")?;
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .take(65_536)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "read_failed")?;
+    server_rs::setup_invitation::decode_verified_invitation(&bytes, token, expected, None)
 }
 
 fn make_state(bs: BootstrapState, state_dir: PathBuf) -> BootstrapHandlerState {
@@ -108,8 +121,11 @@ fn make_state(bs: BootstrapState, state_dir: PathBuf) -> BootstrapHandlerState {
         ),
         started_at: Instant::now(),
         setup_invitation_cache: server_rs::setup_invitation::new_cache(),
-        engine_port: 8091,
-        tailnet_resolver: no_tailnet,
+        installation: server_rs::pairing_addresses::PairingInstallation::new(
+            "release".into(),
+            8091,
+        ),
+        invitation_verifier: verify_test_iphone,
         phase3_runtime: None,
         pair_code_rate_limiter: None,
     }
@@ -119,6 +135,10 @@ fn make_state(bs: BootstrapState, state_dir: PathBuf) -> BootstrapHandlerState {
 
 /// Spawn a mock `POST /setup/verify` that echoes `valid_token` back (success).
 async fn spawn_mock_iphone_ok(valid_token: [u8; 32]) -> SocketAddr {
+    spawn_mock_iphone_with_apns(valid_token, None).await
+}
+
+async fn spawn_mock_iphone_with_apns(valid_token: [u8; 32], apns: Option<[u8; 32]>) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -129,10 +149,18 @@ async fn spawn_mock_iphone_ok(valid_token: [u8; 32]) -> SocketAddr {
             struct Resp {
                 v: u8,
                 token: ByteBuf,
+                installation: PairingInstallation,
+                expires_at: u64,
+                owner_display_name: String,
+                iphone_apns_token: Option<ByteBuf>,
             }
             let bytes = household_rs::cbor::to_canonical_vec(&Resp {
                 v: 1,
                 token: ByteBuf::from(valid_token.to_vec()),
+                installation: installation(),
+                expires_at: FAR_FUTURE,
+                owner_display_name: "Owner".into(),
+                iphone_apns_token: apns.map(|value| ByteBuf::from(value.to_vec())),
             })
             .unwrap_or_default();
             (
@@ -188,10 +216,12 @@ fn cbor_claim(token: &[u8]) -> Vec<u8> {
     struct Req<'a> {
         v: u8,
         token: &'a serde_bytes::Bytes,
+        installation: PairingInstallation,
     }
     household_rs::cbor::to_canonical_vec(&Req {
         v: 1,
         token: serde_bytes::Bytes::new(token),
+        installation: installation(),
     })
     .unwrap()
 }
@@ -201,10 +231,12 @@ fn cbor_claim_wrong_version(token: &[u8]) -> Vec<u8> {
     struct Req<'a> {
         v: u8,
         token: &'a serde_bytes::Bytes,
+        installation: PairingInstallation,
     }
     household_rs::cbor::to_canonical_vec(&Req {
         v: 99,
         token: serde_bytes::Bytes::new(token),
+        installation: installation(),
     })
     .unwrap()
 }
@@ -214,11 +246,13 @@ fn cbor_claim_with_apns(token: &[u8], apns: &[u8]) -> Vec<u8> {
     struct Req<'a> {
         v: u8,
         token: &'a serde_bytes::Bytes,
+        installation: PairingInstallation,
         iphone_apns_token: &'a serde_bytes::Bytes,
     }
     household_rs::cbor::to_canonical_vec(&Req {
         v: 1,
         token: serde_bytes::Bytes::new(token),
+        installation: installation(),
         iphone_apns_token: serde_bytes::Bytes::new(apns),
     })
     .unwrap()
@@ -233,6 +267,21 @@ fn cbor_initialize(name: &str) -> Vec<u8> {
     household_rs::cbor::to_canonical_vec(&Req { v: 1, name }).unwrap()
 }
 
+fn cbor_initialize_claim(name: &str) -> Vec<u8> {
+    #[derive(Serialize)]
+    struct Request<'a> {
+        v: u8,
+        name: &'a str,
+        claim_token: ByteBuf,
+    }
+    household_rs::cbor::to_canonical_vec(&Request {
+        v: 1,
+        name,
+        claim_token: ByteBuf::from(test_token().to_vec()),
+    })
+    .unwrap()
+}
+
 // ── HTTP call helpers ─────────────────────────────────────────────────────────
 
 async fn call_claim(state: BootstrapHandlerState, body: Vec<u8>) -> (StatusCode, Vec<u8>) {
@@ -240,6 +289,9 @@ async fn call_claim(state: BootstrapHandlerState, body: Vec<u8>) -> (StatusCode,
     let req = Request::builder()
         .method("POST")
         .uri("/bootstrap/claim-setup-invitation")
+        .extension(ConnectInfo::<SocketAddr>(
+            "127.0.0.1:43210".parse().unwrap(),
+        ))
         .header("content-type", "application/cbor")
         .body(Body::from(body))
         .unwrap();
@@ -287,6 +339,8 @@ struct ClaimAck {
     iphone_endpoint: String,
     owner_display_name: String,
     hh_id: Option<String>,
+    accepted_at: u64,
+    installation: PairingInstallation,
     #[serde(default)]
     mac_engine_url: Option<String>,
 }
@@ -315,6 +369,79 @@ fn write_pending_invitation(state_dir: &std::path::Path) {
         None,
     )
     .expect("persist_invitation must succeed in test");
+}
+
+#[tokio::test]
+async fn wrong_or_missing_profile_has_no_callback_or_persistent_effect() {
+    for requested in [
+        None,
+        PairingInstallation::new("dev".into(), 8101),
+        PairingInstallation::new("release".into(), 8101),
+    ] {
+        let dir = make_state_dir();
+        let mut state = make_state(BootstrapState::Uninitialized, dir.clone());
+        state.invitation_verifier = |_, _, _| panic!("profile failure reached callback");
+        #[derive(Serialize)]
+        struct Request {
+            v: u8,
+            token: ByteBuf,
+            installation: Option<PairingInstallation>,
+            iphone_endpoint: String,
+        }
+        let body = household_rs::cbor::to_canonical_vec(&Request {
+            v: 1,
+            token: ByteBuf::from(test_token().to_vec()),
+            installation: requested,
+            iphone_endpoint: "http://192.168.1.20:8123".into(),
+        })
+        .unwrap();
+        let (status, body) = call_claim(state, body).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(decode_err(&body).error, "profile_mismatch");
+        assert!(load_persisted_invitation(&dir).unwrap().is_none());
+    }
+}
+
+#[tokio::test]
+async fn network_peer_cannot_select_an_invitation_callback() {
+    let dir = make_state_dir();
+    let mut state = make_state(BootstrapState::Uninitialized, dir.clone());
+    state.invitation_verifier = |_, _, _| panic!("network peer reached callback");
+    let request = Request::builder()
+        .method("POST")
+        .uri("/bootstrap/claim-setup-invitation")
+        .extension(ConnectInfo::<SocketAddr>(
+            "100.64.0.10:43210".parse().unwrap(),
+        ))
+        .body(Body::from(cbor_claim(&test_token())))
+        .unwrap();
+    let response = bootstrap_router(state).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(load_persisted_invitation(&dir).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn retry_keeps_the_same_acceptance_receipt() {
+    let dir = make_state_dir();
+    let state = make_state(BootstrapState::Uninitialized, dir.clone());
+    let token = test_token();
+    let address = spawn_mock_iphone_ok(token).await;
+    populate_cache(&state, make_entry(token, &address.to_string(), FAR_FUTURE)).await;
+    let (first_status, first) = call_claim(state.clone(), cbor_claim(&token)).await;
+    let (second_status, second) = call_claim(state, cbor_claim(&token)).await;
+    assert_eq!(first_status, StatusCode::OK);
+    assert_eq!(second_status, StatusCode::OK);
+    assert_eq!(
+        decode_ack(&first).accepted_at,
+        decode_ack(&second).accepted_at
+    );
+    assert_eq!(
+        load_persisted_invitation(&dir)
+            .unwrap()
+            .unwrap()
+            .accepted_at,
+        Some(decode_ack(&first).accepted_at)
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -496,7 +623,9 @@ async fn claim_200_response_shape() {
     let ack = decode_ack(&body);
     assert_eq!(ack.version, 1, "v must be 1");
     assert_eq!(ack.iphone_endpoint, mock_addr.to_string());
-    assert_eq!(ack.owner_display_name, "Sample Owner");
+    assert_eq!(ack.owner_display_name, "Owner");
+    assert!(ack.accepted_at > 0);
+    assert_eq!(ack.installation, installation());
     assert!(ack.hh_id.is_none(), "hh_id must be null for fresh casa");
 }
 
@@ -553,7 +682,7 @@ async fn claim_200_persists_invitation_to_disk() {
         &token[..],
         "token must be persisted verbatim"
     );
-    assert_eq!(persisted.owner_display_name, "Test User");
+    assert_eq!(persisted.owner_display_name, "Owner");
     assert!(
         persisted.iphone_apns_token.is_none(),
         "no APNs token in request"
@@ -561,35 +690,9 @@ async fn claim_200_persists_invitation_to_disk() {
 }
 
 #[tokio::test]
-async fn claim_200_includes_mac_engine_url_when_tailnet_available() {
-    // Inject a deterministic resolver so this test does not depend on the
-    // test host having a real Tailscale interface.
-    let dir = make_state_dir();
-    let mut state = make_state(BootstrapState::Uninitialized, dir);
-    state.engine_port = 8091;
-    state.tailnet_resolver = fixed_tailnet_ip;
-    let token = test_token();
-    let mock_addr = spawn_mock_iphone_ok(token).await;
-    populate_cache(
-        &state,
-        make_entry(token, &mock_addr.to_string(), FAR_FUTURE),
-    )
-    .await;
-
-    let (status, body) = call_claim(state, cbor_claim(&token)).await;
-    assert_eq!(status, StatusCode::OK, "unexpected body: {body:?}");
-    let ack = decode_ack(&body);
-    assert_eq!(
-        ack.mac_engine_url.as_deref(),
-        Some("http://100.64.0.10:8091"),
-        "engine must steer iPhone to its OWN Tailnet IPv4 + bound port",
-    );
-}
-
-#[tokio::test]
-async fn claim_200_omits_mac_engine_url_when_no_tailnet() {
-    // Default resolver in `make_state` returns None — ACK must omit the field
-    // so the Soyeht.app keeps its existing local-discovery URL.
+async fn claim_receipt_does_not_select_a_household_address() {
+    // Address facts have a separate endpoint; receipt decoding must not
+    // silently recreate a second selector.
     let dir = make_state_dir();
     let state = make_state(BootstrapState::Uninitialized, dir);
     let token = test_token();
@@ -605,7 +708,7 @@ async fn claim_200_omits_mac_engine_url_when_no_tailnet() {
     let ack = decode_ack(&body);
     assert!(
         ack.mac_engine_url.is_none(),
-        "mac_engine_url must be omitted when engine has no Tailnet IP, got {:?}",
+        "claim receipt must never select the phone destination, got {:?}",
         ack.mac_engine_url,
     );
 }
@@ -617,7 +720,7 @@ async fn claim_200_apns_token_persisted_when_provided() {
     let state = make_state(BootstrapState::Uninitialized, dir);
     let token = test_token();
     let apns = [0xAAu8; 32];
-    let mock_addr = spawn_mock_iphone_ok(token).await;
+    let mock_addr = spawn_mock_iphone_with_apns(token, Some(apns)).await;
     populate_cache(
         &state,
         make_entry(token, &mock_addr.to_string(), FAR_FUTURE),
@@ -691,7 +794,7 @@ async fn initialize_200_matching_iphone_tailnet_ip_when_invitation_pending() {
     let state = make_state(BootstrapState::Uninitialized, dir);
     let (status, _) = call_initialize(
         state,
-        cbor_initialize("iPhone Home"),
+        cbor_initialize_claim("iPhone Home"),
         Some(IPHONE_TAILNET_IP),
     )
     .await;

@@ -585,28 +585,9 @@ fn phase3_router(
                     "/api/v1/household/owner-events/{cursor}/decline",
                     axum::routing::post(handlers_owner_events::owner_decline_handler),
                 )
-                .route(
-                    "/api/v1/household/device-pairing/request",
-                    axum::routing::post(handlers_device_pairing::device_pairing_request_handler),
-                )
-                .route(
-                    "/api/v1/household/device-pairing/approve",
-                    axum::routing::post(handlers_device_pairing::device_pairing_approve_handler),
-                )
-                .route(
-                    "/api/v1/household/device-pairing/requests",
-                    axum::routing::get(handlers_device_pairing::device_pairing_requests_handler),
-                )
-                .route(
-                    "/api/v1/household/device-pairing/reject",
-                    axum::routing::post(handlers_device_pairing::device_pairing_reject_handler),
-                )
-                .route(
-                    "/api/v1/household/device-pairing/{request_id}",
-                    axum::routing::get(handlers_device_pairing::device_pairing_poll_handler),
-                )
-                .with_state(owner_events_state),
+                .with_state(owner_events_state.clone()),
         )
+        .merge(handlers_device_pairing::device_pairing_router(owner_events_state))
         // Owner passkey enrollment, and only enrollment, carries
         // `owner_webauthn_enrollment_state`. Adding a route here hands it the
         // RP and the anchor whenever THEYOS_OWNER_WEBAUTHN_NETWORK is open.
@@ -2114,20 +2095,11 @@ pub async fn bootstrap_household(
             state_dir: state_dir.clone(),
         });
 
-    let pair_router = axum::Router::new()
-        .route(
-            "/api/v1/household/pair-device/initiate",
-            axum::routing::post(handlers_pair_device::initiate),
-        )
-        .route(
-            "/api/v1/household/pair-device/confirm",
-            axum::routing::post(handlers_pair_device::confirm),
-        )
-        .with_state(handlers_pair_device::PairDeviceState {
-            window: Arc::clone(&pair_device_window),
-            household: identity_state.clone(),
-            state_dir: state_dir.clone(),
-        });
+    let pair_router = handlers_pair_device::pair_device_router(handlers_pair_device::PairDeviceState {
+        window: Arc::clone(&pair_device_window),
+        household: identity_state.clone(),
+        state_dir: state_dir.clone(),
+    });
 
     // ── Bootstrap router (T008 / T009 / T010 / T011) ─────────────────────
     // ── Bootstrap router (T008 / T009 / T010 / T011) ─────────────────────
@@ -2218,6 +2190,14 @@ pub async fn bootstrap_household(
             },
         ));
     }
+    let bound_set = household_listener::BoundSet::default();
+    let pairing_addresses_rt = crate::pairing_addresses::router(
+        crate::pairing_addresses::PairingAddressesState::new(
+            bound_set.clone(), Arc::clone(&bootstrap_state_arc), identity_state.clone(),
+            Arc::clone(&pair_device_window), Arc::clone(&local_network_visibility),
+            bootstrap_handler_state.installation.clone(),
+        ),
+    );
     let bootstrap_rt = crate::handlers_bootstrap::bootstrap_router(bootstrap_handler_state);
 
     // Household-namespaced Claw Store router. Wraps the shared handlers
@@ -2378,6 +2358,7 @@ pub async fn bootstrap_household(
         .merge(roster_router) // B0a machine roster currency
         .merge(bootstrap_rt)
         .merge(local_network_visibility_rt)
+        .merge(pairing_addresses_rt)
         .merge(pre_household_rt)
         .merge(guest_image_router)
         .merge(claw_share_router);
@@ -2390,7 +2371,7 @@ pub async fn bootstrap_household(
         async move { phase3_fallback.route_or_reject(request).await }
     });
 
-    let bound_set = household_listener::BoundSet::default();
+
     // Re-observed here rather than reusing the value taken above for the
     // setup browser: `theyos install` can persist a live token that this
     // process adopts during bootstrap, and the initial bind must reflect the
@@ -2506,7 +2487,7 @@ pub async fn bootstrap_household(
             Arc::clone(&pair_device_window),
             Arc::clone(&pair_machine_window),
             Arc::clone(&local_network_visibility),
-            initial_bound,
+            bound_set.clone(),
             port,
         )
         .await;
@@ -2515,7 +2496,7 @@ pub async fn bootstrap_household(
             pair_device_window: Arc::clone(&pair_device_window),
             pair_machine_window: Arc::clone(&pair_machine_window),
             local_network_visibility: Arc::clone(&local_network_visibility),
-            targets: initial_bound,
+            targets: bound_set,
             port,
             claw_share: Some(claw_share_runtime),
             phase3_runtime: phase3_runtime.clone(),
@@ -2568,26 +2549,15 @@ async fn publish_household_bonjour_for_identity(
     pair_device_window: Arc<household_rs::pair_device::PairDeviceWindow>,
     pair_machine_window: Arc<household_rs::pair_machine::PairMachineWindow>,
     local_network_visibility: Arc<crate::local_network_visibility::LocalNetworkVisibility>,
-    targets: Vec<(IpAddr, InterfaceClass)>,
+    targets: household_listener::BoundSet,
     port: u16,
 ) {
-    if !targets
-        .iter()
-        .any(|(_, class)| *class != InterfaceClass::Loopback)
-    {
-        info!(
-            stage = "bonjour.skipped",
-            reason = "no_non_loopback_targets",
-            "household Bonjour publish skipped; no peer-reachable interface is bound"
-        );
-        return;
-    }
     let raw_hostname = gethostname::gethostname().to_string_lossy().into_owned();
     let host_label = raw_hostname.replace(['.', ' '], "-");
     // Read current bootstrap state for the TXT enrichment field.
-    let bootstrap_state = global_bootstrap_state().map_or(BootstrapState::Ready, |arc| {
-        *arc.try_read().unwrap_or_else(|_| arc.blocking_read())
-    });
+    let bootstrap_state_source = global_bootstrap_state()
+        .unwrap_or_else(|| Arc::new(tokio::sync::RwLock::new(BootstrapState::Ready)));
+    let bootstrap_state = *bootstrap_state_source.read().await;
     let bs_str = bootstrap_state.as_str().to_string();
     let params = bonjour_publisher::PublishParams {
         hh_id: loaded.record.hh_id.to_string(),
@@ -2609,7 +2579,7 @@ async fn publish_household_bonjour_for_identity(
         pair_machine_window,
         local_network_visibility,
         targets,
-        bootstrap_state,
+        bootstrap_state_source,
     )
     .await
     {
@@ -2634,7 +2604,7 @@ struct HouseholdIdentityWatcherDeps {
     /// publish that happens after a hot-load observes the same two facts the
     /// listener binds on, rather than only the token half.
     local_network_visibility: Arc<crate::local_network_visibility::LocalNetworkVisibility>,
-    targets: Vec<(IpAddr, InterfaceClass)>,
+    targets: household_listener::BoundSet,
     port: u16,
     claw_share: Option<ClawShareRuntimeHandles>,
     phase3_runtime: Phase3RuntimeController,
@@ -3007,6 +2977,11 @@ mod tests {
         let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
         assert_eq!(production.matches("fn phase3_router(").count(), 1);
         assert!(!production.contains("pair_machine_router"));
+        let device_routes = include_str!("handlers_device_pairing.rs");
+        assert_eq!(
+            production.matches("handlers_device_pairing::device_pairing_router(owner_events_state)").count(),
+            1
+        );
         for path in [
             "/api/v1/household/join-request",
             "/api/v1/household/owner-events",
@@ -3034,7 +3009,11 @@ mod tests {
         ] {
             let literal = format!("\"{path}\"");
             assert_eq!(
-                production.matches(&literal).count(),
+                if path.contains("/device-pairing/") {
+                    device_routes.matches(&literal).count()
+                } else {
+                    production.matches(&literal).count()
+                },
                 1,
                 "Phase 3 path must be declared only by the single factory: {path}"
             );
@@ -4891,7 +4870,7 @@ mod tests {
                 local_network_visibility: Arc::new(
                     crate::local_network_visibility::LocalNetworkVisibility::new(),
                 ),
-                targets: Vec::new(),
+                targets: household_listener::BoundSet::default(),
                 port: 8091,
                 claw_share: None,
                 phase3_runtime,

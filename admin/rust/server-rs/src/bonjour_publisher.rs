@@ -48,7 +48,7 @@ use tracing::{info, warn};
 use crate::bonjour_impl_dns_sd as backend;
 #[cfg(not(target_os = "macos"))]
 use crate::bonjour_impl_mdns_sd as backend;
-use crate::household_listener::{HouseholdExposurePolicy, InterfaceClass, PairingWindow};
+use crate::household_listener::{BoundSet, HouseholdExposurePolicy, InterfaceClass, PairingWindow};
 
 /// Service type per FR-017.
 const SERVICE_TYPE: &str = "_soyeht-household._tcp.local.";
@@ -305,36 +305,20 @@ pub async fn publish_household_bonjour(
     pair_device_window: Arc<PairDeviceWindow>,
     pair_machine_window: Arc<PairMachineWindow>,
     visibility: Arc<crate::local_network_visibility::LocalNetworkVisibility>,
-    targets: Vec<(IpAddr, InterfaceClass)>,
-    exposure_state: BootstrapState,
+    bound_set: BoundSet,
+    exposure_state: Arc<tokio::sync::RwLock<BootstrapState>>,
 ) -> Result<HouseholdBonjour, backend::BackendError> {
     let daemon = backend::PublisherHandle::new()?;
     let fullnames: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
-    // The beacon advertises what the listener bound, so it has to be filtered
-    // by the same rule and at the same window position: with a window open,
-    // the Ready beacon carries the LAN address, which is how a phone with no
-    // tailnet finds this Mac by mDNS at all.
-    //
-    // Scope, stated because it is easy to over-read: this address set is fixed
-    // at publish time. A window opened LATER widens the listener within one
-    // reconciliation pass (`household_listener::refresh_loop`) but does not
-    // add a record here until the next publish. That staleness is not new and
-    // is not window-specific -- a Tailscale interface that appears after
-    // startup is missing from this beacon for the same reason -- and the
-    // pairing URI carries an explicit host, so the ceremony does not depend on
-    // this record existing.
-    //
-    // In practice this reads `Closed` for the visibility half every time: the
-    // "Add iPhone" sheet declaration lives in memory, so a process that just
-    // started has none. It is passed anyway because the alternative is a call
-    // site that consults one of the two facts, which is exactly the shape of
-    // the bug that made a Ready household invisible in the first place.
+    // Keep running even with no eligible address. Add iPhone, interface
+    // changes, and listener exits must reconcile records without a restart.
     let pairing_window =
         PairingWindow::observe(pair_device_window.as_ref(), visibility.as_ref()).await;
     let mut bound = 0usize;
+    let state = *exposure_state.read().await;
     let targets =
-        HouseholdExposurePolicy::bonjour_targets_with(exposure_state, targets, pairing_window);
+        current_advertisement_targets(state, bound_set.snapshot_targets().await, pairing_window);
 
     // Advertise an address we actually bound.
     //
@@ -353,6 +337,8 @@ pub async fn publish_household_bonjour(
     // publisher), so patching one built map would let the field vanish on
     // the first pairing-state change.
     let mut params = params;
+    params.bootstrap_state = state.as_str().to_string();
+    params.device_count = u32::from(state == BootstrapState::Ready);
     params.tailnet_addr = advertisable_tailnet_addr(&targets).map(|ip| ip.to_string());
 
     // Pre-fill the pairing-state TXTs from the current window snapshot so
@@ -401,6 +387,7 @@ pub async fn publish_household_bonjour(
     info!(
         stage = "bonjour.ready",
         bound_count = bound,
+        pairing_window = pairing_window.as_str(),
         port = params.port
     );
 
@@ -413,13 +400,14 @@ pub async fn publish_household_bonjour(
     let mut pair_machine_rx = pair_machine_window.subscribe();
     let daemon_clone = daemon.clone();
     let fullnames_clone = Arc::clone(&fullnames);
-    let params_clone = params.clone();
-    let targets_clone = targets.clone();
+    let mut params_clone = params.clone();
     let pair_device_window_clone = Arc::clone(&pair_device_window);
     let pair_machine_window_clone = Arc::clone(&pair_machine_window);
     let instance_clone = instance.clone();
     let host_clone = host.clone();
     let mut last_txt = base_txt.clone();
+    let mut last_targets = targets;
+    let mut retry_registration = bound != last_targets.len();
     tokio::spawn(async move {
         let mut reconcile = tokio::time::interval(TXT_RECONCILE_INTERVAL);
         reconcile.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -449,12 +437,22 @@ pub async fn publish_household_bonjour(
             }
             let pair_device_token = pair_device_window_clone.current_token().await;
             let pair_machine_snapshot = pair_machine_window_clone.snapshot().await;
+            let state = *exposure_state.read().await;
+            let window =
+                PairingWindow::observe(pair_device_window_clone.as_ref(), visibility.as_ref())
+                    .await;
+            let targets =
+                current_advertisement_targets(state, bound_set.snapshot_targets().await, window);
+            params_clone.bootstrap_state = state.as_str().to_string();
+            params_clone.device_count = u32::from(state == BootstrapState::Ready);
+            params_clone.tailnet_addr =
+                advertisable_tailnet_addr(&targets).map(|ip| ip.to_string());
             let txt = HouseholdBonjour::txt_for_state(
                 &params_clone,
                 pair_device_token,
                 Some(&pair_machine_snapshot),
             );
-            if txt == last_txt {
+            if txt == last_txt && targets == last_targets && !retry_registration {
                 continue;
             }
 
@@ -470,7 +468,8 @@ pub async fn publish_household_bonjour(
                     );
                 }
             }
-            for (ip, class) in &targets_clone {
+            let mut registered = 0usize;
+            for (ip, class) in &targets {
                 if !class.is_bonjour_advertisable() {
                     continue;
                 }
@@ -483,7 +482,16 @@ pub async fn publish_household_bonjour(
                     txt: &txt,
                 };
                 match daemon_clone.register(&spec) {
-                    Ok(fullname) => full_guard.push(fullname),
+                    Ok(fullname) => {
+                        info!(
+                            stage = "bonjour.published",
+                            address = %ip,
+                            interface_class = class.as_str(),
+                            fullname = %fullname,
+                        );
+                        full_guard.push(fullname);
+                        registered += 1;
+                    }
                     Err(e) => warn!(
                         stage = "bonjour.txt_update_failed",
                         address = %ip,
@@ -491,17 +499,119 @@ pub async fn publish_household_bonjour(
                     ),
                 }
             }
-            if !full_guard.is_empty() {
-                last_txt = txt;
-            }
+            retry_registration = registered != targets.len();
+            last_txt = txt;
+            last_targets = targets;
             info!(
-                stage = "bonjour.txt_updated",
+                stage = "bonjour.reconciled",
+                target_count = last_targets.len(),
+                registered_count = registered,
+                retry_registration,
+                pairing_window = window.as_str(),
                 pairing = last_txt.get("pairing").map_or("none", String::as_str),
             );
         }
     });
 
     Ok(HouseholdBonjour { daemon, fullnames })
+}
+
+fn current_advertisement_targets(
+    state: BootstrapState,
+    bound: Vec<(IpAddr, InterfaceClass)>,
+    window: PairingWindow,
+) -> Vec<(IpAddr, InterfaceClass)> {
+    let mut targets = HouseholdExposurePolicy::bonjour_targets_with(state, bound, window);
+    // BoundSet is a HashMap: ordering is not a change in advertisement state.
+    targets.sort_by_key(|(ip, _)| *ip);
+    targets
+}
+
+#[cfg(test)]
+mod reconciliation_tests {
+    use super::*;
+
+    fn lan() -> (IpAddr, InterfaceClass) {
+        ("192.168.1.20".parse().unwrap(), InterfaceClass::Lan)
+    }
+
+    fn tailnet() -> (IpAddr, InterfaceClass) {
+        ("100.64.0.10".parse().unwrap(), InterfaceClass::Tailscale)
+    }
+
+    #[test]
+    fn ready_without_tailnet_acquires_and_retires_lan_after_startup() {
+        let closed =
+            current_advertisement_targets(BootstrapState::Ready, vec![], PairingWindow::Closed);
+        assert!(closed.is_empty());
+        // Opening the sheet before the listener binds must not announce a
+        // candidate address. Only the next successful bind makes it eligible.
+        assert!(
+            current_advertisement_targets(BootstrapState::Ready, vec![], PairingWindow::Open)
+                .is_empty()
+        );
+        let opened =
+            current_advertisement_targets(BootstrapState::Ready, vec![lan()], PairingWindow::Open);
+        assert_eq!(opened, vec![lan()]);
+        assert_ne!(opened, closed);
+        // Closing policy removes LAN even before listener reconciliation has
+        // physically removed its registration from the bound set.
+        assert!(
+            current_advertisement_targets(
+                BootstrapState::Ready,
+                vec![lan()],
+                PairingWindow::Closed
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn listener_exit_and_late_tailnet_are_observed_with_unchanged_window() {
+        let before =
+            current_advertisement_targets(BootstrapState::Ready, vec![lan()], PairingWindow::Open);
+        let added = current_advertisement_targets(
+            BootstrapState::Ready,
+            vec![lan(), tailnet()],
+            PairingWindow::Open,
+        );
+        assert_ne!(before, added);
+        assert_eq!(advertisable_tailnet_addr(&added), Some(tailnet().0));
+        let lost =
+            current_advertisement_targets(BootstrapState::Ready, vec![], PairingWindow::Open);
+        assert!(lost.is_empty());
+        assert_eq!(advertisable_tailnet_addr(&lost), None);
+    }
+
+    #[test]
+    fn bootstrap_transition_rechecks_exposure_and_ignores_iteration_order() {
+        let naming = current_advertisement_targets(
+            BootstrapState::ReadyForNaming,
+            vec![lan()],
+            PairingWindow::Closed,
+        );
+        assert_eq!(naming, vec![lan()]);
+        assert!(
+            current_advertisement_targets(
+                BootstrapState::Ready,
+                vec![lan()],
+                PairingWindow::Closed
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            current_advertisement_targets(
+                BootstrapState::Ready,
+                vec![lan(), tailnet()],
+                PairingWindow::Open
+            ),
+            current_advertisement_targets(
+                BootstrapState::Ready,
+                vec![tailnet(), lan()],
+                PairingWindow::Open
+            )
+        );
+    }
 }
 
 /// Publish `_soyeht-household._tcp` for a candidate machine M2 that has

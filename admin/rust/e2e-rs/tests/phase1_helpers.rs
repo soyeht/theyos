@@ -2,10 +2,12 @@
 #![allow(clippy::missing_panics_doc)]
 #![allow(clippy::must_use_candidate)]
 
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
 use axum::body::{Body, to_bytes};
+use axum::extract::ConnectInfo;
 use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use axum::{
     Router,
@@ -192,6 +194,14 @@ pub async fn request(app: &Router, method: Method, path: &str, body: Body) -> Te
     let req = Request::builder()
         .method(method)
         .uri(path)
+        // A loopback peer, because `pair_device::initiate` now admits only
+        // loopback or tailnet and reads that from `ConnectInfo`. Without the
+        // extension the extractor rejects and axum answers 500, so the ACL
+        // gate this harness is supposed to exercise never runs — the route
+        // looks broken while the product is fine. Loopback is also the
+        // caller the contract actually admits, so this asserts the allow
+        // side; `anchor_handoff_contract` covers the refusals.
+        .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 41991))))
         .header(header::CONTENT_TYPE, "application/json")
         .body(body)
         .expect("build request");
@@ -219,6 +229,8 @@ pub async fn request_with_auth(
     let req = Request::builder()
         .method(method)
         .uri(path)
+        // Same loopback peer as `request` — see the note there.
+        .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 41991))))
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::AUTHORIZATION, authorization)
         .body(body)
