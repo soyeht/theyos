@@ -5626,6 +5626,8 @@ version = "0.1.30"
 dependencies = [
  "base64 0.22.1",
  "core-rs",
+ "crc32fast",
+ "fs2",
  "libc",
  "pty-process",
  "rustix 1.1.4",

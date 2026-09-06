@@ -15,6 +15,8 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 base64 = { workspace = true }
 libc = { workspace = true }
+fs2 = { workspace = true }
+crc32fast = "1.5"
 # Direct dep (not just transitive via pty-process) so we can call
 # `ptsname()` (feature = "alloc", not enabled by pty-process itself) to
 # expose the PTY slave device path as session metadata (E5). Version

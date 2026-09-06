@@ -450,6 +450,7 @@ fn append_output_lines(session: &mut Session, output: &str) {
 // ─── PTY subsystem ───────────────────────────────────────────────────────────
 
 pub mod pty;
+pub mod segmented_log;
 
 // ─── Unit tests ──────────────────────────────────────────────────────────────
 
