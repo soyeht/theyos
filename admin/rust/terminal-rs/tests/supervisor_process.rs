@@ -361,8 +361,8 @@ async fn attach(daemon: &Daemon, session: &SessionInfo, next_offset: u64) -> Uni
 }
 
 async fn read_until(stream: &mut UnixStream, needle: &[u8], cursor: &mut u64) -> Vec<u8> {
+    let mut result = Vec::new();
     tokio::time::timeout(Duration::from_secs(15), async {
-        let mut result = Vec::new();
         loop {
             match wire::read_frame(stream).await.unwrap() {
                 Frame::Data {
@@ -377,7 +377,7 @@ async fn read_until(stream: &mut UnixStream, needle: &[u8], cursor: &mut u64) ->
                     *cursor += bytes.len() as u64;
                     result.extend(bytes);
                     if result.windows(needle.len()).any(|part| part == needle) {
-                        return result;
+                        return std::mem::take(&mut result);
                     }
                 }
                 Frame::Control {
@@ -389,7 +389,7 @@ async fn read_until(stream: &mut UnixStream, needle: &[u8], cursor: &mut u64) ->
         }
     })
     .await
-    .expect("output deadline")
+    .unwrap_or_else(|_| panic!("output deadline: wanted {needle:?}, received {result:?}"))
 }
 
 fn process_identity(pid: u32) -> String {
@@ -1026,4 +1026,141 @@ async fn rotation_write_failure_reports_exact_final_output_and_recovers_committe
         replayed += chunk.bytes.len() as u64;
     }
     assert_eq!(replayed, cursor);
+}
+
+#[tokio::test]
+async fn real_job_control_resize_and_split_utf8_work_after_reattach() {
+    let daemon = Daemon::start().await;
+    let session = create(&daemon, issued_request(&daemon).await).await;
+    let mut stream = attach(&daemon, &session, 0).await;
+    let mut cursor = 0;
+    write(
+        &daemon,
+        &session,
+        b"set +H; stty -echo; printf 'ARMED\\n'\n".to_vec(),
+    )
+    .await;
+    read_until(&mut stream, b"ARMED\r\n", &mut cursor).await;
+    assert!(matches!(
+        daemon
+            .request(Control::Resize {
+                conversation_id: session.conversation_id.clone(),
+                session_instance_id: session.session_instance_id.clone(),
+                cols: 111,
+                rows: 47,
+            })
+            .await,
+        Control::Ok
+    ));
+    write(
+        &daemon,
+        &session,
+        b"stty size; printf 'RESIZED\\n'\n".to_vec(),
+    )
+    .await;
+    let dimensions = read_until(&mut stream, b"RESIZED\r\n", &mut cursor).await;
+    assert!(String::from_utf8(dimensions)
+        .unwrap()
+        .contains("47 111\r\n"));
+
+    write(
+        &daemon,
+        &session,
+        b"sleep 60 & JOB=$!; printf 'JOB:%s\\n' \"$JOB\"; fg\n".to_vec(),
+    )
+    .await;
+    let started = read_until(&mut stream, b"sleep 60", &mut cursor).await;
+    let started = String::from_utf8(started).unwrap();
+    let job_pid: u32 = started
+        .split("JOB:")
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let before = process_identity(job_pid);
+    wait_foreground_group(session.pid, job_pid).await;
+    drop(stream);
+    let mut stream = attach(&daemon, &session, cursor).await;
+    // These are terminal control bytes, not kill(2) directed at the child.
+    // The PTY's foreground process group must route the signals correctly.
+    write(&daemon, &session, vec![0x1a]).await;
+    wait_foreground_group(session.pid, u32::try_from(session.pgid).unwrap()).await;
+    assert_eq!(before, process_identity(job_pid));
+    let stopped = Command::new("/bin/ps")
+        .args(["-o", "stat=", "-p", &job_pid.to_string()])
+        .output()
+        .unwrap();
+    assert!(stopped.status.success());
+    assert!(String::from_utf8(stopped.stdout).unwrap().contains('T'));
+    write(&daemon, &session, b"fg\n".to_vec()).await;
+    wait_foreground_group(session.pid, job_pid).await;
+    assert_eq!(before, process_identity(job_pid));
+    write(&daemon, &session, vec![0x03]).await;
+    wait_foreground_group(session.pid, u32::try_from(session.pgid).unwrap()).await;
+    write(
+        &daemon,
+        &session,
+        b"printf 'INTERRUPTED:%s\\n' \"$?\"\n".to_vec(),
+    )
+    .await;
+    let output = read_until(&mut stream, b"INTERRUPTED:130\r\n", &mut cursor).await;
+    assert!(String::from_utf8(output)
+        .unwrap()
+        .contains("INTERRUPTED:130"));
+
+    let release = daemon.root.path().join("release-utf8");
+    let command = format!(
+        "printf '\\342'; while [ ! -e '{}' ]; do sleep 0.02; done; printf '\\202\\254\\nUTF8-DONE\\n'\n",
+        release.display()
+    );
+    write(&daemon, &session, command.into_bytes()).await;
+    let mut output = read_until(&mut stream, &[0xe2], &mut cursor).await;
+    assert_eq!(output.last(), Some(&0xe2));
+    drop(stream);
+    // Force a stream boundary in the middle of a multibyte character. The
+    // continuation must begin at the retained byte cursor, without replaying
+    // the first byte or dropping the other two.
+    std::fs::write(release, b"release").unwrap();
+    let mut stream = attach(&daemon, &session, cursor).await;
+    output.extend(read_until(&mut stream, b"UTF8-DONE\r\n", &mut cursor).await);
+    assert_eq!(String::from_utf8(output).unwrap(), "€\r\nUTF8-DONE\r\n");
+    assert!(matches!(
+        daemon
+            .request(Control::Close {
+                conversation_id: session.conversation_id,
+                session_instance_id: session.session_instance_id,
+            })
+            .await,
+        Control::Ok
+    ));
+}
+
+async fn wait_foreground_group(shell_pid: u32, expected: u32) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let observed = Command::new("/bin/ps")
+                .args(["-o", "tpgid=", "-p", &shell_pid.to_string()])
+                .output()
+                .unwrap();
+            assert!(
+                observed.status.success(),
+                "shell disappeared during job control"
+            );
+            if String::from_utf8(observed.stdout)
+                .unwrap()
+                .trim()
+                .parse::<u32>()
+                .ok()
+                == Some(expected)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("foreground process group deadline");
 }
