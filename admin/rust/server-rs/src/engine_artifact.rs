@@ -5,6 +5,14 @@
 
 use serde::Serialize;
 
+/// Identifies this process incarnation independently of PID reuse. Used only
+/// by runtime readback, never by the standalone artifact identity command.
+#[must_use]
+pub fn process_boot_id() -> &'static str {
+    static BOOT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BOOT.get_or_init(|| format!("{:032x}", rand::random::<u128>()))
+}
+
 #[derive(Debug, Serialize)]
 pub struct EngineArtifact {
     pub version: &'static str,
@@ -138,6 +146,7 @@ mod tests {
             return;
         };
         let root = std::path::PathBuf::from(root);
+        std::fs::write(root.join("boot-before"), process_boot_id()).unwrap();
         std::fs::write(root.join("before"), image_uuid().unwrap()).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !root.join("replaced").exists() {
@@ -145,6 +154,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         std::fs::write(root.join("after"), image_uuid().unwrap()).unwrap();
+        std::fs::write(root.join("boot-after"), process_boot_id()).unwrap();
     }
 
     #[cfg(target_os = "macos")]
@@ -213,6 +223,17 @@ mod tests {
         assert_eq!(
             before,
             fs::read_to_string(root.path().join("after")).unwrap()
+        );
+        let child_boot = fs::read_to_string(root.path().join("boot-before")).unwrap();
+        assert_eq!(child_boot.len(), 32);
+        assert_ne!(
+            child_boot,
+            process_boot_id(),
+            "same image, different process incarnation"
+        );
+        assert_eq!(
+            child_boot,
+            fs::read_to_string(root.path().join("boot-after")).unwrap()
         );
     }
 }

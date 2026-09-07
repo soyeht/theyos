@@ -17,10 +17,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     if args.len() == 3 && args[0] == "--status" && args[1] == "--socket" {
-        let status = terminal_rs::supervisor_client::SupervisorClient::new(PathBuf::from(&args[2]))
+        let result = terminal_rs::supervisor_client::SupervisorClient::new(PathBuf::from(&args[2]))
             .status()
-            .await?;
-        println!("{}", serde_json::to_string(&status)?);
+            .await;
+        match result {
+            Ok(status) => println!("{}", serde_json::to_string(&status)?),
+            Err(error) => {
+                let code = if matches!(error, terminal_rs::supervisor_client::ClientError::Protocol)
+                {
+                    "protocol_incompatible"
+                } else {
+                    "unavailable"
+                };
+                // Machine-readable failure for the installer. No paths,
+                // fabricated inventory, or unstable Debug error formatting.
+                eprintln!("{}", serde_json::json!({"error": code}));
+                std::process::exit(2);
+            }
+        }
         return Ok(());
     }
     if args.len() != 4 || args[0] != "--socket" || args[2] != "--state-dir" {

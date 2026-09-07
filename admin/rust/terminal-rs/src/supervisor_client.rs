@@ -39,6 +39,9 @@ pub struct SupervisorClient {
 pub struct SupervisorStatus {
     pub protocol_version: u16,
     pub broker_boot_id: String,
+    /// Kernel-reported peer PID, not a value supplied by the server. None on
+    /// platforms without this credential; installers must not invent it.
+    pub broker_pid: Option<u32>,
     pub live_sessions: usize,
 }
 
@@ -95,6 +98,10 @@ impl SupervisorClient {
     pub async fn status(&self) -> Result<SupervisorStatus, ClientError> {
         tokio::time::timeout(Duration::from_secs(10), async {
             let (mut stream, broker_boot_id) = self.connect_identified().await?;
+            let broker_pid = stream
+                .peer_cred()?
+                .pid()
+                .and_then(|pid| u32::try_from(pid).ok());
             wire::send_control(&mut stream, 2, Control::List).await?;
             match wire::read_frame(&mut stream).await? {
                 Frame::Control {
@@ -103,6 +110,7 @@ impl SupervisorClient {
                 } => Ok(SupervisorStatus {
                     protocol_version: wire::VERSION,
                     broker_boot_id,
+                    broker_pid,
                     live_sessions: sessions.iter().filter(|session| !session.closed).count(),
                 }),
                 Frame::Control {

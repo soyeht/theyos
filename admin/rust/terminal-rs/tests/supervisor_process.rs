@@ -96,6 +96,7 @@ async fn installation_status_is_read_only_and_fails_when_daemon_is_absent() {
     assert!(second.status.success());
     let second: SupervisorStatus = serde_json::from_slice(&second.stdout).unwrap();
     assert_eq!(first.protocol_version, wire::VERSION);
+    assert_eq!(first.broker_pid, Some(daemon.child.id()));
     assert_eq!(first.broker_boot_id, second.broker_boot_id);
     assert_eq!(first.live_sessions, 1);
     assert_eq!(second.live_sessions, 1);
@@ -119,6 +120,53 @@ async fn installation_status_is_read_only_and_fails_when_daemon_is_absent() {
     assert!(
         absent.stdout.is_empty(),
         "unavailable must not fabricate a zero-session status"
+    );
+}
+
+#[tokio::test]
+async fn installation_status_reports_wire_incompatibility_as_structured_failure() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("probe.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        assert!(matches!(
+            wire::read_frame(&mut stream).await.unwrap(),
+            Frame::Control {
+                message: Control::Hello { .. },
+                ..
+            }
+        ));
+        wire::send_control(
+            &mut stream,
+            1,
+            Control::Error {
+                code: "version_mismatch".into(),
+            },
+        )
+        .await
+        .unwrap();
+    });
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_soyeht-ptyd"))
+            .args(["--status", "--socket"])
+            .arg(&socket)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    server.await.unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        output.stdout.is_empty(),
+        "failure must not manufacture an inventory"
+    );
+    let diagnostic: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(
+        diagnostic,
+        serde_json::json!({"error": "protocol_incompatible"})
     );
 }
 
