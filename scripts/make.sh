@@ -121,6 +121,7 @@ build_binaries() {
         executor_ipc \
         store-ipc \
         terminal-ipc \
+        soyeht-ptyd \
         vmrunner_macos_ipc \
         theyos-provision-inject
     do
@@ -207,6 +208,7 @@ codesign_macos_binaries() {
         executor_ipc \
         store-ipc \
         terminal-ipc \
+        soyeht-ptyd \
         theyos-provision-inject
     do
         if [ -f "${stage_dir}/${bin}" ]; then
@@ -413,6 +415,8 @@ package_soyeht_mac() {
     local unsigned_stage="${PHASE0_UNSIGNED_STAGE_DIR:-}"
     local package_manifest=""
     local phase0_manifest_verified=0
+    local artifact_json
+    artifact_json="$(mktemp)"
     if [ -n "${THEYOS_RELEASE:-}" ]; then
         if [ -z "${unsigned_stage}" ] || \
             [ -z "${PHASE0_EXPECTED_UNSIGNED_PACKAGE_MANIFEST_SHA256:-}" ] || \
@@ -437,6 +441,7 @@ package_soyeht_mac() {
         fi
         if ! jq -e '
             (.executables | keys | sort) == [
+                "soyeht-ptyd",
                 "store-ipc",
                 "terminal-ipc",
                 "theyos-engine",
@@ -450,6 +455,9 @@ package_soyeht_mac() {
             error "unsigned macOS package manifest does not describe the exact app subject"
         fi
         phase0_manifest_verified=1
+        # The manifest already authenticates this attestation. Old attestations
+        # without loaded-image metadata cannot authorize the new package.
+        jq -e '.engine_artifact | objects' "${unsigned_stage}/phase0-build-attestation.json" > "${artifact_json}"
     fi
     local source_dir="${target_dir}"
     if [ -n "${unsigned_stage}" ]; then
@@ -469,6 +477,9 @@ package_soyeht_mac() {
             -p store-rs \
             -p terminal-rs \
             -p vmrunner-macos-rs)
+        # Only the just-built source subject is queried. No cache, installed
+        # engine or arbitrary unsigned-stage executable is ever run here.
+        "${target_dir}/server" --build-info > "${artifact_json}"
     fi
 
     copy_helper() {
@@ -499,6 +510,7 @@ package_soyeht_mac() {
     copy_helper "theyos-ssh" "theyos-ssh"
     copy_helper "store-ipc" "store-ipc"
     copy_helper "terminal-ipc" "terminal-ipc"
+    copy_helper "soyeht-ptyd" "soyeht-ptyd"
     copy_helper "vmrunner_macos_ipc" "vmrunner_macos_ipc"
     # Privileged APFS provisioning helper used by Soyeht.app onboarding to
     # mount the macOS guest disk image with `-o owners` and write provision
@@ -573,10 +585,18 @@ package_soyeht_mac() {
     sign_helper "theyos-ssh" "com.soyeht.theyos.theyos-ssh" ""
     sign_helper "store-ipc" "com.soyeht.theyos.store-ipc" ""
     sign_helper "terminal-ipc" "com.soyeht.theyos.terminal-ipc" ""
+    sign_helper "soyeht-ptyd" "com.soyeht.theyos.soyeht-ptyd" ""
     sign_helper "vmrunner_macos_ipc" "com.soyeht.theyos.vmrunner_macos_ipc" "${entitlements}"
     # provision-inject does not need VM entitlements; it elevates via sudo
     # at runtime to mount the guest disk and write root-owned files.
     sign_helper "theyos-provision-inject" "com.soyeht.theyos.theyos-provision-inject" ""
+
+    # Travel inside the tarball with the signed executable. Consumers verify
+    # both its SHA-256 and thin Mach-O UUID without executing that file.
+    python3 "${SCRIPT_DIR}/engine-artifact-receipt.py" \
+        "${helpers_dir}/theyos-engine" "${helpers_dir}/engine-build-info.json" \
+        --from-build-info "${artifact_json}"
+    rm -f "${artifact_json}"
 
     # Notarize the signed binary. Required for Gatekeeper on machines that don't
     # have the Developer ID cert in their trust store. Gracefully no-ops when any

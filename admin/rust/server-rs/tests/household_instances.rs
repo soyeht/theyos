@@ -254,6 +254,7 @@ fn shared_state() -> SharedState {
         rate_limiter: Arc::new(rate_limiter),
         executor: Arc::new(Mutex::new(executor)),
         pty_mgr,
+        local_pty_supervisor: None,
         vm_runner,
         mobile_tokens: Arc::new(server_rs::mobile_token::MobileTokenStore::new()),
         mobile_sessions: server_rs::mobile_token::MobileSessionDb::open(":memory:")

@@ -63,17 +63,35 @@ pub async fn handle_claw_types(State(_state): State<SharedState>) -> Result<Resp
 /// # Errors
 ///
 /// Returns `ApiError` if the version cache `RwLock` is poisoned.
-#[allow(clippy::unused_async)]
 pub async fn handle_version(State(state): State<SharedState>) -> Result<Json<Value>, ApiError> {
-    let cache = state.ver_cache.read_or_internal("ver_cache")?;
-    let version = if cache.version.is_empty() {
-        "unknown".to_string()
+    let (version, update_available) = {
+        let cache = state.ver_cache.read_or_internal("ver_cache")?;
+        let version = if cache.version.is_empty() {
+            "unknown".to_string()
+        } else {
+            cache.version.clone()
+        };
+        (version, cache.update_available)
+    };
+    // Observe the broker through this engine's configured connection. Merely
+    // selecting the supervisor backend does not prove which daemon it reaches.
+    let supervisor_boot = if let Some(client) = &state.local_pty_supervisor {
+        tokio::time::timeout(std::time::Duration::from_secs(2), client.status())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .map(|status| status.broker_boot_id)
     } else {
-        cache.version.clone()
+        None
     };
     Ok(Json(json!({
         "version": version,
-        "update_available": cache.update_available,
+        "update_available": update_available,
+        "artifact": crate::engine_artifact::current(),
+        "process_id": std::process::id(),
+        "process_boot_id": crate::engine_artifact::process_boot_id(),
+        "terminal_backend": if state.local_pty_supervisor.is_some() { "supervisor" } else { "legacy" },
+        "terminal_supervisor_boot_id": supervisor_boot,
     })))
 }
 

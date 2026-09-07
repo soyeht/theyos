@@ -296,6 +296,7 @@ fn build_engine(target: &str, build_tool: &str) -> Result<(), String> {
     }
     let published_helpers: &[&str] = if target.ends_with("-apple-darwin") {
         &[
+            "soyeht-ptyd",
             "vmrunner_macos_ipc",
             "store-ipc",
             "terminal-ipc",

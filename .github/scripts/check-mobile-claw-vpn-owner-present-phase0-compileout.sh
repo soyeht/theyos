@@ -1678,7 +1678,7 @@ if [[ ! -x "${PROXY_BINARY}" || ! -f "${PROXY_DEPFILE}" ]]; then
   exit 1
 fi
 if [[ "${TARGET}" == *-apple-darwin ]]; then
-  PUBLISHED_HELPERS=(vmrunner_macos_ipc store-ipc terminal-ipc theyos-ssh theyos-provision-inject)
+  PUBLISHED_HELPERS=(soyeht-ptyd vmrunner_macos_ipc store-ipc terminal-ipc theyos-ssh theyos-provision-inject)
 else
   PUBLISHED_HELPERS=(soyeht vmrunner_ipc fc-ssh store-ipc terminal-ipc imagebuilder)
 fi
@@ -1917,7 +1917,13 @@ for forbidden_source in \
 done
 done
 
+BUILD_INFO_JSON="${TMP_ROOT}/engine-build-info.json"
+printf 'null\n' > "${BUILD_INFO_JSON}"
 if [[ "${TARGET}" == "${HOST_TARGET}" || "${PHASE0_RUN_ARTIFACT_DIRECT:-0}" == "1" ]]; then
+  # This is the freshly built, snapshot-verified subject, never an installed
+  # or downloaded candidate whose unknown flags might start a daemon.
+  "${STAGED_ENGINE}" --build-info > "${BUILD_INFO_JSON}"
+  jq -e '.version | type == "string"' "${BUILD_INFO_JSON}" >/dev/null
   CONTRACT_JSON="${TMP_ROOT}/artifact-contract.json"
   "${STAGED_ENGINE}" --owner-present-phase0-contract > "${CONTRACT_JSON}"
   if [[ "$(jq -r '.schema' "${CONTRACT_JSON}")" != \
@@ -2083,6 +2089,7 @@ jq -n -S \
   --arg server_sha256 "$(sha256_file "${BINARY}")" \
   --arg theyos_engine_sha256 "$(sha256_file "${STAGED_ENGINE}")" \
   --argjson published_executables "$(cat "${PUBLISHED_EXECUTABLES_JSON}")" \
+  --argjson engine_artifact "$(cat "${BUILD_INFO_JSON}")" \
   --arg xcode_version "${XCODE_VERSION}" \
   --arg xcode_build "${XCODE_BUILD}" \
   --arg expected_xcode_version "${EXPECTED_XCODE_VERSION}" \
@@ -2130,6 +2137,7 @@ jq -n -S \
     server_sha256: $server_sha256,
     theyos_engine_sha256: $theyos_engine_sha256,
     published_executables: $published_executables,
+    engine_artifact: $engine_artifact,
     xcode_version: $xcode_version,
     xcode_build: $xcode_build,
     expected_xcode_version: $expected_xcode_version,

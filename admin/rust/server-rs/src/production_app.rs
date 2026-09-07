@@ -120,7 +120,16 @@ pub fn compose(state: &SharedState, cfg: &Config) -> Router {
         )
         .route(
             "/terminals/local/{conversation_id}",
-            axum::routing::delete(handlers_terminal::handle_local_terminal_delete),
+            get(handlers_terminal::handle_local_terminal_get)
+                .delete(handlers_terminal::handle_local_terminal_delete),
+        )
+        .route(
+            "/terminals/local/{conversation_id}/intents/{intent_id}/cancel",
+            post(handlers_terminal::handle_local_terminal_cancel_create),
+        )
+        .route(
+            "/terminals/local/{conversation_id}/intents",
+            post(handlers_terminal::handle_local_terminal_issue_intent),
         )
         .route("/auth/logout", post(auth::handle_logout))
         .route("/me", get(auth::handle_me))

@@ -118,6 +118,7 @@ fn fixture() -> (Router, SharedState) {
         rate_limiter: Arc::new(rate_limiter),
         executor: Arc::new(Mutex::new(executor)),
         pty_mgr,
+        local_pty_supervisor: None,
         vm_runner,
         mobile_tokens: Arc::new(server_rs::mobile_token::MobileTokenStore::new()),
         mobile_sessions: server_rs::mobile_token::MobileSessionDb::open(":memory:")
@@ -197,7 +198,7 @@ fn python3_path() -> String {
 async fn wait_for_log_size(state: &SharedState, conv_id: &str, expected: u64) {
     for _ in 0..300 {
         if let Some(sess) = state.pty_mgr.get_local(conv_id) {
-            if sess.log().current_size() >= expected {
+            if sess.log().expect("legacy log").current_size() >= expected {
                 return;
             }
         }

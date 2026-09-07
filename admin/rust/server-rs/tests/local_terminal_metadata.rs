@@ -14,7 +14,7 @@ use axum::extract::State;
 use axum::http::{Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::Response;
-use axum::routing::{delete, get};
+use axum::routing::get;
 use axum::{Router, body::Body};
 use axum_test::TestServer;
 use core_rs::env::set_test_env;
@@ -22,8 +22,8 @@ use executor_rs::{Executor, FlowConfig};
 use jobs_rs::Store as JobsStore;
 use server_rs::auth::AuthUser;
 use server_rs::handlers_terminal::{
-    handle_local_terminal_create, handle_local_terminal_delete, handle_local_terminal_list,
-    handle_local_terminal_pty,
+    handle_local_terminal_create, handle_local_terminal_delete, handle_local_terminal_get,
+    handle_local_terminal_list, handle_local_terminal_pty,
 };
 use server_rs::ratelimit::Limiter;
 use server_rs::state::{AppState, SharedState};
@@ -33,6 +33,9 @@ use std::time::Duration;
 use store_rs::InstanceDb;
 use terminal_rs::pty::PtyManager;
 use vmrunner_rs::VmRunner;
+
+#[path = "support/local_terminal_process_survival.rs"]
+mod process_survival;
 
 fn fake_ipc_bin() -> String {
     let dir = tempfile::TempDir::new().expect("tempdir");
@@ -53,6 +56,12 @@ fn fake_ipc_bin() -> String {
 }
 
 fn fixture() -> (Router, SharedState) {
+    fixture_with_supervisor(None)
+}
+
+fn fixture_with_supervisor(
+    local_pty_supervisor: Option<terminal_rs::supervisor_client::SupervisorClient>,
+) -> (Router, SharedState) {
     let sessions = SessionStore::open(":memory:").expect("session store");
     let jobs = JobsStore::new(":memory:").expect("jobs store");
     let instance_db = InstanceDb::open(":memory:").expect("instance db");
@@ -104,6 +113,7 @@ fn fixture() -> (Router, SharedState) {
         rate_limiter: Arc::new(rate_limiter),
         executor: Arc::new(Mutex::new(executor)),
         pty_mgr,
+        local_pty_supervisor,
         vm_runner,
         mobile_tokens: Arc::new(server_rs::mobile_token::MobileTokenStore::new()),
         mobile_sessions: server_rs::mobile_token::MobileSessionDb::open(":memory:")
@@ -121,6 +131,7 @@ fn fixture() -> (Router, SharedState) {
         role: store_rs::UserRole::User,
     };
     let app = Router::new()
+        .route("/api/v1/version", get(server_rs::handlers_misc::handle_version))
         .route(
             "/api/v1/terminals/local",
             get(handle_local_terminal_list).post(handle_local_terminal_create),
@@ -131,7 +142,15 @@ fn fixture() -> (Router, SharedState) {
         )
         .route(
             "/api/v1/terminals/local/{conversation_id}",
-            delete(handle_local_terminal_delete),
+            get(handle_local_terminal_get).delete(handle_local_terminal_delete),
+        )
+        .route(
+            "/api/v1/terminals/local/{conversation_id}/intents/{intent_id}/cancel",
+            axum::routing::post(server_rs::handlers_terminal::handle_local_terminal_cancel_create),
+        )
+        .route(
+            "/api/v1/terminals/local/{conversation_id}/intents",
+            axum::routing::post(server_rs::handlers_terminal::handle_local_terminal_issue_intent),
         )
         .layer(middleware::from_fn_with_state(auth, inject_auth))
         .with_state(state.clone());
@@ -249,5 +268,230 @@ async fn create_reconnect_and_list_report_session_metadata() {
     assert!(
         !items_after.iter().any(|i| i["conversation_id"] == conv_id),
         "deleted session must not appear in the list anymore"
+    );
+}
+
+struct SupervisorTask(tokio::task::JoinHandle<std::io::Result<()>>);
+
+impl Drop for SupervisorTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+#[tokio::test]
+async fn supervisor_http_contract_preserves_sessions_and_fences_stale_mutations() {
+    use std::os::unix::fs::PermissionsExt;
+    use terminal_rs::supervisor_client::SupervisorClient;
+    use terminal_rs::supervisor_wire::Control;
+    let root = tempfile::Builder::new()
+        .prefix("pty-http-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = root.path().join("socket");
+    let directory = root.path().join("state");
+    let service_socket = socket.clone();
+    let service = SupervisorTask(tokio::spawn(async move {
+        terminal_rs::supervisor::serve(&service_socket, &directory).await
+    }));
+    let client = SupervisorClient::new(socket);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if client.request(Control::List).await.is_ok() {
+                break;
+            }
+            assert!(!service.0.is_finished());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let (app, state) = fixture_with_supervisor(Some(client.clone()));
+    let server = TestServer::builder().http_transport().build(app).unwrap();
+    let path = "/api/v1/terminals/local/supervised-pane";
+    let mut body = serde_json::json!({
+        "conversation_id": "supervised-pane", "cwd": "/tmp",
+        "argv": ["/bin/bash", "--noprofile", "--norc", "-i"],
+        "env": [["PS1", ""], ["PATH", "/usr/bin:/bin"]], "cols": 80, "rows": 24,
+    });
+    let rejected = server.post("/api/v1/terminals/local").json(&body).await;
+    assert_eq!(rejected.status_code(), StatusCode::PRECONDITION_FAILED);
+    let issued: serde_json::Value = server.post(&format!("{path}/intents")).await.json();
+    body["intent_id"] = issued["intent_id"].clone();
+    let original_intent = issued["intent_id"].as_str().unwrap().to_owned();
+    let exchange = std::env::var_os("SOYEHT_TERMINAL_CONTRACT_DIR").map(std::path::PathBuf::from);
+    if let Some(exchange) = &exchange {
+        // The orchestrator asks Swift to decode this actual response, then
+        // encode CREATE with the issued ticket. Neither side invents the ID.
+        std::fs::write(
+            exchange.join("issued.next"),
+            serde_json::to_vec(&issued).unwrap(),
+        )
+        .unwrap();
+        std::fs::rename(exchange.join("issued.next"), exchange.join("issued.json")).unwrap();
+        tokio::time::timeout(Duration::from_secs(900), async {
+            while !exchange.join("request.json").exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("Swift request production deadline");
+        body =
+            serde_json::from_slice(&std::fs::read(exchange.join("request.json")).unwrap()).unwrap();
+        assert_eq!(body["conversation_id"], "supervised-pane");
+    }
+    let created = server.post("/api/v1/terminals/local").json(&body).await;
+    assert_eq!(created.status_code(), StatusCode::OK, "{}", created.text());
+    let first: serde_json::Value = created.json();
+    let instance = first["session_instance_id"].as_str().unwrap();
+    let etag = format!("\"{instance}\"");
+    assert_eq!(first["reconnected"], false);
+    let again = server.post("/api/v1/terminals/local").json(&body).await;
+    let again: serde_json::Value = again.json();
+    assert_eq!(again["session_instance_id"], instance);
+    assert_eq!(again["reconnected"], true);
+    assert!(
+        state.pty_mgr.get_local("supervised-pane").is_none(),
+        "must not create a legacy PTY"
+    );
+    assert_eq!(
+        server.delete(path).await.status_code(),
+        StatusCode::PRECONDITION_FAILED
+    );
+    assert_eq!(
+        server
+            .get_websocket(&format!("{path}/pty"))
+            .await
+            .status_code(),
+        StatusCode::PRECONDITION_FAILED
+    );
+
+    let stream_path =
+        format!("{path}/pty?session_instance_id={instance}&stream_protocol=1&next_offset=0");
+    let response = server.get_websocket(&stream_path).await;
+    assert_eq!(response.status_code(), StatusCode::SWITCHING_PROTOCOLS);
+    let mut ws = response.into_websocket().await;
+    let attached: serde_json::Value = ws.receive_json().await;
+    assert_eq!(attached["type"], "attached");
+    assert_eq!(attached["info"]["session_instance_id"], instance);
+    // Exercise binary input and the actual UTF-8 JSON shape sent by the Mac.
+    ws.send_message(axum_test::WsMessage::Binary(
+        b"stty -echo\n".to_vec().into(),
+    ))
+    .await;
+    let input = exchange.as_ref().map_or_else(
+        || serde_json::json!({"type": "input", "data": "printf '\\143\\162\\157\\163\\163\\055\\142\\157\\165\\156\\144\\141\\162\\171\\055\\157\\153\\n'\n"}).to_string(),
+        |directory| std::fs::read_to_string(directory.join("input.json")).unwrap(),
+    );
+    ws.send_message(axum_test::WsMessage::Text(input.into()))
+        .await;
+    let mut frames: Vec<Vec<u8>> = Vec::new();
+    let mut output = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match ws.receive_message().await {
+                axum_test::WsMessage::Binary(frame) => {
+                    assert!(frame.starts_with(server_rs::supervised_terminals::OUTPUT_PREFIX));
+                    let header = server_rs::supervised_terminals::OUTPUT_PREFIX.len();
+                    let offset = u64::from_be_bytes(frame[header..header + 8].try_into().unwrap());
+                    assert_eq!(offset, output.len() as u64);
+                    output.extend_from_slice(&frame[header + 8..]);
+                    frames.push(frame.to_vec());
+                    if output
+                        .windows(b"cross-boundary-ok".len())
+                        .any(|bytes| bytes == b"cross-boundary-ok")
+                    {
+                        break;
+                    }
+                }
+                axum_test::WsMessage::Text(text) => {
+                    let event: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    assert_eq!(event["type"], "replay_end");
+                }
+                other => panic!("unexpected WebSocket event: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("output through HTTP bridge");
+    ws.close().await;
+    assert_eq!(
+        server.get(path).await.json::<serde_json::Value>()["is_connected"],
+        true
+    );
+    // Drop the entire HTTP adapter and reconnect through a fresh one while
+    // the independent owner remains. This is not an engine-process kill test.
+    drop(server);
+    drop(state);
+    let prior_broker_boot_id = client.status().await.unwrap().broker_boot_id;
+    let (app, _) = fixture_with_supervisor(Some(client.clone()));
+    let server = TestServer::builder().http_transport().build(app).unwrap();
+    let restored: serde_json::Value = server.get(path).await.json();
+    assert_eq!(restored["pid"], first["pid"]);
+    assert_eq!(restored["session_instance_id"], instance);
+    if let Some(exchange) = exchange {
+        let engine: serde_json::Value = server.get("/api/v1/version").await.json();
+        let result = serde_json::json!({
+            "created": first, "restored": restored, "attached": attached, "frames": frames,
+            "engine": engine, "expected_artifact": server_rs::engine_artifact::current(),
+            "supervisor": client.status().await.unwrap(), "prior_broker_boot_id": prior_broker_boot_id,
+        });
+        std::fs::write(
+            exchange.join("response.json"),
+            serde_json::to_vec(&result).unwrap(),
+        )
+        .unwrap();
+    }
+    let closed = server
+        .delete(path)
+        .add_header(
+            axum::http::header::IF_MATCH,
+            etag.parse::<axum::http::HeaderValue>().unwrap(),
+        )
+        .await;
+    assert_eq!(closed.status_code(), StatusCode::NO_CONTENT);
+    let issued: serde_json::Value = server.post(&format!("{path}/intents")).await.json();
+    body["intent_id"] = issued["intent_id"].clone();
+    let replacement: serde_json::Value = server
+        .post("/api/v1/terminals/local")
+        .json(&body)
+        .await
+        .json();
+    assert_ne!(replacement["session_instance_id"], instance);
+    let stale = server
+        .delete(path)
+        .add_header(
+            axum::http::header::IF_MATCH,
+            etag.parse::<axum::http::HeaderValue>().unwrap(),
+        )
+        .await;
+    assert_eq!(stale.status_code(), StatusCode::PRECONDITION_FAILED);
+    let stale_attach = server.get_websocket(&stream_path).await;
+    assert_eq!(stale_attach.status_code(), StatusCode::PRECONDITION_FAILED);
+    let stale_cancel = format!("{path}/intents/{original_intent}/cancel");
+    for _ in 0..2 {
+        assert_eq!(
+            server.post(&stale_cancel).await.status_code(),
+            StatusCode::NO_CONTENT
+        );
+    }
+    assert_eq!(
+        server.get(path).await.json::<serde_json::Value>()["is_connected"],
+        true
+    );
+    service.0.abort();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(
+        server.get(path).await.status_code(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        server
+            .post("/api/v1/terminals/local")
+            .json(&body)
+            .await
+            .status_code(),
+        StatusCode::SERVICE_UNAVAILABLE
     );
 }
