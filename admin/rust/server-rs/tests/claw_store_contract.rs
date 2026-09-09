@@ -232,7 +232,12 @@ fn lex_rust_tokens(source: &str) -> Vec<String> {
                 }
             }
             let content: String = chars[start..end.min(chars.len())].iter().collect();
-            tokens.push(format!("\"{content}"));
+            let value = if raw {
+                content
+            } else {
+                decode_string_escapes(&content)
+            };
+            tokens.push(format!("\"{value}"));
             i = j;
         } else if c == '\'' {
             // char literal 'x' / '\n' / '\u{..}', or a lifetime 'a
@@ -262,6 +267,82 @@ fn lex_rust_tokens(source: &str) -> Vec<String> {
         }
     }
     tokens
+}
+
+/// Decodes the escapes of a non-raw Rust string literal so a path literal is
+/// compared by its VALUE, not by its source characters: `"promotion.r\x73"`
+/// and a `\`-newline continuation both name `promotion.rs`. Covers the
+/// escapes Rust defines (`\n \r \t \\ \0 \' \"`, `\xHH`, `\u{…}`, and
+/// `\` + newline which also swallows the following whitespace). Anything
+/// else is a panic: a literal the guard cannot interpret must fail loudly.
+fn decode_string_escapes(content: &str) -> String {
+    let chars: Vec<char> = content.chars().collect();
+    let mut out = String::with_capacity(content.len());
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] != '\\' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let esc = chars
+            .get(i + 1)
+            .copied()
+            .unwrap_or_else(|| panic!("source guard lexer: dangling backslash in {content:?}"));
+        i += 2;
+        match esc {
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            '\\' => out.push('\\'),
+            '0' => out.push('\0'),
+            '\'' => out.push('\''),
+            '"' => out.push('"'),
+            'x' => {
+                let hex: String = chars[i..(i + 2).min(chars.len())].iter().collect();
+                let code = u32::from_str_radix(&hex, 16).unwrap_or_else(|_| {
+                    panic!("source guard lexer: bad \\x escape in {content:?}")
+                });
+                out.push(char::from_u32(code).expect("two hex digits are a char"));
+                i += 2;
+            }
+            'u' => {
+                assert_eq!(
+                    chars.get(i),
+                    Some(&'{'),
+                    "source guard lexer: bad \\u escape in {content:?}"
+                );
+                let close = chars[i..]
+                    .iter()
+                    .position(|c| *c == '}')
+                    .unwrap_or_else(|| panic!("source guard lexer: unclosed \\u{{ in {content:?}"));
+                let hex: String = chars[i + 1..i + close]
+                    .iter()
+                    .filter(|c| **c != '_')
+                    .collect();
+                let code = u32::from_str_radix(&hex, 16)
+                    .ok()
+                    .and_then(char::from_u32)
+                    .unwrap_or_else(|| panic!("source guard lexer: bad \\u escape in {content:?}"));
+                out.push(code);
+                i += close + 1;
+            }
+            '\n' | '\r' => {
+                // line continuation: the newline and all following whitespace vanish
+                while i < chars.len() && chars[i].is_whitespace() {
+                    i += 1;
+                }
+            }
+            other => panic!("source guard lexer: unsupported escape \\{other} in {content:?}"),
+        }
+    }
+    out
+}
+
+#[test]
+#[should_panic(expected = "unsupported escape")]
+fn references_module_refuses_an_escape_it_cannot_decode() {
+    let _ = references_module("#[path = \"promotion.r\\q\"] mod promoted;", "promotion");
 }
 
 #[test]
@@ -306,6 +387,12 @@ fn references_module_covers_every_import_spelling_and_ignores_non_paths() {
         "#[path = \"promotion.rs\"] mod promoted;",
         "#[path = \"../owner_site/promotion.rs\"]\nmod promoted;",
         "include!(\"promotion.rs\");",
+        // Escapes and continuations that spell the same file ([aria]):
+        "#[path = \"promotion.r\\x73\"] mod promoted;",
+        "#[path = \"promotion.r\\u{73}\"] mod promoted;",
+        "#[path = \"promotion.rs\\\n    \"] mod promoted;",
+        "#[path = \"promotion.\\\n        rs\"] mod promoted;",
+        "include!(\"promotion.r\\x73\");",
     ] {
         assert!(
             references_module(hit, "promotion"),
@@ -334,6 +421,9 @@ fn references_module_covers_every_import_spelling_and_ignores_non_paths() {
         "let c = c\"promotion::x\"; let cr = cr#\"use super::promotion;\"#;",
         "#[path = \"promotion_input.rs\"] mod pi;",
         "let s = \"promotion.rs.bak\";",
+        // A raw literal keeps its backslashes: this is NOT promotion.rs.
+        "#[path = r\"promotion.r\\x73\"] mod promoted;",
+        "let s = \"promotion.r\\x74\";",
     ] {
         assert!(
             !references_module(miss, "promotion"),
