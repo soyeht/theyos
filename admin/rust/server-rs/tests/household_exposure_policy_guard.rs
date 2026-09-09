@@ -85,7 +85,7 @@ fn household_listener_filters_binds_through_exposure_policy() {
 
 #[test]
 fn bonjour_publishers_filter_targets_through_exposure_policy() {
-    let household_source = read_src("bonjour_publisher.rs");
+    let household_source = read_src("bonjour/publisher.rs");
     let household_publish_body = slice_between(
         &household_source,
         "pub async fn publish_household_bonjour",
@@ -318,8 +318,20 @@ fn plain_http_listener_contract_is_pinned_in_code() {
         "diagnostic echo must remain explicit, fixed-size, and independently routed"
     );
     let household = read_src("handlers_household.rs");
+    // handlers_bootstrap.rs keeps its test listeners in extracted test files;
+    // scan the module with them so the claim still covers the listeners.
+    // All three test children of handlers_bootstrap.rs: the two extracted
+    // into handlers_bootstrap/ and the `#[path]`-declared first-owner smoke
+    // file, which a directory listing would miss.
+    let bootstrap_with_tests = [
+        bootstrap.as_str(),
+        &read_src("handlers_bootstrap/tests.rs"),
+        &read_src("handlers_bootstrap/household_teardown_lifecycle_tests.rs"),
+        &read_src("handlers_bootstrap_first_owner_tests.rs"),
+    ]
+    .concat();
     for (file, source) in [
-        ("handlers_bootstrap.rs", bootstrap.as_str()),
+        ("handlers_bootstrap.rs", bootstrap_with_tests.as_str()),
         ("handlers_household.rs", household.as_str()),
     ] {
         assert!(

@@ -31,7 +31,7 @@ use std::thread;
 use std::time::Duration;
 
 use hmac::{Hmac, Mac};
-use household_rs::claw_share_data_tunnel::{DataTunnelError, MeshIpv4, TargetSession};
+use household_rs::claw_share::data_tunnel::{DataTunnelError, MeshIpv4, TargetSession};
 use household_rs::claw_vpn::{
     ClawVpnAcl, ClawVpnAclKey, ClawVpnAgentCore, ClawVpnAuditEvent, ClawVpnDatapathSide,
     ClawVpnSessionRegistry,

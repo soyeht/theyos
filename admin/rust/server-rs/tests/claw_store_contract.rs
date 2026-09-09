@@ -73,13 +73,375 @@ fn terminal_peer_rejection_body(source: &str) -> &str {
     &rest[..end]
 }
 
+/// Does `source` reference the sibling module `name`, by path or by file
+/// inclusion?
+///
+/// After the owner_site modules moved under `owner_site/`, the forbidden
+/// module is a bare identifier (`promotion`) instead of a prefixed one
+/// (`owner_site_promotion`), so a substring needle no longer covers every
+/// spelling. This works on a TOKEN stream of the whole source, so line
+/// breaks, attributes, visibilities and whitespace cannot hide a reference.
+/// Comments (line and nested block), char literals and the delimiters of
+/// string literals (plain, byte, C and raw, in every prefix combination)
+/// are handled by the lexer; a literal or comment the lexer cannot close
+/// is a hard failure, never a silent skip.
+///
+/// The identifier is a module reference when, in path context:
+/// - it follows `::` and is not a call (`crate::owner_site::promotion`,
+///   `super::promotion`, `use ...::promotion as p;`), or
+/// - it is the head of a path (`promotion::promote(...)`), or
+/// - it is an element of a `use` tree group, aliased or not, however the
+///   group is laid out (`use a::{promotion as p, b};`).
+///
+/// The FILE is a reference when any string literal names it by basename
+/// (`#[path = "promotion.rs"] mod x;`, `include!("../promotion.rs")`),
+/// which is what the old `owner_site_promotion` needle caught too.
+///
+/// It is NOT a reference as a declaration (`mod promotion;`), a binding
+/// (`let promotion =`), a field (`.promotion`), a struct shorthand outside a
+/// `use`, an associated call (`Self::promotion(...)`), or part of a longer
+/// identifier (`promotion_input`).
+fn references_module(source: &str, name: &str) -> bool {
+    let tokens = lex_rust_tokens(source);
+    let file_name = format!("{name}.rs");
+    let mut in_use = false;
+    for (i, tok) in tokens.iter().enumerate() {
+        if let Some(literal) = tok.strip_prefix('"') {
+            let basename = literal.rsplit(['/', '\\']).next().unwrap_or(literal);
+            if basename == file_name {
+                return true;
+            }
+            continue;
+        }
+        if tok == "use" {
+            in_use = true;
+        } else if tok == ";" {
+            in_use = false;
+        }
+        if tok != name {
+            continue;
+        }
+        let prev = i.checked_sub(1).map(|j| tokens[j].as_str());
+        let next = tokens.get(i + 1).map(String::as_str);
+        let after_segment = prev == Some("::") && next != Some("(");
+        let head_of_path = next == Some("::") && prev != Some(".");
+        let group_element = in_use
+            && matches!(prev, Some("{") | Some(","))
+            && matches!(next, Some(",") | Some("}") | Some("as") | Some("::"));
+        if after_segment || head_of_path || group_element {
+            return true;
+        }
+    }
+    false
+}
+
+/// Minimal Rust lexer for source guards. Yields identifiers, `::`,
+/// single-character punctuation, and string literals as one token each
+/// (`"` followed by the literal's content, delimiters and prefix removed).
+/// Drops whitespace, `//` and nested `/* */` comments and char literals.
+/// Raw identifiers lose their `r#` prefix; a lifetime keeps its identifier.
+/// Panics on a string literal or block comment that does not close: a guard
+/// must fail loudly rather than lex the rest of the file as a literal.
+fn lex_rust_tokens(source: &str) -> Vec<String> {
+    let chars: Vec<char> = source.chars().collect();
+    let at = |i: usize| chars.get(i).copied();
+    let is_ident_start = |c: char| c.is_alphabetic() || c == '_';
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    // Length of a string-literal prefix at `i` (`b`, `c`, `r`, `br`, `cr`)
+    // that is immediately followed by `"` or by `#…"` (raw form), else None.
+    let string_prefix_len = |i: usize| -> Option<(usize, bool)> {
+        let mut j = i;
+        let mut raw = false;
+        if matches!(at(j), Some('b') | Some('c')) {
+            j += 1;
+        }
+        if at(j) == Some('r') {
+            raw = true;
+            j += 1;
+        }
+        if j == i && at(j) != Some('"') {
+            return None;
+        }
+        let mut k = j;
+        if raw {
+            while at(k) == Some('#') {
+                k += 1;
+            }
+        }
+        (at(k) == Some('"')).then_some((j - i, raw))
+    };
+    let mut tokens = Vec::new();
+    let mut i = 0usize;
+    while let Some(c) = at(i) {
+        if c.is_whitespace() {
+            i += 1;
+        } else if c == '/' && at(i + 1) == Some('/') {
+            while at(i).is_some_and(|c| c != '\n') {
+                i += 1;
+            }
+        } else if c == '/' && at(i + 1) == Some('*') {
+            let mut depth = 0usize;
+            loop {
+                match (at(i), at(i + 1)) {
+                    (Some('/'), Some('*')) => {
+                        depth += 1;
+                        i += 2;
+                    }
+                    (Some('*'), Some('/')) => {
+                        depth -= 1;
+                        i += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    (Some(_), _) => i += 1,
+                    (None, _) => panic!("source guard lexer: unterminated block comment"),
+                }
+            }
+        } else if c == 'r' && at(i + 1) == Some('#') && at(i + 2).is_some_and(is_ident_start) {
+            // raw identifier `r#name`
+            i += 2;
+            let start = i;
+            while at(i).is_some_and(is_ident) {
+                i += 1;
+            }
+            tokens.push(chars[start..i].iter().collect());
+        } else if let Some((prefix_len, raw)) = string_prefix_len(i) {
+            let mut j = i + prefix_len;
+            let mut hashes = 0usize;
+            if raw {
+                while at(j) == Some('#') {
+                    hashes += 1;
+                    j += 1;
+                }
+            }
+            debug_assert_eq!(at(j), Some('"'));
+            j += 1;
+            let start = j;
+            let end;
+            loop {
+                match at(j) {
+                    None => panic!("source guard lexer: unterminated string literal"),
+                    Some('\\') if !raw => j += 2,
+                    Some('"') if !raw || (0..hashes).all(|k| at(j + 1 + k) == Some('#')) => {
+                        end = j;
+                        j += 1 + hashes;
+                        break;
+                    }
+                    Some(_) => j += 1,
+                }
+            }
+            let content: String = chars[start..end.min(chars.len())].iter().collect();
+            let value = if raw {
+                content
+            } else {
+                decode_string_escapes(&content)
+            };
+            tokens.push(format!("\"{value}"));
+            i = j;
+        } else if c == '\'' {
+            // char literal 'x' / '\n' / '\u{..}', or a lifetime 'a
+            if at(i + 1) == Some('\\') {
+                i += 2;
+                while at(i).is_some_and(|c| c != '\'') {
+                    i += 1;
+                }
+                i += 1;
+            } else if at(i + 2) == Some('\'') {
+                i += 3;
+            } else {
+                i += 1;
+            }
+        } else if is_ident_start(c) {
+            let start = i;
+            while at(i).is_some_and(is_ident) {
+                i += 1;
+            }
+            tokens.push(chars[start..i].iter().collect());
+        } else if c == ':' && at(i + 1) == Some(':') {
+            tokens.push("::".to_string());
+            i += 2;
+        } else {
+            tokens.push(c.to_string());
+            i += 1;
+        }
+    }
+    tokens
+}
+
+/// Decodes the escapes of a non-raw Rust string literal so a path literal is
+/// compared by its VALUE, not by its source characters: `"promotion.r\x73"`
+/// and a `\`-newline continuation both name `promotion.rs`. Covers the
+/// escapes Rust defines (`\n \r \t \\ \0 \' \"`, `\xHH`, `\u{…}`, and
+/// `\` + newline which also swallows the following whitespace). Anything
+/// else is a panic: a literal the guard cannot interpret must fail loudly.
+fn decode_string_escapes(content: &str) -> String {
+    let chars: Vec<char> = content.chars().collect();
+    let mut out = String::with_capacity(content.len());
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] != '\\' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let esc = chars
+            .get(i + 1)
+            .copied()
+            .unwrap_or_else(|| panic!("source guard lexer: dangling backslash in {content:?}"));
+        i += 2;
+        match esc {
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            '\\' => out.push('\\'),
+            '0' => out.push('\0'),
+            '\'' => out.push('\''),
+            '"' => out.push('"'),
+            'x' => {
+                let hex: String = chars[i..(i + 2).min(chars.len())].iter().collect();
+                let code = u32::from_str_radix(&hex, 16).unwrap_or_else(|_| {
+                    panic!("source guard lexer: bad \\x escape in {content:?}")
+                });
+                out.push(char::from_u32(code).expect("two hex digits are a char"));
+                i += 2;
+            }
+            'u' => {
+                assert_eq!(
+                    chars.get(i),
+                    Some(&'{'),
+                    "source guard lexer: bad \\u escape in {content:?}"
+                );
+                let close = chars[i..]
+                    .iter()
+                    .position(|c| *c == '}')
+                    .unwrap_or_else(|| panic!("source guard lexer: unclosed \\u{{ in {content:?}"));
+                let hex: String = chars[i + 1..i + close]
+                    .iter()
+                    .filter(|c| **c != '_')
+                    .collect();
+                let code = u32::from_str_radix(&hex, 16)
+                    .ok()
+                    .and_then(char::from_u32)
+                    .unwrap_or_else(|| panic!("source guard lexer: bad \\u escape in {content:?}"));
+                out.push(code);
+                i += close + 1;
+            }
+            '\n' | '\r' => {
+                // line continuation: the newline and all following whitespace vanish
+                while i < chars.len() && chars[i].is_whitespace() {
+                    i += 1;
+                }
+            }
+            other => panic!("source guard lexer: unsupported escape \\{other} in {content:?}"),
+        }
+    }
+    out
+}
+
+#[test]
+#[should_panic(expected = "unsupported escape")]
+fn references_module_refuses_an_escape_it_cannot_decode() {
+    let _ = references_module("#[path = \"promotion.r\\q\"] mod promoted;", "promotion");
+}
+
+#[test]
+#[should_panic(expected = "unterminated string literal")]
+fn references_module_refuses_a_string_literal_it_cannot_close() {
+    let _ = references_module("let s = \"never closed; use super::promotion;", "promotion");
+}
+
+#[test]
+#[should_panic(expected = "unterminated block comment")]
+fn references_module_refuses_a_block_comment_it_cannot_close() {
+    let _ = references_module("/* never closed use super::promotion;", "promotion");
+}
+
+#[test]
+fn references_module_covers_every_import_spelling_and_ignores_non_paths() {
+    for hit in [
+        "use crate::owner_site::promotion;",
+        "use crate::owner_site::promotion as promoted;",
+        "use crate::owner_site::{promotion as promoted};",
+        "use crate::owner_site::{ake, promotion, authority};",
+        "use super::{promotion as p};",
+        "use super::promotion::PromotionInput;",
+        "use crate::owner_site::{\n    ake,\n    promotion as promoted,\n};",
+        "let x = promotion::promote(input);",
+        "let x = crate::owner_site::promotion::promote(input);",
+        "pub use promotion::Promoted;",
+        // Layouts a line-based recogniser missed (review by [aria]):
+        "use\n    crate::owner_site::{promotion as promoted};",
+        "use crate::owner_site::{\n    promotion\n        as promoted,\n};",
+        "fn probe() { use crate::owner_site::{promotion as promoted}; }",
+        "#[allow(unused_imports)] use crate::owner_site::{promotion};",
+        "pub(super) use crate::owner_site::{ake, promotion as p};",
+        "use crate::owner_site::{a2_wire::{ClientHelloCore}, promotion::{PromotionInput}};",
+        "/* leading comment */ use super::promotion;",
+        "let s = \"not it\"; promotion::promote()",
+        // C strings and a trailing backslash inside a raw one ([aria]):
+        "const _: &std::ffi::CStr = cr#\"\\\"#; use crate::owner_site::{promotion as p};",
+        "const _: &std::ffi::CStr = c\"x\"; use super::promotion;",
+        "let r = br\"\\\"; use crate::owner_site::{promotion};",
+        // File inclusion by name, which the old prefixed needle caught too:
+        "#[path = \"promotion.rs\"] mod promoted;",
+        "#[path = \"../owner_site/promotion.rs\"]\nmod promoted;",
+        "include!(\"promotion.rs\");",
+        // Escapes and continuations that spell the same file ([aria]):
+        "#[path = \"promotion.r\\x73\"] mod promoted;",
+        "#[path = \"promotion.r\\u{73}\"] mod promoted;",
+        "#[path = \"promotion.rs\\\n    \"] mod promoted;",
+        "#[path = \"promotion.\\\n        rs\"] mod promoted;",
+        "include!(\"promotion.r\\x73\");",
+    ] {
+        assert!(
+            references_module(hit, "promotion"),
+            "must recognise `{hit}`"
+        );
+    }
+    for miss in [
+        "// peer promotion stays unwired",
+        "/// Promotion happens after C3; see promotion notes.",
+        "let promotion = compute();",
+        "let _ = state.promotion;",
+        "Foo { promotion }",
+        "Self::promotion(input)",
+        "use crate::owner_site::promotion_input::X;",
+        "tracing::debug!(stage = \"owner_site.promotion\");",
+        "let promoted = promotion_input.clone();",
+        "mod promotion;",
+        "/* use crate::owner_site::{promotion as p}; */",
+        "/* outer /* nested */ use super::promotion; */",
+        "let raw = r#\"use crate::owner_site::promotion;\"#;",
+        "let raw = r##\"promotion::x \"# still string\"##;",
+        "let c = '\"'; let promotion = 1; // \"",
+        "struct S<'promotion> { p: &'promotion str }",
+        "use crate::owner_site::{promotion_input as pi};",
+        "let b = b\"promotion::x\";",
+        "let c = c\"promotion::x\"; let cr = cr#\"use super::promotion;\"#;",
+        "#[path = \"promotion_input.rs\"] mod pi;",
+        "let s = \"promotion.rs.bak\";",
+        // A raw literal keeps its backslashes: this is NOT promotion.rs.
+        "#[path = r\"promotion.r\\x73\"] mod promoted;",
+        "let s = \"promotion.r\\x74\";",
+    ] {
+        assert!(
+            !references_module(miss, "promotion"),
+            "must not flag `{miss}`"
+        );
+    }
+}
+
 #[test]
 fn household_claw_contract_routes_are_mounted_with_declared_handlers() {
     let contract = contract();
     assert_eq!(contract.name, "claw-store-household");
     assert_eq!(contract.version, 1);
 
-    let bootstrap = include_str!("../src/household_bootstrap.rs");
+    let bootstrap = concat!(
+        include_str!("../src/household_bootstrap.rs"),
+        include_str!("../src/household_bootstrap/tests.rs")
+    );
     let claw_store_routes = include_str!("../src/claw_store_routes.rs");
     assert!(
         bootstrap.contains("crate::claw_store_routes::household_routes()"),
@@ -109,7 +471,10 @@ fn household_claw_contract_routes_are_mounted_with_declared_handlers() {
 #[test]
 fn household_claw_contract_handlers_require_declared_auth() {
     let contract = contract();
-    let handlers = include_str!("../src/handlers_household_claws.rs");
+    let handlers = concat!(
+        include_str!("../src/handlers_household_claws.rs"),
+        include_str!("../src/handlers_household_claws/tests.rs")
+    );
 
     assert!(
         handlers.contains(
@@ -286,9 +651,18 @@ fn household_claw_contract_handlers_require_declared_auth() {
 #[test]
 fn owner_site_ake_route_is_single_ws_record_aead_and_stays_pre_effect_after_c3() {
     let routes = include_str!("../src/claw_store_routes.rs");
-    let bootstrap = include_str!("../src/household_bootstrap.rs");
-    let handlers = include_str!("../src/handlers_household_claws.rs");
-    let ake = include_str!("../src/owner_site_ake.rs");
+    let bootstrap = concat!(
+        include_str!("../src/household_bootstrap.rs"),
+        include_str!("../src/household_bootstrap/tests.rs")
+    );
+    let handlers = concat!(
+        include_str!("../src/handlers_household_claws.rs"),
+        include_str!("../src/handlers_household_claws/tests.rs")
+    );
+    let ake = concat!(
+        include_str!("../src/owner_site/ake.rs"),
+        include_str!("../src/owner_site/ake/harness.rs")
+    );
     let lib = include_str!("../src/lib.rs");
 
     let route = contract()
@@ -306,11 +680,12 @@ fn owner_site_ake_route_is_single_ws_record_aead_and_stays_pre_effect_after_c3()
         "A2 must remain owned by claw_store_routes::household_routes"
     );
     assert!(
-        !bootstrap.contains("owner_site_ake"),
+        !references_module(bootstrap, "ake"),
         "A2 must not add bootstrap lifecycle or production provider wiring"
     );
     assert!(
-        lib.contains("pub(crate) mod owner_site_ake;"),
+        lib.contains("pub(crate) mod owner_site;")
+            && include_str!("../src/owner_site.rs").contains("pub(crate) mod ake;"),
         "the A2 state machine must remain crate-private server material"
     );
 
@@ -465,11 +840,20 @@ fn owner_site_ake_route_is_single_ws_record_aead_and_stays_pre_effect_after_c3()
 
 #[test]
 fn owner_site_promotion_skeleton_is_deny_only_and_unwired() {
-    let promotion = include_str!("../src/owner_site_promotion.rs");
-    let ake = include_str!("../src/owner_site_ake.rs");
-    let handlers = include_str!("../src/handlers_household_claws.rs");
+    let promotion = include_str!("../src/owner_site/promotion.rs");
+    let ake = concat!(
+        include_str!("../src/owner_site/ake.rs"),
+        include_str!("../src/owner_site/ake/harness.rs")
+    );
+    let handlers = concat!(
+        include_str!("../src/handlers_household_claws.rs"),
+        include_str!("../src/handlers_household_claws/tests.rs")
+    );
     let routes = include_str!("../src/claw_store_routes.rs");
-    let bootstrap = include_str!("../src/household_bootstrap.rs");
+    let bootstrap = concat!(
+        include_str!("../src/household_bootstrap.rs"),
+        include_str!("../src/household_bootstrap/tests.rs")
+    );
     let lib = include_str!("../src/lib.rs");
 
     for required in [
@@ -524,19 +908,20 @@ fn owner_site_promotion_skeleton_is_deny_only_and_unwired() {
         "promotion success exists exactly once, only in the witness-gated body"
     );
     assert!(
-        lib.contains("pub(crate) mod owner_site_promotion;"),
+        lib.contains("pub(crate) mod owner_site;")
+            && include_str!("../src/owner_site.rs").contains("pub(crate) mod promotion;"),
         "the promotion boundary must remain an explicit crate-private module"
     );
     assert!(
-        !ake.contains("owner_site_promotion") && !handlers.contains("owner_site_promotion"),
+        !references_module(ake, "promotion") && !references_module(handlers, "promotion"),
         "the A2 route must still close after C3 without wiring peer promotion"
     );
     assert!(
-        !routes.contains("owner_site_promotion"),
+        !references_module(routes, "promotion"),
         "peer promotion must not register a route in this inert slice"
     );
     assert!(
-        !bootstrap.contains("owner_site_promotion"),
+        !references_module(bootstrap, "promotion"),
         "peer promotion must not enter household bootstrap wiring"
     );
     for forbidden in [
@@ -576,11 +961,20 @@ fn owner_site_promotion_skeleton_is_deny_only_and_unwired() {
 #[test]
 fn owner_site_pre_effect_route_is_router_only_and_capability_sibling() {
     let routes = include_str!("../src/claw_store_routes.rs");
-    let bootstrap = include_str!("../src/household_bootstrap.rs");
-    let capability = include_str!("../src/owner_site_capability.rs");
-    let authority = include_str!("../src/owner_site_authority.rs");
-    let challenge = include_str!("../src/owner_site_challenge.rs");
-    let handlers = include_str!("../src/handlers_household_claws.rs");
+    let bootstrap = concat!(
+        include_str!("../src/household_bootstrap.rs"),
+        include_str!("../src/household_bootstrap/tests.rs")
+    );
+    let capability = include_str!("../src/owner_site/capability.rs");
+    let authority = concat!(
+        include_str!("../src/owner_site/authority.rs"),
+        include_str!("../src/owner_site/authority/tests.rs")
+    );
+    let challenge = include_str!("../src/owner_site/challenge.rs");
+    let handlers = concat!(
+        include_str!("../src/handlers_household_claws.rs"),
+        include_str!("../src/handlers_household_claws/tests.rs")
+    );
     let lib = include_str!("../src/lib.rs");
 
     let route = contract()
@@ -604,12 +998,15 @@ fn owner_site_pre_effect_route_is_router_only_and_capability_sibling() {
         "PR1 must not add owner-site lifecycle or routing to household_bootstrap"
     );
     assert!(
-        lib.contains("pub(crate) mod owner_site_capability;"),
+        lib.contains("pub(crate) mod owner_site;")
+            && include_str!("../src/owner_site.rs").contains("pub(crate) mod capability;"),
         "owner-site capability types must stay crate-private server-owned material"
     );
     assert!(
-        lib.contains("pub(crate) mod owner_site_authority;")
-            && lib.contains("pub(crate) mod owner_site_challenge;"),
+        lib.contains("pub(crate) mod owner_site;")
+            && include_str!("../src/owner_site.rs").contains("pub(crate) mod authority;")
+            && lib.contains("pub(crate) mod owner_site;")
+            && include_str!("../src/owner_site.rs").contains("pub(crate) mod challenge;"),
         "pre-effect A2 authority/challenge shapes must stay crate-private server-owned material"
     );
     assert!(
@@ -627,7 +1024,7 @@ fn owner_site_pre_effect_route_is_router_only_and_capability_sibling() {
         "the route-real harness must keep explicit zero challenge issue/claim probes"
     );
     assert!(
-        !capability.contains("use crate::owner_site_challenge"),
+        !references_module(capability, "challenge"),
         "the inert preflight capability must not acquire the A2 challenge table"
     );
 
@@ -648,7 +1045,7 @@ fn owner_site_pre_effect_route_is_router_only_and_capability_sibling() {
     }
 
     assert!(
-        !handler.contains("owner_site_challenge"),
+        !references_module(handler, "challenge"),
         "the inert preflight handler must not issue or claim an A2 challenge"
     );
     // S2 promoted OwnerSiteChallengeTable from cfg(test) to production.
@@ -779,12 +1176,16 @@ fn owner_site_pre_effect_route_is_router_only_and_capability_sibling() {
     // ── DP2 Fatia-2 additive coverage (§11): the promotion linearizer + store
     // are the crate-private, unwired, witness-gated sibling to this route, and
     // the store persists only a record projection (never the sealed carriers). ──
-    let store = include_str!("../src/owner_site_resolution_store.rs");
-    let promotion = include_str!("../src/owner_site_promotion.rs");
-    let ake = include_str!("../src/owner_site_ake.rs");
+    let store = include_str!("../src/owner_site/resolution_store.rs");
+    let promotion = include_str!("../src/owner_site/promotion.rs");
+    let ake = concat!(
+        include_str!("../src/owner_site/ake.rs"),
+        include_str!("../src/owner_site/ake/harness.rs")
+    );
 
     assert!(
-        lib.contains("pub(crate) mod owner_site_resolution_store;"),
+        lib.contains("pub(crate) mod owner_site;")
+            && include_str!("../src/owner_site.rs").contains("pub(crate) mod resolution_store;"),
         "the resolution store must be a crate-private module"
     );
     assert!(
@@ -792,14 +1193,14 @@ fn owner_site_pre_effect_route_is_router_only_and_capability_sibling() {
         "the promotion linearizer lives in the crate-private authority module"
     );
     for surface in [routes, bootstrap, handlers, ake] {
-        for wired in [
-            "OwnerSitePromotionLinearizer",
-            "owner_site_resolution_store",
-            "owner_site_promotion",
-        ] {
+        assert!(
+            !surface.contains("OwnerSitePromotionLinearizer"),
+            "production route/bootstrap/handler/provider must not wire `OwnerSitePromotionLinearizer`"
+        );
+        for module in ["resolution_store", "promotion"] {
             assert!(
-                !surface.contains(wired),
-                "production route/bootstrap/handler/provider must not wire `{wired}`"
+                !references_module(surface, module),
+                "production route/bootstrap/handler/provider must not wire the `{module}` module"
             );
         }
     }
@@ -835,8 +1236,7 @@ fn owner_site_pre_effect_route_is_router_only_and_capability_sibling() {
     // Third block: the store persists ONLY the record projection — never the
     // sealed carriers — and keeps the consumed-claim set and envelope identity.
     assert!(
-        !store.contains("crate::owner_site_authority")
-            && !store.contains("crate::owner_site_promotion"),
+        !references_module(store, "authority") && !references_module(store, "promotion"),
         "the store must not import the sealed authority/promotion carriers, so it \
          cannot serialize PendingFinished / witness / VerifiedMeshPeer / DialPermit"
     );
@@ -861,8 +1261,11 @@ fn owner_site_pre_effect_route_is_router_only_and_capability_sibling() {
 
 #[test]
 fn amendment_a1_challenge_accessors_are_projection_only() {
-    let challenge = include_str!("../src/owner_site_challenge.rs");
-    let authority = include_str!("../src/owner_site_authority.rs");
+    let challenge = include_str!("../src/owner_site/challenge.rs");
+    let authority = concat!(
+        include_str!("../src/owner_site/authority.rs"),
+        include_str!("../src/owner_site/authority/tests.rs")
+    );
 
     // (1)(2) Exactly the two projection getters exist, verbatim, each
     // `&self -> &[u8; 32]`.
@@ -932,7 +1335,10 @@ fn amendment_a1_challenge_accessors_are_projection_only() {
 
 #[test]
 fn owner_site_pending_finished_is_sealed_inert_and_non_promoting() {
-    let authority = include_str!("../src/owner_site_authority.rs");
+    let authority = concat!(
+        include_str!("../src/owner_site/authority.rs"),
+        include_str!("../src/owner_site/authority/tests.rs")
+    );
     let start = authority
         .find("pub(crate) struct PendingFinished {")
         .expect("production PendingFinished type must exist");

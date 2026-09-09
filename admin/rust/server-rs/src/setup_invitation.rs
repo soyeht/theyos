@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use tokio::sync::Mutex;
 
-use crate::bonjour_trust::{DiscoverySource, classify_source};
+use crate::bonjour::trust::{DiscoverySource, classify_source};
 use crate::pairing_addresses::PairingInstallation;
 
 // ── Cache entry ───────────────────────────────────────────────────────────────

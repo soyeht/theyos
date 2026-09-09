@@ -1,7 +1,7 @@
 use household_rs::keys::{IdentityKey, P256Keypair};
 use household_rs::owner_auth::OwnerAuthError;
 use household_rs::owner_webauthn::OwnerWebauthnCredential;
-use household_rs::owner_webauthn_authority::OwnerWebauthnAuthority;
+use household_rs::owner_webauthn::authority::OwnerWebauthnAuthority;
 use household_rs::person_cert::SignOwnerOptions;
 use household_rs::{
     BootstrapOpts, HouseholdAuthState, KeyBackingPolicy, PersonCert, bootstrap_or_load,

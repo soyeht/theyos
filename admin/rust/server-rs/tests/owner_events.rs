@@ -28,22 +28,22 @@ use household_rs::owner_events::{
     JoinRequestPayload, OwnerEvent, OwnerEventLog, OwnerEventPayload, OwnerEventType,
     OwnerEventsBroadcaster,
 };
-use household_rs::owner_webauthn::{
-    OwnerWebauthnConfig, OwnerWebauthnCredential, OwnerWebauthnRegistrationBinding, OwnerWebauthnRp,
-};
-use household_rs::owner_webauthn_anchor::{
+use household_rs::owner_webauthn::anchor::{
     OwnerWebauthnAnchorMode, OwnerWebauthnAuthorityAnchor, OwnerWebauthnAuthorityHead,
     read_owner_webauthn_authority_anchor, verified_owner_webauthn_authority_head,
     verify_or_update_owner_webauthn_authority_anchor, write_owner_webauthn_authority_anchor,
 };
-use household_rs::owner_webauthn_authority::{
+use household_rs::owner_webauthn::authority::{
     OwnerWebauthnAuthority, OwnerWebauthnCredentialEventAction, OwnerWebauthnEventActor,
 };
-use household_rs::owner_webauthn_recovery::{
+use household_rs::owner_webauthn::recovery::{
     OwnerWebauthnRecoveryEventAction, verified_owner_webauthn_recovery_head,
 };
-use household_rs::owner_webauthn_recovery_anchor::{
+use household_rs::owner_webauthn::recovery_anchor::{
     classify_owner_webauthn_recovery_anchor_read_only, read_owner_webauthn_recovery_anchor,
+};
+use household_rs::owner_webauthn::{
+    OwnerWebauthnConfig, OwnerWebauthnCredential, OwnerWebauthnRegistrationBinding, OwnerWebauthnRp,
 };
 use household_rs::pair_machine::{
     JoinTransport, OwnerApproval, OwnerApprovalContext, PairMachineState, PairMachineWindow,
@@ -64,7 +64,7 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
-use server_rs::apns_dispatcher::{APNS_TICKLE_BODY, ApnsError, ApnsTransport, install_transport};
+use server_rs::apns::dispatcher::{APNS_TICKLE_BODY, ApnsError, ApnsTransport, install_transport};
 use server_rs::handlers_owner_events::{
     self, OwnerApprovalEnforcementPolicy, OwnerEventsRouterState, OwnerOperationEnforcement,
     RecoveryCodeEnforcement, SecureUpgradeEnforcement, SecureUpgradeRuntimeConfig,
@@ -3574,6 +3574,12 @@ fn assert_passkey_conversion_only_in_local_attested_helper() {
 fn runtime_lines_only(source: &str) -> String {
     let lines: Vec<&str> = source.lines().collect();
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    // An extracted test module file (`<module>/tests.rs`) declares itself with
+    // an inner `#![cfg(test)]` on its first line. Blank it whole, keeping the
+    // line count so reported numbers stay aligned with disk.
+    if source.starts_with("#![cfg(test)]") {
+        return vec![String::new(); lines.len()].join("\n");
+    }
     let mut index = 0usize;
 
     while index < lines.len() {
@@ -3635,6 +3641,19 @@ fn runtime_lines_only_keeps_production_minters_and_drops_test_module_ones() {
     assert!(
         runtime_lines_only(after_module).contains("sign_owner_with_verified_provenance"),
         "a minter call below a test module must survive the filter"
+    );
+
+    // An extracted test module file is excised whole, by its inner attribute.
+    let extracted =
+        "#![cfg(test)]\n\nfn t() {\n    PersonCert::sign_owner_with_verified_provenance();\n}\n";
+    assert!(
+        !runtime_lines_only(extracted).contains("sign_owner_with_verified_provenance"),
+        "a minter call inside an extracted `#![cfg(test)]` module file must be excised"
+    );
+    // Blanked, not truncated: one (empty) line per input line.
+    assert_eq!(
+        runtime_lines_only(extracted).split('\n').count(),
+        extracted.lines().count()
     );
 
     // Blanking, not deleting: reported line numbers stay aligned with disk.
@@ -3819,7 +3838,10 @@ fn approved_online_signal_source_guard_remains_stop_gated() {
 
 #[test]
 fn device_pairing_fan_out_gate_source_guard_remains_stop_gated() {
-    let device_pairing = include_str!("../src/handlers_device_pairing.rs");
+    let device_pairing = concat!(
+        include_str!("../src/handlers_device_pairing.rs"),
+        include_str!("../src/handlers_device_pairing/tests.rs")
+    );
     let approve_handler = source_segment(
         device_pairing,
         "pub async fn device_pairing_approve_handler(",
@@ -4027,6 +4049,57 @@ fn product_a_transport_source_guard_does_not_become_owner_tier_authority() {
         "Product A / nvpn / relay_stream must stay post-trust connectivity, not owner-tier authority:\n{}",
         violations.join("\n")
     );
+}
+
+/// Whether `path` belongs to a reviewed module for the per-Claw VPN scan.
+///
+/// A reviewed module is its own file, or a test module extracted into the
+/// module's directory, recognised by the `#![cfg(test)]` that every extracted
+/// test file opens with. The directory alone is deliberately NOT enough: a
+/// production submodule dropped into `<module>/` would otherwise inherit the
+/// module's allowance without review.
+fn in_reviewed_module(path: &Path, source: &str, module_file: &Path, module_dir: &Path) -> bool {
+    path == module_file || (path.starts_with(module_dir) && source.starts_with("#![cfg(test)]"))
+}
+
+#[test]
+fn in_reviewed_module_admits_only_the_file_and_its_extracted_tests() {
+    let src = Path::new("/src");
+    let file = src.join("startup_wiring.rs");
+    let dir = src.join("startup_wiring");
+    let production = "pub fn probe() {}\n";
+    let extracted = "#![cfg(test)]\n\nuse super::*;\n";
+
+    // The module file itself, whatever it contains.
+    assert!(in_reviewed_module(&file, production, &file, &dir));
+    // An extracted test module in the module's directory.
+    assert!(in_reviewed_module(
+        &dir.join("tests.rs"),
+        extracted,
+        &file,
+        &dir
+    ));
+    // A production submodule in the same directory is NOT reviewed.
+    assert!(!in_reviewed_module(
+        &dir.join("probe.rs"),
+        production,
+        &file,
+        &dir
+    ));
+    // The marker does not help a file outside the directory.
+    assert!(!in_reviewed_module(
+        &src.join("elsewhere.rs"),
+        extracted,
+        &file,
+        &dir
+    ));
+    // A sibling whose name merely starts with the module name is unrelated.
+    assert!(!in_reviewed_module(
+        &src.join("startup_wiring_extra.rs"),
+        extracted,
+        &file,
+        &dir
+    ));
 }
 
 #[test]
@@ -4619,18 +4692,38 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
             let in_target_session_relay_module = path == target_session_relay_path;
             let in_target_session_router_module = path == target_session_router_path;
             let in_target_session_runtime_module = path == target_session_runtime_path;
-            let in_relay_stream_responder_reverse_connect_module =
-                path == relay_stream_responder_reverse_connect_path;
-            let in_relay_stream_reverse_connect_binding_module =
-                path == relay_stream_reverse_connect_binding_path;
-            let in_relay_stream_reverse_connect_pool_module =
-                path == relay_stream_reverse_connect_pool_path;
+            // A reviewed module is its file plus the test files extracted into
+            // its own directory; see `in_reviewed_module` for why the
+            // directory alone is not enough.
+            let in_relay_stream_responder_reverse_connect_module = in_reviewed_module(
+                &path,
+                &source,
+                &relay_stream_responder_reverse_connect_path,
+                &server_src_dir.join("claw_share_relay_stream_responder_reverse_connect"),
+            );
+            let in_relay_stream_reverse_connect_binding_module = in_reviewed_module(
+                &path,
+                &source,
+                &relay_stream_reverse_connect_binding_path,
+                &server_src_dir.join("claw_share_relay_stream_reverse_connect_binding"),
+            );
+            let in_relay_stream_reverse_connect_pool_module = in_reviewed_module(
+                &path,
+                &source,
+                &relay_stream_reverse_connect_pool_path,
+                &server_src_dir.join("claw_share_relay_stream_reverse_connect_pool"),
+            );
             let in_relay_stream_runtime_module = path == relay_stream_runtime_path;
             let in_relay_stream_mount_module = path == relay_stream_mount_path;
             let in_relay_stream_target_router_module = path == relay_stream_target_router_path;
             let in_runtime_module = path == runtime_path;
             let in_wiring_module = path == wiring_path;
-            let in_startup_wiring_module = path == startup_wiring_path;
+            let in_startup_wiring_module = in_reviewed_module(
+                &path,
+                &source,
+                &startup_wiring_path,
+                &server_src_dir.join("startup_wiring"),
+            );
             let in_linux_tun_module = path == linux_tun_path;
             let in_macos_utun_module = path == macos_utun_path;
             let in_packet_pump_tests = in_packet_pump_module
@@ -5387,7 +5480,10 @@ fn owner_webauthn_registration_local_source_guards_fail_closed_boundary() {
     assert!(tcp_finish.contains("authorize_owner_auth_enroll_initial_request"));
     assert!(!tcp_finish.contains("authorize_macos_local_caller"));
 
-    let router_source = include_str!("../src/household_bootstrap.rs");
+    let router_source = concat!(
+        include_str!("../src/household_bootstrap.rs"),
+        include_str!("../src/household_bootstrap/tests.rs")
+    );
     assert!(!router_source.contains("/registration/local/"));
     assert!(!router_source.contains(".merge(owner_webauthn_macos_local_registration_router"));
     assert!(router_source.contains("spawn_macos_local_registration_listener"));
@@ -5592,7 +5688,10 @@ fn owner_approval_rollout_source_guard_requires_explicit_default_off_wiring() {
     assert!(parser.contains("with_secure_upgrade(SecureUpgradeEnforcement::StrongMintingEnabled)"));
     assert!(parser.contains("OwnerApprovalEnforcementPolicy::default()"));
 
-    let router_source = include_str!("../src/household_bootstrap.rs");
+    let router_source = concat!(
+        include_str!("../src/household_bootstrap.rs"),
+        include_str!("../src/household_bootstrap/tests.rs")
+    );
     assert!(router_source.contains(
         "let owner_approval_policy = handlers_owner_events::owner_approval_policy_from_env();"
     ));
@@ -5671,7 +5770,10 @@ fn owner_webauthn_revoke_start_source_guards_read_only_contract() {
     assert!(!auth_helper.contains("HouseholdAddMachine"));
     assert!(!auth_helper.contains("OwnerAuthEnrollInitial"));
 
-    let router_source = include_str!("../src/household_bootstrap.rs");
+    let router_source = concat!(
+        include_str!("../src/household_bootstrap.rs"),
+        include_str!("../src/household_bootstrap/tests.rs")
+    );
     assert!(router_source.contains("/api/v1/household/owner-webauthn/revoke/start"));
 }
 
@@ -5743,7 +5845,10 @@ fn owner_webauthn_add_credential_start_source_guards_challenge_only_contract() {
     assert!(!auth_helper.contains("HouseholdAddMachine"));
     assert!(!auth_helper.contains("OwnerAuthEnrollInitial"));
 
-    let router_source = include_str!("../src/household_bootstrap.rs");
+    let router_source = concat!(
+        include_str!("../src/household_bootstrap.rs"),
+        include_str!("../src/household_bootstrap/tests.rs")
+    );
     assert!(router_source.contains("/api/v1/household/owner-webauthn/add-credential/start"));
     assert!(router_source.contains("/api/v1/household/owner-webauthn/add-credential/finish"));
 }
@@ -5862,7 +5967,10 @@ fn owner_webauthn_add_credential_finish_source_guards_mutation_contract() {
     assert!(!auth_helper.contains("HouseholdAddMachine"));
     assert!(!auth_helper.contains("OwnerAuthEnrollInitial"));
 
-    let router_source = include_str!("../src/household_bootstrap.rs");
+    let router_source = concat!(
+        include_str!("../src/household_bootstrap.rs"),
+        include_str!("../src/household_bootstrap/tests.rs")
+    );
     assert!(router_source.contains("/api/v1/household/owner-webauthn/add-credential/finish"));
 }
 
@@ -5936,7 +6044,10 @@ fn owner_webauthn_revoke_finish_source_guards_mutation_contract() {
     assert!(!auth_helper.contains("HouseholdAddMachine"));
     assert!(!auth_helper.contains("OwnerAuthEnrollInitial"));
 
-    let router_source = include_str!("../src/household_bootstrap.rs");
+    let router_source = concat!(
+        include_str!("../src/household_bootstrap.rs"),
+        include_str!("../src/household_bootstrap/tests.rs")
+    );
     assert!(router_source.contains("/api/v1/household/owner-webauthn/revoke/finish"));
 }
 
@@ -6205,7 +6316,10 @@ fn owner_webauthn_recovery_source_guards_provision_readiness_contract() {
         assert!(!auth_helper.contains("OwnerAuthEnrollInitial"));
     }
 
-    let router_source = include_str!("../src/household_bootstrap.rs");
+    let router_source = concat!(
+        include_str!("../src/household_bootstrap.rs"),
+        include_str!("../src/household_bootstrap/tests.rs")
+    );
     assert!(router_source.contains("/api/v1/household/owner-webauthn/recovery/status"));
     assert!(router_source.contains("/api/v1/household/owner-webauthn/recovery/start"));
     assert!(router_source.contains("/api/v1/household/owner-webauthn/recovery/finish"));

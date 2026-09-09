@@ -1,0 +1,2293 @@
+//! Pre-effect owner-site membership and roster authority types.
+//!
+//! This is deliberately a typed *shape*, not a production authority provider.
+//! A [`household_rs::MemberDeviceBinding`] verifies that a member key vouched
+//! for a device key and participant identity. It does not make that member
+//! trusted for a household, identify an incoming TCP connection, or establish
+//! that a roster was signed by the household owner. Those three properties stay
+//! fail-closed until the reviewed remote-principal and roster-provider slices.
+//!
+//! In particular, this module does not read `ConnectInfo`, addresses, interface
+//! names, or mesh projections. The sole admitting variant is compiled only for
+//! crate tests; production has no constructor that can produce an authority.
+
+#![allow(dead_code)] // deliberately staged, unreachable until the reviewed A2/provider slices
+
+use std::num::NonZeroU64;
+
+use household_rs::{HouseholdId, MachineCert, MemberDeviceBinding, P256PublicKey};
+
+#[cfg(test)]
+use crate::owner_site::capability::validated_server_identifier;
+use crate::owner_site::capability::{
+    OwnerSiteCanonicalRequest, OwnerSiteIntent, OwnerSiteIntentError, OwnerSiteResource,
+    validated_component,
+};
+use crate::owner_site::challenge::{
+    OwnerSiteChannelEpoch, OwnerSiteChannelId, OwnerSiteWebSocketInstance,
+};
+use crate::owner_site::promotion::OwnerSitePromotedChannel;
+
+/// Version reserved for the future signed owner-site roster envelope.
+///
+/// No parser, signer, verifier, persistence, or provider accepts this shape in
+/// this PR. Keeping the version private to server types prevents a provisional
+/// HTTP or A2 encoding from becoming a protocol commitment.
+pub(crate) const OWNER_SITE_ROSTER_VERSION: u8 = 1;
+
+/// Server-local state after A2 has authenticated both sides and confirmed C3.
+///
+/// This is the complete immutable identity/authority tuple that a later
+/// linearizer must resolve.  It is deliberately not serializable, clonable,
+/// default-constructible, or convertible from another value.  Production has
+/// no constructor in this slice; the only constructor is a synthetic crate
+/// test fixture below.
+pub(crate) struct PendingFinished {
+    household: HouseholdId,
+    exact_resource: OwnerSiteResource,
+    exact_route: OwnerSiteCanonicalRequest,
+    machine_cert: MachineCert,
+    device_binding: MemberDeviceBinding,
+    principal_d: OwnerSiteRemotePrincipal,
+    ws_instance: OwnerSiteWebSocketInstance,
+    channel_id: OwnerSiteChannelId,
+    channel_epoch: OwnerSiteChannelEpoch,
+    channel_binding: [u8; 32],
+    authz_epoch: NonZeroU64,
+    roster_digest: [u8; 32],
+    fresh_until: u64,
+    provider_generation: u64,
+    cancellation_generation: u64,
+}
+
+impl std::fmt::Debug for PendingFinished {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PendingFinished(REDACTED)")
+    }
+}
+
+impl PendingFinished {
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn injected_for_harness(
+        household: HouseholdId,
+        exact_resource: OwnerSiteResource,
+        exact_route: OwnerSiteCanonicalRequest,
+        machine_cert: MachineCert,
+        device_binding: MemberDeviceBinding,
+        principal_d: OwnerSiteRemotePrincipal,
+        ws_instance: OwnerSiteWebSocketInstance,
+        channel_id: OwnerSiteChannelId,
+        channel_epoch: OwnerSiteChannelEpoch,
+        channel_binding: [u8; 32],
+        authz_epoch: u64,
+        roster_digest: [u8; 32],
+        fresh_until: u64,
+        provider_generation: u64,
+        cancellation_generation: u64,
+    ) -> Result<Self, OwnerSiteAuthorityError> {
+        let authz_epoch =
+            NonZeroU64::new(authz_epoch).ok_or(OwnerSiteAuthorityError::ZeroGeneration)?;
+        Ok(Self {
+            household,
+            exact_resource,
+            exact_route,
+            machine_cert,
+            device_binding,
+            principal_d,
+            ws_instance,
+            channel_id,
+            channel_epoch,
+            channel_binding,
+            authz_epoch,
+            roster_digest,
+            fresh_until,
+            provider_generation,
+            cancellation_generation,
+        })
+    }
+
+    #[must_use]
+    fn generation_vector(&self) -> OwnerSiteGenerationVector {
+        OwnerSiteGenerationVector {
+            authz_epoch: self.authz_epoch.get(),
+            roster_digest: self.roster_digest,
+            provider_generation: self.provider_generation,
+            cancellation_generation: self.cancellation_generation,
+        }
+    }
+}
+
+/// Non-forgeable app-layer proof that one exact A2 channel is authenticated
+/// and confidential.
+///
+/// The type is intentionally defined but not wired to any production session,
+/// mint, route, or promotion boundary in this slice.
+pub(crate) struct AuthenticatedConfidentialChannel {
+    _seal: AuthenticatedConfidentialChannelSeal,
+    ws_instance: OwnerSiteWebSocketInstance,
+    channel_id: OwnerSiteChannelId,
+    channel_epoch: OwnerSiteChannelEpoch,
+    channel_binding: [u8; 32],
+}
+
+struct AuthenticatedConfidentialChannelSeal;
+
+impl std::fmt::Debug for AuthenticatedConfidentialChannel {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AuthenticatedConfidentialChannel(REDACTED)")
+    }
+}
+
+impl AuthenticatedConfidentialChannel {
+    #[cfg(test)]
+    pub(crate) fn injected_for_harness(
+        ws_instance: OwnerSiteWebSocketInstance,
+        channel_id: OwnerSiteChannelId,
+        channel_epoch: OwnerSiteChannelEpoch,
+        channel_binding: [u8; 32],
+    ) -> Self {
+        Self {
+            _seal: AuthenticatedConfidentialChannelSeal,
+            ws_instance,
+            channel_id,
+            channel_epoch,
+            channel_binding,
+        }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn matches_pending(&self, pending: &PendingFinished) -> bool {
+        self.ws_instance == pending.ws_instance
+            && self.channel_id == pending.channel_id
+            && self.channel_epoch == pending.channel_epoch
+            && self.channel_binding == pending.channel_binding
+    }
+}
+
+/// Type-level representation of a channel waiting for the later linearizer.
+pub(crate) struct Pending {
+    pending_finished: PendingFinished,
+    channel: AuthenticatedConfidentialChannel,
+}
+
+impl Pending {
+    #[cfg(test)]
+    pub(crate) fn injected_for_harness(
+        pending_finished: PendingFinished,
+        channel: AuthenticatedConfidentialChannel,
+    ) -> Result<Self, OwnerSiteAuthorityError> {
+        if !channel.matches_pending(&pending_finished) {
+            return Err(OwnerSiteAuthorityError::ChannelProofMismatch);
+        }
+        Ok(Self {
+            pending_finished,
+            channel,
+        })
+    }
+
+    fn begin_closing(self) -> Closing {
+        Closing { pending: self }
+    }
+}
+
+/// Type-level promoted state.  Its carrier has no construction path here.
+pub(crate) struct Promoted {
+    channel: OwnerSitePromotedChannel,
+}
+
+/// Type-level state after a future single-use permit reserves one backend.
+pub(crate) struct Dialing {
+    promoted: Promoted,
+}
+
+/// Type-level state for a future fenced byte pump.
+pub(crate) struct Pumping {
+    dialing: Dialing,
+}
+
+/// Pure terminal path available to an unpromoted channel in this slice.
+pub(crate) struct Closing {
+    pending: Pending,
+}
+
+impl Closing {
+    fn finish(self) -> Closed {
+        let Self { pending } = self;
+        let Pending {
+            pending_finished,
+            channel,
+        } = pending;
+        let _ = (pending_finished, channel);
+        Closed {
+            _seal: ClosedStateSeal,
+        }
+    }
+}
+
+/// Type-level revoke state reserved for the later persisted linearizer.
+pub(crate) struct Revoking {
+    _seal: RevokingStateSeal,
+}
+
+struct RevokingStateSeal;
+
+/// Idempotent terminal state.  Closing it again cannot recreate authority.
+pub(crate) struct Closed {
+    _seal: ClosedStateSeal,
+}
+
+struct ClosedStateSeal;
+
+impl Closed {
+    #[must_use]
+    fn close(self) -> Self {
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OwnerSiteStateKind {
+    Pending,
+    Promoted,
+    Dialing,
+    Pumping,
+    Closing,
+    Revoking,
+    Closed,
+}
+
+/// Pure topology predicate for the deliberately non-promoting first slice.
+#[must_use]
+const fn owner_site_transition_is_allowed(
+    from: OwnerSiteStateKind,
+    to: OwnerSiteStateKind,
+) -> bool {
+    matches!(
+        (from, to),
+        (OwnerSiteStateKind::Pending, OwnerSiteStateKind::Closing)
+            | (
+                OwnerSiteStateKind::Closing
+                    | OwnerSiteStateKind::Closed
+                    | OwnerSiteStateKind::Revoking,
+                OwnerSiteStateKind::Closed
+            )
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OwnerSiteGenerationVector {
+    authz_epoch: u64,
+    roster_digest: [u8; 32],
+    provider_generation: u64,
+    cancellation_generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OwnerSiteGenerationComparison {
+    Exact,
+    AuthorityChanged,
+    ProviderChanged,
+    CancellationChanged,
+}
+
+/// Pure generation comparison; it reads no provider, clock, store, or socket.
+#[must_use]
+fn compare_owner_site_generations(
+    expected: OwnerSiteGenerationVector,
+    observed: OwnerSiteGenerationVector,
+) -> OwnerSiteGenerationComparison {
+    if expected.cancellation_generation != observed.cancellation_generation {
+        OwnerSiteGenerationComparison::CancellationChanged
+    } else if expected.authz_epoch != observed.authz_epoch
+        || expected.roster_digest != observed.roster_digest
+    {
+        OwnerSiteGenerationComparison::AuthorityChanged
+    } else if expected.provider_generation != observed.provider_generation {
+        OwnerSiteGenerationComparison::ProviderChanged
+    } else {
+        OwnerSiteGenerationComparison::Exact
+    }
+}
+
+/// Opaque identity expected from the future reviewed connection-principal
+/// boundary.
+///
+/// It is intentionally an identity string, never an IP address or a client
+/// supplied request field. Production cannot construct one in this slice.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OwnerSiteRemotePrincipal {
+    participant_npub: String,
+}
+
+impl OwnerSiteRemotePrincipal {
+    #[cfg(test)]
+    pub(crate) fn injected_for_harness(
+        participant_npub: &str,
+    ) -> Result<Self, OwnerSiteIntentError> {
+        Ok(Self {
+            participant_npub: validated_component(participant_npub)?,
+        })
+    }
+
+    #[must_use]
+    pub(crate) fn participant_npub(&self) -> &str {
+        &self.participant_npub
+    }
+}
+
+/// Monotonic authorization epoch plus the opaque digest of the authoritative
+/// roster content for one household/network scope.
+///
+/// The epoch is deliberately not a timestamp. A future durable provider must
+/// reject rollback or a conflicting digest before it can emit this type.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OwnerSiteAuthorityGeneration {
+    authz_epoch: NonZeroU64,
+    digest: [u8; 32],
+}
+
+impl OwnerSiteAuthorityGeneration {
+    #[cfg(test)]
+    pub(crate) fn injected_for_harness(
+        authz_epoch: u64,
+        digest: [u8; 32],
+    ) -> Result<Self, OwnerSiteAuthorityError> {
+        let authz_epoch =
+            NonZeroU64::new(authz_epoch).ok_or(OwnerSiteAuthorityError::ZeroGeneration)?;
+        Ok(Self {
+            authz_epoch,
+            digest,
+        })
+    }
+
+    #[must_use]
+    pub(crate) fn authz_epoch(self) -> u64 {
+        self.authz_epoch.get()
+    }
+
+    #[must_use]
+    pub(crate) fn digest(self) -> [u8; 32] {
+        self.digest
+    }
+
+    #[must_use]
+    fn is_after(self, other: Self) -> bool {
+        self.authz_epoch() > other.authz_epoch()
+    }
+
+    #[must_use]
+    fn is_same_epoch_with_different_digest(self, other: Self) -> bool {
+        self.authz_epoch() == other.authz_epoch() && self.digest != other.digest
+    }
+
+    /// A nested binding or tombstone may be historical, or may belong to the
+    /// exact snapshot generation that carries it. A same-epoch digest mismatch
+    /// is an authority conflict, never an ordering tie to accept.
+    #[must_use]
+    fn is_nested_in_or_before(self, snapshot: Self) -> bool {
+        self.authz_epoch() < snapshot.authz_epoch()
+            || (self.authz_epoch() == snapshot.authz_epoch() && self.digest == snapshot.digest)
+    }
+}
+
+/// Household and mesh network namespace for an owner-site authority snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OwnerSiteRosterScope {
+    household_id: String,
+    network_id: String,
+}
+
+impl OwnerSiteRosterScope {
+    #[cfg(test)]
+    pub(crate) fn injected_for_harness(
+        household_id: &str,
+        network_id: &str,
+    ) -> Result<Self, OwnerSiteIntentError> {
+        Ok(Self {
+            household_id: validated_server_identifier(household_id)?,
+            network_id: validated_component(network_id)?,
+        })
+    }
+
+    #[must_use]
+    fn matches_intent(&self, intent: &OwnerSiteIntent) -> bool {
+        self.household_id == intent.household_id() && self.network_id == intent.network_id()
+    }
+}
+
+/// Owner-site role carried by a future owner-signed roster decision.
+///
+/// PR2 records the role in the staged type but authorizes no production caller.
+/// The only harness positive uses `Owner`; membership/ACL policy remains a
+/// reviewed provider decision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OwnerSiteMembershipRole {
+    Owner,
+    Member,
+}
+
+/// Opaque roster-local identifier for a member-device enrollment.
+///
+/// Its canonical derivation and owner signature are deliberately deferred. The
+/// identifier exists now only so tombstones can be typed separately from a
+/// live `MemberDeviceBinding` and can never be confused with a peer address.
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub(crate) struct OwnerSiteBindingId([u8; 32]);
+
+impl std::fmt::Debug for OwnerSiteBindingId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("OwnerSiteBindingId(REDACTED)")
+    }
+}
+
+impl OwnerSiteBindingId {
+    /// Production constructor for a claimed binding id arriving over the
+    /// wire: same validation as the harness path (all-zero is rejected).
+    #[allow(dead_code)]
+    pub(crate) fn from_wire(bytes: [u8; 32]) -> Result<Self, OwnerSiteAuthorityError> {
+        if bytes.iter().all(|byte| *byte == 0) {
+            return Err(OwnerSiteAuthorityError::ZeroBindingId);
+        }
+        Ok(Self(bytes))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn injected_for_harness(bytes: [u8; 32]) -> Result<Self, OwnerSiteAuthorityError> {
+        if bytes.iter().all(|byte| *byte == 0) {
+            return Err(OwnerSiteAuthorityError::ZeroBindingId);
+        }
+        Ok(Self(bytes))
+    }
+
+    #[must_use]
+    pub(crate) fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Opaque canonical digest of the owner-site binding as committed by a future
+/// signed roster envelope.
+///
+/// The digest is deliberately injected only in tests for now: deriving it and
+/// signing the exact CBOR envelope are part of the reviewed authority-provider
+/// slice, not a license to accept an ad-hoc client binding.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct OwnerSiteBindingDigest([u8; 32]);
+
+impl std::fmt::Debug for OwnerSiteBindingDigest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("OwnerSiteBindingDigest(REDACTED)")
+    }
+}
+
+impl OwnerSiteBindingDigest {
+    /// Production constructor for a claimed binding digest arriving over the
+    /// wire: same validation as the harness path (all-zero is rejected).
+    #[allow(dead_code)]
+    pub(crate) fn from_wire(bytes: [u8; 32]) -> Result<Self, OwnerSiteAuthorityError> {
+        if bytes.iter().all(|byte| *byte == 0) {
+            return Err(OwnerSiteAuthorityError::ZeroBindingDigest);
+        }
+        Ok(Self(bytes))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn injected_for_harness(bytes: [u8; 32]) -> Result<Self, OwnerSiteAuthorityError> {
+        if bytes.iter().all(|byte| *byte == 0) {
+            return Err(OwnerSiteAuthorityError::ZeroBindingDigest);
+        }
+        Ok(Self(bytes))
+    }
+
+    #[must_use]
+    pub(crate) fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// The device-auth transcript hash. Deliberately a DIFFERENT Rust type from
+/// [`OwnerActionHash`]: the M3 signs two different hashes, and a naked
+/// `&[u8; 32]` parameter leaves the exact swap the key types prevent
+/// available one argument down — passing the action hash to channel-auth
+/// verification compiles and verifies, because the client signed both.
+/// With distinct types the swap is a compile error, not a runtime
+/// coincidence (finding A; same move as `household_id`/`network_id` in 3a-2).
+///
+/// Constructed ONLY by the hash-computing function — never parsed from wire
+/// bytes (finding B: the transcript hash is computed from server session
+/// state, never read from the wire).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DeviceAuthHash([u8; 32]);
+
+#[allow(dead_code)] // produced by the A2 hash functions (3a-4)
+impl DeviceAuthHash {
+    /// The ONE production constructor: takes the transcript INPUTS and
+    /// computes inside (via `owner_site_binding_glue::device_auth_hash`,
+    /// the same function the peer uses). There is no `from_bytes`: wire
+    /// bytes cannot become a transcript hash, because there is no
+    /// parameter of bytes by which they could be passed — and the pre
+    /// itself arrives typed ([`ChannelBindingPre`], also byte-proof).
+    pub(crate) fn compute(
+        channel_binding_pre: &crate::owner_site::binding_glue::ChannelBindingPre,
+        binding_id: &OwnerSiteBindingId,
+        binding_digest: &OwnerSiteBindingDigest,
+        participant_npub: &str,
+        channel_auth_key_id: &OwnerSiteChannelAuthKeyId,
+    ) -> Result<Self, OwnerSiteAuthorityError> {
+        crate::owner_site::binding_glue::device_auth_hash(
+            channel_binding_pre,
+            binding_id,
+            binding_digest,
+            participant_npub,
+            channel_auth_key_id,
+        )
+    }
+
+    /// Crate-internal constructor for the glue itself — the only other
+    /// place a hash may materialize.
+    pub(crate) fn from_digest_impl(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// The owner-action transcript hash. See [`DeviceAuthHash`] for why these
+/// are two types and not one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OwnerActionHash([u8; 32]);
+
+impl OwnerActionHash {
+    /// The ONE production constructor (3a-4): transcript fields in, hash
+    /// out, via the same `owner_action_hash` the peer uses. Said out loud,
+    /// per the audit requirement: adding this constructor converts the type
+    /// from UNINHABITABLE in production (fail-closed by TYPE — the value
+    /// could not exist) to constructible-through-one-path (fail-closed by
+    /// DECISION — strictly weaker). Correct, and a change of guarantee, not
+    /// plumbing.
+    #[allow(dead_code)] // wired by the A2 M3 verification flow (3a-5)
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn compute(
+        channel_binding_pre: &crate::owner_site::binding_glue::ChannelBindingPre,
+        m2: &crate::owner_site::a2_wire::ServerHello,
+        c1: &crate::owner_site::a2_wire::ClientHelloCore,
+        binding_id: &OwnerSiteBindingId,
+        binding_digest: &OwnerSiteBindingDigest,
+        participant_npub: &str,
+        intent_wire: &[u8],
+    ) -> Result<Self, OwnerSiteAuthorityError> {
+        crate::owner_site::binding_glue::owner_action_hash(
+            channel_binding_pre,
+            m2,
+            c1,
+            binding_id,
+            binding_digest,
+            participant_npub,
+            intent_wire,
+        )
+    }
+
+    /// TEST-ONLY constructor. Production construction goes through
+    /// `compute` only — an infallible `from_bytes` here would let wire
+    /// bytes pose as a transcript hash, so there is none in production.
+    #[cfg(test)]
+    pub(crate) fn from_computed(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Crate-internal constructor for the glue itself — the only other
+    /// place a hash may materialize.
+    pub(crate) fn from_digest_impl(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    #[allow(dead_code)] // produced by the A2 hash functions (3a-5)
+    pub(crate) fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Channel-auth P-256 signer in one owner-site binding.
+///
+/// The Secure Enclave/P-256 key signs channel material; it never supplies the
+/// X25519 ECDH secret. The wrapper exists so the roster can bind two distinct
+/// logical signers without changing the compatibility-sensitive generic
+/// [`MemberDeviceBinding`] wire format.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OwnerSiteChannelAuthKey {
+    key_id: OwnerSiteChannelAuthKeyId,
+    public_key: P256PublicKey,
+}
+
+impl OwnerSiteChannelAuthKey {
+    #[cfg(test)]
+    pub(crate) fn injected_for_harness(
+        key_id: &str,
+        public_key: P256PublicKey,
+    ) -> Result<Self, OwnerSiteIntentError> {
+        Ok(Self {
+            key_id: OwnerSiteChannelAuthKeyId::injected_for_harness(key_id)?,
+            public_key,
+        })
+    }
+
+    /// Exposes the exact verified channel-auth public key only to the future
+    /// A2 verifier. Its distinct wrapper type prevents it from being used as
+    /// the action-PoP key by accident.
+    #[must_use]
+    pub(crate) fn verifying_key(&self) -> &P256PublicKey {
+        &self.public_key
+    }
+
+    /// The first PRODUCTION constructor (S2 glue, 3a-3): the key is admitted
+    /// ONLY with a valid P-256 signature over the DEVICE-AUTH transcript
+    /// hash. Presence is not derivation — a key whose proof does not match
+    /// the transcript is REFUSED and no key is produced. "The keys exist"
+    /// never passes for "the parties exchanged"; the proof IS the exchange.
+    /// The hash type pins WHICH transcript hash: the action hash cannot be
+    /// passed here by accident.
+    #[allow(dead_code)] // wired by the A2 M3 verification flow (3a-4)
+    pub(crate) fn from_transcript_proof(
+        key_id: &str,
+        public_key: P256PublicKey,
+        proof: &[u8],
+        transcript_hash: &DeviceAuthHash,
+    ) -> Result<Self, OwnerSiteAuthorityError> {
+        let signature = household_rs::P256Signature::from_bytes(proof)
+            .map_err(|_| OwnerSiteAuthorityError::ChannelProofMismatch)?;
+        household_rs::keys::verify_signature(&public_key, transcript_hash.as_bytes(), &signature)
+            .map_err(|_| OwnerSiteAuthorityError::ChannelProofMismatch)?;
+        Ok(Self {
+            key_id: OwnerSiteChannelAuthKeyId::from_wire(key_id)
+                .map_err(|_| OwnerSiteAuthorityError::ChannelProofMismatch)?,
+            public_key,
+        })
+    }
+
+    #[must_use]
+    pub(crate) fn key_id(&self) -> &OwnerSiteChannelAuthKeyId {
+        &self.key_id
+    }
+}
+
+/// Action-PoP P-256 signer in one owner-site binding.
+///
+/// This deliberately has a different Rust type from
+/// [`OwnerSiteChannelAuthKey`]. A future A2 handler cannot accidentally pass a
+/// `PoP` signer where a channel-auth signature is required.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OwnerSiteActionPopKey {
+    key_id: OwnerSiteActionPopKeyId,
+    public_key: P256PublicKey,
+}
+
+impl OwnerSiteActionPopKey {
+    #[cfg(test)]
+    pub(crate) fn injected_for_harness(
+        key_id: &str,
+        public_key: P256PublicKey,
+    ) -> Result<Self, OwnerSiteIntentError> {
+        Ok(Self {
+            key_id: OwnerSiteActionPopKeyId::injected_for_harness(key_id)?,
+            public_key,
+        })
+    }
+
+    /// The first PRODUCTION constructor (S2 glue, 3a-3): the key is admitted
+    /// ONLY with a valid P-256 signature over the OWNER-ACTION transcript
+    /// hash. Presence is not derivation — a key whose proof does not match
+    /// the transcript is REFUSED and no key is produced. The hash type pins
+    /// WHICH transcript hash: the device-auth hash cannot be passed here by
+    /// accident.
+    #[allow(dead_code)] // wired by the A2 M3 verification flow (3a-4)
+    pub(crate) fn from_transcript_proof(
+        key_id: &str,
+        public_key: P256PublicKey,
+        proof: &[u8],
+        transcript_hash: &OwnerActionHash,
+    ) -> Result<Self, OwnerSiteAuthorityError> {
+        let signature = household_rs::P256Signature::from_bytes(proof)
+            .map_err(|_| OwnerSiteAuthorityError::ChannelProofMismatch)?;
+        household_rs::keys::verify_signature(&public_key, transcript_hash.as_bytes(), &signature)
+            .map_err(|_| OwnerSiteAuthorityError::ChannelProofMismatch)?;
+        Ok(Self {
+            key_id: OwnerSiteActionPopKeyId::from_wire(key_id)
+                .map_err(|_| OwnerSiteAuthorityError::ChannelProofMismatch)?,
+            public_key,
+        })
+    }
+
+    /// Exposes the exact verified action-PoP public key only to the future
+    /// A2 verifier. It has a distinct Rust type from channel authentication.
+    #[must_use]
+    pub(crate) fn verifying_key(&self) -> &P256PublicKey {
+        &self.public_key
+    }
+
+    #[must_use]
+    pub(crate) fn key_id(&self) -> &OwnerSiteActionPopKeyId {
+        &self.key_id
+    }
+}
+
+/// Typed key identifier for the P-256 signature that authenticates A2 channel
+/// material. It is intentionally not interchangeable with an action-PoP id.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OwnerSiteChannelAuthKeyId(String);
+
+impl OwnerSiteChannelAuthKeyId {
+    #[cfg(test)]
+    pub(crate) fn injected_for_harness(value: &str) -> Result<Self, OwnerSiteIntentError> {
+        Ok(Self(validated_component(value)?))
+    }
+
+    /// Production constructor for a key id arriving over the wire: same
+    /// validation as the harness path, no test gate.
+    #[allow(dead_code)] // wired by the A2 M3 verification flow (3a-4)
+    pub(crate) fn from_wire(value: &str) -> Result<Self, OwnerSiteIntentError> {
+        Ok(Self(validated_component(value)?))
+    }
+
+    #[must_use]
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Typed key identifier for the P-256 signature authorizing the final action.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OwnerSiteActionPopKeyId(String);
+
+impl OwnerSiteActionPopKeyId {
+    #[cfg(test)]
+    pub(crate) fn injected_for_harness(value: &str) -> Result<Self, OwnerSiteIntentError> {
+        Ok(Self(validated_component(value)?))
+    }
+
+    /// Production constructor for a key id arriving over the wire: same
+    /// validation as the harness path, no test gate.
+    #[allow(dead_code)] // wired by the A2 M3 verification flow (3a-4)
+    pub(crate) fn from_wire(value: &str) -> Result<Self, OwnerSiteIntentError> {
+        Ok(Self(validated_component(value)?))
+    }
+
+    #[must_use]
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// One active member-device enrollment scoped to a household, mesh network,
+/// role, and exact owner-site resource.
+///
+/// `MemberDeviceBinding` must verify before this staging type can be built.
+/// That still does not turn it into household authority: the future signed
+/// roster envelope and the per-connection principal assertion are both
+/// mandatory before any effect.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OwnerSiteRosterBinding {
+    binding_id: OwnerSiteBindingId,
+    binding_digest: OwnerSiteBindingDigest,
+    scope: OwnerSiteRosterScope,
+    member_device: MemberDeviceBinding,
+    role: OwnerSiteMembershipRole,
+    resource: OwnerSiteResource,
+    channel_auth: OwnerSiteChannelAuthKey,
+    action_pop: OwnerSiteActionPopKey,
+    enrolled_at: OwnerSiteAuthorityGeneration,
+}
+
+impl OwnerSiteRosterBinding {
+    #[cfg(test)]
+    pub(crate) fn injected_for_harness(
+        binding_id: OwnerSiteBindingId,
+        binding_digest: OwnerSiteBindingDigest,
+        scope: OwnerSiteRosterScope,
+        member_device: MemberDeviceBinding,
+        role: OwnerSiteMembershipRole,
+        resource: OwnerSiteResource,
+        channel_auth: OwnerSiteChannelAuthKey,
+        action_pop: OwnerSiteActionPopKey,
+        enrolled_at: OwnerSiteAuthorityGeneration,
+    ) -> Result<Self, OwnerSiteAuthorityError> {
+        member_device
+            .verify()
+            .map_err(|_| OwnerSiteAuthorityError::MemberDeviceBindingRejected)?;
+        Ok(Self {
+            binding_id,
+            binding_digest,
+            scope,
+            member_device,
+            role,
+            resource,
+            channel_auth,
+            action_pop,
+            enrolled_at,
+        })
+    }
+
+    /// The first PRODUCTION constructor (S2 glue, increment 3a-2): the
+    /// `binding_id`/`binding_digest` pair is RECOMPUTED here from the
+    /// declared inputs via `owner_site_binding_glue` — never accepted as
+    /// parameters. A caller-supplied digest would let a caller bind what the
+    /// authority did not derive (the caller-chosen-universal-value class).
+    ///
+    /// Field origins per the glue's table: `machine_cert` from the roster
+    /// authority; `member_device` verified, never trusted; the session keys
+    /// arrive already wrapped in their distinct types (they are born in the
+    /// handshake); `enrolled_at` comes from the adapter observation
+    /// (floor-less digest, like-to-like with the AKE's target).
+    #[allow(dead_code)] // wired by the binding-establishment flow (3a-3)
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_glue(
+        machine_cert: &[u8],
+        scope: OwnerSiteRosterScope,
+        member_device: MemberDeviceBinding,
+        role: OwnerSiteMembershipRole,
+        resource: OwnerSiteResource,
+        channel_auth: OwnerSiteChannelAuthKey,
+        action_pop: OwnerSiteActionPopKey,
+        enrolled_at: OwnerSiteAuthorityGeneration,
+    ) -> Result<Self, OwnerSiteAuthorityError> {
+        member_device
+            .verify()
+            .map_err(|_| OwnerSiteAuthorityError::MemberDeviceBindingRejected)?;
+        let (binding_id, binding_digest) =
+            crate::owner_site::binding_glue::derive_binding_id_and_digest(
+                machine_cert,
+                channel_auth.public_key.as_bytes(),
+                action_pop.public_key.as_bytes(),
+                &scope.household_id,
+                &scope.network_id,
+                resource.as_str(),
+                enrolled_at.authz_epoch(),
+                &enrolled_at.digest(),
+            )?;
+        Ok(Self {
+            binding_id: OwnerSiteBindingId(binding_id),
+            binding_digest: OwnerSiteBindingDigest(binding_digest),
+            scope,
+            member_device,
+            role,
+            resource,
+            channel_auth,
+            action_pop,
+            enrolled_at,
+        })
+    }
+
+    #[must_use]
+    fn binding_id(&self) -> OwnerSiteBindingId {
+        self.binding_id
+    }
+
+    #[must_use]
+    fn binding_digest(&self) -> OwnerSiteBindingDigest {
+        self.binding_digest
+    }
+
+    #[must_use]
+    fn resolves(
+        &self,
+        intent: &OwnerSiteIntent,
+        principal: &OwnerSiteRemotePrincipal,
+    ) -> Option<OwnerSiteResolvedBinding> {
+        if !(self.scope.matches_intent(intent)
+            && self.member_device.member_id == intent.actor_id()
+            && self.member_device.participant_npub == principal.participant_npub()
+            && self.role == OwnerSiteMembershipRole::Owner
+            && self.resource == *intent.resource())
+        {
+            return None;
+        }
+        Some(OwnerSiteResolvedBinding {
+            binding_id: self.binding_id,
+            binding_digest: self.binding_digest,
+            participant_npub: self.member_device.participant_npub.clone(),
+            channel_auth: self.channel_auth.clone(),
+            action_pop: self.action_pop.clone(),
+        })
+    }
+}
+
+/// Exact local C-resolution for a future A2 `C2` message.
+///
+/// It is server-only, not serializable, and can be created only after the
+/// roster provider resolves one exact binding. PR2 exposes it only through a
+/// crate-test fixture.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OwnerSiteResolvedBinding {
+    binding_id: OwnerSiteBindingId,
+    binding_digest: OwnerSiteBindingDigest,
+    participant_npub: String,
+    channel_auth: OwnerSiteChannelAuthKey,
+    action_pop: OwnerSiteActionPopKey,
+}
+
+impl OwnerSiteResolvedBinding {
+    #[cfg(test)]
+    pub(crate) fn injected_for_harness(
+        binding_id: OwnerSiteBindingId,
+        binding_digest: OwnerSiteBindingDigest,
+        participant_npub: &str,
+        channel_auth: OwnerSiteChannelAuthKey,
+        action_pop: OwnerSiteActionPopKey,
+    ) -> Result<Self, OwnerSiteIntentError> {
+        Ok(Self {
+            binding_id,
+            binding_digest,
+            participant_npub: validated_component(participant_npub)?,
+            channel_auth,
+            action_pop,
+        })
+    }
+
+    /// Returns the sealed channel-auth key selected by exact roster
+    /// resolution. The AKE slice must use this for `signature_D` only.
+    #[must_use]
+    pub(crate) fn channel_auth_key(&self) -> &OwnerSiteChannelAuthKey {
+        &self.channel_auth
+    }
+
+    /// Returns the sealed action-PoP key selected by exact roster resolution.
+    /// The AKE slice must use this for `pop_D` only.
+    #[must_use]
+    pub(crate) fn action_pop_key(&self) -> &OwnerSiteActionPopKey {
+        &self.action_pop
+    }
+
+    #[must_use]
+    pub(crate) fn binding_id(&self) -> OwnerSiteBindingId {
+        self.binding_id
+    }
+
+    #[must_use]
+    pub(crate) fn binding_digest(&self) -> OwnerSiteBindingDigest {
+        self.binding_digest
+    }
+
+    #[must_use]
+    pub(crate) fn participant_npub(&self) -> &str {
+        &self.participant_npub
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn binding_id_for_harness(&self) -> OwnerSiteBindingId {
+        self.binding_id
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn binding_digest_for_harness(&self) -> OwnerSiteBindingDigest {
+        self.binding_digest
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn participant_npub_for_harness(&self) -> &str {
+        &self.participant_npub
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn channel_auth_key_id_for_harness(&self) -> &OwnerSiteChannelAuthKeyId {
+        &self.channel_auth.key_id
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn action_pop_key_id_for_harness(&self) -> &OwnerSiteActionPopKeyId {
+        &self.action_pop.key_id
+    }
+}
+
+/// Durable revoke record staged for the future signed roster provider.
+///
+/// A tombstone names the enrollment it revokes and the epoch at which the
+/// revoke took effect. It intentionally contains no route, peer address, or
+/// transport operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OwnerSiteRevocationTombstone {
+    binding_id: OwnerSiteBindingId,
+    revoked_at: OwnerSiteAuthorityGeneration,
+}
+
+impl OwnerSiteRevocationTombstone {
+    #[cfg(test)]
+    pub(crate) fn injected_for_harness(
+        binding_id: OwnerSiteBindingId,
+        revoked_at: OwnerSiteAuthorityGeneration,
+    ) -> Self {
+        Self {
+            binding_id,
+            revoked_at,
+        }
+    }
+}
+
+/// Pre-effect shape for a future owner-signed roster snapshot.
+///
+/// The signature/issuer bytes are deliberately opaque and never accepted or
+/// verified here. This type only makes the required fields and monotonicity
+/// rules explicit for tests. A real provider must verify the envelope, persist
+/// the highest accepted `(epoch, digest)`, enforce freshness, and bind a
+/// verified principal to the exact incoming channel.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OwnerSiteRosterSnapshot {
+    version: u8,
+    scope: OwnerSiteRosterScope,
+    generation: OwnerSiteAuthorityGeneration,
+    bindings: Vec<OwnerSiteRosterBinding>,
+    tombstones: Vec<OwnerSiteRevocationTombstone>,
+    issued_at: u64,
+    fresh_until: u64,
+    issuer_key_id: String,
+    signature: Vec<u8>,
+}
+
+impl OwnerSiteRosterSnapshot {
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn injected_for_harness(
+        scope: OwnerSiteRosterScope,
+        generation: OwnerSiteAuthorityGeneration,
+        bindings: Vec<OwnerSiteRosterBinding>,
+        tombstones: Vec<OwnerSiteRevocationTombstone>,
+        issued_at: u64,
+        fresh_until: u64,
+        issuer_key_id: &str,
+        signature: Vec<u8>,
+    ) -> Result<Self, OwnerSiteAuthorityError> {
+        if fresh_until <= issued_at {
+            return Err(OwnerSiteAuthorityError::InvalidFreshness);
+        }
+        if signature.is_empty() {
+            return Err(OwnerSiteAuthorityError::MissingRosterSignature);
+        }
+        let issuer_key_id = validated_component(issuer_key_id)
+            .map_err(|_| OwnerSiteAuthorityError::InvalidIssuer)?;
+
+        for binding in &bindings {
+            if binding.scope != scope || !binding.enrolled_at.is_nested_in_or_before(generation) {
+                return Err(OwnerSiteAuthorityError::BindingScopeOrGenerationMismatch);
+            }
+        }
+        for tombstone in &tombstones {
+            if !tombstone.revoked_at.is_nested_in_or_before(generation) {
+                return Err(OwnerSiteAuthorityError::TombstoneAfterSnapshot);
+            }
+        }
+        for (index, binding) in bindings.iter().enumerate() {
+            if bindings[index + 1..]
+                .iter()
+                .any(|other| other.binding_id() == binding.binding_id())
+            {
+                return Err(OwnerSiteAuthorityError::DuplicateBindingId);
+            }
+            if tombstones
+                .iter()
+                .any(|tombstone| tombstone.binding_id == binding.binding_id())
+            {
+                return Err(OwnerSiteAuthorityError::RevokedBindingStillActive);
+            }
+        }
+        for (index, tombstone) in tombstones.iter().enumerate() {
+            if tombstones[index + 1..]
+                .iter()
+                .any(|other| other.binding_id == tombstone.binding_id)
+            {
+                return Err(OwnerSiteAuthorityError::DuplicateTombstone);
+            }
+        }
+
+        Ok(Self {
+            version: OWNER_SITE_ROSTER_VERSION,
+            scope,
+            generation,
+            bindings,
+            tombstones,
+            issued_at,
+            fresh_until,
+            issuer_key_id,
+            signature,
+        })
+    }
+
+    #[must_use]
+    pub(crate) fn generation(&self) -> OwnerSiteAuthorityGeneration {
+        self.generation
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn fresh_until_for_harness(&self) -> u64 {
+        self.fresh_until
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn is_fresh_for_ake_harness(&self, observed_at: u64) -> bool {
+        self.is_fresh_at(observed_at)
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn resolve_for_ake_harness(
+        &self,
+        intent: &OwnerSiteIntent,
+        principal: &OwnerSiteRemotePrincipal,
+        claimed_binding_id: OwnerSiteBindingId,
+        claimed_binding_digest: OwnerSiteBindingDigest,
+        claimed_channel_auth_key_id: &OwnerSiteChannelAuthKeyId,
+        claimed_action_pop_key_id: &OwnerSiteActionPopKeyId,
+    ) -> Option<OwnerSiteResolvedBinding> {
+        self.resolve_exact(
+            intent,
+            principal,
+            claimed_binding_id,
+            claimed_binding_digest,
+            claimed_channel_auth_key_id,
+            claimed_action_pop_key_id,
+        )
+    }
+
+    #[must_use]
+    fn is_fresh_at(&self, observed_at: u64) -> bool {
+        self.version == OWNER_SITE_ROSTER_VERSION
+            && self.issued_at <= observed_at
+            && observed_at < self.fresh_until
+            && !self.issuer_key_id.is_empty()
+            && !self.signature.is_empty()
+    }
+
+    #[must_use]
+    fn resolve_exact(
+        &self,
+        intent: &OwnerSiteIntent,
+        principal: &OwnerSiteRemotePrincipal,
+        claimed_binding_id: OwnerSiteBindingId,
+        claimed_binding_digest: OwnerSiteBindingDigest,
+        claimed_channel_auth_key_id: &OwnerSiteChannelAuthKeyId,
+        claimed_action_pop_key_id: &OwnerSiteActionPopKeyId,
+    ) -> Option<OwnerSiteResolvedBinding> {
+        if !self.scope.matches_intent(intent) {
+            return None;
+        }
+        let mut matches = self
+            .bindings
+            .iter()
+            .filter(|binding| {
+                binding.binding_id() == claimed_binding_id
+                    && binding.binding_digest() == claimed_binding_digest
+                    && binding.channel_auth.key_id == *claimed_channel_auth_key_id
+                    && binding.action_pop.key_id == *claimed_action_pop_key_id
+            })
+            .filter_map(|binding| binding.resolves(intent, principal));
+        let resolved = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(resolved)
+    }
+
+    /// Checks only local monotonicity between two already-verified candidate
+    /// snapshots. It does not persist a watermark or verify either signature.
+    #[cfg(test)]
+    pub(crate) fn is_strict_successor_of(
+        &self,
+        previous: &Self,
+    ) -> Result<(), OwnerSiteAuthorityError> {
+        if self.scope != previous.scope {
+            return Err(OwnerSiteAuthorityError::SnapshotScopeMismatch);
+        }
+        if self
+            .generation
+            .is_same_epoch_with_different_digest(previous.generation)
+        {
+            return Err(OwnerSiteAuthorityError::GenerationDigestConflict);
+        }
+        if !self.generation.is_after(previous.generation) {
+            return Err(OwnerSiteAuthorityError::NonMonotonicGeneration);
+        }
+        for tombstone in &previous.tombstones {
+            if !self.tombstones.contains(tombstone) {
+                return Err(OwnerSiteAuthorityError::TombstoneDropped);
+            }
+        }
+        if self.bindings.iter().any(|binding| {
+            previous
+                .tombstones
+                .iter()
+                .any(|tombstone| tombstone.binding_id == binding.binding_id())
+        }) {
+            return Err(OwnerSiteAuthorityError::TombstonedBindingResurrected);
+        }
+        Ok(())
+    }
+}
+
+/// A server-only authority observation used by the capability shape.
+///
+/// `Unavailable`, `Stale`, `Mismatch`, and `Revoked` are explicit fail-closed
+/// outcomes. The sole positive variant is test-only and cannot be acquired by
+/// production routing, CIDR classification, a name, or `ConnectInfo`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum OwnerSiteAuthoritySnapshot {
+    #[cfg(test)]
+    Unavailable,
+    #[cfg(test)]
+    Stale,
+    #[cfg(test)]
+    Mismatch,
+    #[cfg(test)]
+    Revoked,
+    #[cfg(test)]
+    InjectedForHarness(OwnerSiteHarnessAuthority),
+}
+
+impl OwnerSiteAuthoritySnapshot {
+    #[must_use]
+    pub(crate) fn admits_pre_effect(&self, intent: &OwnerSiteIntent) -> bool {
+        #[cfg(test)]
+        {
+            matches!(self, Self::InjectedForHarness(authority) if authority.admits(intent))
+        }
+        #[cfg(not(test))]
+        {
+            let _ = (self, intent);
+            false
+        }
+    }
+}
+
+/// Test-only injection of a fully typed but non-production authority view.
+///
+/// This fixture exists to make route-real fail-closed tests prove the future
+/// shape. It does not assert that a connection belongs to `participant_npub`;
+/// that A2/provider boundary is deliberately absent until reviewed.
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OwnerSiteHarnessAuthority {
+    principal: OwnerSiteRemotePrincipal,
+    roster: OwnerSiteRosterSnapshot,
+    claimed_binding_id: OwnerSiteBindingId,
+    claimed_binding_digest: OwnerSiteBindingDigest,
+    claimed_channel_auth_key_id: OwnerSiteChannelAuthKeyId,
+    claimed_action_pop_key_id: OwnerSiteActionPopKeyId,
+    observed_at: u64,
+}
+
+#[cfg(test)]
+impl OwnerSiteHarnessAuthority {
+    pub(crate) fn injected_for_harness(
+        principal: OwnerSiteRemotePrincipal,
+        roster: OwnerSiteRosterSnapshot,
+        claimed_binding_id: OwnerSiteBindingId,
+        claimed_binding_digest: OwnerSiteBindingDigest,
+        claimed_channel_auth_key_id: OwnerSiteChannelAuthKeyId,
+        claimed_action_pop_key_id: OwnerSiteActionPopKeyId,
+        observed_at: u64,
+    ) -> Result<Self, OwnerSiteAuthorityError> {
+        if !roster.is_fresh_at(observed_at) {
+            return Err(OwnerSiteAuthorityError::SnapshotNotFresh);
+        }
+        Ok(Self {
+            principal,
+            roster,
+            claimed_binding_id,
+            claimed_binding_digest,
+            claimed_channel_auth_key_id,
+            claimed_action_pop_key_id,
+            observed_at,
+        })
+    }
+
+    #[must_use]
+    fn admits(&self, intent: &OwnerSiteIntent) -> bool {
+        self.roster.is_fresh_at(self.observed_at)
+            && self
+                .roster
+                .resolve_exact(
+                    intent,
+                    &self.principal,
+                    self.claimed_binding_id,
+                    self.claimed_binding_digest,
+                    &self.claimed_channel_auth_key_id,
+                    &self.claimed_action_pop_key_id,
+                )
+                .is_some()
+    }
+}
+
+/// Rejections while constructing the pre-effect authority shapes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OwnerSiteAuthorityError {
+    ZeroGeneration,
+    ChannelProofMismatch,
+    ZeroBindingId,
+    ZeroBindingDigest,
+    MemberDeviceBindingRejected,
+    InvalidFreshness,
+    MissingRosterSignature,
+    InvalidIssuer,
+    BindingScopeOrGenerationMismatch,
+    TombstoneAfterSnapshot,
+    DuplicateBindingId,
+    RevokedBindingStillActive,
+    DuplicateTombstone,
+    SnapshotScopeMismatch,
+    NonMonotonicGeneration,
+    GenerationDigestConflict,
+    TombstoneDropped,
+    TombstonedBindingResurrected,
+    SnapshotNotFresh,
+    CborEncode,
+}
+
+#[cfg(test)]
+pub(crate) fn active_authority_fixture(
+    household_id: &str,
+    resource: OwnerSiteResource,
+) -> Result<(String, OwnerSiteAuthoritySnapshot), OwnerSiteAuthorityError> {
+    use household_rs::keys::{IdentityKey, P256Keypair};
+
+    let member = P256Keypair::generate();
+    let device = P256Keypair::generate();
+    let channel_auth = P256Keypair::generate();
+    let action_pop = P256Keypair::generate();
+    let participant_npub = "npub1owneralpha";
+    let member_device = MemberDeviceBinding::sign(
+        &member,
+        device.public(),
+        participant_npub.to_string(),
+        1_000,
+    )
+    .map_err(|_| OwnerSiteAuthorityError::MemberDeviceBindingRejected)?;
+    let actor_id = member_device.member_id.clone();
+    let scope = OwnerSiteRosterScope::injected_for_harness(household_id, "owner-site-mesh")
+        .map_err(|_| OwnerSiteAuthorityError::BindingScopeOrGenerationMismatch)?;
+    let generation = OwnerSiteAuthorityGeneration::injected_for_harness(1, [0x41; 32])?;
+    let binding_id = OwnerSiteBindingId::injected_for_harness([0x01; 32])?;
+    let binding_digest = OwnerSiteBindingDigest::injected_for_harness([0x51; 32])?;
+    let channel_auth =
+        OwnerSiteChannelAuthKey::injected_for_harness("channel-auth-alpha", channel_auth.public())
+            .map_err(|_| OwnerSiteAuthorityError::BindingScopeOrGenerationMismatch)?;
+    let action_pop =
+        OwnerSiteActionPopKey::injected_for_harness("action-pop-alpha", action_pop.public())
+            .map_err(|_| OwnerSiteAuthorityError::BindingScopeOrGenerationMismatch)?;
+    let channel_auth_key_id = channel_auth.key_id.clone();
+    let action_pop_key_id = action_pop.key_id.clone();
+    let binding = OwnerSiteRosterBinding::injected_for_harness(
+        binding_id,
+        binding_digest,
+        scope.clone(),
+        member_device,
+        OwnerSiteMembershipRole::Owner,
+        resource,
+        channel_auth,
+        action_pop,
+        generation,
+    )?;
+    let roster = OwnerSiteRosterSnapshot::injected_for_harness(
+        scope,
+        generation,
+        vec![binding],
+        Vec::new(),
+        1_000,
+        1_060,
+        "owner-key-alpha",
+        vec![0xa5; 64],
+    )?;
+    let principal = OwnerSiteRemotePrincipal::injected_for_harness(participant_npub)
+        .map_err(|_| OwnerSiteAuthorityError::BindingScopeOrGenerationMismatch)?;
+    let authority = OwnerSiteHarnessAuthority::injected_for_harness(
+        principal,
+        roster,
+        binding_id,
+        binding_digest,
+        channel_auth_key_id,
+        action_pop_key_id,
+        1_001,
+    )?;
+    Ok((
+        actor_id,
+        OwnerSiteAuthoritySnapshot::InjectedForHarness(authority),
+    ))
+}
+
+// ===== DP2 Fatia-2: promotion linearizer, one-shot claim, and sealed witness =====
+
+/// Opaque 32-byte one-shot promotion claim, minted by CSPRNG at registration
+/// and never accepted from wire (§4).
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct OwnerSitePromotionClaimId([u8; 32]);
+
+impl std::fmt::Debug for OwnerSitePromotionClaimId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("OwnerSitePromotionClaimId(REDACTED)")
+    }
+}
+
+impl OwnerSitePromotionClaimId {
+    #[must_use]
+    fn generate() -> Self {
+        use rand::RngCore;
+        let mut bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        Self(bytes)
+    }
+
+    #[must_use]
+    fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// The current authority observation OWNED by the linearizer. Production has no
+/// admitting provider (`owner_site_ake` `admits_resource == false`) and no route
+/// that sets this, so in production it is never populated and the linearizer is
+/// unreachable (K0-PASS doubly inert). Tests populate it via the harness seam.
+///
+/// S2 SEAM (design g1 §1): this is a typed seam with ONE producer — the roster
+/// adapter (`owner_site_roster_adapter`) — and TWO subscribers (the S2 glue and
+/// the S4 watcher). Fields stay private: **no consumer constructs its own
+/// view**, so a second, divergent adapter cannot be built by accident.
+#[derive(Clone, Debug)]
+pub(crate) struct OwnerSiteAuthorityObservation {
+    household: String,
+    authz_epoch: u64,
+    roster_digest: [u8; 32],
+    provider_generation: u64,
+    cancellation_generation: u64,
+    household_root: [u8; 33],
+    observed_at: u64,
+    /// `min(checkpoint.not_after, observed_at + REFRESH_FAILURE_BUDGET)` —
+    /// the authority sets the CEILING and is never exceeded; the staleness
+    /// term covers the refresh loop failing (the checkpoint's `not_after`
+    /// describes the checkpoint's validity, never the observation's
+    /// recency). Named NOT a session TTL: it is the failure budget of the
+    /// observation instrument.
+    fresh_until: u64,
+}
+
+/// Failure budget of the observation refresh loop — NOT a session TTL.
+/// Chosen as ~10 cycles of the 30 s loop (network hiccups must not drop
+/// good sessions) and orders of magnitude below any plausible checkpoint
+/// `not_after` (or it would never bite).
+pub(crate) const REFRESH_FAILURE_BUDGET_SECS: u64 = 300;
+
+impl OwnerSiteAuthorityObservation {
+    /// The only production constructor, called by the roster adapter after its
+    /// own validation. A zero digest or zero generation is not an observation:
+    /// fail closed, return `None`.
+    // Wired in increment 2 (live roster projection); the allow comes off then.
+    #[allow(dead_code)]
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_roster_adapter(
+        household: String,
+        authz_epoch: u64,
+        roster_digest: [u8; 32],
+        provider_generation: u64,
+        cancellation_generation: u64,
+        household_root: [u8; 33],
+        observed_at: u64,
+        checkpoint_not_after: u64,
+    ) -> Option<Self> {
+        if roster_digest == [0u8; 32] || provider_generation == 0 || household.is_empty() {
+            return None;
+        }
+        let fresh_until =
+            checkpoint_not_after.min(observed_at.saturating_add(REFRESH_FAILURE_BUDGET_SECS));
+        Some(Self {
+            household,
+            authz_epoch,
+            roster_digest,
+            provider_generation,
+            cancellation_generation,
+            household_root,
+            observed_at,
+            fresh_until,
+        })
+    }
+
+    /// Freshness at the effect site: admission reads THIS, never the raw
+    /// presence of an observation. `now` is the caller's clock.
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn is_fresh_at(&self, now: u64) -> bool {
+        now <= self.fresh_until
+    }
+
+    /// The authority coordinate for the AKE generation (epoch + floor-less
+    /// digest — like-to-like with the AKE's comparison target).
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn generation(&self) -> OwnerSiteAuthorityGeneration {
+        OwnerSiteAuthorityGeneration {
+            authz_epoch: NonZeroU64::new(self.authz_epoch)
+                .expect("constructor rejected zero generation"),
+            digest: self.roster_digest,
+        }
+    }
+
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn fresh_until(&self) -> u64 {
+        self.fresh_until
+    }
+}
+
+/// Sealed, move-only promotion witness (§7). Constructible ONLY by the
+/// linearizer, and only after the resolution has been durably persisted. It has
+/// no public/`pub(crate)` constructor, no clone/copy/serde/default, and never
+/// leaves by reusable reference; it owns the material that authorized the
+/// transition and is the sole value that makes `VerifiedMeshPeer`/`DialPermit`
+/// reachable.
+#[allow(dead_code)]
+pub(crate) struct OwnerSitePromotionWitness {
+    pending: Pending,
+    claim: OwnerSitePromotionClaimId,
+    seal: OwnerSitePromotionWitnessSeal,
+}
+
+struct OwnerSitePromotionWitnessSeal;
+
+impl std::fmt::Debug for OwnerSitePromotionWitness {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("OwnerSitePromotionWitness(REDACTED)")
+    }
+}
+
+/// By-ownership promotion input: the full `Pending` plus its claim, sealed
+/// inside the authority module (§4). Never built from a raw tuple; only
+/// `register_pending` constructs it.
+#[allow(dead_code)]
+pub(crate) struct OwnerSitePromotionInput {
+    pending: Pending,
+    claim: OwnerSitePromotionClaimId,
+}
+
+impl std::fmt::Debug for OwnerSitePromotionInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("OwnerSitePromotionInput(REDACTED)")
+    }
+}
+
+/// The seven rechecks, each an individually provable outcome (§8).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OwnerSiteRecheck {
+    AuthorityExact,
+    CancellationFence,
+    ProviderGeneration,
+    Freshness,
+    ChannelIdentity,
+    AuthenticatedIdentity,
+    OneShotClaim,
+}
+
+/// Typed rejection. Every variant fails closed: no witness, peer, or permit,
+/// and no partial state change.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OwnerSitePromotionRejection {
+    StoreUnavailable,
+    NoLiveAuthority,
+    Recheck(OwnerSiteRecheck),
+    StorePersist,
+    DuplicateRegistration,
+}
+
+impl From<crate::owner_site::resolution_store::OwnerSiteResolutionStoreError>
+    for OwnerSitePromotionRejection
+{
+    fn from(error: crate::owner_site::resolution_store::OwnerSiteResolutionStoreError) -> Self {
+        use crate::owner_site::resolution_store::OwnerSiteResolutionStoreError as StoreError;
+        match error {
+            StoreError::Unavailable => Self::StoreUnavailable,
+            StoreError::DuplicateKey | StoreError::DuplicateClaim => Self::DuplicateRegistration,
+            _ => Self::StorePersist,
+        }
+    }
+}
+
+/// The single synchronized promotion linearizer (§7). Every mutation of the
+/// resolution store and the owned authority observation passes through one
+/// `Mutex`; there are no independent locks whose composition could expose half
+/// a transaction.
+pub(crate) struct OwnerSitePromotionLinearizer {
+    inner: std::sync::Mutex<OwnerSitePromotionLinearizerInner>,
+}
+
+struct OwnerSitePromotionLinearizerInner {
+    store: crate::owner_site::resolution_store::OwnerSiteResolutionStore,
+    authority: Option<OwnerSiteAuthorityObservation>,
+}
+
+/// Derive the resolution key from the sealed `PendingFinished` private fields.
+fn owner_site_resolution_key(
+    pending_finished: &PendingFinished,
+) -> crate::owner_site::resolution_store::OwnerSiteResolutionKeyV1 {
+    crate::owner_site::resolution_store::OwnerSiteResolutionKeyV1 {
+        household: pending_finished.household.0.clone(),
+        ws_instance: *pending_finished.ws_instance.as_bytes(),
+        channel_id: *pending_finished.channel_id.as_bytes(),
+        channel_epoch: pending_finished.channel_epoch.get(),
+        channel_binding: pending_finished.channel_binding,
+    }
+}
+
+impl OwnerSitePromotionLinearizer {
+    /// Open the linearizer over the durable resolution store. No authority is
+    /// observed yet; in production nothing ever populates it.
+    pub(crate) fn open(state_dir: &std::path::Path) -> Result<Self, OwnerSitePromotionRejection> {
+        let store = crate::owner_site::resolution_store::OwnerSiteResolutionStore::open(state_dir)?;
+        Ok(Self {
+            inner: std::sync::Mutex::new(OwnerSitePromotionLinearizerInner {
+                store,
+                authority: None,
+            }),
+        })
+    }
+
+    /// TEST-ONLY authority seam. Production has no admitting provider, so this
+    /// is the only path that ever makes the linearizer reachable; it advances
+    /// the durable authority watermark inside the same lock.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn observe_authority_for_harness(
+        &self,
+        household: &str,
+        authz_epoch: u64,
+        roster_digest: [u8; 32],
+        provider_generation: u64,
+        cancellation_generation: u64,
+        household_root: [u8; 33],
+        observed_at: u64,
+    ) -> Result<(), OwnerSitePromotionRejection> {
+        let mut inner = self.inner.lock().expect("linearizer mutex poisoned");
+        inner.store.observe_authority(
+            household,
+            authz_epoch,
+            roster_digest,
+            provider_generation,
+            cancellation_generation,
+        )?;
+        inner.authority = Some(OwnerSiteAuthorityObservation {
+            household: household.to_string(),
+            authz_epoch,
+            roster_digest,
+            provider_generation,
+            cancellation_generation,
+            household_root,
+            observed_at,
+            // Harness path: freshness is the harness's own concern; keep the
+            // observation fresh for the window the tests run in.
+            fresh_until: observed_at.saturating_add(REFRESH_FAILURE_BUDGET_SECS),
+        });
+        Ok(())
+    }
+
+    /// Register one sealed `Pending` (§7.1): derive its key from private fields,
+    /// mint a CSPRNG claim, persist the `Pending` record, and return an owned
+    /// input. No variant accepts the 15 fields raw.
+    pub(crate) fn register_pending(
+        &self,
+        pending: Pending,
+    ) -> Result<OwnerSitePromotionInput, OwnerSitePromotionRejection> {
+        let mut inner = self.inner.lock().expect("linearizer mutex poisoned");
+        let key = owner_site_resolution_key(&pending.pending_finished);
+        let claim = OwnerSitePromotionClaimId::generate();
+        let pending_finished = &pending.pending_finished;
+        inner.store.register_pending(
+            key,
+            *claim.as_bytes(),
+            pending_finished.authz_epoch.get(),
+            pending_finished.roster_digest,
+            pending_finished.provider_generation,
+            pending_finished.cancellation_generation,
+        )?;
+        Ok(OwnerSitePromotionInput { pending, claim })
+    }
+
+    /// The one atomic promotion path (§7.3–7.9). Runs the seven rechecks inside
+    /// the critical section with no lock release and no `await`, CAS
+    /// `Pending -> Promoted`, consumes the claim, persists, and only then
+    /// produces the sealed witness. Any failure leaves zero carrier/state.
+    pub(crate) fn authorize(
+        &self,
+        input: OwnerSitePromotionInput,
+    ) -> Result<OwnerSitePromotionWitness, OwnerSitePromotionRejection> {
+        let mut inner = self.inner.lock().expect("linearizer mutex poisoned");
+        let OwnerSitePromotionInput { pending, claim } = input;
+        let key = owner_site_resolution_key(&pending.pending_finished);
+        let authority = inner
+            .authority
+            .clone()
+            .ok_or(OwnerSitePromotionRejection::NoLiveAuthority)?;
+        let pending_finished = &pending.pending_finished;
+
+        // (1) Authority exact — captured (household, authz_epoch, roster_digest)
+        // equal the current authority coordinate.
+        if pending_finished.household.0 != authority.household
+            || pending_finished.authz_epoch.get() != authority.authz_epoch
+            || pending_finished.roster_digest != authority.roster_digest
+        {
+            return Err(OwnerSitePromotionRejection::Recheck(
+                OwnerSiteRecheck::AuthorityExact,
+            ));
+        }
+        // (2) Cancellation fence — captured equals current and the durable
+        // watermark has not advanced past it (no later revoke/tombstone).
+        let watermark = inner.store.watermark(
+            &pending_finished.household.0,
+            pending_finished.authz_epoch.get(),
+            pending_finished.roster_digest,
+        );
+        if pending_finished.cancellation_generation != authority.cancellation_generation
+            || watermark
+                .is_some_and(|(_, cancel)| cancel > pending_finished.cancellation_generation)
+        {
+            return Err(OwnerSitePromotionRejection::Recheck(
+                OwnerSiteRecheck::CancellationFence,
+            ));
+        }
+        // (3) Provider generation.
+        if pending_finished.provider_generation != authority.provider_generation {
+            return Err(OwnerSitePromotionRejection::Recheck(
+                OwnerSiteRecheck::ProviderGeneration,
+            ));
+        }
+        // (4) Freshness — not expired at the observed clock.
+        if authority.observed_at >= pending_finished.fresh_until {
+            return Err(OwnerSitePromotionRejection::Recheck(
+                OwnerSiteRecheck::Freshness,
+            ));
+        }
+        // (5) Channel identity (§8.5) — this key resolves to a unique live
+        // (non-Closed) record. Per the store's key-uniqueness invariant a key
+        // maps to at most one record, so "the unique live record" reduces to
+        // "a live record exists". State (Pending vs Promoted/Revoking), claim
+        // belonging, one-shot consumption and saturation are all recheck (7),
+        // enforced by the store `promote` CAS below; a Closed or absent key
+        // fails here.
+        if inner.store.live_record(&key).is_none() {
+            return Err(OwnerSitePromotionRejection::Recheck(
+                OwnerSiteRecheck::ChannelIdentity,
+            ));
+        }
+        // (6) Authenticated identity — machine cert chains to the household root
+        // and the device binding still matches principal_D.
+        if household_rs::machine_cert::verify_against_household_root(
+            &pending_finished.machine_cert,
+            &authority.household_root,
+        )
+        .is_err()
+            || pending_finished.device_binding.participant_npub
+                != pending_finished.principal_d.participant_npub()
+        {
+            return Err(OwnerSitePromotionRejection::Recheck(
+                OwnerSiteRecheck::AuthenticatedIdentity,
+            ));
+        }
+        // (7) One-shot claim — present, belongs to the key, unconsumed. The
+        // store CAS `Pending -> Promoted` + claim-consume is the atomic image.
+        inner
+            .store
+            .promote(&key, claim.as_bytes())
+            .map_err(|_| OwnerSitePromotionRejection::Recheck(OwnerSiteRecheck::OneShotClaim))?;
+
+        // Persistence succeeded; only now is the witness produced.
+        Ok(OwnerSitePromotionWitness {
+            pending,
+            claim,
+            seal: OwnerSitePromotionWitnessSeal,
+        })
+    }
+
+    /// Revoke a promoted channel in the mandatory order (§9): persist the
+    /// cancellation advance and mark `Revoking`, publish the fence and release
+    /// the linearizer without `await`, drain (empty in this slice — no dial or
+    /// pump, so no network I/O is introduced to "demonstrate" it), then reenter
+    /// and confirm `Closed`. The channel is consumed by ownership; its retained
+    /// witness supplies the exact key without a rebind.
+    // The channel is consumed by ownership (§7.11/§9): revoke destroys the
+    // promoted channel so it can never be revoked twice; taking it by value is
+    // the enforcement, even though the body only reads its retained key.
+    #[allow(clippy::needless_pass_by_value)]
+    pub(crate) fn revoke(
+        &self,
+        channel: crate::owner_site::promotion::OwnerSitePromotedChannel,
+        cancellation_generation: u64,
+    ) -> Result<(), OwnerSitePromotionRejection> {
+        let key = owner_site_resolution_key(&channel.witness.pending.pending_finished);
+        {
+            let mut inner = self.inner.lock().expect("linearizer mutex poisoned");
+            inner.store.begin_revoke(&key, cancellation_generation)?;
+        }
+        // Fence published; linearizer released. Drain is empty in this slice.
+        {
+            let mut inner = self.inner.lock().expect("linearizer mutex poisoned");
+            inner.store.confirm_closed(&key)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+mod glue_constructor_tests {
+    //! REDs for the 3a-2 production constructor: the binding carries EXACTLY
+    //! what the glue derives (never a caller-supplied digest), distinctness
+    //! and verification still fail closed, and the enrolled digest is
+    //! load-bearing (like-to-like with the AKE's target).
+
+    use super::*;
+    use household_rs::keys::{IdentityKey, P256Keypair};
+
+    fn inputs() -> (
+        OwnerSiteRosterScope,
+        MemberDeviceBinding,
+        OwnerSiteChannelAuthKey,
+        OwnerSiteActionPopKey,
+        OwnerSiteAuthorityGeneration,
+    ) {
+        let member = P256Keypair::generate();
+        let device = P256Keypair::generate();
+        let member_device =
+            MemberDeviceBinding::sign(&member, device.public(), "npub1a".into(), 1_000)
+                .expect("member device binding");
+        let scope = OwnerSiteRosterScope::injected_for_harness("hh-a", "net-a").unwrap();
+        let channel_auth =
+            OwnerSiteChannelAuthKey::injected_for_harness("ch-a", P256Keypair::generate().public())
+                .unwrap();
+        let action_pop =
+            OwnerSiteActionPopKey::injected_for_harness("pop-a", P256Keypair::generate().public())
+                .unwrap();
+        let generation = OwnerSiteAuthorityGeneration::injected_for_harness(1, [7u8; 32]).unwrap();
+        (scope, member_device, channel_auth, action_pop, generation)
+    }
+
+    #[test]
+    fn from_glue_carries_exactly_the_derived_pair() {
+        let (scope, member_device, channel_auth, action_pop, generation) = inputs();
+        let binding = OwnerSiteRosterBinding::from_glue(
+            b"cert",
+            scope.clone(),
+            member_device,
+            OwnerSiteMembershipRole::Owner,
+            OwnerSiteResource::from_route_claw("claw-a").unwrap(),
+            channel_auth.clone(),
+            action_pop.clone(),
+            generation,
+        )
+        .expect("production constructor succeeds");
+
+        let (expected_id, expected_digest) =
+            crate::owner_site::binding_glue::derive_binding_id_and_digest(
+                b"cert",
+                channel_auth.public_key.as_bytes(),
+                action_pop.public_key.as_bytes(),
+                "hh-a",
+                "net-a",
+                "claw-a",
+                generation.authz_epoch(),
+                &generation.digest(),
+            )
+            .unwrap();
+        assert_eq!(binding.binding_id(), OwnerSiteBindingId(expected_id));
+        assert_eq!(
+            binding.binding_digest(),
+            OwnerSiteBindingDigest(expected_digest)
+        );
+    }
+
+    /// THE SUBSTITUTION RED (ratification condition 2, non-vacuous): one
+    /// session key is ACCEPTED in both roles, AND a signature made for one
+    /// domain does NOT verify in the other — the separation lives in the
+    /// transcript preimage, not in the key. Without the second half, "keys
+    /// may coincide" would read as "there is no separation at all".
+    #[test]
+    fn one_key_serves_both_roles_and_the_domains_still_do_not_cross() {
+        let shared_signer = P256Keypair::generate();
+        let (scope, member_device, _ch, _pop, generation) = inputs();
+        let channel_auth =
+            OwnerSiteChannelAuthKey::injected_for_harness("ch-a", shared_signer.public()).unwrap();
+        let action_pop =
+            OwnerSiteActionPopKey::injected_for_harness("pop-a", shared_signer.public()).unwrap();
+        let binding = OwnerSiteRosterBinding::from_glue(
+            b"cert",
+            scope,
+            member_device,
+            OwnerSiteMembershipRole::Owner,
+            OwnerSiteResource::from_route_claw("claw-a").unwrap(),
+            channel_auth.clone(),
+            action_pop,
+            generation,
+        )
+        .expect("one key must be accepted in both roles after the ratification");
+
+        // Sign over the device-auth hash with the shared key: verifies in
+        // the channel role...
+        let pre = crate::owner_site::binding_glue::pop_binding_pre([0xA1; 32], [0xC3; 32])
+            .expect("pre computes");
+        let d_auth = crate::owner_site::binding_glue::device_auth_hash(
+            &pre,
+            &binding.binding_id(),
+            &binding.binding_digest(),
+            "npub1a",
+            channel_auth.key_id(),
+        )
+        .expect("d_auth");
+        let proof = shared_signer.sign(d_auth.as_bytes()).unwrap();
+        household_rs::keys::verify_signature(
+            channel_auth.verifying_key(),
+            d_auth.as_bytes(),
+            &proof,
+        )
+        .expect("the channel-domain proof verifies in the channel role");
+
+        // ...and does NOT verify against the owner-action hash: the
+        // separation is in the preimage, not in the key.
+        let m2 = crate::owner_site::a2_wire::ServerHello {
+            engine_machine_certificate: vec![0x11; 64],
+            engine_key_id: "engine-key".into(),
+            channel_id: vec![0x22; 32],
+            channel_epoch: 1,
+            challenge_id: vec![0x33; 32],
+            challenge_secret: vec![0x44; 32],
+            authz_epoch: 1,
+            roster_digest: vec![0x55; 32],
+            fresh_until: 1_060,
+            engine_signature: vec![0x66; 64],
+        };
+        let c1 = crate::owner_site::a2_wire::ClientHelloCore {
+            domain: "soyeht/owner-site/a2/v1".into(),
+            version: 1,
+            household_id: "hh-a".into(),
+            network_id: "net-a".into(),
+            route: "/api/v1/household/claws/claw-a/owner-site".into(),
+            resource: "claw-a".into(),
+            intent: crate::owner_site::a2_wire::CanonicalIntent {
+                method: "GET".into(),
+                target: "/api/v1/household/claws/claw-a/owner-site".into(),
+                body_hash: vec![0x77; 32],
+            },
+            claimed_binding_id: vec![0x01; 32],
+        };
+        let action = crate::owner_site::binding_glue::owner_action_hash(
+            &pre,
+            &m2,
+            &c1,
+            &binding.binding_id(),
+            &binding.binding_digest(),
+            "npub1a",
+            b"intent-wire",
+        )
+        .expect("action");
+        assert!(
+            household_rs::keys::verify_signature(
+                channel_auth.verifying_key(),
+                action.as_bytes(),
+                &proof,
+            )
+            .is_err(),
+            "a proof for the channel domain must NOT verify in the action domain — separation is in the preimage"
+        );
+    }
+
+    #[test]
+    fn the_enrolled_digest_is_load_bearing() {
+        let (scope, member_device, channel_auth, action_pop, generation) = inputs();
+        let other_generation =
+            OwnerSiteAuthorityGeneration::injected_for_harness(1, [8u8; 32]).unwrap();
+        let resource = OwnerSiteResource::from_route_claw("claw-a").unwrap();
+        let base = OwnerSiteRosterBinding::from_glue(
+            b"cert",
+            scope.clone(),
+            member_device.clone(),
+            OwnerSiteMembershipRole::Owner,
+            resource.clone(),
+            channel_auth.clone(),
+            action_pop.clone(),
+            generation,
+        )
+        .unwrap();
+        let other = OwnerSiteRosterBinding::from_glue(
+            b"cert",
+            scope,
+            member_device,
+            OwnerSiteMembershipRole::Owner,
+            resource,
+            channel_auth,
+            action_pop,
+            other_generation,
+        )
+        .unwrap();
+        assert_ne!(
+            base.binding_digest(),
+            other.binding_digest(),
+            "a different enrolled digest must move the binding digest (like-to-like)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod transcript_proof_tests {
+    //! RED for 3a-3 (the pin from the coordinator): session keys come OUT of
+    //! the handshake transcript, never in by parameter. A key whose proof
+    //! does not match the transcript is REFUSED — "the keys exist" never
+    //! passes for "the parties exchanged".
+
+    use super::*;
+    use household_rs::keys::{IdentityKey, P256Keypair};
+
+    fn t1_device() -> DeviceAuthHash {
+        let pre = crate::owner_site::binding_glue::pop_binding_pre([0xA1; 32], [0xC3; 32])
+            .expect("pre computes");
+        DeviceAuthHash::compute(
+            &pre,
+            &OwnerSiteBindingId::injected_for_harness([0x01; 32]).unwrap(),
+            &OwnerSiteBindingDigest::injected_for_harness([0x51; 32]).unwrap(),
+            "npub1a",
+            &OwnerSiteChannelAuthKeyId::from_wire("ch-a").unwrap(),
+        )
+        .expect("compute over literal transcript inputs")
+    }
+
+    fn other_device() -> DeviceAuthHash {
+        let pre = crate::owner_site::binding_glue::pop_binding_pre([0xB2; 32], [0xC3; 32])
+            .expect("pre computes");
+        DeviceAuthHash::compute(
+            &pre,
+            &OwnerSiteBindingId::injected_for_harness([0x01; 32]).unwrap(),
+            &OwnerSiteBindingDigest::injected_for_harness([0x51; 32]).unwrap(),
+            "npub1a",
+            &OwnerSiteChannelAuthKeyId::from_wire("ch-a").unwrap(),
+        )
+        .expect("compute over literal transcript inputs")
+    }
+
+    fn t1_action() -> OwnerActionHash {
+        OwnerActionHash::from_computed([0xA1; 32])
+    }
+
+    fn other_action() -> OwnerActionHash {
+        OwnerActionHash::from_computed([0xB2; 32])
+    }
+
+    fn signed(key: &P256Keypair, hash: &[u8; 32]) -> Vec<u8> {
+        key.sign(hash).expect("sign").as_bytes().to_vec()
+    }
+
+    #[test]
+    fn channel_key_with_a_valid_transcript_proof_is_admitted() {
+        let signer = P256Keypair::generate();
+        let proof = signed(&signer, t1_device().as_bytes());
+        let key = OwnerSiteChannelAuthKey::from_transcript_proof(
+            "ch-a",
+            signer.public(),
+            &proof,
+            &t1_device(),
+        )
+        .expect("a valid transcript proof must admit the key");
+        assert_eq!(key.verifying_key(), &signer.public());
+    }
+
+    #[test]
+    fn channel_key_whose_proof_does_not_match_the_transcript_is_refused() {
+        let signer = P256Keypair::generate();
+        let stale_proof = signed(&signer, other_device().as_bytes());
+        let err = OwnerSiteChannelAuthKey::from_transcript_proof(
+            "ch-a",
+            signer.public(),
+            &stale_proof,
+            &t1_device(),
+        )
+        .expect_err("a proof over another transcript must be refused");
+        assert_eq!(err, OwnerSiteAuthorityError::ChannelProofMismatch);
+
+        let other_signer = P256Keypair::generate();
+        let foreign_proof = signed(&other_signer, t1_device().as_bytes());
+        let err = OwnerSiteChannelAuthKey::from_transcript_proof(
+            "ch-a",
+            signer.public(),
+            &foreign_proof,
+            &t1_device(),
+        )
+        .expect_err("a proof from another key must be refused");
+        assert_eq!(err, OwnerSiteAuthorityError::ChannelProofMismatch);
+    }
+
+    #[test]
+    fn action_pop_key_follows_the_same_transcript_rule() {
+        let signer = P256Keypair::generate();
+        let proof = signed(&signer, t1_action().as_bytes());
+        assert!(
+            OwnerSiteActionPopKey::from_transcript_proof(
+                "pop-a",
+                signer.public(),
+                &proof,
+                &t1_action()
+            )
+            .is_ok()
+        );
+        let stale_proof = signed(&signer, other_action().as_bytes());
+        assert_eq!(
+            OwnerSiteActionPopKey::from_transcript_proof(
+                "pop-a",
+                signer.public(),
+                &stale_proof,
+                &t1_action()
+            )
+            .expect_err("stale proof must be refused"),
+            OwnerSiteAuthorityError::ChannelProofMismatch
+        );
+    }
+
+    #[test]
+    fn a_malformed_proof_blob_is_refused_not_panicked() {
+        let signer = P256Keypair::generate();
+        let err = OwnerSiteChannelAuthKey::from_transcript_proof(
+            "ch-a",
+            signer.public(),
+            b"not a signature",
+            &t1_device(),
+        )
+        .expect_err("malformed proof must be refused");
+        assert_eq!(err, OwnerSiteAuthorityError::ChannelProofMismatch);
+    }
+
+    /// Finding A pinned structurally: the two hash newtypes are DISTINCT
+    /// types, so the swap (action hash into channel verification) is a
+    /// compile error — it cannot exist as a runtime coincidence. This test
+    /// exists so a future "simplify to one hash type" change fails here.
+    #[test]
+    fn the_two_transcript_hashes_are_distinct_types() {
+        fn takes_device(_: &DeviceAuthHash) {}
+        fn takes_action(_: &OwnerActionHash) {}
+        takes_device(&t1_device());
+        takes_action(&t1_action());
+        // These two must NOT compile if uncommented — that is the pin:
+        // takes_device(&t1_action());
+        // takes_action(&t1_device());
+    }
+}
+
+#[cfg(test)]
+mod owner_action_compute_tests {
+    //! RED for 3a-4: OwnerActionHash::compute exists (the DOWNGRADE is named:
+    /// the type was uninhabitable; now it is constructible through ONE path),
+    /// and the two transcript hashes over the SAME pre are distinct — the
+    /// channel/action swap cannot produce a collision even by content.
+    use super::*;
+    use crate::owner_site::a2_wire::{CanonicalIntent, ClientHelloCore, ServerHello};
+    use crate::owner_site::binding_glue::pop_binding_pre;
+
+    fn fixture() -> (
+        crate::owner_site::binding_glue::ChannelBindingPre,
+        ServerHello,
+        ClientHelloCore,
+        OwnerSiteBindingId,
+        OwnerSiteBindingDigest,
+    ) {
+        let pre = pop_binding_pre([0xA1; 32], [0xC3; 32]).expect("pre computes");
+        let m2 = ServerHello {
+            engine_machine_certificate: vec![0x11; 64],
+            engine_key_id: "engine-key".into(),
+            channel_id: vec![0x22; 32],
+            channel_epoch: 1,
+            challenge_id: vec![0x33; 32],
+            challenge_secret: vec![0x44; 32],
+            authz_epoch: 1,
+            roster_digest: vec![0x55; 32],
+            fresh_until: 1_060,
+            engine_signature: vec![0x66; 64],
+        };
+        let c1 = ClientHelloCore {
+            domain: "soyeht/owner-site/a2/v1".into(),
+            version: 1,
+            household_id: "hh-a".into(),
+            network_id: "net-a".into(),
+            route: "/api/v1/household/claws/claw-a/owner-site".into(),
+            resource: "claw-a".into(),
+            intent: CanonicalIntent {
+                method: "GET".into(),
+                target: "/api/v1/household/claws/claw-a/owner-site".into(),
+                body_hash: vec![0x77; 32],
+            },
+            claimed_binding_id: vec![0x01; 32],
+        };
+        let binding_id = OwnerSiteBindingId::injected_for_harness([0x01; 32]).unwrap();
+        let binding_digest = OwnerSiteBindingDigest::injected_for_harness([0x51; 32]).unwrap();
+        (pre, m2, c1, binding_id, binding_digest)
+    }
+
+    #[test]
+    fn owner_action_compute_produces_a_hash_and_it_is_distinct_from_device_auth() {
+        let (pre, m2, c1, binding_id, binding_digest) = fixture();
+        let action = OwnerActionHash::compute(
+            &pre,
+            &m2,
+            &c1,
+            &binding_id,
+            &binding_digest,
+            "npub1a",
+            b"intent-wire",
+        )
+        .expect("compute over real transcript fields");
+
+        let key_id = OwnerSiteChannelAuthKeyId::from_wire("ch-a").unwrap();
+        let device = DeviceAuthHash::compute(&pre, &binding_id, &binding_digest, "npub1a", &key_id)
+            .expect("device compute");
+        assert_ne!(
+            action.as_bytes(),
+            device.as_bytes(),
+            "the two transcript hashes must differ over the same pre — domain separation by content"
+        );
+    }
+
+    #[test]
+    fn owner_action_compute_is_deterministic_and_field_sensitive() {
+        let (pre, m2, c1, binding_id, binding_digest) = fixture();
+        let a = OwnerActionHash::compute(
+            &pre,
+            &m2,
+            &c1,
+            &binding_id,
+            &binding_digest,
+            "npub1a",
+            b"intent-wire",
+        )
+        .unwrap();
+        let b = OwnerActionHash::compute(
+            &pre,
+            &m2,
+            &c1,
+            &binding_id,
+            &binding_digest,
+            "npub1a",
+            b"intent-wire",
+        )
+        .unwrap();
+        assert_eq!(a, b, "same transcript fields must give the same hash");
+
+        let c = OwnerActionHash::compute(
+            &pre,
+            &m2,
+            &c1,
+            &binding_id,
+            &binding_digest,
+            "npub1b",
+            b"intent-wire",
+        )
+        .unwrap();
+        assert_ne!(a, c, "a field change must move the hash");
+    }
+}

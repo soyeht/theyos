@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use household_rs::owner_events::OwnerDevicePushToken;
 use serde_bytes::ByteBuf;
-use server_rs::apns_dispatcher::{APNS_TICKLE_BODY, ApnsError, ApnsTransport, install_transport};
+use server_rs::apns::dispatcher::{APNS_TICKLE_BODY, ApnsError, ApnsTransport, install_transport};
 
 use phase3_support::{
     OwnerApprovalAck, OwnerEventsResponse, candidate_harness, cursor_param, founder_harness,

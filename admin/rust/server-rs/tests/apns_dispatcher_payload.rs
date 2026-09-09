@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use household_rs::owner_events::OwnerDevicePushToken;
 use serde_bytes::ByteBuf;
-use server_rs::apns_dispatcher::{
+use server_rs::apns::dispatcher::{
     APNS_TICKLE_BODY, ApnsError, ApnsTransport, dispatch_tickle_with,
 };
 

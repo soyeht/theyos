@@ -13,7 +13,7 @@ use household_rs::pair_machine::{
 };
 use household_rs::person_cert::{PersonCert, SignOwnerOptions};
 use household_rs::{BootstrapOpts, HouseholdAuthState, KeyBackingPolicy};
-use server_rs::bonjour_browser::{JoinerAnnouncement, spawn_bonjour_browser_with_source};
+use server_rs::bonjour::browser::{JoinerAnnouncement, spawn_bonjour_browser_with_source};
 use server_rs::handlers_pair_machine::{
     PairMachineRouterState, PreHouseholdRouterState, pre_household_router,
 };

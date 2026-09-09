@@ -199,7 +199,7 @@ impl fmt::Debug for MeshIpv4 {
 ///
 /// Bytes this module frames and never interprets. The field is private and there
 /// is no public accessor or constructor: the only public doors are
-/// `claw_share_data_tunnel::{encode,decode}_network_settings_body`, and the
+/// `claw_share::data_tunnel::{encode,decode}_network_settings_body`, and the
 /// decode one applies the strict canonical mirrors.
 ///
 /// **Why sealed rather than a bare `Vec<u8>`.** A plain public body would have

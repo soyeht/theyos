@@ -15,12 +15,12 @@ use server_rs::claw_share_session_clock::AdmissionInstant;
 
 use household_rs::LoadedIdentity;
 use household_rs::cbor;
-use household_rs::claw_share::{ClawShareSlotStore, SLOT_ID_LEN, SlotId};
-use household_rs::claw_share_data_tunnel::ReplayGuard;
-use household_rs::claw_share_relay_stream_contract::{
+use household_rs::claw_share::data_tunnel::ReplayGuard;
+use household_rs::claw_share::relay_stream_contract::{
     RelayStreamClawStaticPublicKey, RelayStreamOfferContract, RelayStreamResource,
     mint_relay_stream_group_offer,
 };
+use household_rs::claw_share::{ClawShareSlotStore, SLOT_ID_LEN, SlotId};
 use household_rs::household_mesh_log::{
     MeshLogStore, MeshMembership, ProjectedGroup, ProjectedMemberDevice, ProjectedState,
     build_claw_site_published_event,

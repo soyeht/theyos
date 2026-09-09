@@ -8,8 +8,8 @@ use thiserror::Error;
 use crate::error::{HouseholdError, StorageError};
 use crate::household_record::HouseholdRecord;
 use crate::owner_webauthn::OwnerWebauthnCredentialStore;
-use crate::owner_webauthn_authority::{OwnerWebauthnAuthority, OwnerWebauthnAuthorityError};
-use crate::owner_webauthn_recovery::{OwnerWebauthnRecoveryAuthority, OwnerWebauthnRecoveryError};
+use crate::owner_webauthn::authority::{OwnerWebauthnAuthority, OwnerWebauthnAuthorityError};
+use crate::owner_webauthn::recovery::{OwnerWebauthnRecoveryAuthority, OwnerWebauthnRecoveryError};
 use crate::person_cert::PersonCert;
 use crate::storage::{self, atomic_write_cbor};
 

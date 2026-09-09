@@ -9,7 +9,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
-use crate::claw_share_rendezvous_token::RendezvousToken;
+use crate::claw_share::rendezvous_token::RendezvousToken;
 use crate::claw_vpn_mobile_state::{
     ClawVpnMobileAclGrant, ClawVpnMobileClawAvailabilityChange, ClawVpnMobileClawId,
     ClawVpnMobileDeviceId, ClawVpnMobileMesh, ClawVpnMobileMeshError, ClawVpnMobileMeshRevocation,

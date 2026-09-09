@@ -5,11 +5,11 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use household_rs::LoadedIdentity;
+use household_rs::claw_share::data_tunnel::{ReplayGuard, SessionAuthToken, TcpStreamRouter};
 use household_rs::claw_share::{
     ClawShareSlotStore, GuestCredential, MAX_CREDENTIAL_TTL_SECS, SLOT_ID_LEN, SlotId, SlotRecord,
     SlotState,
 };
-use household_rs::claw_share_data_tunnel::{ReplayGuard, SessionAuthToken, TcpStreamRouter};
 use household_rs::household_mesh_log::{MeshLogStore, ProjectedState};
 use household_rs::household_record::HouseholdRecord;
 use household_rs::ids::{derive_household_id, derive_machine_id};

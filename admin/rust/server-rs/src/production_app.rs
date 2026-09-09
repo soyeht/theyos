@@ -20,7 +20,7 @@ use tower_http::{
 
 use crate::{
     auth::{self, require_auth},
-    claw_store_routes, cloudflare_admin,
+    claw_store_routes, cloudflare,
     config::Config,
     handlers_admin, handlers_instances, handlers_invites, handlers_jobs, handlers_misc,
     handlers_mobile, handlers_network, handlers_terminal, handlers_terminal_attachments, health,
@@ -217,15 +217,15 @@ pub fn compose(state: &SharedState, cfg: &Config) -> Router {
         )
         .route(
             "/admin/cloudflare/status",
-            get(cloudflare_admin::handle_status),
+            get(cloudflare::admin::handle_status),
         )
         .route(
             "/admin/cloudflare/zones",
-            post(cloudflare_admin::handle_list_zones),
+            post(cloudflare::admin::handle_list_zones),
         )
         .route(
             "/admin/cloudflare/setup",
-            post(cloudflare_admin::handle_setup).delete(cloudflare_admin::handle_disconnect),
+            post(cloudflare::admin::handle_setup).delete(cloudflare::admin::handle_disconnect),
         )
         .route("/llm/catalog", get(crate::handlers_llm::handle_catalog))
         .route(

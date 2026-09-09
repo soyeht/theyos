@@ -469,7 +469,7 @@ mod tests {
     use std::path::PathBuf;
     use std::rc::Rc;
 
-    use household_rs::claw_share_data_tunnel::TunnelFrame;
+    use household_rs::claw_share::data_tunnel::TunnelFrame;
     use household_rs::claw_vpn::{
         ClawVpnAcl, ClawVpnAclKey, ClawVpnAgentCore, ClawVpnAuditReason, ClawVpnIpv4Pool,
         ClawVpnSession, ClawVpnSessionRegistry,

@@ -1,7 +1,7 @@
 //! Per-principal reopen-rate gate for `ClawSite` `relay_stream` dials,
 //! applied by BOTH the Group/Public arm and the Device arm of the responder.
 //!
-//! The `OpenPersistent` byte/open budget in `household_rs::claw_share_data_tunnel`
+//! The `OpenPersistent` byte/open budget in `household_rs::claw_share::data_tunnel`
 //! bounds volume for ONE authenticated `ClawSite` connection, but that budget
 //! resets on every reconnect: nothing upstream of it bounds how often a
 //! principal can mint a fresh budget. This module closes that gap with a
@@ -31,7 +31,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use household_rs::claw_share_data_tunnel::DataTunnelError;
+use household_rs::claw_share::data_tunnel::DataTunnelError;
 use household_rs::keys::P256PublicKey;
 
 /// Fixed-window reopen-rate defaults for V1: 8 authenticated connections per

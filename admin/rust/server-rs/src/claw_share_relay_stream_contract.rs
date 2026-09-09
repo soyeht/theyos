@@ -8,4 +8,4 @@
 //! working. The engine-only pieces (issuer-trust seam, Noise initiator/responder,
 //! store, pool, admission, target router, mount, provision, runtime) stay here.
 
-pub use household_rs::claw_share_relay_stream_contract::*;
+pub use household_rs::claw_share::relay_stream_contract::*;

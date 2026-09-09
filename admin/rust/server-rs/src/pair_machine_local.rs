@@ -54,7 +54,7 @@
 //!
 //! See `specs/006-pair-machine-daemon-stage/` for the contract.
 
-use crate::bonjour_publisher::{
+use crate::bonjour::publisher::{
     PairMachineBonjourRole, PublishParams, publish_candidate_joiner_bonjour,
 };
 use crate::household_listener::{InterfaceClass, enumerate_bind_targets};

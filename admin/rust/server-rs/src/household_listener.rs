@@ -3235,6 +3235,11 @@ mod tests {
     /// .rs` has seven at column zero, the first on line 55, with the definition
     /// on 588 -- the naive cut keeps 54 lines and finds nothing.
     fn production_half(text: &str) -> &str {
+        // An extracted test module (`<module>/tests.rs`) declares itself with
+        // an inner `#![cfg(test)]` on its first line: no production half.
+        if text.starts_with("#![cfg(test)]") {
+            return "";
+        }
         text.split_once("\n#[cfg(test)]\nmod tests")
             .map_or(text, |(production, _)| production)
     }

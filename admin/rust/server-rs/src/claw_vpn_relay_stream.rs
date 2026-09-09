@@ -9,7 +9,7 @@
 use std::fmt;
 use std::io::{self, Read, Write};
 
-use household_rs::claw_share_data_tunnel::{MAX_FRAME_LEN, TunnelFrame};
+use household_rs::claw_share::data_tunnel::{MAX_FRAME_LEN, TunnelFrame};
 
 use crate::claw_vpn_packet_pump::ClawVpnPacketRelay;
 

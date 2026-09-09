@@ -72,7 +72,7 @@ pub async fn handle_list_public_sites(
         body["cloudflared_warning"] = json!({
             "message": "These domains are not present in the cloudflared config. Add an `ingress` entry pointing to http://localhost:8080 and run `cloudflared service restart`.",
             "missing": missing,
-            "config_path": crate::cloudflared_sync::cloudflared_config_path(),
+            "config_path": crate::cloudflare::cloudflared_sync::cloudflared_config_path(),
         });
     }
     Ok(Json(body))
@@ -154,12 +154,12 @@ pub async fn handle_upsert_public_sites(
         body["cloudflared_warning"] = json!({
             "message": "These domains are not present in the cloudflared config. Add an `ingress` entry pointing to http://localhost:8080 and run `cloudflared service restart`.",
             "missing": missing,
-            "config_path": crate::cloudflared_sync::cloudflared_config_path(),
+            "config_path": crate::cloudflare::cloudflared_sync::cloudflared_config_path(),
         });
     }
 
     // Regenerate cloudflared config and reload (env-gated; no-op on dev hosts).
-    crate::cloudflared_sync::sync_cloudflared_config(&state).await;
+    crate::cloudflare::cloudflared_sync::sync_cloudflared_config(&state).await;
 
     Ok(Json(body))
 }
@@ -201,7 +201,7 @@ pub async fn handle_delete_public_site(
     );
 
     // Regenerate cloudflared config and reload (env-gated; no-op on dev hosts).
-    crate::cloudflared_sync::sync_cloudflared_config(&state).await;
+    crate::cloudflare::cloudflared_sync::sync_cloudflared_config(&state).await;
 
     Ok(Json(json!({ "deleted": true, "domain": domain })))
 }
@@ -339,7 +339,7 @@ pub async fn ensure_public_site_targets_for_instance(
     // can't leave every site 502-ing until someone manually adds/removes a
     // domain. No-op when cloudflared isn't configured on this host.
     if refreshed > 0 {
-        crate::cloudflared_sync::sync_cloudflared_config(state).await;
+        crate::cloudflare::cloudflared_sync::sync_cloudflared_config(state).await;
     }
     Ok(())
 }
@@ -378,13 +378,13 @@ async fn ensure_cloudflare_cname_for_site(
     })?;
     let target = format!("{}.cfargotunnel.com", cfg.tunnel_id);
 
-    let token = crate::cloudflare_admin::read_api_token().map_err(ApiError::internal)?;
+    let token = crate::cloudflare::admin::read_api_token().map_err(ApiError::internal)?;
     let zone_id = cfg.zone_id.clone();
     let record = blocking(move || {
-        let client = crate::cloudflare_api::CloudflareClient::new(token);
+        let client = crate::cloudflare::api::CloudflareClient::new(token);
         client
             .create_dns_cname(&zone_id, &cname_name, &target)
-            .map_err(crate::cloudflare_admin::map_cf_error)
+            .map_err(crate::cloudflare::admin::map_cf_error)
     })
     .await??;
 
@@ -421,7 +421,7 @@ async fn cleanup_cloudflare_cname_for_deleted_site(state: &SharedState, deleted:
     else {
         return;
     };
-    let token = match crate::cloudflare_admin::read_api_token() {
+    let token = match crate::cloudflare::admin::read_api_token() {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!("[public-sites] cannot read CF api token for cleanup: {e}");
@@ -431,7 +431,7 @@ async fn cleanup_cloudflare_cname_for_deleted_site(state: &SharedState, deleted:
     let zone_id = cfg.zone_id;
     let domain = deleted.domain.clone();
     let _ = blocking(move || {
-        let client = crate::cloudflare_api::CloudflareClient::new(token);
+        let client = crate::cloudflare::api::CloudflareClient::new(token);
         if let Err(e) = client.delete_dns_record(&zone_id, &record_id) {
             tracing::warn!("[public-sites] failed to delete CNAME for {domain} ({record_id}): {e}");
         }
@@ -782,7 +782,7 @@ fn validate_public_domain(domain: &str) -> Result<(), ApiError> {
 /// be using Cloudflare Tunnel — DNS-only / proxied DNS are valid alternatives).
 /// Never errors; the warning is informational.
 fn missing_cloudflared_ingress(domains: &[String]) -> Vec<String> {
-    let path = crate::cloudflared_sync::cloudflared_config_path();
+    let path = crate::cloudflare::cloudflared_sync::cloudflared_config_path();
     let Ok(content) = std::fs::read_to_string(&path) else {
         return Vec::new();
     };

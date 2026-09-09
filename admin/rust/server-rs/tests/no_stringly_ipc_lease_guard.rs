@@ -67,6 +67,10 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
 /// Production slice = everything before the first test-module marker. Test
 /// modules in this codebase live at the bottom of the file.
 fn prod_region(src: &str) -> &str {
+    // An extracted test module file opens with `#![cfg(test)]`: no production.
+    if src.starts_with("#![cfg(test)]") {
+        return "";
+    }
     let cut = [src.find("#[cfg(test)]"), src.find("\nmod tests")]
         .into_iter()
         .flatten()

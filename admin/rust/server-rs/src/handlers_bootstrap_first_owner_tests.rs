@@ -232,14 +232,11 @@ async fn first_owner_loopback_http_smoke_has_liveness_before_and_after() {
     );
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            bootstrap_router(state).into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(async move {
-            let _ = shutdown_rx.await;
-        })
-        .await
+        core_rs::phase0_axum_serve!(listener, bootstrap_router(state), connect_info = SocketAddr)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
     });
     let client = reqwest::Client::new();
     let origin = format!("http://{address}");
@@ -594,7 +591,12 @@ fn public_attempt_matcher_accepts_one_valid_case_and_rejects_each_divergence() {
 
 #[test]
 fn household_bootstrap_does_not_select_addresses_from_administrative_or_interface_helpers() {
-    let source = include_str!("handlers_bootstrap.rs");
+    // The module's tests live in extracted files; sweep them with it.
+    let source = concat!(
+        include_str!("handlers_bootstrap.rs"),
+        include_str!("handlers_bootstrap/tests.rs"),
+        include_str!("handlers_bootstrap/household_teardown_lifecycle_tests.rs")
+    );
     for forbidden in [
         "best_qr_host",
         "current_tailnet_ipv4",

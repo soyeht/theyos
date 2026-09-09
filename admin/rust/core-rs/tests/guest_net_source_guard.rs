@@ -185,6 +185,11 @@ fn normalize_path(path: &Path) -> String {
 
 fn production_lines(content: &str) -> Vec<(usize, &str)> {
     let mut lines = Vec::new();
+    // An extracted test module file opens with `#![cfg(test)]`: nothing in it
+    // is production.
+    if content.starts_with("#![cfg(test)]") {
+        return lines;
+    }
     let mut skip_cfg_test_item = false;
     let mut skip_depth: Option<i32> = None;
 
