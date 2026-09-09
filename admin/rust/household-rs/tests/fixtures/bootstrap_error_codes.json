@@ -25,6 +25,9 @@
     { "wire": "invitation_not_found",      "http_status": 404 },
     { "wire": "accept_household_not_pending", "http_status": 409 },
     { "wire": "engine_initializing",       "http_status": 503 },
-    { "wire": "pair_code_rejected",        "http_status": 404 }
+    { "wire": "pair_code_rejected",        "http_status": 404 },
+    { "wire": "profile_missing",           "http_status": 503 },
+    { "wire": "profile_mismatch",          "http_status": 409 },
+    { "wire": "invitation_already_claimed", "http_status": 409 }
   ]
 }
