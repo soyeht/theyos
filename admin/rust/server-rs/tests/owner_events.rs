@@ -4051,6 +4051,57 @@ fn product_a_transport_source_guard_does_not_become_owner_tier_authority() {
     );
 }
 
+/// Whether `path` belongs to a reviewed module for the per-Claw VPN scan.
+///
+/// A reviewed module is its own file, or a test module extracted into the
+/// module's directory, recognised by the `#![cfg(test)]` that every extracted
+/// test file opens with. The directory alone is deliberately NOT enough: a
+/// production submodule dropped into `<module>/` would otherwise inherit the
+/// module's allowance without review.
+fn in_reviewed_module(path: &Path, source: &str, module_file: &Path, module_dir: &Path) -> bool {
+    path == module_file || (path.starts_with(module_dir) && source.starts_with("#![cfg(test)]"))
+}
+
+#[test]
+fn in_reviewed_module_admits_only_the_file_and_its_extracted_tests() {
+    let src = Path::new("/src");
+    let file = src.join("startup_wiring.rs");
+    let dir = src.join("startup_wiring");
+    let production = "pub fn probe() {}\n";
+    let extracted = "#![cfg(test)]\n\nuse super::*;\n";
+
+    // The module file itself, whatever it contains.
+    assert!(in_reviewed_module(&file, production, &file, &dir));
+    // An extracted test module in the module's directory.
+    assert!(in_reviewed_module(
+        &dir.join("tests.rs"),
+        extracted,
+        &file,
+        &dir
+    ));
+    // A production submodule in the same directory is NOT reviewed.
+    assert!(!in_reviewed_module(
+        &dir.join("probe.rs"),
+        production,
+        &file,
+        &dir
+    ));
+    // The marker does not help a file outside the directory.
+    assert!(!in_reviewed_module(
+        &src.join("elsewhere.rs"),
+        extracted,
+        &file,
+        &dir
+    ));
+    // A sibling whose name merely starts with the module name is unrelated.
+    assert!(!in_reviewed_module(
+        &src.join("startup_wiring_extra.rs"),
+        extracted,
+        &file,
+        &dir
+    ));
+}
+
 #[test]
 fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
     let server_crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -4641,30 +4692,38 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
             let in_target_session_relay_module = path == target_session_relay_path;
             let in_target_session_router_module = path == target_session_router_path;
             let in_target_session_runtime_module = path == target_session_runtime_path;
-            // A reviewed module is its file plus the extracted test files in
-            // its own directory (`<module>/tests.rs`).
-            let in_relay_stream_responder_reverse_connect_module = path
-                == relay_stream_responder_reverse_connect_path
-                || path.starts_with(
-                    server_src_dir.join("claw_share_relay_stream_responder_reverse_connect"),
-                );
-            let in_relay_stream_reverse_connect_binding_module = path
-                == relay_stream_reverse_connect_binding_path
-                || path.starts_with(
-                    server_src_dir.join("claw_share_relay_stream_reverse_connect_binding"),
-                );
-            let in_relay_stream_reverse_connect_pool_module = path
-                == relay_stream_reverse_connect_pool_path
-                || path.starts_with(
-                    server_src_dir.join("claw_share_relay_stream_reverse_connect_pool"),
-                );
+            // A reviewed module is its file plus the test files extracted into
+            // its own directory; see `in_reviewed_module` for why the
+            // directory alone is not enough.
+            let in_relay_stream_responder_reverse_connect_module = in_reviewed_module(
+                &path,
+                &source,
+                &relay_stream_responder_reverse_connect_path,
+                &server_src_dir.join("claw_share_relay_stream_responder_reverse_connect"),
+            );
+            let in_relay_stream_reverse_connect_binding_module = in_reviewed_module(
+                &path,
+                &source,
+                &relay_stream_reverse_connect_binding_path,
+                &server_src_dir.join("claw_share_relay_stream_reverse_connect_binding"),
+            );
+            let in_relay_stream_reverse_connect_pool_module = in_reviewed_module(
+                &path,
+                &source,
+                &relay_stream_reverse_connect_pool_path,
+                &server_src_dir.join("claw_share_relay_stream_reverse_connect_pool"),
+            );
             let in_relay_stream_runtime_module = path == relay_stream_runtime_path;
             let in_relay_stream_mount_module = path == relay_stream_mount_path;
             let in_relay_stream_target_router_module = path == relay_stream_target_router_path;
             let in_runtime_module = path == runtime_path;
             let in_wiring_module = path == wiring_path;
-            let in_startup_wiring_module = path == startup_wiring_path
-                || path.starts_with(server_src_dir.join("startup_wiring"));
+            let in_startup_wiring_module = in_reviewed_module(
+                &path,
+                &source,
+                &startup_wiring_path,
+                &server_src_dir.join("startup_wiring"),
+            );
             let in_linux_tun_module = path == linux_tun_path;
             let in_macos_utun_module = path == macos_utun_path;
             let in_packet_pump_tests = in_packet_pump_module
