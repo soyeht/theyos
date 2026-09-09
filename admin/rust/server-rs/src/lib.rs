@@ -171,6 +171,7 @@ pub mod setup_beacon;
 pub mod setup_invitation;
 pub mod shutdown;
 pub mod startup_wiring;
+pub mod accessibility_cli;
 pub mod mac_host_supervised;
 pub mod state;
 pub mod supervised_terminals;

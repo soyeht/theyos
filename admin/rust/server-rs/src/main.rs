@@ -63,6 +63,13 @@ async fn main() {
     // under the supervisor's label; the Mac lifecycle only writes the `ptyd`
     // LaunchAgent after staging an engine that carries it.
     let argv: Vec<String> = std::env::args().collect();
+    // `theyos-engine accessibility [--prompt]`: the Mac app asks, with launch
+    // responsibility disclaimed, whether THIS file is trusted for
+    // Accessibility — the identity the supervisor and every pane shell run
+    // under (`server_rs::accessibility_cli`).
+    if argv.len() >= 2 && argv[1] == "accessibility" {
+        std::process::exit(server_rs::accessibility_cli::run(&argv[2..]));
+    }
     if argv.len() >= 2 && argv[1] == "ptyd" {
         terminal_rs::supervisor_cli::init_tracing();
         if let Err(error) = terminal_rs::supervisor_cli::run(&argv[2..]).await {
