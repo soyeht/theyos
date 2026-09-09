@@ -13,7 +13,7 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::time::Duration;
 
-use household_rs::claw_share_data_tunnel::TargetSession;
+use household_rs::claw_share::data_tunnel::TargetSession;
 use tokio::net::UnixStream as TokioUnixStream;
 
 use crate::claw_vpn_pollable_pump::ClawVpnPollablePacketRelay;
@@ -115,7 +115,7 @@ impl fmt::Debug for ClawVpnTargetSessionRelayPair {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use household_rs::claw_share_data_tunnel::TunnelFrame;
+    use household_rs::claw_share::data_tunnel::TunnelFrame;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

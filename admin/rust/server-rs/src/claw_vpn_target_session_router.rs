@@ -10,7 +10,7 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::os::unix::net::UnixStream as StdUnixStream;
 
-use household_rs::claw_share_data_tunnel::{ClawTargetRouter, DataTunnelError, TargetSession};
+use household_rs::claw_share::data_tunnel::{ClawTargetRouter, DataTunnelError, TargetSession};
 
 use crate::claw_vpn_packet_pump::ClawVpnPacketInterface;
 use crate::claw_vpn_pollable_pump::ClawVpnPollablePacketInterface;
@@ -173,7 +173,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use household_rs::claw_share_data_tunnel::TunnelFrame;
+    use household_rs::claw_share::data_tunnel::TunnelFrame;
     use household_rs::claw_vpn::{
         ClawVpnAcl, ClawVpnAclKey, ClawVpnAgentCore, ClawVpnAuditReason, ClawVpnDatapathSide,
         ClawVpnIpv4Pool, ClawVpnSession, ClawVpnSessionRegistry,

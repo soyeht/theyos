@@ -13,7 +13,7 @@
 // production route in this slice; production has no `Pending` source.
 #![allow(dead_code)]
 
-use crate::owner_site_authority::{
+use crate::owner_site::authority::{
     OwnerSitePromotionInput, OwnerSitePromotionLinearizer, OwnerSitePromotionRejection,
     OwnerSitePromotionWitness,
 };

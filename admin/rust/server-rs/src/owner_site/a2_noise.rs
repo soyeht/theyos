@@ -11,8 +11,8 @@
 use snow::{Builder, HandshakeState};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::owner_site_authority::OwnerSiteAuthorityError;
-use crate::owner_site_binding_glue::{A2_DOMAIN, hash_canonical};
+use crate::owner_site::authority::OwnerSiteAuthorityError;
+use crate::owner_site::binding_glue::{A2_DOMAIN, hash_canonical};
 
 #[allow(dead_code)]
 pub(crate) const A2_VERSION: u8 = 1;

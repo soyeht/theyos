@@ -16,10 +16,10 @@ use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 // can share them; re-exported here so this module's table/pairing/splicer and
 // the types' external importers (e.g. the listener) keep the same path. Only the
 // leaf codec moved - the relay mechanics stay in this module.
-pub use household_rs::claw_share_rendezvous_hello::{
+pub use household_rs::claw_share::rendezvous_hello::{
     RENDEZVOUS_HELLO_VERSION, RendezvousHello, RendezvousHelloError, RendezvousRole,
 };
-pub use household_rs::claw_share_rendezvous_token::{
+pub use household_rs::claw_share::rendezvous_token::{
     MAX_RENDEZVOUS_TOKEN_LEN, MIN_RENDEZVOUS_TOKEN_LEN, RendezvousToken, RendezvousTokenError,
 };
 

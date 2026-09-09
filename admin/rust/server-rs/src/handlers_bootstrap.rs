@@ -3379,7 +3379,7 @@ pub async fn post_initialize(
     if let Ok(Some(inv)) = crate::setup_invitation::load_persisted_invitation(&state.state_dir) {
         if let Some(token_buf) = &inv.iphone_apns_token {
             if let Ok(token_arr) = <[u8; 32]>::try_from(token_buf.as_ref()) {
-                crate::apns_push::dispatch_fire_and_forget(crate::apns_push::HouseCreatedEvent {
+                crate::apns::push::dispatch_fire_and_forget(crate::apns::push::HouseCreatedEvent {
                     apns_device_token: token_arr,
                     hh_id: hh_id.clone(),
                     hh_name: name_persisted.clone(),

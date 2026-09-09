@@ -1,12 +1,12 @@
 //! Concrete owner-event APNS "tickle" transport (silent background push).
 //!
 //! This is the real-provider implementation of
-//! [`crate::apns_dispatcher::ApnsTransport`]. It lives OUTSIDE
+//! [`crate::apns::dispatcher::ApnsTransport`]. It lives OUTSIDE
 //! `apns_dispatcher.rs` on purpose: that file is the Constitution III guarded
 //! surface ("no household metadata reaches the push provider") and must stay
 //! pure — only the canonical silent-push body, a fixed `pub` set, and no
 //! body-source machinery. Concrete transports (like
-//! [`crate::apns_push::A2Transport`]) belong in their own modules. This
+//! [`crate::apns::push::A2Transport`]) belong in their own modules. This
 //! transport only forwards the canonical body it is handed by the dispatcher,
 //! plus addressing (device token + topic); it never constructs household
 //! metadata of its own.
@@ -15,8 +15,8 @@ use std::fs::File;
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::apns_dispatcher::{APNS_TOPIC_ENV, ApnsError, ApnsTransport};
-use crate::apns_push::{
+use crate::apns::dispatcher::{APNS_TOPIC_ENV, ApnsError, ApnsTransport};
+use crate::apns::push::{
     APNS_PUSH_KEY_ID_ENV, APNS_PUSH_KEY_PATH_ENV, APNS_PUSH_TEAM_ID_ENV, apns_endpoint_from_env,
 };
 

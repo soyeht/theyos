@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use crate::claw_share_relay_stream_abuse::RelayAbuseConfig;
 use crate::claw_share_rendezvous_stream_relay_listener::RendezvousStreamRelayListenerConfig;
-use household_rs::claw_share_data_tunnel::PERSISTENT_MAX_BYTES_PER_DIRECTION;
+use household_rs::claw_share::data_tunnel::PERSISTENT_MAX_BYTES_PER_DIRECTION;
 
 pub const RELAY_STREAM_PUBLIC_RELAY_ENV: &str = "THEYOS_RELAY_STREAM_PUBLIC_RELAY";
 pub const RELAY_STREAM_PUBLIC_BIND_ADDR_ENV: &str = "THEYOS_RELAY_STREAM_PUBLIC_BIND_ADDR";

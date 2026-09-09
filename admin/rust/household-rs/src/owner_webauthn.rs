@@ -6,6 +6,12 @@
 //! slices. The `WebAuthn` ceremonies themselves are delegated to `webauthn-rs`;
 //! we do not hand-roll COSE, client-data, or assertion verification.
 
+pub mod anchor;
+pub mod authority;
+pub mod recovery;
+pub mod recovery_anchor;
+pub mod recovery_consume;
+
 use std::collections::HashMap;
 use std::time::Duration;
 

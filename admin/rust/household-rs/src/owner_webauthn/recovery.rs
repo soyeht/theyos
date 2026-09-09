@@ -255,7 +255,7 @@ impl OwnerWebauthnRecoveryAuthority {
     #[must_use]
     pub fn recovery_head_consumed_by_any_log(
         &self,
-        webauthn_authority: &crate::owner_webauthn_authority::OwnerWebauthnAuthority,
+        webauthn_authority: &crate::owner_webauthn::authority::OwnerWebauthnAuthority,
         recovery_head_sequence: u64,
         recovery_head_hash: &[u8],
     ) -> bool {
@@ -266,7 +266,7 @@ impl OwnerWebauthnRecoveryAuthority {
 
     pub fn latest_unconsumed_active_verifier_head(
         &self,
-        webauthn_authority: &crate::owner_webauthn_authority::OwnerWebauthnAuthority,
+        webauthn_authority: &crate::owner_webauthn::authority::OwnerWebauthnAuthority,
     ) -> Result<Option<OwnerWebauthnRecoveryHead>, OwnerWebauthnRecoveryError> {
         let Some(head) = self.latest_active_verifier_head()? else {
             return Ok(None);
@@ -636,7 +636,7 @@ mod tests {
     use crate::ids::{MachineId, derive_household_id};
     use crate::keys::P256Keypair;
     use crate::owner_webauthn::OwnerWebauthnCredential;
-    use crate::owner_webauthn_authority::{OwnerWebauthnAuthority, OwnerWebauthnRecoveryAddInput};
+    use crate::owner_webauthn::authority::{OwnerWebauthnAuthority, OwnerWebauthnRecoveryAddInput};
     use crate::person_cert::{PersonCert, SignOwnerOptions};
 
     const NOW: u64 = 1_800_000_000;
@@ -723,7 +723,7 @@ mod tests {
         owner_cert: &PersonCert,
     ) -> (
         OwnerWebauthnAuthority,
-        crate::owner_webauthn_authority::SignedOwnerWebauthnCredentialEvent,
+        crate::owner_webauthn::authority::SignedOwnerWebauthnCredentialEvent,
     ) {
         let genesis = OwnerWebauthnAuthority::sign_genesis(
             root,

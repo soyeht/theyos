@@ -50,8 +50,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use household_rs::cbor;
+use household_rs::claw_share::data_tunnel as dt;
 use household_rs::claw_share::{ClawShareError, GuestCredential};
-use household_rs::claw_share_data_tunnel as dt;
 use thiserror::Error;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpStream, lookup_host};
@@ -841,7 +841,7 @@ impl ClawSession {
 impl ClawSession {
     /// Validate + store a post-Open `NetworkSettings` frame, fail-closed.
     ///
-    /// The engine's contract (`claw_share_data_tunnel::NetworkSettings`) is that
+    /// The engine's contract (`claw_share::data_tunnel::NetworkSettings`) is that
     /// a *missing, duplicated, or invalid* frame fails the connection closed
     /// before any interface is configured. This enforces the two halves the
     /// client owns:

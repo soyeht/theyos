@@ -13,8 +13,8 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+use household_rs::claw_share::data_tunnel::{ClawTargetRouter, DataTunnelError, TargetSession};
 use household_rs::claw_share::{ClawShareSlotStore, SlotState};
-use household_rs::claw_share_data_tunnel::{ClawTargetRouter, DataTunnelError, TargetSession};
 #[cfg(any(test, feature = "dev_t1_datapath"))]
 use household_rs::keys::P256PublicKey;
 
@@ -435,8 +435,8 @@ fn target_unavailable(reason: &'static str) -> DataTunnelError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use household_rs::claw_share::data_tunnel::TcpStreamRouter;
     use household_rs::claw_share::{GuestCredential, SlotId, SlotRecord};
-    use household_rs::claw_share_data_tunnel::TcpStreamRouter;
     use household_rs::household_mesh_log::{
         DirectoryDeviceStatus, MeshMembership, ProjectedDirectoryDevice, ProjectedGroup,
         ProjectedMemberDevice, ProjectedState,

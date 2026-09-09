@@ -29,31 +29,31 @@ use household_rs::owner_events::{
     JoinCancelledPayload, MachineJoinedPayload, OwnerDevicePushToken, OwnerEvent, OwnerEventLog,
     OwnerEventPayload, OwnerEventType, OwnerEventsBroadcaster,
 };
-use household_rs::owner_webauthn::{
-    OwnerWebauthnChallengeId, OwnerWebauthnCredentialStore, OwnerWebauthnRegistrationBinding,
-    OwnerWebauthnRegistrationStart, OwnerWebauthnRp,
-};
-use household_rs::owner_webauthn_anchor::{
+use household_rs::owner_webauthn::anchor::{
     OwnerWebauthnAnchorError, OwnerWebauthnAnchorMode, OwnerWebauthnAnchorStatus,
     OwnerWebauthnAuthorityHead, classify_owner_webauthn_authority_anchor_read_only,
     verified_owner_webauthn_authority_head, verify_or_update_owner_webauthn_authority_anchor,
 };
-use household_rs::owner_webauthn_authority::{
+use household_rs::owner_webauthn::authority::{
     OwnerWebauthnAuthority, OwnerWebauthnCredentialEventAction, OwnerWebauthnEventActor,
     OwnerWebauthnRecoveryAddInput, SignedOwnerWebauthnCredentialEvent,
 };
-use household_rs::owner_webauthn_recovery::{
+use household_rs::owner_webauthn::recovery::{
     OwnerWebauthnRecoveryActor, OwnerWebauthnRecoveryAuthority, OwnerWebauthnRecoveryEventAction,
     OwnerWebauthnRecoveryHead, RecoveryCodeVerifier, SignedOwnerWebauthnRecoveryEvent,
     verified_owner_webauthn_recovery_head,
 };
-use household_rs::owner_webauthn_recovery_anchor::{
+use household_rs::owner_webauthn::recovery_anchor::{
     OwnerWebauthnRecoveryAnchorError, OwnerWebauthnRecoveryAnchorStatus,
     advance_owner_webauthn_recovery_anchor_after_commit,
     classify_owner_webauthn_recovery_anchor_read_only,
 };
-use household_rs::owner_webauthn_recovery_consume::{
+use household_rs::owner_webauthn::recovery_consume::{
     OwnerWebauthnRecoveryConsumeReadiness, classify_owner_webauthn_recovery_consume_readiness,
+};
+use household_rs::owner_webauthn::{
+    OwnerWebauthnChallengeId, OwnerWebauthnCredentialStore, OwnerWebauthnRegistrationBinding,
+    OwnerWebauthnRegistrationStart, OwnerWebauthnRp,
 };
 use household_rs::pair_machine::{
     CeremonyError, CeremonyInputs, CeremonyTxn, FinalizeWithM2Options, FinalizeWithM2Outcome,
@@ -79,7 +79,7 @@ use webauthn_rs::prelude::{
 };
 use zeroize::Zeroizing;
 
-use crate::apns_dispatcher;
+use crate::apns::dispatcher;
 use crate::handlers_device_pairing::DevicePairingStore;
 use crate::household_auth;
 use crate::household_state::HouseholdState;
@@ -3168,10 +3168,10 @@ fn marker_matches_initial_enrollment(
         return false;
     }
     match &first_entry.event.action {
-        household_rs::owner_webauthn_authority::OwnerWebauthnCredentialEventAction::Add {
+        household_rs::owner_webauthn::authority::OwnerWebauthnCredentialEventAction::Add {
             credential,
         } => credential.credential_id_bytes() == marker.credential_id.as_ref(),
-        household_rs::owner_webauthn_authority::OwnerWebauthnCredentialEventAction::Revoke {
+        household_rs::owner_webauthn::authority::OwnerWebauthnCredentialEventAction::Revoke {
             ..
         } => false,
     }
@@ -4069,7 +4069,7 @@ pub async fn owner_webauthn_revoke_credential_finish_handler(
     }
     drop(rp);
 
-    let revoke = match household_rs::owner_webauthn_authority::OwnerWebauthnAuthority::sign_append(
+    let revoke = match household_rs::owner_webauthn::authority::OwnerWebauthnAuthority::sign_append(
         hh_priv,
         &identity.record,
         &current_owner_auth.owner_person_cert,
@@ -5463,21 +5463,22 @@ pub async fn owner_webauthn_registration_finish_handler(
             }
         };
     let credential_id = ByteBuf::from(credential.credential_id_bytes().to_vec());
-    let genesis = match household_rs::owner_webauthn_authority::OwnerWebauthnAuthority::sign_genesis(
-        hh_priv,
-        &identity.record,
-        &current_owner_auth.owner_person_cert,
-        credential,
-        now,
-    ) {
-        Ok(genesis) => genesis,
-        Err(e) => {
-            return reject_owner_webauthn_registration(
-                "authority_sign_failed",
-                Some(e.to_string()),
-            );
-        }
-    };
+    let genesis =
+        match household_rs::owner_webauthn::authority::OwnerWebauthnAuthority::sign_genesis(
+            hh_priv,
+            &identity.record,
+            &current_owner_auth.owner_person_cert,
+            credential,
+            now,
+        ) {
+            Ok(genesis) => genesis,
+            Err(e) => {
+                return reject_owner_webauthn_registration(
+                    "authority_sign_failed",
+                    Some(e.to_string()),
+                );
+            }
+        };
     let mut next_auth = current_owner_auth.as_ref().clone();
     next_auth.owner_webauthn.push_signed(genesis);
     next_auth.updated_at = now;
@@ -6981,7 +6982,7 @@ pub fn dispatch_owner_event_tickle_if_idle(
                 return;
             }
         };
-        match apns_dispatcher::dispatch_tickle(&token).await {
+        match dispatcher::dispatch_tickle(&token).await {
             Ok(()) => {
                 // Positive observability gate (T093) — the dispatcher
                 // returned successfully. Note: this fires AFTER the

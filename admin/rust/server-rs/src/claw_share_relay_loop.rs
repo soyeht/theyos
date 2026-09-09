@@ -25,11 +25,11 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use household_rs::cbor;
+use household_rs::claw_share::flow::{EngineContext, engine_handle_claim};
 use household_rs::claw_share::{
     CLAW_SHARE_GROUP_ACK_VERSION, CLAW_SHARE_GROUP_REQUEST_VERSION, ClawShareAck, ClawShareClaim,
     ClawShareGroupAck, ClawShareSlotStore, GroupClaimRequest, SLOT_ID_LEN, SlotId, TunnelHandle,
 };
-use household_rs::claw_share_flow::{EngineContext, engine_handle_claim};
 use household_rs::household_mesh_log::{LogEntry, MeshEvent, MeshLogStore, ProjectedState};
 use household_rs::keys::{IdentityKey, P256PublicKey};
 use nostr_relay_rs::nostr::prelude::*;

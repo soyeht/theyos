@@ -32,7 +32,7 @@ use household_rs::pair_machine::{
     PairMachineState, household_root_sole_path, shamir_self_shard_path,
 };
 use household_rs::storage::read_known_peer_addr;
-use server_rs::bonjour_browser::{JoinerAnnouncement, spawn_bonjour_browser_with_source};
+use server_rs::bonjour::browser::{JoinerAnnouncement, spawn_bonjour_browser_with_source};
 use server_rs::household_bootstrap::household_port_from_env;
 use tokio::sync::mpsc;
 

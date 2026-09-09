@@ -26,7 +26,7 @@ use crate::cbor;
 use crate::error::{HouseholdError, KeystoreError};
 use crate::household_record::HouseholdRecord;
 use crate::ids::HouseholdId;
-use crate::owner_webauthn_authority::{OwnerWebauthnAuthority, OwnerWebauthnAuthorityError};
+use crate::owner_webauthn::authority::{OwnerWebauthnAuthority, OwnerWebauthnAuthorityError};
 use crate::person_cert::PersonCert;
 
 const ANCHOR_SCHEMA_VERSION: u8 = 1;
@@ -327,7 +327,7 @@ mod tests {
     use crate::ids::{MachineId, derive_household_id};
     use crate::keys::{IdentityKey, P256Keypair};
     use crate::owner_webauthn::OwnerWebauthnCredential;
-    use crate::owner_webauthn_authority::{
+    use crate::owner_webauthn::authority::{
         OwnerWebauthnCredentialEventAction, SignedOwnerWebauthnCredentialEvent,
     };
     use crate::person_cert::{PersonCert, SignOwnerOptions};

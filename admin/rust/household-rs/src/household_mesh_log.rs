@@ -51,7 +51,7 @@ pub enum MeshEvent {
         /// helpers; product callers pass `None` until 4B wires it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         app_presentation: Option<
-            crate::claw_share_relay_stream_contract::ShareableAppPresentation,
+            crate::claw_share::relay_stream_contract::ShareableAppPresentation,
         >,
     },
     /// Owner revoked a claw-share slot. **Wins** against any prior or
@@ -355,7 +355,7 @@ pub struct ProjectedSlot {
     pub expires_at: u64,
     pub status: SlotProjectedStatus,
     pub app_presentation:
-        Option<crate::claw_share_relay_stream_contract::ShareableAppPresentation>,
+        Option<crate::claw_share::relay_stream_contract::ShareableAppPresentation>,
     /// `entry.timestamp` of the `ClawShareSlotMinted` event. `None` when the
     /// mint was never observed — the two out-of-order arms below synthesize a
     /// slot from a consume or a revoke and genuinely do not know when it was
@@ -1222,7 +1222,7 @@ pub fn build_slot_mint_event_with_presentation(
     issuer_pub: P256PublicKey,
     issuer_key: &dyn IdentityKey,
     app_presentation: Option<
-        crate::claw_share_relay_stream_contract::ShareableAppPresentation,
+        crate::claw_share::relay_stream_contract::ShareableAppPresentation,
     >,
 ) -> Result<LogEntry, MeshLogError> {
     LogEntry::sign(
@@ -3049,7 +3049,7 @@ mod tests {
     // ── Slice B step 4A: durable app presentation snapshot ────────────────
 
     use crate::claw_share::ClawShareSlotStore;
-    use crate::claw_share_relay_stream_contract::ShareableAppPresentation;
+    use crate::claw_share::relay_stream_contract::ShareableAppPresentation;
 
     const APP_ID: &str = "app_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 

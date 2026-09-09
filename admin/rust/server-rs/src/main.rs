@@ -392,7 +392,7 @@ async fn main() {
     // table at startup. Handles drift (e.g. backend wrote sites while
     // cloudflared was off, or the file was edited manually). Env-gated:
     // silently no-ops when THEYOS_CLOUDFLARED_CONFIG is unset.
-    server_rs::cloudflared_sync::sync_cloudflared_config(&state).await;
+    server_rs::cloudflare::cloudflared_sync::sync_cloudflared_config(&state).await;
 
     // ── Phase 1: snapshot active instances, then sweep orphans + reconcile DB ──
     // Save the list of Active containers BEFORE sweep/reconcile marks them as Stopped.
@@ -549,7 +549,7 @@ async fn main() {
                     );
                 }
             }
-            server_rs::cloudflared_sync::sync_cloudflared_config(&st).await;
+            server_rs::cloudflare::cloudflared_sync::sync_cloudflared_config(&st).await;
 
             tracing::info!(
                 "[startup] auto-restart complete ({} instance(s))",
@@ -711,7 +711,7 @@ async fn main() {
         .await
         .expect("Server error");
 
-    server_rs::bonjour_publisher::shutdown_household_bonjour().await;
+    server_rs::bonjour::publisher::shutdown_household_bonjour().await;
 
     // Drain warm-pool VMs before exiting so they don't survive as orphans.
     // Use the Executor's IPC connection to drain the REAL warm pool inside

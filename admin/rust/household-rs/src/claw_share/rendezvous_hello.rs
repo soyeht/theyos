@@ -1,7 +1,7 @@
 //! Relay-visible rendezvous hello shape for Product A `relay_stream`.
 //!
 //! C7c-2c-2a moved this codec here, alongside the rendezvous token
-//! ([`crate::claw_share_rendezvous_token`]), so the guest (friend-cli) can
+//! ([`crate::claw_share::rendezvous_token`]), so the guest (friend-cli) can
 //! encode the hello it sends to the relay without depending on the engine
 //! crate. The relay-side splicer/table and the listener stay in server-rs and
 //! re-export these types, so their behavior is unchanged. Only the leaf codec
@@ -11,7 +11,7 @@
 
 use std::fmt;
 
-use crate::claw_share_rendezvous_token::{RendezvousToken, RendezvousTokenError};
+use crate::claw_share::rendezvous_token::{RendezvousToken, RendezvousTokenError};
 
 pub const RENDEZVOUS_HELLO_VERSION: u8 = 1;
 

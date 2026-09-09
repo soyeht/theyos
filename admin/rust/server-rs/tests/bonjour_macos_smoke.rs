@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
-use server_rs::bonjour_impl_dns_sd::{
+use server_rs::bonjour::impl_dns_sd::{
     BrowserHandle, PublisherHandle, ServiceSpec, ShutdownOutcome,
 };
 

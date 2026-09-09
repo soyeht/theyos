@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::Ipv4Addr;
 
-use crate::claw_share_data_tunnel::TunnelFrame;
+use crate::claw_share::data_tunnel::TunnelFrame;
 use crate::keys::P256PublicKey;
 use sha2::{Digest, Sha256};
 

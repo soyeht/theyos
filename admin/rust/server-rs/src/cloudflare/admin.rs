@@ -13,7 +13,7 @@
 //! local writes (token files, DB row) and return the error to the UI so the
 //! operator can retry. We never leave the system in a half-configured state.
 
-use crate::cloudflare_api::{CfError, CloudflareClient};
+use crate::cloudflare::api::{CfError, CloudflareClient};
 use crate::state::SharedState;
 use axum::{Json, extract::State};
 use core_rs::error::{ApiError, blocking};

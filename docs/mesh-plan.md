@@ -19,7 +19,7 @@ paths:
   - admin/rust/mesh-session-core-rs/**
   - admin/rust/mesh-session-control-model-rs/**
   - admin/rust/server-rs/src/claw_vpn_*
-  - admin/rust/server-rs/src/bonjour_trust.rs
+  - admin/rust/server-rs/src/bonjour/trust.rs
   - admin/rust/server-rs/src/setup_invitation.rs
   - admin/rust/server-rs/src/tailnet_address.rs
   - admin/rust/server-rs/src/handlers_pair_machine.rs
@@ -110,7 +110,7 @@ construir carrier datagrama próprio — que o M12a estaciona como decisão expl
 Medido em `b4aae5cc`, 2026-08-18. A integração atual usa **faixa de endereço como
 rótulo de confiança**, e o rótulo promete mais do que o mecanismo entrega.
 
-`bonjour_trust.rs::classify_source` decide por faixa e só por faixa —
+`bonjour/trust.rs::classify_source` decide por faixa e só por faixa —
 `100.64.0.0/10`, `fd7a:115c:a1e0::/48` e **`fc00::/7` inteiro** ⇒
 `DiscoverySource::Tailnet`, documentado como *"→ trusted"*.
 

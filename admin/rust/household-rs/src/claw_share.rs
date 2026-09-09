@@ -31,6 +31,15 @@
 //! household-management caveats. The credential's authority is bounded
 //! by `(claw_id, expires_at, revoked)`.
 
+pub mod data_tunnel;
+pub mod flow;
+pub mod relay;
+pub mod relay_stream_contract;
+pub mod relay_stream_endpoint;
+pub mod relay_stream_noise;
+pub mod rendezvous_hello;
+pub mod rendezvous_token;
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -685,7 +694,7 @@ pub struct SlotRecord {
     pub expires_at: u64,
     pub state: SlotState,
     pub app_presentation:
-        Option<crate::claw_share_relay_stream_contract::ShareableAppPresentation>,
+        Option<crate::claw_share::relay_stream_contract::ShareableAppPresentation>,
     /// When the invite was minted. `None` only where the mint event was never
     /// observed — a projection that saw a consume or a revoke before its mint.
     /// Never synthesized: an owner surface must be able to tell "minted then"
@@ -1020,7 +1029,7 @@ pub fn owner_mint_invite_with_presentation(
     claim_relays: Vec<String>,
     slot_store: &ClawShareSlotStore,
     app_presentation: Option<
-        crate::claw_share_relay_stream_contract::ShareableAppPresentation,
+        crate::claw_share::relay_stream_contract::ShareableAppPresentation,
     >,
 ) -> Result<ClawShareInvite, ClawShareError> {
     let ttl_capped = ttl_secs.min(MAX_INVITE_TTL_SECS);
@@ -1989,7 +1998,7 @@ mod tests {
 
     #[test]
     fn owner_mint_invite_with_presentation_persists_snapshot() {
-        use crate::claw_share_relay_stream_contract::ShareableAppPresentation;
+        use crate::claw_share::relay_stream_contract::ShareableAppPresentation;
 
         let (owner_key, hh_id, owner_p_id) = fresh_owner();
         let store = ClawShareSlotStore::new();

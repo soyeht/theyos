@@ -8,7 +8,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use household_rs::claw_share_data_tunnel::ClawTargetRouter;
+use household_rs::claw_share::data_tunnel::ClawTargetRouter;
 use keystore_rs::KeystoreBackend;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
@@ -266,11 +266,11 @@ mod tests {
     use std::time::Duration;
 
     use household_rs::cbor;
-    use household_rs::claw_share::{ClawShareSlotStore, GuestCredential};
-    use household_rs::claw_share_data_tunnel::{
+    use household_rs::claw_share::data_tunnel::{
         HEALTH_PROBE, ReplayGuard, SessionAuthToken, TcpStreamRouter, TunnelAck, TunnelFrame,
         client_authenticate, client_health, client_open_stream, recv_frame, send_frame,
     };
+    use household_rs::claw_share::{ClawShareSlotStore, GuestCredential};
     use household_rs::household_mesh_log::MeshLogStore;
     use household_rs::ids::derive_household_id;
     use household_rs::keys::{IdentityKey, P256PublicKey};

@@ -11,7 +11,7 @@ use std::io;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::time::Duration;
 
-use household_rs::claw_share_data_tunnel::TargetSession;
+use household_rs::claw_share::data_tunnel::TargetSession;
 use household_rs::claw_vpn::{ClawVpnAgentSessionCore, ClawVpnSessionFrameError};
 
 use crate::claw_vpn_packet_pump::ClawVpnPacketInterface;
@@ -229,7 +229,7 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::path::PathBuf;
 
-    use household_rs::claw_share_data_tunnel::TunnelFrame;
+    use household_rs::claw_share::data_tunnel::TunnelFrame;
     use household_rs::claw_vpn::{
         ClawVpnAcl, ClawVpnAclKey, ClawVpnAgentCore, ClawVpnAuditReason, ClawVpnDatapathSide,
         ClawVpnIpv4Pool, ClawVpnSession, ClawVpnSessionRegistry,

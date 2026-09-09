@@ -5,7 +5,7 @@ use std::time::Duration;
 use household_rs::pair_device::PairToken;
 use household_rs::pair_machine::{PairMachineState, PairMachineWindowSnapshot};
 use serde_bytes::ByteBuf;
-use server_rs::bonjour_publisher::{HouseholdBonjour, PairMachineBonjourRole, PublishParams};
+use server_rs::bonjour::publisher::{HouseholdBonjour, PairMachineBonjourRole, PublishParams};
 
 fn params(role: PairMachineBonjourRole) -> PublishParams {
     PublishParams {

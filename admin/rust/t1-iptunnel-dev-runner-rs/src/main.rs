@@ -15,18 +15,18 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
-use household_rs::claw_share_data_tunnel::{
+use household_rs::claw_share::data_tunnel::{
     HEALTH_PROBE, SessionAuthToken, TunnelAck, client_authenticate, client_health,
     client_open_stream,
 };
-use household_rs::claw_share_relay_stream_contract::{
+use household_rs::claw_share::relay_stream_contract::{
     RelayStreamAudience, RelayStreamExpectedPath, RelayStreamOfferContract, RelayStreamResource,
 };
-use household_rs::claw_share_relay_stream_endpoint::parse_relay_endpoint;
-use household_rs::claw_share_relay_stream_noise::{
+use household_rs::claw_share::relay_stream_endpoint::parse_relay_endpoint;
+use household_rs::claw_share::relay_stream_noise::{
     RelayStreamNoiseAsyncStream, RelayStreamNoiseFramed,
 };
-use household_rs::claw_share_rendezvous_hello::{RendezvousHello, RendezvousRole};
+use household_rs::claw_share::rendezvous_hello::{RendezvousHello, RendezvousRole};
 #[cfg(feature = "dev_t1_datapath")]
 use household_rs::claw_vpn::ClawVpnIpv4Pool;
 use household_rs::claw_vpn::ClawVpnSessionAddrs;
@@ -780,10 +780,10 @@ mod dev_datapath {
     use std::net::{IpAddr, Ipv4Addr};
 
     use anyhow::{Result, anyhow, bail};
-    use household_rs::claw_share_data_tunnel::{
+    use household_rs::claw_share::data_tunnel::{
         DataTunnelError, TargetSession, TunnelFrame, recv_frame, send_frame,
     };
-    use household_rs::claw_share_relay_stream_contract::RelayStreamAudience;
+    use household_rs::claw_share::relay_stream_contract::RelayStreamAudience;
     use household_rs::claw_vpn::{
         ClawVpnAcl, ClawVpnAclKey, ClawVpnAgentCore, ClawVpnAgentSessionCore, ClawVpnDatapathSide,
         ClawVpnIpv4Pool, ClawVpnSessionRegistry,
@@ -1045,7 +1045,7 @@ mod dev_datapath {
     // the caller instead, which is how a check ends up proven by a positive path
     // that could not fail.
     pub(super) fn served_allocation_matches_configured(
-        served: &household_rs::claw_share_data_tunnel::MeshIpv4,
+        served: &household_rs::claw_share::data_tunnel::MeshIpv4,
         configured: super::ClawVpnSessionAddrs,
     ) -> Result<()> {
         // Both parse in the live path: `route_scope_violation` returns
@@ -1200,7 +1200,7 @@ mod dev_datapath {
                                 // rejects a peer outside the prefix and a peer equal to
                                 // addr — strictly more than it caught before.
                                 let settings =
-                                    household_rs::claw_share_data_tunnel::decode_network_settings_body(
+                                    household_rs::claw_share::data_tunnel::decode_network_settings_body(
                                         &sealed,
                                     )
                                     .map_err(|_| anyhow!("dev datapath received a malformed NetworkSettings body"))?;
@@ -1490,16 +1490,16 @@ async fn main() -> Result<()> {
 mod tests {
     use std::sync::Arc;
 
-    use household_rs::claw_share::{GuestCredential, SlotId};
-    use household_rs::claw_share_data_tunnel::{
+    use household_rs::claw_share::data_tunnel::{
         ClawTargetRouter, DataTunnelError, DataTunnelSession, TargetSession, credential_hash,
         serve_connection_io_with_auth_deadline,
     };
-    use household_rs::claw_share_relay_stream_contract::{
+    use household_rs::claw_share::relay_stream_contract::{
         RelayStreamClawStaticPublicKey, RelayStreamOfferMintInput, mint_relay_stream_group_offer,
         mint_relay_stream_offer, mint_relay_stream_public_offer,
     };
-    use household_rs::claw_share_rendezvous_token::RendezvousToken;
+    use household_rs::claw_share::rendezvous_token::RendezvousToken;
+    use household_rs::claw_share::{GuestCredential, SlotId};
     use household_rs::ids::derive_household_id;
     use household_rs::keys::{IdentityKey, P256Keypair, P256PublicKey};
     use household_rs::person_cert::derive_person_id;
@@ -1751,7 +1751,7 @@ mod tests {
         let verify_called = Arc::new(AtomicBool::new(false));
         let verify_called_for_closure = Arc::clone(&verify_called);
         let verify_session = session.clone();
-        let verify = move |envelope: &household_rs::claw_share_data_tunnel::AuthEnvelope,
+        let verify = move |envelope: &household_rs::claw_share::data_tunnel::AuthEnvelope,
                            now_unix: u64| {
             verify_called_for_closure.store(true, Ordering::SeqCst);
             if !expect_auth_success {
@@ -2019,7 +2019,7 @@ mod tests {
 
         assert_eq!(
             token.credential_hash,
-            household_rs::claw_share_data_tunnel::credential_hash(&offer_cbor)
+            household_rs::claw_share::data_tunnel::credential_hash(&offer_cbor)
         );
         assert_eq!(token.endpoint, offer.payload.relay_endpoint);
         assert_eq!(token.target_id, offer.payload.claw_id);
@@ -2309,8 +2309,8 @@ mod tests {
         use std::time::Duration;
 
         use household_rs::LoadedIdentity;
+        use household_rs::claw_share::data_tunnel::ReplayGuard;
         use household_rs::claw_share::{ClawShareSlotStore, SLOT_ID_LEN};
-        use household_rs::claw_share_data_tunnel::ReplayGuard;
         use household_rs::household_mesh_log::{
             MeshLogStore, MeshMembership, ProjectedGroup, ProjectedMemberDevice, ProjectedState,
         };
@@ -3094,7 +3094,7 @@ mod tests {
     #[test]
     fn served_allocation_that_disagrees_with_the_configured_session_fails_closed() {
         use dev_datapath::served_allocation_matches_configured;
-        use household_rs::claw_share_data_tunnel::MeshIpv4;
+        use household_rs::claw_share::data_tunnel::MeshIpv4;
 
         let configured = ClawVpnSessionAddrs::try_new(
             Ipv4Addr::new(198, 18, 0, 2),
@@ -3145,7 +3145,7 @@ mod tests {
     #[test]
     fn served_allocation_with_unparseable_addresses_is_refused() {
         use dev_datapath::served_allocation_matches_configured;
-        use household_rs::claw_share_data_tunnel::MeshIpv4;
+        use household_rs::claw_share::data_tunnel::MeshIpv4;
 
         let configured = ClawVpnSessionAddrs::try_new(
             Ipv4Addr::new(198, 18, 0, 2),

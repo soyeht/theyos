@@ -18,15 +18,15 @@ use std::num::NonZeroU64;
 use household_rs::{HouseholdId, MachineCert, MemberDeviceBinding, P256PublicKey};
 
 #[cfg(test)]
-use crate::owner_site_capability::validated_server_identifier;
-use crate::owner_site_capability::{
+use crate::owner_site::capability::validated_server_identifier;
+use crate::owner_site::capability::{
     OwnerSiteCanonicalRequest, OwnerSiteIntent, OwnerSiteIntentError, OwnerSiteResource,
     validated_component,
 };
-use crate::owner_site_challenge::{
+use crate::owner_site::challenge::{
     OwnerSiteChannelEpoch, OwnerSiteChannelId, OwnerSiteWebSocketInstance,
 };
-use crate::owner_site_promotion::OwnerSitePromotedChannel;
+use crate::owner_site::promotion::OwnerSitePromotedChannel;
 
 /// Version reserved for the future signed owner-site roster envelope.
 ///
@@ -530,13 +530,13 @@ impl DeviceAuthHash {
     /// parameter of bytes by which they could be passed — and the pre
     /// itself arrives typed ([`ChannelBindingPre`], also byte-proof).
     pub(crate) fn compute(
-        channel_binding_pre: &crate::owner_site_binding_glue::ChannelBindingPre,
+        channel_binding_pre: &crate::owner_site::binding_glue::ChannelBindingPre,
         binding_id: &OwnerSiteBindingId,
         binding_digest: &OwnerSiteBindingDigest,
         participant_npub: &str,
         channel_auth_key_id: &OwnerSiteChannelAuthKeyId,
     ) -> Result<Self, OwnerSiteAuthorityError> {
-        crate::owner_site_binding_glue::device_auth_hash(
+        crate::owner_site::binding_glue::device_auth_hash(
             channel_binding_pre,
             binding_id,
             binding_digest,
@@ -572,15 +572,15 @@ impl OwnerActionHash {
     #[allow(dead_code)] // wired by the A2 M3 verification flow (3a-5)
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn compute(
-        channel_binding_pre: &crate::owner_site_binding_glue::ChannelBindingPre,
-        m2: &crate::owner_site_a2_wire::ServerHello,
-        c1: &crate::owner_site_a2_wire::ClientHelloCore,
+        channel_binding_pre: &crate::owner_site::binding_glue::ChannelBindingPre,
+        m2: &crate::owner_site::a2_wire::ServerHello,
+        c1: &crate::owner_site::a2_wire::ClientHelloCore,
         binding_id: &OwnerSiteBindingId,
         binding_digest: &OwnerSiteBindingDigest,
         participant_npub: &str,
         intent_wire: &[u8],
     ) -> Result<Self, OwnerSiteAuthorityError> {
-        crate::owner_site_binding_glue::owner_action_hash(
+        crate::owner_site::binding_glue::owner_action_hash(
             channel_binding_pre,
             m2,
             c1,
@@ -857,7 +857,7 @@ impl OwnerSiteRosterBinding {
             .verify()
             .map_err(|_| OwnerSiteAuthorityError::MemberDeviceBindingRejected)?;
         let (binding_id, binding_digest) =
-            crate::owner_site_binding_glue::derive_binding_id_and_digest(
+            crate::owner_site::binding_glue::derive_binding_id_and_digest(
                 machine_cert,
                 channel_auth.public_key.as_bytes(),
                 action_pop.public_key.as_bytes(),
@@ -1602,11 +1602,11 @@ pub(crate) enum OwnerSitePromotionRejection {
     DuplicateRegistration,
 }
 
-impl From<crate::owner_site_resolution_store::OwnerSiteResolutionStoreError>
+impl From<crate::owner_site::resolution_store::OwnerSiteResolutionStoreError>
     for OwnerSitePromotionRejection
 {
-    fn from(error: crate::owner_site_resolution_store::OwnerSiteResolutionStoreError) -> Self {
-        use crate::owner_site_resolution_store::OwnerSiteResolutionStoreError as StoreError;
+    fn from(error: crate::owner_site::resolution_store::OwnerSiteResolutionStoreError) -> Self {
+        use crate::owner_site::resolution_store::OwnerSiteResolutionStoreError as StoreError;
         match error {
             StoreError::Unavailable => Self::StoreUnavailable,
             StoreError::DuplicateKey | StoreError::DuplicateClaim => Self::DuplicateRegistration,
@@ -1624,15 +1624,15 @@ pub(crate) struct OwnerSitePromotionLinearizer {
 }
 
 struct OwnerSitePromotionLinearizerInner {
-    store: crate::owner_site_resolution_store::OwnerSiteResolutionStore,
+    store: crate::owner_site::resolution_store::OwnerSiteResolutionStore,
     authority: Option<OwnerSiteAuthorityObservation>,
 }
 
 /// Derive the resolution key from the sealed `PendingFinished` private fields.
 fn owner_site_resolution_key(
     pending_finished: &PendingFinished,
-) -> crate::owner_site_resolution_store::OwnerSiteResolutionKeyV1 {
-    crate::owner_site_resolution_store::OwnerSiteResolutionKeyV1 {
+) -> crate::owner_site::resolution_store::OwnerSiteResolutionKeyV1 {
+    crate::owner_site::resolution_store::OwnerSiteResolutionKeyV1 {
         household: pending_finished.household.0.clone(),
         ws_instance: *pending_finished.ws_instance.as_bytes(),
         channel_id: *pending_finished.channel_id.as_bytes(),
@@ -1645,7 +1645,7 @@ impl OwnerSitePromotionLinearizer {
     /// Open the linearizer over the durable resolution store. No authority is
     /// observed yet; in production nothing ever populates it.
     pub(crate) fn open(state_dir: &std::path::Path) -> Result<Self, OwnerSitePromotionRejection> {
-        let store = crate::owner_site_resolution_store::OwnerSiteResolutionStore::open(state_dir)?;
+        let store = crate::owner_site::resolution_store::OwnerSiteResolutionStore::open(state_dir)?;
         Ok(Self {
             inner: std::sync::Mutex::new(OwnerSitePromotionLinearizerInner {
                 store,
@@ -1821,7 +1821,7 @@ impl OwnerSitePromotionLinearizer {
     #[allow(clippy::needless_pass_by_value)]
     pub(crate) fn revoke(
         &self,
-        channel: crate::owner_site_promotion::OwnerSitePromotedChannel,
+        channel: crate::owner_site::promotion::OwnerSitePromotedChannel,
         cancellation_generation: u64,
     ) -> Result<(), OwnerSitePromotionRejection> {
         let key = owner_site_resolution_key(&channel.witness.pending.pending_finished);
@@ -1887,8 +1887,8 @@ mod tests {
         let exact_resource =
             OwnerSiteResource::from_route_claw("pending-secret-claw").expect("resource");
         let exact_route =
-            crate::owner_site_capability::OwnerSiteCanonicalRequest::injected_for_harness(
-                crate::owner_site_capability::OwnerSiteRequestMethod::Post,
+            crate::owner_site::capability::OwnerSiteCanonicalRequest::injected_for_harness(
+                crate::owner_site::capability::OwnerSiteRequestMethod::Post,
                 "/api/v1/household/claws/{name}/owner-site/preflight",
                 [0x31; 32],
             )
@@ -2453,8 +2453,8 @@ mod tests {
             "other-network",
             &actor_id,
             OwnerSiteResource::from_route_claw("picoclaw").expect("resource"),
-            crate::owner_site_capability::OwnerSiteCanonicalRequest::injected_for_harness(
-                crate::owner_site_capability::OwnerSiteRequestMethod::Post,
+            crate::owner_site::capability::OwnerSiteCanonicalRequest::injected_for_harness(
+                crate::owner_site::capability::OwnerSiteRequestMethod::Post,
                 "/api/v1/household/claws/{name}/owner-site/preflight",
                 [0x42; 32],
             )
@@ -2498,8 +2498,8 @@ mod tests {
         let exact_resource =
             OwnerSiteResource::from_route_claw("linearizer-claw").expect("resource");
         let exact_route =
-            crate::owner_site_capability::OwnerSiteCanonicalRequest::injected_for_harness(
-                crate::owner_site_capability::OwnerSiteRequestMethod::Post,
+            crate::owner_site::capability::OwnerSiteCanonicalRequest::injected_for_harness(
+                crate::owner_site::capability::OwnerSiteRequestMethod::Post,
                 "/api/v1/household/claws/{name}/owner-site/preflight",
                 [0x31; 32],
             )
@@ -2654,9 +2654,9 @@ mod tests {
         let input = linearizer
             .register_pending(pending)
             .expect("register pending");
-        let request = crate::owner_site_promotion::OwnerSitePromotionRequest(input);
+        let request = crate::owner_site::promotion::OwnerSitePromotionRequest(input);
         let result =
-            crate::owner_site_promotion::OwnerSitePromotionBoundary::promote(&linearizer, request);
+            crate::owner_site::promotion::OwnerSitePromotionBoundary::promote(&linearizer, request);
         assert!(
             matches!(result, Ok(_)),
             "promote must yield a channel: {result:?}"
@@ -2672,9 +2672,9 @@ mod tests {
         let input = linearizer
             .register_pending(pending)
             .expect("register pending");
-        let request = crate::owner_site_promotion::OwnerSitePromotionRequest(input);
+        let request = crate::owner_site::promotion::OwnerSitePromotionRequest(input);
         let channel =
-            crate::owner_site_promotion::OwnerSitePromotionBoundary::promote(&linearizer, request)
+            crate::owner_site::promotion::OwnerSitePromotionBoundary::promote(&linearizer, request)
                 .expect("promote");
         // Revoke follows the §9 order (persist advance -> Revoking -> release ->
         // empty drain -> confirm Closed) and consumes the channel by ownership.
@@ -2753,7 +2753,7 @@ mod tests {
             .expect("the registered record stays live");
         assert_eq!(
             record.state(),
-            crate::owner_site_resolution_store::OwnerSiteResolutionState::Pending,
+            crate::owner_site::resolution_store::OwnerSiteResolutionState::Pending,
             "a gate-7 rejection must leave the record Pending"
         );
         assert_eq!(
@@ -2817,7 +2817,7 @@ mod glue_constructor_tests {
         .expect("production constructor succeeds");
 
         let (expected_id, expected_digest) =
-            crate::owner_site_binding_glue::derive_binding_id_and_digest(
+            crate::owner_site::binding_glue::derive_binding_id_and_digest(
                 b"cert",
                 channel_auth.public_key.as_bytes(),
                 action_pop.public_key.as_bytes(),
@@ -2862,9 +2862,9 @@ mod glue_constructor_tests {
 
         // Sign over the device-auth hash with the shared key: verifies in
         // the channel role...
-        let pre = crate::owner_site_binding_glue::pop_binding_pre([0xA1; 32], [0xC3; 32])
+        let pre = crate::owner_site::binding_glue::pop_binding_pre([0xA1; 32], [0xC3; 32])
             .expect("pre computes");
-        let d_auth = crate::owner_site_binding_glue::device_auth_hash(
+        let d_auth = crate::owner_site::binding_glue::device_auth_hash(
             &pre,
             &binding.binding_id(),
             &binding.binding_digest(),
@@ -2882,7 +2882,7 @@ mod glue_constructor_tests {
 
         // ...and does NOT verify against the owner-action hash: the
         // separation is in the preimage, not in the key.
-        let m2 = crate::owner_site_a2_wire::ServerHello {
+        let m2 = crate::owner_site::a2_wire::ServerHello {
             engine_machine_certificate: vec![0x11; 64],
             engine_key_id: "engine-key".into(),
             channel_id: vec![0x22; 32],
@@ -2894,21 +2894,21 @@ mod glue_constructor_tests {
             fresh_until: 1_060,
             engine_signature: vec![0x66; 64],
         };
-        let c1 = crate::owner_site_a2_wire::ClientHelloCore {
+        let c1 = crate::owner_site::a2_wire::ClientHelloCore {
             domain: "soyeht/owner-site/a2/v1".into(),
             version: 1,
             household_id: "hh-a".into(),
             network_id: "net-a".into(),
             route: "/api/v1/household/claws/claw-a/owner-site".into(),
             resource: "claw-a".into(),
-            intent: crate::owner_site_a2_wire::CanonicalIntent {
+            intent: crate::owner_site::a2_wire::CanonicalIntent {
                 method: "GET".into(),
                 target: "/api/v1/household/claws/claw-a/owner-site".into(),
                 body_hash: vec![0x77; 32],
             },
             claimed_binding_id: vec![0x01; 32],
         };
-        let action = crate::owner_site_binding_glue::owner_action_hash(
+        let action = crate::owner_site::binding_glue::owner_action_hash(
             &pre,
             &m2,
             &c1,
@@ -2976,7 +2976,7 @@ mod transcript_proof_tests {
     use household_rs::keys::{IdentityKey, P256Keypair};
 
     fn t1_device() -> DeviceAuthHash {
-        let pre = crate::owner_site_binding_glue::pop_binding_pre([0xA1; 32], [0xC3; 32])
+        let pre = crate::owner_site::binding_glue::pop_binding_pre([0xA1; 32], [0xC3; 32])
             .expect("pre computes");
         DeviceAuthHash::compute(
             &pre,
@@ -2989,7 +2989,7 @@ mod transcript_proof_tests {
     }
 
     fn other_device() -> DeviceAuthHash {
-        let pre = crate::owner_site_binding_glue::pop_binding_pre([0xB2; 32], [0xC3; 32])
+        let pre = crate::owner_site::binding_glue::pop_binding_pre([0xB2; 32], [0xC3; 32])
             .expect("pre computes");
         DeviceAuthHash::compute(
             &pre,
@@ -3114,11 +3114,11 @@ mod owner_action_compute_tests {
     /// and the two transcript hashes over the SAME pre are distinct — the
     /// channel/action swap cannot produce a collision even by content.
     use super::*;
-    use crate::owner_site_a2_wire::{CanonicalIntent, ClientHelloCore, ServerHello};
-    use crate::owner_site_binding_glue::pop_binding_pre;
+    use crate::owner_site::a2_wire::{CanonicalIntent, ClientHelloCore, ServerHello};
+    use crate::owner_site::binding_glue::pop_binding_pre;
 
     fn fixture() -> (
-        crate::owner_site_binding_glue::ChannelBindingPre,
+        crate::owner_site::binding_glue::ChannelBindingPre,
         ServerHello,
         ClientHelloCore,
         OwnerSiteBindingId,

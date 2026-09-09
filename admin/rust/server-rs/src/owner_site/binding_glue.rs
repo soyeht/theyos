@@ -47,8 +47,8 @@
 
 use sha2::{Digest, Sha256};
 
-use crate::owner_site_a2_wire::{ClientHelloCore, ServerHello};
-use crate::owner_site_authority::{
+use crate::owner_site::a2_wire::{ClientHelloCore, ServerHello};
+use crate::owner_site::authority::{
     DeviceAuthHash, OwnerActionHash, OwnerSiteAuthorityError, OwnerSiteBindingDigest,
     OwnerSiteBindingId, OwnerSiteChannelAuthKeyId,
 };

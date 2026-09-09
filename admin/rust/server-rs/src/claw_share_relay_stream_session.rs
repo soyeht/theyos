@@ -17,7 +17,7 @@
 use std::fmt::Write as _;
 
 use household_rs::claw_share::GuestCredential;
-use household_rs::claw_share_data_tunnel::{
+use household_rs::claw_share::data_tunnel::{
     AuthEnvelope, DataTunnelError, DataTunnelSession, ReplayGuard, credential_hash,
 };
 
@@ -34,7 +34,7 @@ use crate::claw_share_relay_stream_issuer_trust::RelayStreamIssuerTrust;
 /// they are stable per-offer but NOT slot-stable across reconnects (each offer is
 /// its own session). The panel's choice A: no synthetic [`GuestCredential`].
 ///
-/// [`TunnelAck`]: household_rs::claw_share_data_tunnel::TunnelAck
+/// [`TunnelAck`]: household_rs::claw_share::data_tunnel::TunnelAck
 /// [`GuestCredential`]: household_rs::claw_share::GuestCredential
 pub struct RelayStreamOfferSession {
     session_id: String,
@@ -229,7 +229,7 @@ mod tests {
     use std::time::Duration;
 
     use household_rs::claw_share::SlotId;
-    use household_rs::claw_share_data_tunnel::{
+    use household_rs::claw_share::data_tunnel::{
         SessionAuthToken, TcpStreamRouter, TunnelAck, client_authenticate, client_open_stream,
         recv_frame, serve_connection_io_with_auth_deadline,
     };

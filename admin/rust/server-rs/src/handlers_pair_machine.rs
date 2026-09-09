@@ -37,7 +37,7 @@ use household_rs::pair_machine::{
 use serde::Serialize;
 use serde_bytes::ByteBuf;
 
-use crate::bonjour_trust::{DiscoverySource, classify_source};
+use crate::bonjour::trust::{DiscoverySource, classify_source};
 use crate::handlers_owner_events;
 use crate::household_auth;
 use crate::household_state::HouseholdState;

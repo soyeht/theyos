@@ -39,8 +39,8 @@
 use crate::household_attach_token::{HouseholdAttachScope, HouseholdAttachTokenStore};
 use crate::household_auth;
 use crate::household_state::HouseholdState;
-use crate::owner_site_ake::{OWNER_SITE_AKE_MAX_RECORD_ENVELOPE_BYTES, OwnerSiteAkeProvider};
-use crate::owner_site_capability::{OwnerSiteCapabilityStore, OwnerSiteResource};
+use crate::owner_site::ake::{OWNER_SITE_AKE_MAX_RECORD_ENVELOPE_BYTES, OwnerSiteAkeProvider};
+use crate::owner_site::capability::{OwnerSiteCapabilityStore, OwnerSiteResource};
 use crate::responses::{InstanceResponse, ListResponse};
 use crate::state::SharedState;
 use crate::time_util;
@@ -1325,11 +1325,11 @@ async fn household_delete_workspace(
 mod tests {
     use super::*;
     use crate::claw_store_routes;
-    use crate::owner_site_ake::{
+    use crate::owner_site::ake::{
         OwnerSiteAkeEffectSnapshot, OwnerSiteAkeFixture, OwnerSiteAkeHarness,
     };
-    use crate::owner_site_authority::{OwnerSiteAuthoritySnapshot, active_authority_fixture};
-    use crate::owner_site_capability::{
+    use crate::owner_site::authority::{OwnerSiteAuthoritySnapshot, active_authority_fixture};
+    use crate::owner_site::capability::{
         OwnerSiteBackend, OwnerSiteCapability, OwnerSiteCapabilityScope, OwnerSiteCapabilityStore,
         OwnerSiteEffectCounters, OwnerSiteEffectSnapshot, OwnerSiteIntent, OwnerSiteResource,
     };

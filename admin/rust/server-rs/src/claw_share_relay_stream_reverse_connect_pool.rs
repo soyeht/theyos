@@ -38,7 +38,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use household_rs::claw_share_data_tunnel::ClawTargetRouter;
+use household_rs::claw_share::data_tunnel::ClawTargetRouter;
 use tunnel_wire_rs::worker_pool::{
     AttemptOutcome, ItemAttempt, PoolWorkItem, ResyncView, WorkerPoolConfig, WorkerPoolError,
     spawn_item_resync_driver, spawn_worker_pool,
@@ -329,11 +329,11 @@ mod tests {
     use tokio::task::JoinHandle;
 
     use household_rs::cbor;
-    use household_rs::claw_share::{ClawShareSlotStore, SlotRecord, SlotState};
-    use household_rs::claw_share_data_tunnel::{
+    use household_rs::claw_share::data_tunnel::{
         HEALTH_PROBE, ReplayGuard, SessionAuthToken, TcpStreamRouter, TunnelAck, TunnelFrame,
         client_authenticate, client_health, client_open_stream, recv_frame, send_frame,
     };
+    use household_rs::claw_share::{ClawShareSlotStore, SlotRecord, SlotState};
     use household_rs::household_mesh_log::MeshLogStore;
     use household_rs::ids::derive_household_id;
     use household_rs::keys::IdentityKey;

@@ -41,7 +41,7 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use crate::owner_site_authority::OwnerSiteAuthorityObservation;
+use crate::owner_site::authority::OwnerSiteAuthorityObservation;
 
 /// Refresh cadence for the observation loop: the observation must stay
 /// fresher than the shortest challenge window the A2 issues (60 s), so 30 s.
@@ -232,7 +232,7 @@ impl OwnerSiteRosterAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::owner_site_authority::OwnerSiteAuthorityObservation;
+    use crate::owner_site::authority::OwnerSiteAuthorityObservation;
 
     /// The constructor discipline, pinned at the seam itself: degenerate
     /// projections are NOT observations (zero digest, zero generation, empty

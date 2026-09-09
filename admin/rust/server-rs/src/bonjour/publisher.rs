@@ -28,7 +28,7 @@
 //! On shutdown the service is unregistered cleanly via
 //! [`shutdown_household_bonjour`].
 //!
-//! I/O is delegated to [`crate::bonjour_impl_mdns_sd`] so a parallel
+//! I/O is delegated to [`crate::bonjour::impl_mdns_sd`] so a parallel
 //! macOS-native backend (Apple's `dns_sd.h` system bridge) can be wired in
 //! later without touching this facade.
 
@@ -45,9 +45,9 @@ use tokio::time::{Duration, MissedTickBehavior};
 use tracing::{info, warn};
 
 #[cfg(target_os = "macos")]
-use crate::bonjour_impl_dns_sd as backend;
+use crate::bonjour::impl_dns_sd as backend;
 #[cfg(not(target_os = "macos"))]
-use crate::bonjour_impl_mdns_sd as backend;
+use crate::bonjour::impl_mdns_sd as backend;
 use crate::household_listener::{BoundSet, HouseholdExposurePolicy, InterfaceClass, PairingWindow};
 
 /// Service type per FR-017.

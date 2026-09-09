@@ -916,14 +916,14 @@ mod tests {
     use crate::claw_share_relay_stream_test_support::relay_stream_issuer_trust as trust;
     use crate::claw_share_rendezvous_stream_relay::{RendezvousRole, RendezvousToken};
     use household_rs::cbor;
-    use household_rs::claw_share::{
-        ClawShareSlotStore, GuestCredential, SLOT_ID_LEN, SlotId, SlotRecord, SlotState,
-    };
-    use household_rs::claw_share_data_tunnel::{
+    use household_rs::claw_share::data_tunnel::{
         DEFAULT_AUTH_DEADLINE, DataTunnelError, HEALTH_PROBE, ReplayGuard, SessionAuthToken,
         TcpStreamRouter, TunnelAck, TunnelFrame, authorize_session, client_authenticate,
         client_health, client_open_stream, recv_frame, send_frame,
         serve_connection_io_with_auth_deadline,
+    };
+    use household_rs::claw_share::{
+        ClawShareSlotStore, GuestCredential, SLOT_ID_LEN, SlotId, SlotRecord, SlotState,
     };
     use household_rs::ids::derive_household_id;
     use household_rs::keys::{IdentityKey, P256Keypair, P256PublicKey};

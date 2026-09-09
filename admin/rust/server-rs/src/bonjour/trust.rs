@@ -48,7 +48,7 @@ const TAILSCALE_ULA_PREFIX_BITS: u32 = 48;
 ///
 /// ```
 /// use std::net::IpAddr;
-/// use server_rs::bonjour_trust::{DiscoverySource, classify_source};
+/// use server_rs::bonjour::trust::{DiscoverySource, classify_source};
 ///
 /// // Tailscale CGNAT address
 /// let ts_ip: IpAddr = "100.100.1.2".parse().unwrap();

@@ -1,7 +1,7 @@
 //! Engine-side TCP listener for the claw-share data tunnel.
 //!
 //! Binds a TCP port and serves each connection through
-//! [`household_rs::claw_share_data_tunnel::serve_connection`], using the
+//! [`household_rs::claw_share::data_tunnel::serve_connection`], using the
 //! engine's live household id + slot store as the authorization policy
 //! ([`authorize_credential`]). This is the real, reachable data-tunnel
 //! endpoint the iOS bridge dials; the wire protocol + the credential
@@ -18,10 +18,10 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use household_rs::claw_share::{ClawShareSlotStore, SlotState};
-use household_rs::claw_share_data_tunnel::{
+use household_rs::claw_share::data_tunnel::{
     ReplayGuard, TcpStreamRouter, authorize_session, serve_connection,
 };
+use household_rs::claw_share::{ClawShareSlotStore, SlotState};
 use household_rs::ids::HouseholdId;
 use tokio::net::{TcpListener, TcpStream};
 
@@ -256,12 +256,12 @@ async fn spawn_with_replay_inner(
 mod tests {
     use super::*;
     use household_rs::cbor;
-    use household_rs::claw_share::{GuestCredential, SLOT_ID_LEN, SlotId, SlotRecord, SlotState};
-    use household_rs::claw_share_data_tunnel::{
+    use household_rs::claw_share::data_tunnel::{
         HEALTH_PROBE, ReplayGuard, SessionAuthToken, TargetExit, TunnelAck, TunnelFrame,
         client_authenticate, client_health, client_open_stream, client_resize, recv_frame,
         send_frame,
     };
+    use household_rs::claw_share::{GuestCredential, SLOT_ID_LEN, SlotId, SlotRecord, SlotState};
     use household_rs::ids::derive_household_id;
     use household_rs::keys::{IdentityKey, P256Keypair};
     use household_rs::person_cert::derive_person_id;

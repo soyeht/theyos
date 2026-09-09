@@ -1,19 +1,11 @@
 //! server-rs library target — exposes handler modules for integration tests.
 
-pub mod apns_dispatcher;
-pub mod apns_push;
-pub mod apns_tickle_transport;
+pub mod apns;
 pub mod artifact_installer;
 pub mod artifact_resolver;
 pub mod auth;
 pub mod availability;
-pub mod bonjour_browser;
-#[cfg(target_os = "macos")]
-pub mod bonjour_impl_dns_sd;
-#[cfg(not(target_os = "macos"))]
-pub mod bonjour_impl_mdns_sd;
-pub mod bonjour_publisher;
-pub mod bonjour_trust;
+pub mod bonjour;
 pub mod bootstrap_mutation_lock;
 pub mod bootstrap_pair_code_rate_limit;
 pub mod capacity;
@@ -92,9 +84,7 @@ pub mod claw_vpn_target_session_router;
 pub mod claw_vpn_target_session_runtime;
 #[cfg(any(test, feature = "dev_t1_datapath"))]
 pub mod claw_vpn_wiring;
-pub mod cloudflare_admin;
-pub mod cloudflare_api;
-pub mod cloudflared_sync;
+pub mod cloudflare;
 pub mod config;
 #[cfg(any(test, feature = "failure-injection"))]
 pub mod failure_injection;
@@ -148,18 +138,7 @@ mod mobile_claw_vpn_owner_present_foundation;
 pub mod mobile_token;
 pub mod nonce_cache;
 pub mod owner_cert_auth;
-pub(crate) mod owner_site_a2_noise;
-pub(crate) mod owner_site_a2_responder;
-pub(crate) mod owner_site_a2_wire;
-pub(crate) mod owner_site_ake;
-pub(crate) mod owner_site_authority;
-pub(crate) mod owner_site_binding_glue;
-pub(crate) mod owner_site_capability;
-pub(crate) mod owner_site_challenge;
-pub(crate) mod owner_site_m3_verify;
-pub(crate) mod owner_site_promotion;
-pub(crate) mod owner_site_resolution_store;
-pub(crate) mod owner_site_roster_adapter;
+pub(crate) mod owner_site;
 pub mod owner_webauthn_recovery_consume_rate_limit;
 pub mod pair_machine_local;
 pub mod production_app;

@@ -22,12 +22,12 @@ use axum::{
 };
 use household_rs::caveats::Operation;
 use household_rs::cbor;
+use household_rs::claw_share::flow::{EngineContext, engine_handle_claim};
+use household_rs::claw_share::relay_stream_contract::ShareableAppPresentation;
 use household_rs::claw_share::{
     ClawShareClaim, ClawShareError, ClawShareInvite, ClawShareSlotStore, SlotId, TunnelHandle,
     owner_mint_invite_with_presentation,
 };
-use household_rs::claw_share_flow::{EngineContext, engine_handle_claim};
-use household_rs::claw_share_relay_stream_contract::ShareableAppPresentation;
 use household_rs::household_mesh_log::{
     LogEntry, MeshEvent, MeshLogStore, MeshMembership, ProjectedState, SlotProjectedStatus,
 };
@@ -3534,7 +3534,7 @@ fn cbor_response(status: StatusCode, body: Vec<u8>) -> Response {
 // non-trivial machinery that lives in `household-rs::bootstrap::tests`.
 // The slice's correctness is already covered by:
 //
-//   - `household_rs::claw_share_flow::tests` for the engine handler
+//   - `household_rs::claw_share::flow::tests` for the engine handler
 //     (pure function, no HTTP).
 //   - `household_rs::claw_share::tests` for wire shapes, signing,
 //     slot CAS, URI round-trip.

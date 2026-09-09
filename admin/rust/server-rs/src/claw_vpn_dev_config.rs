@@ -6,7 +6,7 @@
 use std::fmt;
 use std::net::Ipv4Addr;
 
-use household_rs::claw_share_relay_stream_endpoint::{
+use household_rs::claw_share::relay_stream_endpoint::{
     RelayStreamEndpointParseError, parse_relay_endpoint,
 };
 use household_rs::claw_vpn::{

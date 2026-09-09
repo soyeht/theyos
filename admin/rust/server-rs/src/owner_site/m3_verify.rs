@@ -18,9 +18,9 @@
 //! ([`OwnerSiteResolvedBinding`]); the signatures are verified against the
 //! hashes computed HERE, with the same shared functions the peer uses.
 
-use crate::owner_site_a2_wire::{ClientHelloCore, ServerHello};
-use crate::owner_site_authority::{OwnerSiteAuthorityError, OwnerSiteResolvedBinding};
-use crate::owner_site_binding_glue::ChannelBindingPre;
+use crate::owner_site::a2_wire::{ClientHelloCore, ServerHello};
+use crate::owner_site::authority::{OwnerSiteAuthorityError, OwnerSiteResolvedBinding};
+use crate::owner_site::binding_glue::ChannelBindingPre;
 
 /// The server-held session transcript values — the chain's legitimate end.
 /// Built by the caller from the live Noise session, never from wire bytes.
@@ -45,7 +45,7 @@ impl M3SessionTranscript {
     }
 
     fn binding_pre(&self) -> Result<ChannelBindingPre, OwnerSiteAuthorityError> {
-        crate::owner_site_binding_glue::pop_binding_pre(self.t1, self.device_static)
+        crate::owner_site::binding_glue::pop_binding_pre(self.t1, self.device_static)
     }
 }
 
@@ -73,7 +73,7 @@ pub(crate) fn verify_client_proof(
 ) -> Result<(), OwnerSiteAuthorityError> {
     let binding_pre = session.binding_pre()?;
 
-    let d_auth = crate::owner_site_binding_glue::device_auth_hash(
+    let d_auth = crate::owner_site::binding_glue::device_auth_hash(
         &binding_pre,
         &resolved.binding_id(),
         &resolved.binding_digest(),
@@ -89,7 +89,7 @@ pub(crate) fn verify_client_proof(
     )
     .map_err(|_| OwnerSiteAuthorityError::ChannelProofMismatch)?;
 
-    let action = crate::owner_site_binding_glue::owner_action_hash(
+    let action = crate::owner_site::binding_glue::owner_action_hash(
         &binding_pre,
         m2,
         c1_core,
@@ -113,8 +113,8 @@ pub(crate) fn verify_client_proof(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::owner_site_a2_wire::CanonicalIntent;
-    use crate::owner_site_authority::{
+    use crate::owner_site::a2_wire::CanonicalIntent;
+    use crate::owner_site::authority::{
         OwnerSiteActionPopKey, OwnerSiteBindingDigest, OwnerSiteBindingId, OwnerSiteChannelAuthKey,
     };
     use household_rs::keys::{IdentityKey, P256Keypair};
@@ -182,7 +182,7 @@ mod tests {
 
     fn sign_both(fx: &Fx, session: &M3SessionTranscript) -> (Vec<u8>, Vec<u8>) {
         let pre = session.binding_pre().expect("pre computes");
-        let d_auth = crate::owner_site_binding_glue::device_auth_hash(
+        let d_auth = crate::owner_site::binding_glue::device_auth_hash(
             &pre,
             &fx.resolved.binding_id(),
             &fx.resolved.binding_digest(),
@@ -190,7 +190,7 @@ mod tests {
             fx.resolved.channel_auth_key().key_id(),
         )
         .expect("d_auth");
-        let action = crate::owner_site_binding_glue::owner_action_hash(
+        let action = crate::owner_site::binding_glue::owner_action_hash(
             &pre,
             &fx.m2,
             &fx.c1,

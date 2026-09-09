@@ -19,8 +19,8 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
-use server_rs::bonjour_publisher::{HouseholdBonjour, PairMachineBonjourRole, PublishParams};
-use server_rs::bonjour_trust::{BrowserConfig, DiscoverySource, classify_source, should_emit};
+use server_rs::bonjour::publisher::{HouseholdBonjour, PairMachineBonjourRole, PublishParams};
+use server_rs::bonjour::trust::{BrowserConfig, DiscoverySource, classify_source, should_emit};
 use server_rs::setup_beacon::{SetupBeaconParams, SetupRole};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

@@ -20,8 +20,8 @@
 //! `pair_machine_window.cbor` (Phase 3) atomically so the daemon picks up
 //! the same nonce on restart.
 
-use crate::bonjour_browser::SOYEHT_HOUSEHOLD_SERVICE;
-use crate::bonjour_publisher::{
+use crate::bonjour::browser::SOYEHT_HOUSEHOLD_SERVICE;
+use crate::bonjour::publisher::{
     PairMachineBonjourRole, PublishParams, publish_candidate_joiner_bonjour,
 };
 use crate::handlers_pair_machine::{

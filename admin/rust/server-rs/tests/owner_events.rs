@@ -28,22 +28,22 @@ use household_rs::owner_events::{
     JoinRequestPayload, OwnerEvent, OwnerEventLog, OwnerEventPayload, OwnerEventType,
     OwnerEventsBroadcaster,
 };
-use household_rs::owner_webauthn::{
-    OwnerWebauthnConfig, OwnerWebauthnCredential, OwnerWebauthnRegistrationBinding, OwnerWebauthnRp,
-};
-use household_rs::owner_webauthn_anchor::{
+use household_rs::owner_webauthn::anchor::{
     OwnerWebauthnAnchorMode, OwnerWebauthnAuthorityAnchor, OwnerWebauthnAuthorityHead,
     read_owner_webauthn_authority_anchor, verified_owner_webauthn_authority_head,
     verify_or_update_owner_webauthn_authority_anchor, write_owner_webauthn_authority_anchor,
 };
-use household_rs::owner_webauthn_authority::{
+use household_rs::owner_webauthn::authority::{
     OwnerWebauthnAuthority, OwnerWebauthnCredentialEventAction, OwnerWebauthnEventActor,
 };
-use household_rs::owner_webauthn_recovery::{
+use household_rs::owner_webauthn::recovery::{
     OwnerWebauthnRecoveryEventAction, verified_owner_webauthn_recovery_head,
 };
-use household_rs::owner_webauthn_recovery_anchor::{
+use household_rs::owner_webauthn::recovery_anchor::{
     classify_owner_webauthn_recovery_anchor_read_only, read_owner_webauthn_recovery_anchor,
+};
+use household_rs::owner_webauthn::{
+    OwnerWebauthnConfig, OwnerWebauthnCredential, OwnerWebauthnRegistrationBinding, OwnerWebauthnRp,
 };
 use household_rs::pair_machine::{
     JoinTransport, OwnerApproval, OwnerApprovalContext, PairMachineState, PairMachineWindow,
@@ -64,7 +64,7 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
-use server_rs::apns_dispatcher::{APNS_TICKLE_BODY, ApnsError, ApnsTransport, install_transport};
+use server_rs::apns::dispatcher::{APNS_TICKLE_BODY, ApnsError, ApnsTransport, install_transport};
 use server_rs::handlers_owner_events::{
     self, OwnerApprovalEnforcementPolicy, OwnerEventsRouterState, OwnerOperationEnforcement,
     RecoveryCodeEnforcement, SecureUpgradeEnforcement, SecureUpgradeRuntimeConfig,

@@ -11,7 +11,7 @@
 //!   `HouseholdExposurePolicy`, and the 60s refresh loop (FR-008).
 //! - Bonjour publisher (FR-017) — only announces once identity is loaded.
 
-use crate::bonjour_trust::BrowserConfig;
+use crate::bonjour::trust::BrowserConfig;
 use crate::claw_share_relay_offer_challenge::{GroupClaimNonceTable, RelayOfferChallengeTable};
 use crate::claw_share_relay_stream_abuse::RelayAbuseState;
 use crate::handlers_bootstrap::{BootstrapHandlerState, BootstrapStateArc};
@@ -29,14 +29,14 @@ use crate::household_listener::InterfaceClass;
 use crate::household_state::HouseholdState;
 use crate::state::SharedState;
 use crate::time_util;
-use crate::{bonjour_browser, bonjour_publisher, setup_beacon, startup_wiring};
+use crate::{bonjour::browser, bonjour::publisher, setup_beacon, startup_wiring};
 use household_rs::KeyBackingPolicy;
 use household_rs::bootstrap::{
     recover_interrupted_household_teardown_under_lifecycle, try_load_existing_under_lifecycle,
 };
 use household_rs::bootstrap_state::{self, BootstrapState};
 use household_rs::claw_share::ClawShareSlotStore;
-use household_rs::claw_share_data_tunnel::ReplayGuard;
+use household_rs::claw_share::data_tunnel::ReplayGuard;
 use household_rs::household_lifecycle::{
     HouseholdLifecycleLock, HouseholdLifecycleLockError, LifecycleWriteGuard,
 };
@@ -418,7 +418,7 @@ impl Phase3RuntimeController {
             watchdog_rx,
         );
         let bonjour_task = (loaded.record.shamir_n == 1)
-            .then(|| bonjour_browser::spawn_bonjour_browser(pair_machine_state));
+            .then(|| browser::spawn_bonjour_browser(pair_machine_state));
 
         let replacement = Phase3RuntimeBundle {
             generation,
@@ -2183,7 +2183,7 @@ pub async fn bootstrap_household(
             include_local_network,
             bootstrap_state = initial_bootstrap_state.as_str(),
         );
-        drop(bonjour_browser::spawn_setup_invitation_browser_with_cache(
+        drop(browser::spawn_setup_invitation_browser_with_cache(
             bootstrap_handler_state.setup_invitation_cache.clone(),
             BrowserConfig {
                 include_local_network,
@@ -2559,7 +2559,7 @@ async fn publish_household_bonjour_for_identity(
         .unwrap_or_else(|| Arc::new(tokio::sync::RwLock::new(BootstrapState::Ready)));
     let bootstrap_state = *bootstrap_state_source.read().await;
     let bs_str = bootstrap_state.as_str().to_string();
-    let params = bonjour_publisher::PublishParams {
+    let params = publisher::PublishParams {
         hh_id: loaded.record.hh_id.to_string(),
         hh_name: loaded.record.name.clone(),
         m_id: loaded.cert.m_id.to_string(),
@@ -2568,12 +2568,12 @@ async fn publish_household_bonjour_for_identity(
         host_dns: raw_hostname,
         // Filled by `publish_household_bonjour` from the post-policy bind set.
         tailnet_addr: None,
-        pair_machine_role: Some(bonjour_publisher::PairMachineBonjourRole::Founder),
+        pair_machine_role: Some(publisher::PairMachineBonjourRole::Founder),
         owner_display_name: String::new(), // populated by agente-front after iCloud name is known
         device_count: u32::from(bs_str == "ready"),
         bootstrap_state: bs_str,
     };
-    match bonjour_publisher::publish_household_bonjour(
+    match publisher::publish_household_bonjour(
         params,
         pair_device_window,
         pair_machine_window,
@@ -2584,7 +2584,7 @@ async fn publish_household_bonjour_for_identity(
     .await
     {
         Ok(handle) => {
-            bonjour_publisher::install_household_bonjour(handle);
+            publisher::install_household_bonjour(handle);
         }
         Err(e) => {
             tracing::warn!(

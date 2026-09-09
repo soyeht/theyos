@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# T028 source-level lint for `apns_dispatcher.rs` — the third layer of
+# T028 source-level lint for `apns/dispatcher.rs` — the third layer of
 # the Constitution III "no household metadata reaches the push provider"
 # enforcement stack (compile-time API shape + runtime spy test +
 # this lint).
@@ -23,7 +23,7 @@
 
 set -euo pipefail
 
-DISPATCHER="${DISPATCHER:-admin/rust/server-rs/src/apns_dispatcher.rs}"
+DISPATCHER="${DISPATCHER:-admin/rust/server-rs/src/apns/dispatcher.rs}"
 
 if [[ ! -f "${DISPATCHER}" ]]; then
     echo "lint-apns-payload: dispatcher source not found at ${DISPATCHER}" >&2

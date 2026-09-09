@@ -11,7 +11,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use server_rs::apns_push::{
+use server_rs::apns::push::{
     DispatchAttemptError, HouseCreatedError, HouseCreatedEvent, HouseCreatedTransport,
     build_house_created_json, dispatch_house_created_with_delays,
 };

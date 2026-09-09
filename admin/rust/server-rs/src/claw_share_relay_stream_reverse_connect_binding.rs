@@ -18,7 +18,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use household_rs::claw_share::ClawShareSlotStore;
-use household_rs::claw_share_data_tunnel::{ClawTargetRouter, ReplayGuard};
+use household_rs::claw_share::data_tunnel::{ClawTargetRouter, ReplayGuard};
 use household_rs::ids::HouseholdId;
 
 use crate::claw_share_relay_stream_contract::RelayStreamOfferContract;
@@ -139,10 +139,10 @@ mod tests {
     use super::*;
 
     use crate::claw_share_relay_stream_reopen_limiter::ReopenLimiterConfig;
-    use household_rs::claw_share::{SlotRecord, SlotState};
-    use household_rs::claw_share_data_tunnel::{
+    use household_rs::claw_share::data_tunnel::{
         ClawTargetRouter, DataTunnelError, TargetSession, TcpStreamRouter,
     };
+    use household_rs::claw_share::{SlotRecord, SlotState};
     use household_rs::household_mesh_log::{
         MeshMembership, ProjectedGroup, ProjectedMemberDevice, ProjectedState,
     };

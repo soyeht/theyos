@@ -85,7 +85,7 @@ fn household_listener_filters_binds_through_exposure_policy() {
 
 #[test]
 fn bonjour_publishers_filter_targets_through_exposure_policy() {
-    let household_source = read_src("bonjour_publisher.rs");
+    let household_source = read_src("bonjour/publisher.rs");
     let household_publish_body = slice_between(
         &household_source,
         "pub async fn publish_household_bonjour",

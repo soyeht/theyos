@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use household_rs::claw_share::ClawShareSlotStore;
-use household_rs::claw_share_data_tunnel::{ClawTargetRouter, ReplayGuard};
+use household_rs::claw_share::data_tunnel::{ClawTargetRouter, ReplayGuard};
 use household_rs::household_mesh_log::MeshLogStore;
 use household_rs::ids::HouseholdId;
 use keystore_rs::KeystoreBackend;
@@ -493,7 +493,7 @@ mod tests {
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use household_rs::claw_share_data_tunnel::{
+    use household_rs::claw_share::data_tunnel::{
         ClawTargetRouter, DataTunnelError, TcpStreamRouter,
     };
     use household_rs::household_mesh_log::{
@@ -603,7 +603,7 @@ mod tests {
         async fn open_ip_tunnel(
             &self,
             _target: RelayStreamIpTunnelTarget,
-        ) -> Result<household_rs::claw_share_data_tunnel::TargetSession, DataTunnelError> {
+        ) -> Result<household_rs::claw_share::data_tunnel::TargetSession, DataTunnelError> {
             self.opens.fetch_add(1, Ordering::SeqCst);
             Err(DataTunnelError::TargetUnavailable(
                 "runtime-iptunnel-backend-hit".to_string(),

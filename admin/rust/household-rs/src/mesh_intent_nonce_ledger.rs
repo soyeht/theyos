@@ -3608,16 +3608,35 @@ mod tests {
             .expect("file!() must have a basename")
             .to_owned();
         let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut defining_files_other_than_self: Vec<String> = std::fs::read_dir(&src_dir)
-            .expect("household-rs/src must exist")
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "rs"))
-            .filter(|entry| entry.file_name() != self_basename)
-            .filter_map(|entry| {
+        // Recursive: modules now also live in subdirectories of `src/`
+        // (`claw_share/`, `owner_webauthn/`, ...). A top-level-only listing
+        // would silently drop every file that moved below one.
+        let mut rs_files: Vec<std::path::PathBuf> = Vec::new();
+        let mut stack = vec![src_dir.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir)
+                .expect("household-rs/src must exist")
+                .filter_map(Result::ok)
+            {
                 let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    rs_files.push(path);
+                }
+            }
+        }
+        let mut defining_files_other_than_self: Vec<String> = rs_files
+            .into_iter()
+            .filter(|path| path.file_name() != Some(self_basename.as_os_str()))
+            .filter_map(|path| {
                 let text = std::fs::read_to_string(&path).ok()?;
-                text.contains(definer)
-                    .then(|| path.file_name().unwrap().to_string_lossy().into_owned())
+                text.contains(definer).then(|| {
+                    path.strip_prefix(&src_dir)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .into_owned()
+                })
             })
             .collect();
         defining_files_other_than_self.sort();

@@ -11,7 +11,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::claw_share_rendezvous_token::RendezvousToken;
+use crate::claw_share::rendezvous_token::RendezvousToken;
 
 pub const CLAW_VPN_MOBILE_MESH_SNAPSHOT_SCHEMA_VERSION: u16 = 3;
 const CLAW_VPN_MOBILE_MESH_PRE_OFFER_TOKEN_SCHEMA_VERSION: u16 = 1;

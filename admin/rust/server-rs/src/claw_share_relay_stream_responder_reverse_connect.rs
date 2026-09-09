@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use household_rs::claw_share_data_tunnel::ClawTargetRouter;
+use household_rs::claw_share::data_tunnel::ClawTargetRouter;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -287,7 +287,7 @@ mod tests {
     use super::*;
 
     use household_rs::cbor;
-    use household_rs::claw_share_data_tunnel::{
+    use household_rs::claw_share::data_tunnel::{
         HEALTH_PROBE, SessionAuthToken, TunnelAck, TunnelFrame, client_authenticate, client_health,
         client_open_stream, recv_frame, send_frame,
     };

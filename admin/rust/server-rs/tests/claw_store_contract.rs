@@ -288,7 +288,7 @@ fn owner_site_ake_route_is_single_ws_record_aead_and_stays_pre_effect_after_c3()
     let routes = include_str!("../src/claw_store_routes.rs");
     let bootstrap = include_str!("../src/household_bootstrap.rs");
     let handlers = include_str!("../src/handlers_household_claws.rs");
-    let ake = include_str!("../src/owner_site_ake.rs");
+    let ake = include_str!("../src/owner_site/ake.rs");
     let lib = include_str!("../src/lib.rs");
 
     let route = contract()
@@ -310,7 +310,8 @@ fn owner_site_ake_route_is_single_ws_record_aead_and_stays_pre_effect_after_c3()
         "A2 must not add bootstrap lifecycle or production provider wiring"
     );
     assert!(
-        lib.contains("pub(crate) mod owner_site_ake;"),
+        lib.contains("pub(crate) mod owner_site;")
+            && include_str!("../src/owner_site.rs").contains("pub(crate) mod ake;"),
         "the A2 state machine must remain crate-private server material"
     );
 
@@ -465,8 +466,8 @@ fn owner_site_ake_route_is_single_ws_record_aead_and_stays_pre_effect_after_c3()
 
 #[test]
 fn owner_site_promotion_skeleton_is_deny_only_and_unwired() {
-    let promotion = include_str!("../src/owner_site_promotion.rs");
-    let ake = include_str!("../src/owner_site_ake.rs");
+    let promotion = include_str!("../src/owner_site/promotion.rs");
+    let ake = include_str!("../src/owner_site/ake.rs");
     let handlers = include_str!("../src/handlers_household_claws.rs");
     let routes = include_str!("../src/claw_store_routes.rs");
     let bootstrap = include_str!("../src/household_bootstrap.rs");
@@ -524,19 +525,24 @@ fn owner_site_promotion_skeleton_is_deny_only_and_unwired() {
         "promotion success exists exactly once, only in the witness-gated body"
     );
     assert!(
-        lib.contains("pub(crate) mod owner_site_promotion;"),
+        lib.contains("pub(crate) mod owner_site;")
+            && include_str!("../src/owner_site.rs").contains("pub(crate) mod promotion;"),
         "the promotion boundary must remain an explicit crate-private module"
     );
     assert!(
-        !ake.contains("owner_site_promotion") && !handlers.contains("owner_site_promotion"),
+        !ake.contains("owner_site::promotion")
+            && !ake.contains("super::promotion")
+            && !ake.contains("promotion::")
+            && !handlers.contains("owner_site::promotion")
+            && !handlers.contains("promotion::"),
         "the A2 route must still close after C3 without wiring peer promotion"
     );
     assert!(
-        !routes.contains("owner_site_promotion"),
+        !routes.contains("owner_site::promotion") && !routes.contains("promotion::"),
         "peer promotion must not register a route in this inert slice"
     );
     assert!(
-        !bootstrap.contains("owner_site_promotion"),
+        !bootstrap.contains("owner_site::promotion") && !bootstrap.contains("promotion::"),
         "peer promotion must not enter household bootstrap wiring"
     );
     for forbidden in [
@@ -577,9 +583,9 @@ fn owner_site_promotion_skeleton_is_deny_only_and_unwired() {
 fn owner_site_pre_effect_route_is_router_only_and_capability_sibling() {
     let routes = include_str!("../src/claw_store_routes.rs");
     let bootstrap = include_str!("../src/household_bootstrap.rs");
-    let capability = include_str!("../src/owner_site_capability.rs");
-    let authority = include_str!("../src/owner_site_authority.rs");
-    let challenge = include_str!("../src/owner_site_challenge.rs");
+    let capability = include_str!("../src/owner_site/capability.rs");
+    let authority = include_str!("../src/owner_site/authority.rs");
+    let challenge = include_str!("../src/owner_site/challenge.rs");
     let handlers = include_str!("../src/handlers_household_claws.rs");
     let lib = include_str!("../src/lib.rs");
 
@@ -604,12 +610,15 @@ fn owner_site_pre_effect_route_is_router_only_and_capability_sibling() {
         "PR1 must not add owner-site lifecycle or routing to household_bootstrap"
     );
     assert!(
-        lib.contains("pub(crate) mod owner_site_capability;"),
+        lib.contains("pub(crate) mod owner_site;")
+            && include_str!("../src/owner_site.rs").contains("pub(crate) mod capability;"),
         "owner-site capability types must stay crate-private server-owned material"
     );
     assert!(
-        lib.contains("pub(crate) mod owner_site_authority;")
-            && lib.contains("pub(crate) mod owner_site_challenge;"),
+        lib.contains("pub(crate) mod owner_site;")
+            && include_str!("../src/owner_site.rs").contains("pub(crate) mod authority;")
+            && lib.contains("pub(crate) mod owner_site;")
+            && include_str!("../src/owner_site.rs").contains("pub(crate) mod challenge;"),
         "pre-effect A2 authority/challenge shapes must stay crate-private server-owned material"
     );
     assert!(
@@ -627,7 +636,9 @@ fn owner_site_pre_effect_route_is_router_only_and_capability_sibling() {
         "the route-real harness must keep explicit zero challenge issue/claim probes"
     );
     assert!(
-        !capability.contains("use crate::owner_site_challenge"),
+        !capability.contains("use crate::owner_site::challenge")
+            && !capability.contains("use super::challenge")
+            && !capability.contains("challenge::"),
         "the inert preflight capability must not acquire the A2 challenge table"
     );
 
@@ -648,7 +659,7 @@ fn owner_site_pre_effect_route_is_router_only_and_capability_sibling() {
     }
 
     assert!(
-        !handler.contains("owner_site_challenge"),
+        !handler.contains("owner_site::challenge") && !handler.contains("challenge::"),
         "the inert preflight handler must not issue or claim an A2 challenge"
     );
     // S2 promoted OwnerSiteChallengeTable from cfg(test) to production.
@@ -779,12 +790,13 @@ fn owner_site_pre_effect_route_is_router_only_and_capability_sibling() {
     // ── DP2 Fatia-2 additive coverage (§11): the promotion linearizer + store
     // are the crate-private, unwired, witness-gated sibling to this route, and
     // the store persists only a record projection (never the sealed carriers). ──
-    let store = include_str!("../src/owner_site_resolution_store.rs");
-    let promotion = include_str!("../src/owner_site_promotion.rs");
-    let ake = include_str!("../src/owner_site_ake.rs");
+    let store = include_str!("../src/owner_site/resolution_store.rs");
+    let promotion = include_str!("../src/owner_site/promotion.rs");
+    let ake = include_str!("../src/owner_site/ake.rs");
 
     assert!(
-        lib.contains("pub(crate) mod owner_site_resolution_store;"),
+        lib.contains("pub(crate) mod owner_site;")
+            && include_str!("../src/owner_site.rs").contains("pub(crate) mod resolution_store;"),
         "the resolution store must be a crate-private module"
     );
     assert!(
@@ -794,8 +806,12 @@ fn owner_site_pre_effect_route_is_router_only_and_capability_sibling() {
     for surface in [routes, bootstrap, handlers, ake] {
         for wired in [
             "OwnerSitePromotionLinearizer",
-            "owner_site_resolution_store",
-            "owner_site_promotion",
+            "owner_site::resolution_store",
+            "super::resolution_store",
+            "resolution_store::",
+            "owner_site::promotion",
+            "super::promotion",
+            "promotion::",
         ] {
             assert!(
                 !surface.contains(wired),
@@ -835,8 +851,12 @@ fn owner_site_pre_effect_route_is_router_only_and_capability_sibling() {
     // Third block: the store persists ONLY the record projection — never the
     // sealed carriers — and keeps the consumed-claim set and envelope identity.
     assert!(
-        !store.contains("crate::owner_site_authority")
-            && !store.contains("crate::owner_site_promotion"),
+        !store.contains("crate::owner_site::authority")
+            && !store.contains("super::authority")
+            && !store.contains("authority::")
+            && !store.contains("crate::owner_site::promotion")
+            && !store.contains("super::promotion")
+            && !store.contains("promotion::"),
         "the store must not import the sealed authority/promotion carriers, so it \
          cannot serialize PendingFinished / witness / VerifiedMeshPeer / DialPermit"
     );
@@ -861,8 +881,8 @@ fn owner_site_pre_effect_route_is_router_only_and_capability_sibling() {
 
 #[test]
 fn amendment_a1_challenge_accessors_are_projection_only() {
-    let challenge = include_str!("../src/owner_site_challenge.rs");
-    let authority = include_str!("../src/owner_site_authority.rs");
+    let challenge = include_str!("../src/owner_site/challenge.rs");
+    let authority = include_str!("../src/owner_site/authority.rs");
 
     // (1)(2) Exactly the two projection getters exist, verbatim, each
     // `&self -> &[u8; 32]`.
@@ -932,7 +952,7 @@ fn amendment_a1_challenge_accessors_are_projection_only() {
 
 #[test]
 fn owner_site_pending_finished_is_sealed_inert_and_non_promoting() {
-    let authority = include_str!("../src/owner_site_authority.rs");
+    let authority = include_str!("../src/owner_site/authority.rs");
     let start = authority
         .find("pub(crate) struct PendingFinished {")
         .expect("production PendingFinished type must exist");

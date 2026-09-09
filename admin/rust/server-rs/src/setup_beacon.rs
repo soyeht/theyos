@@ -29,11 +29,11 @@ use tokio::time::{self, MissedTickBehavior, timeout};
 use tracing::{info, warn};
 
 #[cfg(target_os = "macos")]
-use crate::bonjour_impl_dns_sd as backend;
+use crate::bonjour::impl_dns_sd as backend;
 #[cfg(not(target_os = "macos"))]
-use crate::bonjour_impl_mdns_sd as backend;
+use crate::bonjour::impl_mdns_sd as backend;
 
-use crate::bonjour_browser::SOYEHT_HOUSEHOLD_SERVICE;
+use crate::bonjour::browser::SOYEHT_HOUSEHOLD_SERVICE;
 use crate::handlers_bootstrap::BootstrapStateArc;
 use crate::household_listener::{BoundSet, HouseholdExposurePolicy, InterfaceClass, PairingWindow};
 use household_rs::bootstrap_state::BootstrapState;

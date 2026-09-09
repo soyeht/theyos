@@ -8,7 +8,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use household_rs::owner_events::OwnerDevicePushToken;
-use server_rs::apns_dispatcher::{ApnsError, dispatch_tickle};
+use server_rs::apns::dispatcher::{ApnsError, dispatch_tickle};
 
 fn accept_only_push_token<F>(_: F)
 where

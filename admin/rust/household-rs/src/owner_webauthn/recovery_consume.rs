@@ -7,12 +7,12 @@
 
 use thiserror::Error;
 
-use crate::owner_webauthn_anchor::{OwnerWebauthnAnchorStatus, OwnerWebauthnAuthorityHead};
-use crate::owner_webauthn_authority::OwnerWebauthnAuthority;
-use crate::owner_webauthn_recovery::{
+use crate::owner_webauthn::anchor::{OwnerWebauthnAnchorStatus, OwnerWebauthnAuthorityHead};
+use crate::owner_webauthn::authority::OwnerWebauthnAuthority;
+use crate::owner_webauthn::recovery::{
     OwnerWebauthnRecoveryAuthority, OwnerWebauthnRecoveryError, OwnerWebauthnRecoveryHead,
 };
-use crate::owner_webauthn_recovery_anchor::{
+use crate::owner_webauthn::recovery_anchor::{
     OwnerWebauthnRecoveryAnchor, OwnerWebauthnRecoveryAnchorStatus,
 };
 
@@ -159,17 +159,17 @@ mod tests {
     use crate::ids::{MachineId, derive_household_id};
     use crate::keys::{IdentityKey, P256Keypair};
     use crate::owner_webauthn::OwnerWebauthnCredential;
-    use crate::owner_webauthn_anchor::{
+    use crate::owner_webauthn::anchor::{
         OwnerWebauthnAuthorityAnchor, verified_owner_webauthn_authority_head,
     };
-    use crate::owner_webauthn_authority::{
+    use crate::owner_webauthn::authority::{
         OwnerWebauthnAuthority, OwnerWebauthnCredentialEventAction, OwnerWebauthnRecoveryAddInput,
         SignedOwnerWebauthnCredentialEvent,
     };
-    use crate::owner_webauthn_recovery::{
+    use crate::owner_webauthn::recovery::{
         OwnerWebauthnRecoveryAuthority, RecoveryCodeVerifier, verified_owner_webauthn_recovery_head,
     };
-    use crate::owner_webauthn_recovery_anchor::OwnerWebauthnRecoveryAnchor;
+    use crate::owner_webauthn::recovery_anchor::OwnerWebauthnRecoveryAnchor;
     use crate::person_cert::{PersonCert, SignOwnerOptions};
 
     const NOW: u64 = 1_800_000_000;
@@ -270,7 +270,7 @@ mod tests {
         owner_cert: &PersonCert,
     ) -> (
         OwnerWebauthnRecoveryAuthority,
-        crate::owner_webauthn_recovery::SignedOwnerWebauthnRecoveryEvent,
+        crate::owner_webauthn::recovery::SignedOwnerWebauthnRecoveryEvent,
     ) {
         let provision = OwnerWebauthnRecoveryAuthority::sign_next(
             root,

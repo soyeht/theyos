@@ -17,7 +17,7 @@
 //! here would invent an obligation the base never had, and this slice's bar is
 //! behaviour identity.
 
-use household_rs::claw_share_data_tunnel::TunnelFrame;
+use household_rs::claw_share::data_tunnel::TunnelFrame;
 use household_rs::claw_vpn::{CLAW_VPN_V1_INNER_MTU, ClawVpnAgentSessionCore};
 use tunnel_wire_rs::pollable_pump::{PacketOutcome, PacketPolicyPort, PollablePump};
 
@@ -94,7 +94,7 @@ mod tests {
     // is touched — the assertions are the oracle for behaviour identity across
     // this move, and rewriting them while moving them would destroy the only
     // evidence that behaviour did not change.
-    use household_rs::claw_share_data_tunnel::TunnelFrame;
+    use household_rs::claw_share::data_tunnel::TunnelFrame;
     use household_rs::claw_vpn::{
         ClawVpnAcl, ClawVpnAclKey, ClawVpnAgentCore, ClawVpnAuditReason, ClawVpnDatapathSide,
         ClawVpnIpv4Pool, ClawVpnSessionAddrs, ClawVpnSessionRegistry,

@@ -21,15 +21,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use sha2::Digest as _;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::owner_site_a2_noise::{self, A2_VERSION, MAX_A2_FRAME_BYTES};
-use crate::owner_site_a2_wire::{
+use crate::owner_site::a2_noise::{self, A2_VERSION, MAX_A2_FRAME_BYTES};
+use crate::owner_site::a2_wire::{
     AkeFrame, AkeMessageKind, ClientHello, ClientHelloCore, ServerHello,
 };
-use crate::owner_site_authority::{
+use crate::owner_site::authority::{
     OwnerSiteAuthorityGeneration, OwnerSiteAuthorityObservation, OwnerSiteBindingId,
 };
-use crate::owner_site_capability::{OwnerSitePreAuthIntent, OwnerSiteResource};
-use crate::owner_site_challenge::{
+use crate::owner_site::capability::{OwnerSitePreAuthIntent, OwnerSiteResource};
+use crate::owner_site::challenge::{
     OwnerSiteChallengeIssueScope, OwnerSiteChallengeTable, OwnerSiteChannelEpoch,
     OwnerSiteChannelId, OwnerSiteEngineIdentityCommitment, OwnerSiteTranscriptT1,
     OwnerSiteWebSocketInstance,
@@ -90,7 +90,7 @@ pub(crate) struct OwnerSiteA2ResponderSession {
     m2: ServerHello,
     t1: [u8; 32],
     issue: OwnerSiteChallengeIssueScope,
-    issued: crate::owner_site_challenge::OwnerSiteIssuedChallenge,
+    issued: crate::owner_site::challenge::OwnerSiteIssuedChallenge,
     claimed_binding_id: OwnerSiteBindingId,
     generation: OwnerSiteAuthorityGeneration,
 }
@@ -133,18 +133,15 @@ impl OwnerSiteA2Responder {
         {
             return reject("m1_frame_shape");
         }
-        let device_ephemeral = owner_site_a2_noise::noise_public_prefix(&frame.noise)
+        let device_ephemeral = a2_noise::noise_public_prefix(&frame.noise)
             .map_err(|_| reject::<()>("ephemeral_prefix").unwrap_err())?;
 
-        let (mut static_private, engine_static) =
-            owner_site_a2_noise::new_noise_static_keypair()
-                .map_err(|_| reject::<()>("noise_keypair").unwrap_err())?;
+        let (mut static_private, engine_static) = a2_noise::new_noise_static_keypair()
+            .map_err(|_| reject::<()>("noise_keypair").unwrap_err())?;
         let engine_ephemeral_secret = Zeroizing::new(random_32());
-        let mut preview = owner_site_a2_noise::responder_with_channel_keys(
-            &static_private,
-            &engine_ephemeral_secret[..],
-        )
-        .map_err(|_| reject::<()>("responder_build").unwrap_err())?;
+        let mut preview =
+            a2_noise::responder_with_channel_keys(&static_private, &engine_ephemeral_secret[..])
+                .map_err(|_| reject::<()>("responder_build").unwrap_err())?;
         let mut plaintext = vec![0u8; MAX_A2_FRAME_BYTES];
         let preview_read = preview
             .read_message(&frame.noise, &mut plaintext)
@@ -157,7 +154,7 @@ impl OwnerSiteA2Responder {
             device_ephemeral: device_ephemeral.to_vec(),
         };
         let claimed_binding_id = OwnerSiteBindingId::from_wire(
-            owner_site_a2_noise::array_32(&c1.core.claimed_binding_id)
+            a2_noise::array_32(&c1.core.claimed_binding_id)
                 .map_err(|_| reject::<()>("claimed_binding_shape").unwrap_err())?,
         )
         .map_err(|_| reject::<()>("claimed_binding_zero").unwrap_err())?;
@@ -180,7 +177,7 @@ impl OwnerSiteA2Responder {
         let epoch = self.next_channel_epoch.fetch_add(1, Ordering::SeqCst);
         let channel_epoch = OwnerSiteChannelEpoch::new(epoch)
             .map_err(|_| reject::<()>("channel_epoch_zero").unwrap_err())?;
-        let issued = crate::owner_site_challenge::OwnerSiteIssuedChallenge::generate();
+        let issued = crate::owner_site::challenge::OwnerSiteIssuedChallenge::generate();
         let machine_digest: [u8; 32] =
             sha2::Sha256::digest(&self.engine_machine_certificate).into();
         let mut m2 = ServerHello {
@@ -203,10 +200,10 @@ impl OwnerSiteA2Responder {
         let preview_len = preview
             .write_message(&[], &mut noise)
             .map_err(|_| reject::<()>("preview_write").unwrap_err())?;
-        let engine_ephemeral = owner_site_a2_noise::noise_public_prefix(&noise[..preview_len])
+        let engine_ephemeral = a2_noise::noise_public_prefix(&noise[..preview_len])
             .map_err(|_| reject::<()>("ephemeral_prefix_preview").unwrap_err())?;
         let c1_wire = encode_canonical(&c1).map_err(|_| reject::<()>("c1_encode").unwrap_err())?;
-        let t1 = owner_site_a2_noise::server_auth_t1(
+        let t1 = a2_noise::server_auth_t1(
             &c1_wire,
             engine_ephemeral,
             engine_static,
@@ -252,11 +249,9 @@ impl OwnerSiteA2Responder {
             .map_err(|_| reject::<()>("challenge_insert").unwrap_err())?;
 
         let payload = encode_canonical(&m2).map_err(|_| reject::<()>("m2_encode").unwrap_err())?;
-        let mut handshake = owner_site_a2_noise::responder_with_channel_keys(
-            &static_private,
-            &engine_ephemeral_secret[..],
-        )
-        .map_err(|_| reject::<()>("responder_rebuild").unwrap_err())?;
+        let mut handshake =
+            a2_noise::responder_with_channel_keys(&static_private, &engine_ephemeral_secret[..])
+                .map_err(|_| reject::<()>("responder_rebuild").unwrap_err())?;
         let mut reread = vec![0u8; MAX_A2_FRAME_BYTES];
         let reread_len = handshake
             .read_message(&frame.noise, &mut reread)
@@ -267,7 +262,7 @@ impl OwnerSiteA2Responder {
         let len = handshake
             .write_message(&payload, &mut noise)
             .map_err(|_| reject::<()>("m2_noise_write").unwrap_err())?;
-        if owner_site_a2_noise::noise_public_prefix(&noise[..len])
+        if a2_noise::noise_public_prefix(&noise[..len])
             .map_err(|_| reject::<()>("ephemeral_recheck_read").unwrap_err())?
             != engine_ephemeral
         {
@@ -300,7 +295,7 @@ impl OwnerSiteA2Responder {
 /// intent in every field — domain, version, household, network, route,
 /// resource, and the canonical request triple. Anything less is Rejected.
 fn matches_pre_auth(c1: &ClientHello, intent: &OwnerSitePreAuthIntent) -> bool {
-    c1.core.domain == crate::owner_site_binding_glue::A2_DOMAIN
+    c1.core.domain == crate::owner_site::binding_glue::A2_DOMAIN
         && c1.core.version == A2_VERSION
         && c1.core.household_id == intent.household_id()
         && c1.core.network_id == intent.network_id()
@@ -319,8 +314,8 @@ mod tests {
     /// the gate that keeps a well-formed M1 for the WRONG intent out.
     #[test]
     fn pre_auth_rejects_any_single_field_drift() {
-        let request = crate::owner_site_capability::OwnerSiteCanonicalRequest::new(
-            crate::owner_site_capability::OwnerSiteRequestMethod::Get,
+        let request = crate::owner_site::capability::OwnerSiteCanonicalRequest::new(
+            crate::owner_site::capability::OwnerSiteRequestMethod::Get,
             "/api/v1/household/claws/claw-a/owner-site/ake",
             [7u8; 32],
         )
@@ -333,13 +328,13 @@ mod tests {
         )
         .unwrap();
         let base = ClientHelloCore {
-            domain: crate::owner_site_binding_glue::A2_DOMAIN.to_string(),
+            domain: crate::owner_site::binding_glue::A2_DOMAIN.to_string(),
             version: A2_VERSION,
             household_id: "hh-a".into(),
             network_id: "owner-site-mesh".into(),
             route: "/api/v1/household/claws/claw-a/owner-site/ake".into(),
             resource: "claw-a".into(),
-            intent: crate::owner_site_a2_wire::CanonicalIntent {
+            intent: crate::owner_site::a2_wire::CanonicalIntent {
                 method: "GET".into(),
                 target: "/api/v1/household/claws/claw-a/owner-site/ake".into(),
                 body_hash: vec![7u8; 32],
@@ -398,8 +393,8 @@ impl OwnerSiteA2ResponderSession {
     pub(crate) fn accept_m3(
         &mut self,
         challenges: &OwnerSiteChallengeTable,
-        resolved: &crate::owner_site_authority::OwnerSiteResolvedBinding,
-        intent: &crate::owner_site_capability::OwnerSiteIntent,
+        resolved: &crate::owner_site::authority::OwnerSiteResolvedBinding,
+        intent: &crate::owner_site::capability::OwnerSiteIntent,
         bytes: &[u8],
     ) -> Result<[u8; 32], OwnerSiteA2Rejection> {
         let frame: AkeFrame =
@@ -417,7 +412,7 @@ impl OwnerSiteA2ResponderSession {
             .read_message(&frame.noise, &mut plaintext)
             .map_err(|_| reject::<()>("m3_noise_read").unwrap_err())?;
         plaintext.truncate(len);
-        let proof: crate::owner_site_a2_wire::ClientProof =
+        let proof: crate::owner_site::a2_wire::ClientProof =
             decode_canonical(&plaintext).map_err(|_| reject::<()>("proof_decode").unwrap_err())?;
 
         // THE LIVE HANDSHAKE OBJECT, same function, no parsing intermediate.
@@ -425,16 +420,16 @@ impl OwnerSiteA2ResponderSession {
             .handshake
             .get_remote_static()
             .ok_or(OwnerSiteA2Rejection)
-            .and_then(|raw| owner_site_a2_noise::array_32(raw).map_err(|_| OwnerSiteA2Rejection))
+            .and_then(|raw| a2_noise::array_32(raw).map_err(|_| OwnerSiteA2Rejection))
             .map_err(|_| reject::<()>("remote_static").unwrap_err())?;
-        let session = crate::owner_site_m3_verify::M3SessionTranscript::from_noise_session(
+        let session = crate::owner_site::m3_verify::M3SessionTranscript::from_noise_session(
             self.t1,
             device_static,
         );
 
         let intent_wire = encode_canonical(&self.c1.core.intent)
             .map_err(|_| reject::<()>("intent_encode").unwrap_err())?;
-        crate::owner_site_m3_verify::verify_client_proof(
+        crate::owner_site::m3_verify::verify_client_proof(
             &session,
             &self.m2,
             &self.c1.core,
@@ -445,7 +440,7 @@ impl OwnerSiteA2ResponderSession {
         )
         .map_err(|_| reject::<()>("proof_verify").unwrap_err())?;
 
-        let claim = crate::owner_site_challenge::OwnerSiteChallengeClaimScope::from_session(
+        let claim = crate::owner_site::challenge::OwnerSiteChallengeClaimScope::from_session(
             self.issue.clone(),
             intent.clone(),
             resolved.clone(),
@@ -459,9 +454,9 @@ impl OwnerSiteA2ResponderSession {
             .claim_after_verified_pop(self.issued.id(), &claim, now)
             .map_err(|_| reject::<()>("challenge_claim").unwrap_err())?;
 
-        let h_final = owner_site_a2_noise::final_handshake_hash(&self.handshake)
+        let h_final = a2_noise::final_handshake_hash(&self.handshake)
             .map_err(|_| reject::<()>("h_final").unwrap_err())?;
-        owner_site_a2_noise::channel_binding(h_final, &self.m2.channel_id, self.m2.channel_epoch)
+        a2_noise::channel_binding(h_final, &self.m2.channel_id, self.m2.channel_epoch)
             .map_err(|_| reject::<()>("channel_binding").unwrap_err())
     }
 }
@@ -475,7 +470,7 @@ mod session_closing_tests {
     //! and the challenge is consumed exactly once (non-vacuity).
 
     use super::*;
-    use crate::owner_site_authority::{
+    use crate::owner_site::authority::{
         OwnerSiteActionPopKey, OwnerSiteBindingDigest, OwnerSiteChannelAuthKey,
         OwnerSiteResolvedBinding,
     };
@@ -491,8 +486,8 @@ mod session_closing_tests {
             "engine-test.v1".into(),
             Arc::new(P256Keypair::generate()),
         );
-        let request = crate::owner_site_capability::OwnerSiteCanonicalRequest::new(
-            crate::owner_site_capability::OwnerSiteRequestMethod::Get,
+        let request = crate::owner_site::capability::OwnerSiteCanonicalRequest::new(
+            crate::owner_site::capability::OwnerSiteRequestMethod::Get,
             "/api/v1/household/claws/claw-a/owner-site/ake",
             [7u8; 32],
         )
@@ -541,16 +536,15 @@ mod session_closing_tests {
         resource: &OwnerSiteResource,
         observation: &OwnerSiteAuthorityObservation,
     ) -> (snow::HandshakeState, [u8; 32], OwnerSiteA2ResponderSession) {
-        let (client_hs, client_static) =
-            owner_site_a2_noise::new_noise_initiator().expect("initiator");
+        let (client_hs, client_static) = a2_noise::new_noise_initiator().expect("initiator");
         let core = ClientHelloCore {
-            domain: crate::owner_site_binding_glue::A2_DOMAIN.to_string(),
+            domain: crate::owner_site::binding_glue::A2_DOMAIN.to_string(),
             version: A2_VERSION,
             household_id: "hh-a".into(),
             network_id: "owner-site-mesh".into(),
             route: "/api/v1/household/claws/claw-a/owner-site/ake".into(),
             resource: "claw-a".into(),
-            intent: crate::owner_site_a2_wire::CanonicalIntent {
+            intent: crate::owner_site::a2_wire::CanonicalIntent {
                 method: "GET".into(),
                 target: "/api/v1/household/claws/claw-a/owner-site/ake".into(),
                 body_hash: vec![7u8; 32],
@@ -585,8 +579,8 @@ mod session_closing_tests {
         t1: [u8; 32],
         device_static: [u8; 32],
     ) -> Vec<u8> {
-        let pre = crate::owner_site_binding_glue::pop_binding_pre(t1, device_static).unwrap();
-        let d_auth = crate::owner_site_binding_glue::device_auth_hash(
+        let pre = crate::owner_site::binding_glue::pop_binding_pre(t1, device_static).unwrap();
+        let d_auth = crate::owner_site::binding_glue::device_auth_hash(
             &pre,
             &binding.binding_id(),
             &binding.binding_digest(),
@@ -595,7 +589,7 @@ mod session_closing_tests {
         )
         .unwrap();
         let intent_wire = encode_canonical(&session.c1.core.intent).unwrap();
-        let action = crate::owner_site_binding_glue::owner_action_hash(
+        let action = crate::owner_site::binding_glue::owner_action_hash(
             &pre,
             &session.m2,
             &session.c1.core,
@@ -605,7 +599,7 @@ mod session_closing_tests {
             &intent_wire,
         )
         .unwrap();
-        let proof = crate::owner_site_a2_wire::ClientProof {
+        let proof = crate::owner_site::a2_wire::ClientProof {
             binding_id: binding.binding_id().as_bytes().to_vec(),
             binding_digest: binding.binding_digest().as_bytes().to_vec(),
             participant_npub: binding.participant_npub().to_string(),
@@ -667,7 +661,7 @@ mod session_closing_tests {
             foreign_static,
         );
 
-        let intent_for_claim = crate::owner_site_capability::OwnerSiteIntent::from_pre_auth(
+        let intent_for_claim = crate::owner_site::capability::OwnerSiteIntent::from_pre_auth(
             intent.clone(),
             "member-a".to_string(),
         );
@@ -709,7 +703,7 @@ mod session_closing_tests {
             client_static, // the REAL static the handshake learned
         );
 
-        let intent_for_claim = crate::owner_site_capability::OwnerSiteIntent::from_pre_auth(
+        let intent_for_claim = crate::owner_site::capability::OwnerSiteIntent::from_pre_auth(
             intent.clone(),
             "member-a".to_string(),
         );
@@ -750,7 +744,7 @@ mod session_closing_tests {
     fn two_distinct_causes_return_the_same_opaque_rejection_and_debug_form() {
         let (responder, intent, observation) = fixture();
         let resource = OwnerSiteResource::from_route_claw("claw-a").unwrap();
-        let intent_for_claim = crate::owner_site_capability::OwnerSiteIntent::from_pre_auth(
+        let intent_for_claim = crate::owner_site::capability::OwnerSiteIntent::from_pre_auth(
             intent.clone(),
             "member-a".to_string(),
         );

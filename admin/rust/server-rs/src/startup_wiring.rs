@@ -5,8 +5,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::apns_dispatcher::{self, ApnsTransport};
-use crate::apns_push::{self, HouseCreatedTransport};
+use crate::apns::dispatcher::{self, ApnsTransport};
+use crate::apns::push::{self, HouseCreatedTransport};
 use crate::claw_vpn_dev_config::{ClawVpnDevConfig, ClawVpnDevConfigError, ClawVpnDevMode};
 use crate::setup_beacon::SetupBeaconParams;
 
@@ -244,10 +244,10 @@ fn has_non_normal_path_component(path: &Path) -> bool {
 pub fn install_house_created_push_transport_from_env() -> PushTransportStartupStatus {
     install_house_created_push_transport_with(
         || {
-            apns_push::A2Transport::from_env()
+            push::A2Transport::from_env()
                 .map(|transport| Arc::new(transport) as Arc<dyn HouseCreatedTransport>)
         },
-        apns_push::install_transport,
+        push::install_transport,
     )
 }
 
@@ -257,10 +257,10 @@ pub fn install_house_created_push_transport_from_env() -> PushTransportStartupSt
 pub fn install_owner_event_tickle_transport_from_env() -> PushTransportStartupStatus {
     install_owner_event_tickle_transport_with(
         || {
-            crate::apns_tickle_transport::A2TickleTransport::from_env()
+            crate::apns::tickle_transport::A2TickleTransport::from_env()
                 .map(|transport| Arc::new(transport) as Arc<dyn ApnsTransport>)
         },
-        apns_dispatcher::install_transport,
+        dispatcher::install_transport,
     )
 }
 
@@ -476,7 +476,7 @@ mod tests {
             &'a self,
             _token_hex: &'a str,
             _json_body: &'a str,
-        ) -> Pin<Box<dyn Future<Output = Result<(), apns_push::DispatchAttemptError>> + Send + 'a>>
+        ) -> Pin<Box<dyn Future<Output = Result<(), push::DispatchAttemptError>> + Send + 'a>>
         {
             Box::pin(async { Ok(()) })
         }
@@ -491,8 +491,7 @@ mod tests {
             &'a self,
             _push_token: &'a [u8],
             _body: &'a [u8],
-        ) -> Pin<Box<dyn Future<Output = Result<(), apns_dispatcher::ApnsError>> + Send + 'a>>
-        {
+        ) -> Pin<Box<dyn Future<Output = Result<(), dispatcher::ApnsError>> + Send + 'a>> {
             Box::pin(async { Ok(()) })
         }
     }

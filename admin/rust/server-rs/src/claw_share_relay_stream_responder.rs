@@ -9,7 +9,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use household_rs::claw_share::{ClawShareSlotStore, SlotState};
-use household_rs::claw_share_data_tunnel::{
+use household_rs::claw_share::data_tunnel::{
     AuthEnvelope, ClawTargetRouter, DataTunnelError, ReplayGuard, authorize_session,
     serve_connection_io_with_auth_deadline,
 };
@@ -305,7 +305,7 @@ mod tests {
     use std::time::Duration;
 
     use household_rs::cbor;
-    use household_rs::claw_share_data_tunnel::{
+    use household_rs::claw_share::data_tunnel::{
         HEALTH_PROBE, SessionAuthToken, TunnelAck, TunnelFrame, client_authenticate, client_health,
         client_open_persistent_stream, client_open_stream, recv_frame, send_frame,
     };
@@ -449,7 +449,7 @@ mod tests {
     async fn device_auth_round(
         offer: &RelayStreamOfferContract,
         params: &RelayStreamResponderParams,
-        deps: &ResponderDataTunnelDeps<household_rs::claw_share_data_tunnel::TcpStreamRouter>,
+        deps: &ResponderDataTunnelDeps<household_rs::claw_share::data_tunnel::TcpStreamRouter>,
         trust: &RelayStreamIssuerTrust,
         serve_now: u64,
         cbor: &[u8],

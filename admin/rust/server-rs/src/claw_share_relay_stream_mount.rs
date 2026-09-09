@@ -46,7 +46,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use household_rs::claw_share::{ClawShareSlotStore, GuestCredential};
-use household_rs::claw_share_data_tunnel::{
+use household_rs::claw_share::data_tunnel::{
     ClawTargetRouter, DataTunnelError, ReplayGuard, TargetSession, TcpStreamRouter,
 };
 use household_rs::household_mesh_log::MeshLogStore;

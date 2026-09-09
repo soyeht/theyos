@@ -10,7 +10,7 @@ use std::fmt;
 use std::io;
 use std::time::{Duration, Instant};
 
-use household_rs::claw_share_data_tunnel::TunnelFrame;
+use household_rs::claw_share::data_tunnel::TunnelFrame;
 use household_rs::claw_vpn::{
     CLAW_VPN_V1_INNER_MTU, ClawVpnAgentSessionCore, ClawVpnAuditEvent, ClawVpnDatapathSide,
     ClawVpnSessionFrameError,

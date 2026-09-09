@@ -10,7 +10,7 @@
 
 use std::net::SocketAddr;
 
-use crate::owner_site_authority::OwnerSiteAuthoritySnapshot;
+use crate::owner_site::authority::OwnerSiteAuthoritySnapshot;
 
 #[cfg(test)]
 use std::sync::{
@@ -568,7 +568,7 @@ impl OwnerSiteEffectCounters {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::owner_site_authority::active_authority_fixture;
+    use crate::owner_site::authority::active_authority_fixture;
 
     fn scope(actor_id: &str, authority: OwnerSiteAuthoritySnapshot) -> OwnerSiteCapabilityScope {
         let resource = OwnerSiteResource::from_route_claw("picoclaw").expect("resource");

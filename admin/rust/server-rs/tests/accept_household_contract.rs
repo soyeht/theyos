@@ -17,7 +17,7 @@ use household_rs::pair_device::PairDeviceWindow;
 use household_rs::{BootstrapOpts, KeyBackingPolicy};
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
-use server_rs::bonjour_publisher::{HouseholdBonjour, PairMachineBonjourRole, PublishParams};
+use server_rs::bonjour::publisher::{HouseholdBonjour, PairMachineBonjourRole, PublishParams};
 use server_rs::handlers_bootstrap::{BootstrapHandlerState, BootstrapStateArc, bootstrap_router};
 use server_rs::household_state::HouseholdState;
 use server_rs::setup_invitation::{

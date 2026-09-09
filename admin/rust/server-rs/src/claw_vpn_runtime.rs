@@ -336,7 +336,7 @@ mod tests {
     use crate::claw_vpn_packet_pump::{
         ClawVpnPacketPumpDirection, ClawVpnPacketPumpLoopControl, ClawVpnPacketPumpLoopStopReason,
     };
-    use household_rs::claw_share_data_tunnel::TunnelFrame;
+    use household_rs::claw_share::data_tunnel::TunnelFrame;
     use household_rs::claw_vpn::{
         ClawVpnAcl, ClawVpnAclKey, ClawVpnAgentCore, ClawVpnAuditReason, ClawVpnDatapathSide,
         ClawVpnIpv4Pool, ClawVpnSessionAddrs, ClawVpnSessionRegistry,

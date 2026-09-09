@@ -20,7 +20,7 @@ use snow::{Builder, params::NoiseParams};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use zeroize::Zeroize;
 
-use crate::claw_share_relay_stream_contract::{
+use crate::claw_share::relay_stream_contract::{
     RelayStreamClawStaticPublicKey, RelayStreamContractError, RelayStreamNoisePrologue,
     RelayStreamOfferContract,
 };
@@ -777,10 +777,10 @@ pub enum RelayStreamNoiseError {
 mod tests {
     use super::*;
     use crate::claw_share::SlotId;
-    use crate::claw_share_relay_stream_contract::{
+    use crate::claw_share::relay_stream_contract::{
         RelayStreamExpectedPath, RelayStreamOfferPayload, RelayStreamResource,
     };
-    use crate::claw_share_rendezvous_token::RendezvousToken;
+    use crate::claw_share::rendezvous_token::RendezvousToken;
     use crate::keys::{IdentityKey, P256Keypair};
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex};
 

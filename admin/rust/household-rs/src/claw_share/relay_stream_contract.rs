@@ -18,7 +18,7 @@ use crate::keys::{IdentityKey, P256PublicKey, P256Signature, verify_signature};
 use crate::machine_cert::MachineCert;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
-use crate::claw_share_rendezvous_token::RendezvousToken;
+use crate::claw_share::rendezvous_token::RendezvousToken;
 
 pub const RELAY_STREAM_OFFER_VERSION: u8 = 2;
 pub const RELAY_STREAM_OFFER_KIND: &str = "claw-share/relay-stream-offer";

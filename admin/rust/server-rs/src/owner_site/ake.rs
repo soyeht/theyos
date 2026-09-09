@@ -18,7 +18,7 @@ use std::net::SocketAddr;
 use axum::extract::ws::WebSocket;
 use futures_util::SinkExt;
 
-use crate::owner_site_capability::OwnerSiteResource;
+use crate::owner_site::capability::OwnerSiteResource;
 
 /// Maximum canonical A2-R1 record envelope accepted by the WebSocket boundary.
 ///
@@ -60,7 +60,7 @@ pub(crate) struct OwnerSiteAkeProvider {
 pub(crate) struct OwnerSiteRosterArm {
     admitted: std::sync::Arc<std::sync::RwLock<std::collections::BTreeSet<String>>>,
     latest: std::sync::Arc<
-        std::sync::RwLock<Option<crate::owner_site_authority::OwnerSiteAuthorityObservation>>,
+        std::sync::RwLock<Option<crate::owner_site::authority::OwnerSiteAuthorityObservation>>,
     >,
 }
 
@@ -95,7 +95,7 @@ impl OwnerSiteRosterArm {
     pub(crate) fn observation_slot(
         &self,
     ) -> std::sync::Arc<
-        std::sync::RwLock<Option<crate::owner_site_authority::OwnerSiteAuthorityObservation>>,
+        std::sync::RwLock<Option<crate::owner_site::authority::OwnerSiteAuthorityObservation>>,
     > {
         std::sync::Arc::clone(&self.latest)
     }
@@ -224,7 +224,7 @@ mod harness {
         atomic::{AtomicU64, AtomicUsize, Ordering},
     };
 
-    use crate::owner_site_a2_wire::{
+    use crate::owner_site::a2_wire::{
         CanonicalIntent, ClientHello, ClientHelloCore, ClientProof, ServerHello,
     };
     use axum::extract::ws::{Message, WebSocket};
@@ -252,17 +252,17 @@ mod harness {
     use zeroize::{Zeroize, Zeroizing};
 
     use super::{OwnerSiteAkeProvider, OwnerSiteResource, SocketAddr};
-    use crate::owner_site_authority::{
+    use crate::owner_site::authority::{
         OwnerSiteActionPopKey, OwnerSiteActionPopKeyId, OwnerSiteAuthorityGeneration,
         OwnerSiteBindingDigest, OwnerSiteBindingId, OwnerSiteChannelAuthKey,
         OwnerSiteChannelAuthKeyId, OwnerSiteMembershipRole, OwnerSiteRemotePrincipal,
         OwnerSiteResolvedBinding, OwnerSiteRevocationTombstone, OwnerSiteRosterBinding,
         OwnerSiteRosterScope, OwnerSiteRosterSnapshot,
     };
-    use crate::owner_site_capability::{
+    use crate::owner_site::capability::{
         OwnerSiteCanonicalRequest, OwnerSiteIntent, OwnerSiteRequestMethod,
     };
-    use crate::owner_site_challenge::{
+    use crate::owner_site::challenge::{
         OWNER_SITE_CHALLENGE_BYTES, OwnerSiteChallengeClaimScope, OwnerSiteChallengeIssueScope,
         OwnerSiteChallengeTable, OwnerSiteChannelEpoch, OwnerSiteChannelId,
         OwnerSiteEngineIdentityCommitment, OwnerSiteIssuedChallenge, OwnerSiteTranscriptT1,
@@ -1973,19 +1973,19 @@ mod harness {
     fn pop_binding_pre(
         t1: [u8; 32],
         device_static: [u8; 32],
-    ) -> AkeResult<crate::owner_site_binding_glue::ChannelBindingPre> {
-        crate::owner_site_binding_glue::pop_binding_pre(t1, device_static)
+    ) -> AkeResult<crate::owner_site::binding_glue::ChannelBindingPre> {
+        crate::owner_site::binding_glue::pop_binding_pre(t1, device_static)
             .map_err(|_| OwnerSiteAkeFailure::Rejected)
     }
 
     fn device_auth_hash(
-        channel_binding_pre: &crate::owner_site_binding_glue::ChannelBindingPre,
+        channel_binding_pre: &crate::owner_site::binding_glue::ChannelBindingPre,
         binding_id: OwnerSiteBindingId,
         binding_digest: OwnerSiteBindingDigest,
         participant_npub: &str,
         channel_auth_key_id: &OwnerSiteChannelAuthKeyId,
     ) -> AkeResult<[u8; 32]> {
-        let hash = crate::owner_site_binding_glue::device_auth_hash(
+        let hash = crate::owner_site::binding_glue::device_auth_hash(
             channel_binding_pre,
             &binding_id,
             &binding_digest,
@@ -1997,7 +1997,7 @@ mod harness {
     }
 
     fn owner_action_hash(
-        channel_binding_pre: &crate::owner_site_binding_glue::ChannelBindingPre,
+        channel_binding_pre: &crate::owner_site::binding_glue::ChannelBindingPre,
         m2: &ServerHello,
         c1: &ClientHelloCore,
         binding_id: OwnerSiteBindingId,
@@ -2005,7 +2005,7 @@ mod harness {
         participant_npub: &str,
     ) -> AkeResult<[u8; 32]> {
         let intent_wire = encode_canonical(&c1.intent)?;
-        let hash = crate::owner_site_binding_glue::owner_action_hash(
+        let hash = crate::owner_site::binding_glue::owner_action_hash(
             channel_binding_pre,
             m2,
             c1,
@@ -2019,7 +2019,7 @@ mod harness {
     }
 
     fn hash_canonical<T: Serialize>(value: &T) -> AkeResult<[u8; 32]> {
-        crate::owner_site_binding_glue::hash_canonical(value)
+        crate::owner_site::binding_glue::hash_canonical(value)
             .map_err(|_| OwnerSiteAkeFailure::Rejected)
     }
 
@@ -3313,7 +3313,7 @@ mod pair1_promotion_tests {
     //! uses, not a test backdoor into the decision.
 
     use super::*;
-    use crate::owner_site_authority::OwnerSiteAuthorityObservation;
+    use crate::owner_site::authority::OwnerSiteAuthorityObservation;
 
     fn resource(name: &str) -> OwnerSiteResource {
         OwnerSiteResource::from_route_claw(name).expect("valid resource")
@@ -3387,7 +3387,9 @@ mod refresh_budget_tests {
     //! decoration and a future "simplification" removes it.
 
     use super::*;
-    use crate::owner_site_authority::{OwnerSiteAuthorityObservation, REFRESH_FAILURE_BUDGET_SECS};
+    use crate::owner_site::authority::{
+        OwnerSiteAuthorityObservation, REFRESH_FAILURE_BUDGET_SECS,
+    };
 
     fn resource(name: &str) -> OwnerSiteResource {
         OwnerSiteResource::from_route_claw(name).expect("valid resource")

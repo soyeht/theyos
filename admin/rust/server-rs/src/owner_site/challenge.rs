@@ -17,12 +17,12 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 #[cfg(test)]
-use crate::owner_site_authority::OwnerSiteBindingDigest;
-use crate::owner_site_authority::{
+use crate::owner_site::authority::OwnerSiteBindingDigest;
+use crate::owner_site::authority::{
     OwnerSiteAuthorityGeneration, OwnerSiteBindingId, OwnerSiteResolvedBinding,
 };
-use crate::owner_site_capability::OwnerSiteIntentError;
-use crate::owner_site_capability::{OwnerSiteIntent, OwnerSitePreAuthIntent};
+use crate::owner_site::capability::OwnerSiteIntentError;
+use crate::owner_site::capability::{OwnerSiteIntent, OwnerSitePreAuthIntent};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Entropy length for the opaque A2 challenge id and distinct challenge secret.
@@ -684,10 +684,10 @@ pub(crate) enum OwnerSiteChallengeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::owner_site_authority::{
+    use crate::owner_site::authority::{
         OwnerSiteActionPopKey, OwnerSiteChannelAuthKey, OwnerSiteResolvedBinding,
     };
-    use crate::owner_site_capability::{
+    use crate::owner_site::capability::{
         OwnerSiteCanonicalRequest, OwnerSiteRequestMethod, OwnerSiteResource,
     };
     use household_rs::keys::{IdentityKey, P256Keypair};

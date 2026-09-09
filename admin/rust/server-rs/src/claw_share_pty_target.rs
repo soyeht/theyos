@@ -1,6 +1,6 @@
 //! Real interactive PTY target for the claw-share data tunnel.
 //!
-//! Implements [`household_rs::claw_share_data_tunnel::ClawTargetRouter`] by
+//! Implements [`household_rs::claw_share::data_tunnel::ClawTargetRouter`] by
 //! allocating a real local PTY and spawning a **policy-controlled** shell on
 //! it. The serve loop then pipes the friend's terminal stdin/stdout over the
 //! authenticated tunnel, propagates terminal resizes (`TIOCSWINSZ`), and
@@ -24,7 +24,7 @@
 
 use std::os::fd::{AsFd, AsRawFd, RawFd};
 
-use household_rs::claw_share_data_tunnel::{
+use household_rs::claw_share::data_tunnel::{
     ClawTargetRouter, DataTunnelError, TargetExit, TargetSession,
 };
 

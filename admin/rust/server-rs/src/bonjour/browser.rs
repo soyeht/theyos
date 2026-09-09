@@ -10,7 +10,7 @@
 //!   cache used by `POST /bootstrap/claim-setup-invitation`. Only
 //!   Tailnet-sourced services are accepted by default (FR-015).
 //!
-//! I/O is delegated to [`crate::bonjour_impl_mdns_sd`] so a parallel
+//! I/O is delegated to [`crate::bonjour::impl_mdns_sd`] so a parallel
 //! macOS-native backend (Apple's `dns_sd.h` system bridge) can be wired in
 //! later without touching this facade.
 
@@ -25,10 +25,10 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 #[cfg(target_os = "macos")]
-use crate::bonjour_impl_dns_sd as backend;
+use crate::bonjour::impl_dns_sd as backend;
 #[cfg(not(target_os = "macos"))]
-use crate::bonjour_impl_mdns_sd as backend;
-use crate::bonjour_trust::{BrowserConfig, should_emit_with_txt_hint};
+use crate::bonjour::impl_mdns_sd as backend;
+use crate::bonjour::trust::{BrowserConfig, should_emit_with_txt_hint};
 use crate::handlers_pair_machine::{
     FounderStageError, FounderStageOutcome, JoinSource, PairMachineRouterState,
     founder_stage_join_request,

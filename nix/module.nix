@@ -719,13 +719,13 @@ in
         THEYOS_BIN_DIR = "${cfg.package}/bin";
         WEB_DIR = "${cfg.frontendPackage}";
       } // lib.optionalAttrs cfg.cloudflare.enable {
-        # Cloudflared sync (consumed by admin/rust/server-rs/src/cloudflared_sync.rs).
+        # Cloudflared sync (consumed by admin/rust/server-rs/src/cloudflare/cloudflared_sync.rs).
         # When set, the backend regenerates the cloudflared config.yml on every
         # public-site change and reloads cloudflared via systemctl. Without
         # these vars the sync code is a silent no-op.
         THEYOS_CLOUDFLARED_CONFIG = cfg.cloudflare.configFile;
         # File paths the API-driven setup writes/reads (admin/rust/server-rs/
-        # src/cloudflare_admin.rs). The backend places the operator's API
+        # src/cloudflare/admin.rs). The backend places the operator's API
         # token in apiTokenFile and the connector token in tokenFile.
         THEYOS_CLOUDFLARED_TOKEN_FILE     = cfg.cloudflare.tokenFile;
         THEYOS_CLOUDFLARED_API_TOKEN_FILE = cfg.cloudflare.apiTokenFile;

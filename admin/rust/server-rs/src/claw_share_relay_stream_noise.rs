@@ -18,7 +18,7 @@
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
-pub use household_rs::claw_share_relay_stream_noise::*;
+pub use household_rs::claw_share::relay_stream_noise::*;
 
 use crate::claw_share_relay_stream_contract::RelayStreamOfferContract;
 use crate::claw_share_relay_stream_issuer_trust::RelayStreamIssuerTrust;

@@ -28,22 +28,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use household_rs::cbor;
+use household_rs::claw_share::data_tunnel::{
+    HEALTH_PROBE, SessionAuthToken, TargetExit, TunnelAck, TunnelFrame, client_authenticate,
+    client_health, client_open_stream, recv_frame, send_frame,
+};
+use household_rs::claw_share::relay_stream_contract::{
+    RelayStreamExpectedPath, RelayStreamOfferContract, RelayStreamResource,
+};
+use household_rs::claw_share::relay_stream_endpoint::parse_relay_endpoint;
+use household_rs::claw_share::relay_stream_noise::{
+    RelayStreamNoiseAsyncStream, RelayStreamNoiseFramed,
+};
+use household_rs::claw_share::rendezvous_hello::{RendezvousHello, RendezvousRole};
 use household_rs::claw_share::{
     CLAW_SHARE_GROUP_ACK_VERSION, ClaimNonce, ClawShareAck, ClawShareClaim, ClawShareGroupAck,
     ClawShareInvite, GroupClaimRequest, GuestCredential, TunnelHandle,
 };
-use household_rs::claw_share_data_tunnel::{
-    HEALTH_PROBE, SessionAuthToken, TargetExit, TunnelAck, TunnelFrame, client_authenticate,
-    client_health, client_open_stream, recv_frame, send_frame,
-};
-use household_rs::claw_share_relay_stream_contract::{
-    RelayStreamExpectedPath, RelayStreamOfferContract, RelayStreamResource,
-};
-use household_rs::claw_share_relay_stream_endpoint::parse_relay_endpoint;
-use household_rs::claw_share_relay_stream_noise::{
-    RelayStreamNoiseAsyncStream, RelayStreamNoiseFramed,
-};
-use household_rs::claw_share_rendezvous_hello::{RendezvousHello, RendezvousRole};
 use household_rs::keys::{
     IdentityKey, P256Keypair, P256PublicKey, P256Signature, verify_signature,
 };
@@ -1640,18 +1640,18 @@ mod tests {
 
     // ─── C7c-2b: relay_stream offer parse + audience verification ─────────────
 
-    use household_rs::claw_share::{GuestCredential, SlotId};
-    use household_rs::claw_share_data_tunnel::{
+    use household_rs::claw_share::data_tunnel::{
         AuthEnvelope, ClawTargetRouter, DataTunnelError, DataTunnelSession, ReplayGuard,
         TargetSession, credential_hash, serve_connection_io,
         serve_connection_io_with_auth_deadline,
     };
-    use household_rs::claw_share_relay_stream_contract::{
+    use household_rs::claw_share::relay_stream_contract::{
         RelayStreamAudience, RelayStreamClawStaticPublicKey, RelayStreamOfferMintInput,
         RelayStreamResource, mint_relay_stream_group_offer, mint_relay_stream_offer,
         mint_relay_stream_public_offer,
     };
-    use household_rs::claw_share_rendezvous_token::RendezvousToken;
+    use household_rs::claw_share::rendezvous_token::RendezvousToken;
+    use household_rs::claw_share::{GuestCredential, SlotId};
     use household_rs::ids::derive_household_id;
     use household_rs::keys::P256PublicKey;
     use household_rs::person_cert::derive_person_id;

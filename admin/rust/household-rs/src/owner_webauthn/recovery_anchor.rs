@@ -8,7 +8,7 @@ use crate::cbor;
 use crate::error::{HouseholdError, KeystoreError};
 use crate::household_record::HouseholdRecord;
 use crate::ids::HouseholdId;
-use crate::owner_webauthn_recovery::{
+use crate::owner_webauthn::recovery::{
     OwnerWebauthnRecoveryAuthority, OwnerWebauthnRecoveryError, OwnerWebauthnRecoveryHead,
     verified_owner_webauthn_recovery_head,
 };
@@ -261,7 +261,7 @@ mod tests {
     use super::*;
     use crate::ids::{MachineId, derive_household_id};
     use crate::keys::{IdentityKey, P256Keypair};
-    use crate::owner_webauthn_recovery::{RecoveryCodeVerifier, SignedOwnerWebauthnRecoveryEvent};
+    use crate::owner_webauthn::recovery::{RecoveryCodeVerifier, SignedOwnerWebauthnRecoveryEvent};
     use crate::person_cert::{PersonCert, SignOwnerOptions};
 
     const NOW: u64 = 1_800_000_000;
