@@ -73,15 +73,18 @@ fn terminal_peer_rejection_body(source: &str) -> &str {
     &rest[..end]
 }
 
-/// Does `source` reference the sibling module `name` by path?
+/// Does `source` reference the sibling module `name`, by path or by file
+/// inclusion?
 ///
 /// After the owner_site modules moved under `owner_site/`, the forbidden
 /// module is a bare identifier (`promotion`) instead of a prefixed one
 /// (`owner_site_promotion`), so a substring needle no longer covers every
 /// spelling. This works on a TOKEN stream of the whole source, so line
 /// breaks, attributes, visibilities and whitespace cannot hide a reference.
-/// Comments (line and nested block), string literals (plain, byte and raw)
-/// and char literals are dropped by the lexer first.
+/// Comments (line and nested block), char literals and the delimiters of
+/// string literals (plain, byte, C and raw, in every prefix combination)
+/// are handled by the lexer; a literal or comment the lexer cannot close
+/// is a hard failure, never a silent skip.
 ///
 /// The identifier is a module reference when, in path context:
 /// - it follows `::` and is not a call (`crate::owner_site::promotion`,
@@ -90,14 +93,26 @@ fn terminal_peer_rejection_body(source: &str) -> &str {
 /// - it is an element of a `use` tree group, aliased or not, however the
 ///   group is laid out (`use a::{promotion as p, b};`).
 ///
+/// The FILE is a reference when any string literal names it by basename
+/// (`#[path = "promotion.rs"] mod x;`, `include!("../promotion.rs")`),
+/// which is what the old `owner_site_promotion` needle caught too.
+///
 /// It is NOT a reference as a declaration (`mod promotion;`), a binding
 /// (`let promotion =`), a field (`.promotion`), a struct shorthand outside a
 /// `use`, an associated call (`Self::promotion(...)`), or part of a longer
 /// identifier (`promotion_input`).
 fn references_module(source: &str, name: &str) -> bool {
     let tokens = lex_rust_tokens(source);
+    let file_name = format!("{name}.rs");
     let mut in_use = false;
     for (i, tok) in tokens.iter().enumerate() {
+        if let Some(literal) = tok.strip_prefix('"') {
+            let basename = literal.rsplit(['/', '\\']).next().unwrap_or(literal);
+            if basename == file_name {
+                return true;
+            }
+            continue;
+        }
         if tok == "use" {
             in_use = true;
         } else if tok == ";" {
@@ -120,15 +135,41 @@ fn references_module(source: &str, name: &str) -> bool {
     false
 }
 
-/// Minimal Rust lexer for source guards: yields identifiers, `::`, and
-/// single-character punctuation; drops whitespace, `//` and nested `/* */`
-/// comments, plain/byte/raw string literals, and char literals. Raw
-/// identifiers lose their `r#` prefix; a lifetime keeps its identifier.
+/// Minimal Rust lexer for source guards. Yields identifiers, `::`,
+/// single-character punctuation, and string literals as one token each
+/// (`"` followed by the literal's content, delimiters and prefix removed).
+/// Drops whitespace, `//` and nested `/* */` comments and char literals.
+/// Raw identifiers lose their `r#` prefix; a lifetime keeps its identifier.
+/// Panics on a string literal or block comment that does not close: a guard
+/// must fail loudly rather than lex the rest of the file as a literal.
 fn lex_rust_tokens(source: &str) -> Vec<String> {
     let chars: Vec<char> = source.chars().collect();
     let at = |i: usize| chars.get(i).copied();
     let is_ident_start = |c: char| c.is_alphabetic() || c == '_';
     let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    // Length of a string-literal prefix at `i` (`b`, `c`, `r`, `br`, `cr`)
+    // that is immediately followed by `"` or by `#…"` (raw form), else None.
+    let string_prefix_len = |i: usize| -> Option<(usize, bool)> {
+        let mut j = i;
+        let mut raw = false;
+        if matches!(at(j), Some('b') | Some('c')) {
+            j += 1;
+        }
+        if at(j) == Some('r') {
+            raw = true;
+            j += 1;
+        }
+        if j == i && at(j) != Some('"') {
+            return None;
+        }
+        let mut k = j;
+        if raw {
+            while at(k) == Some('#') {
+                k += 1;
+            }
+        }
+        (at(k) == Some('"')).then_some((j - i, raw))
+    };
     let mut tokens = Vec::new();
     let mut i = 0usize;
     while let Some(c) = at(i) {
@@ -140,18 +181,21 @@ fn lex_rust_tokens(source: &str) -> Vec<String> {
             }
         } else if c == '/' && at(i + 1) == Some('*') {
             let mut depth = 0usize;
-            while i < chars.len() {
-                if at(i) == Some('/') && at(i + 1) == Some('*') {
-                    depth += 1;
-                    i += 2;
-                } else if at(i) == Some('*') && at(i + 1) == Some('/') {
-                    depth -= 1;
-                    i += 2;
-                    if depth == 0 {
-                        break;
+            loop {
+                match (at(i), at(i + 1)) {
+                    (Some('/'), Some('*')) => {
+                        depth += 1;
+                        i += 2;
                     }
-                } else {
-                    i += 1;
+                    (Some('*'), Some('/')) => {
+                        depth -= 1;
+                        i += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    (Some(_), _) => i += 1,
+                    (None, _) => panic!("source guard lexer: unterminated block comment"),
                 }
             }
         } else if c == 'r' && at(i + 1) == Some('#') && at(i + 2).is_some_and(is_ident_start) {
@@ -162,45 +206,34 @@ fn lex_rust_tokens(source: &str) -> Vec<String> {
                 i += 1;
             }
             tokens.push(chars[start..i].iter().collect());
-        } else if (c == 'r' && matches!(at(i + 1), Some('"') | Some('#')))
-            || (c == 'b' && at(i + 1) == Some('r') && matches!(at(i + 2), Some('"') | Some('#')))
-        {
-            // raw string r"..." / r#"..."# / br"..."
-            let mut j = if c == 'b' { i + 2 } else { i + 1 };
+        } else if let Some((prefix_len, raw)) = string_prefix_len(i) {
+            let mut j = i + prefix_len;
             let mut hashes = 0usize;
-            while at(j) == Some('#') {
-                hashes += 1;
-                j += 1;
+            if raw {
+                while at(j) == Some('#') {
+                    hashes += 1;
+                    j += 1;
+                }
             }
-            if at(j) != Some('"') {
-                // `r#` that is not a raw string (e.g. `r#` followed by a
-                // non-identifier): treat `r` as an identifier and move on.
-                tokens.push("r".to_string());
-                i += 1;
-                continue;
-            }
+            debug_assert_eq!(at(j), Some('"'));
             j += 1;
-            while j < chars.len() {
-                if at(j) == Some('"') && (0..hashes).all(|k| at(j + 1 + k) == Some('#')) {
-                    j += 1 + hashes;
-                    break;
+            let start = j;
+            let end;
+            loop {
+                match at(j) {
+                    None => panic!("source guard lexer: unterminated string literal"),
+                    Some('\\') if !raw => j += 2,
+                    Some('"') if !raw || (0..hashes).all(|k| at(j + 1 + k) == Some('#')) => {
+                        end = j;
+                        j += 1 + hashes;
+                        break;
+                    }
+                    Some(_) => j += 1,
                 }
-                j += 1;
             }
+            let content: String = chars[start..end.min(chars.len())].iter().collect();
+            tokens.push(format!("\"{content}"));
             i = j;
-        } else if c == '"' || (c == 'b' && at(i + 1) == Some('"')) {
-            // plain or byte string with escapes
-            i += if c == 'b' { 2 } else { 1 };
-            while let Some(c) = at(i) {
-                if c == '\\' {
-                    i += 2;
-                } else if c == '"' {
-                    i += 1;
-                    break;
-                } else {
-                    i += 1;
-                }
-            }
         } else if c == '\'' {
             // char literal 'x' / '\n' / '\u{..}', or a lifetime 'a
             if at(i + 1) == Some('\\') {
@@ -232,6 +265,18 @@ fn lex_rust_tokens(source: &str) -> Vec<String> {
 }
 
 #[test]
+#[should_panic(expected = "unterminated string literal")]
+fn references_module_refuses_a_string_literal_it_cannot_close() {
+    let _ = references_module("let s = \"never closed; use super::promotion;", "promotion");
+}
+
+#[test]
+#[should_panic(expected = "unterminated block comment")]
+fn references_module_refuses_a_block_comment_it_cannot_close() {
+    let _ = references_module("/* never closed use super::promotion;", "promotion");
+}
+
+#[test]
 fn references_module_covers_every_import_spelling_and_ignores_non_paths() {
     for hit in [
         "use crate::owner_site::promotion;",
@@ -253,6 +298,14 @@ fn references_module_covers_every_import_spelling_and_ignores_non_paths() {
         "use crate::owner_site::{a2_wire::{ClientHelloCore}, promotion::{PromotionInput}};",
         "/* leading comment */ use super::promotion;",
         "let s = \"not it\"; promotion::promote()",
+        // C strings and a trailing backslash inside a raw one ([aria]):
+        "const _: &std::ffi::CStr = cr#\"\\\"#; use crate::owner_site::{promotion as p};",
+        "const _: &std::ffi::CStr = c\"x\"; use super::promotion;",
+        "let r = br\"\\\"; use crate::owner_site::{promotion};",
+        // File inclusion by name, which the old prefixed needle caught too:
+        "#[path = \"promotion.rs\"] mod promoted;",
+        "#[path = \"../owner_site/promotion.rs\"]\nmod promoted;",
+        "include!(\"promotion.rs\");",
     ] {
         assert!(
             references_module(hit, "promotion"),
@@ -278,6 +331,9 @@ fn references_module_covers_every_import_spelling_and_ignores_non_paths() {
         "struct S<'promotion> { p: &'promotion str }",
         "use crate::owner_site::{promotion_input as pi};",
         "let b = b\"promotion::x\";",
+        "let c = c\"promotion::x\"; let cr = cr#\"use super::promotion;\"#;",
+        "#[path = \"promotion_input.rs\"] mod pi;",
+        "let s = \"promotion.rs.bak\";",
     ] {
         assert!(
             !references_module(miss, "promotion"),
