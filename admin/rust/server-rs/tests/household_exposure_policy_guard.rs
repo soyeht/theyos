@@ -320,10 +320,14 @@ fn plain_http_listener_contract_is_pinned_in_code() {
     let household = read_src("handlers_household.rs");
     // handlers_bootstrap.rs keeps its test listeners in extracted test files;
     // scan the module with them so the claim still covers the listeners.
+    // All three test children of handlers_bootstrap.rs: the two extracted
+    // into handlers_bootstrap/ and the `#[path]`-declared first-owner smoke
+    // file, which a directory listing would miss.
     let bootstrap_with_tests = [
         bootstrap.as_str(),
         &read_src("handlers_bootstrap/tests.rs"),
         &read_src("handlers_bootstrap/household_teardown_lifecycle_tests.rs"),
+        &read_src("handlers_bootstrap_first_owner_tests.rs"),
     ]
     .concat();
     for (file, source) in [

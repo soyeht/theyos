@@ -232,14 +232,11 @@ async fn first_owner_loopback_http_smoke_has_liveness_before_and_after() {
     );
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            bootstrap_router(state).into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(async move {
-            let _ = shutdown_rx.await;
-        })
-        .await
+        core_rs::phase0_axum_serve!(listener, bootstrap_router(state), connect_info = SocketAddr)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
     });
     let client = reqwest::Client::new();
     let origin = format!("http://{address}");
