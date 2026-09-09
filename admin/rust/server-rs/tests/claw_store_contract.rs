@@ -78,79 +78,157 @@ fn terminal_peer_rejection_body(source: &str) -> &str {
 /// After the owner_site modules moved under `owner_site/`, the forbidden
 /// module is a bare identifier (`promotion`) instead of a prefixed one
 /// (`owner_site_promotion`), so a substring needle no longer covers every
-/// spelling. This recognises the identifier in PATH CONTEXT only:
+/// spelling. This works on a TOKEN stream of the whole source, so line
+/// breaks, attributes, visibilities and whitespace cannot hide a reference.
+/// Comments (line and nested block), string literals (plain, byte and raw)
+/// and char literals are dropped by the lexer first.
 ///
-/// - as a path segment: `crate::owner_site::promotion`, `super::promotion`,
-///   `promotion::Item`, `use ... promotion as p;`
-/// - as an element of a `use` group, possibly aliased:
-///   `use crate::owner_site::{promotion as p, ake};`, across lines.
+/// The identifier is a module reference when, in path context:
+/// - it follows `::` and is not a call (`crate::owner_site::promotion`,
+///   `super::promotion`, `use ...::promotion as p;`), or
+/// - it is the head of a path (`promotion::promote(...)`), or
+/// - it is an element of a `use` tree group, aliased or not, however the
+///   group is laid out (`use a::{promotion as p, b};`).
 ///
-/// Comments and string literals are dropped first, so prose that mentions
-/// "promotion" is not a hit; `let promotion = ...`, `.promotion`, a struct
-/// shorthand `{ promotion }` outside a `use`, and `Self::promotion(...)` are
-/// not path references to a module and are not hits either.
+/// It is NOT a reference as a declaration (`mod promotion;`), a binding
+/// (`let promotion =`), a field (`.promotion`), a struct shorthand outside a
+/// `use`, an associated call (`Self::promotion(...)`), or part of a longer
+/// identifier (`promotion_input`).
 fn references_module(source: &str, name: &str) -> bool {
-    fn code_only(line: &str) -> String {
-        // Strip string literals, then a trailing `//` comment.
-        let mut out = String::with_capacity(line.len());
-        let mut in_str = false;
-        let mut escaped = false;
-        for ch in line.chars() {
-            match (in_str, ch) {
-                (true, '\\') if !escaped => escaped = true,
-                (true, '"') if !escaped => in_str = false,
-                (true, _) => escaped = false,
-                (false, '"') => in_str = true,
-                (false, _) => out.push(ch),
-            }
-        }
-        match out.find("//") {
-            Some(at) => out[..at].to_string(),
-            None => out,
-        }
-    }
-    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    let tokens = lex_rust_tokens(source);
     let mut in_use = false;
-    for raw in source.lines() {
-        let line = code_only(raw);
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("use ")
-            || trimmed.starts_with("pub use ")
-            || trimmed.starts_with("pub(crate) use ")
-        {
+    for (i, tok) in tokens.iter().enumerate() {
+        if tok == "use" {
             in_use = true;
-        }
-        let mut from = 0usize;
-        while let Some(rel) = line[from..].find(name) {
-            let at = from + rel;
-            let end = at + name.len();
-            from = end;
-            if line[..at].chars().next_back().is_some_and(is_ident)
-                || line[end..].chars().next().is_some_and(is_ident)
-            {
-                continue;
-            }
-            let prefix = line[..at].trim_end();
-            let suffix = line[end..].trim_start();
-            let segment_before = prefix.ends_with("::");
-            // Inside a `use` group an element may also open a continuation line.
-            let group_before =
-                in_use && (prefix.ends_with('{') || prefix.ends_with(',') || prefix.is_empty());
-            let path_after = suffix.starts_with("::")
-                || suffix.starts_with(';')
-                || suffix.starts_with("as ")
-                || (in_use && (suffix.starts_with(',') || suffix.starts_with('}')));
-            // A bare `promotion::item` after an import is a path too.
-            let head_of_path = suffix.starts_with("::") && !prefix.ends_with('.');
-            if (segment_before || group_before || head_of_path) && path_after {
-                return true;
-            }
-        }
-        if in_use && line.contains(';') {
+        } else if tok == ";" {
             in_use = false;
+        }
+        if tok != name {
+            continue;
+        }
+        let prev = i.checked_sub(1).map(|j| tokens[j].as_str());
+        let next = tokens.get(i + 1).map(String::as_str);
+        let after_segment = prev == Some("::") && next != Some("(");
+        let head_of_path = next == Some("::") && prev != Some(".");
+        let group_element = in_use
+            && matches!(prev, Some("{") | Some(","))
+            && matches!(next, Some(",") | Some("}") | Some("as") | Some("::"));
+        if after_segment || head_of_path || group_element {
+            return true;
         }
     }
     false
+}
+
+/// Minimal Rust lexer for source guards: yields identifiers, `::`, and
+/// single-character punctuation; drops whitespace, `//` and nested `/* */`
+/// comments, plain/byte/raw string literals, and char literals. Raw
+/// identifiers lose their `r#` prefix; a lifetime keeps its identifier.
+fn lex_rust_tokens(source: &str) -> Vec<String> {
+    let chars: Vec<char> = source.chars().collect();
+    let at = |i: usize| chars.get(i).copied();
+    let is_ident_start = |c: char| c.is_alphabetic() || c == '_';
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    let mut tokens = Vec::new();
+    let mut i = 0usize;
+    while let Some(c) = at(i) {
+        if c.is_whitespace() {
+            i += 1;
+        } else if c == '/' && at(i + 1) == Some('/') {
+            while at(i).is_some_and(|c| c != '\n') {
+                i += 1;
+            }
+        } else if c == '/' && at(i + 1) == Some('*') {
+            let mut depth = 0usize;
+            while i < chars.len() {
+                if at(i) == Some('/') && at(i + 1) == Some('*') {
+                    depth += 1;
+                    i += 2;
+                } else if at(i) == Some('*') && at(i + 1) == Some('/') {
+                    depth -= 1;
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        } else if c == 'r' && at(i + 1) == Some('#') && at(i + 2).is_some_and(is_ident_start) {
+            // raw identifier `r#name`
+            i += 2;
+            let start = i;
+            while at(i).is_some_and(is_ident) {
+                i += 1;
+            }
+            tokens.push(chars[start..i].iter().collect());
+        } else if (c == 'r' && matches!(at(i + 1), Some('"') | Some('#')))
+            || (c == 'b' && at(i + 1) == Some('r') && matches!(at(i + 2), Some('"') | Some('#')))
+        {
+            // raw string r"..." / r#"..."# / br"..."
+            let mut j = if c == 'b' { i + 2 } else { i + 1 };
+            let mut hashes = 0usize;
+            while at(j) == Some('#') {
+                hashes += 1;
+                j += 1;
+            }
+            if at(j) != Some('"') {
+                // `r#` that is not a raw string (e.g. `r#` followed by a
+                // non-identifier): treat `r` as an identifier and move on.
+                tokens.push("r".to_string());
+                i += 1;
+                continue;
+            }
+            j += 1;
+            while j < chars.len() {
+                if at(j) == Some('"') && (0..hashes).all(|k| at(j + 1 + k) == Some('#')) {
+                    j += 1 + hashes;
+                    break;
+                }
+                j += 1;
+            }
+            i = j;
+        } else if c == '"' || (c == 'b' && at(i + 1) == Some('"')) {
+            // plain or byte string with escapes
+            i += if c == 'b' { 2 } else { 1 };
+            while let Some(c) = at(i) {
+                if c == '\\' {
+                    i += 2;
+                } else if c == '"' {
+                    i += 1;
+                    break;
+                } else {
+                    i += 1;
+                }
+            }
+        } else if c == '\'' {
+            // char literal 'x' / '\n' / '\u{..}', or a lifetime 'a
+            if at(i + 1) == Some('\\') {
+                i += 2;
+                while at(i).is_some_and(|c| c != '\'') {
+                    i += 1;
+                }
+                i += 1;
+            } else if at(i + 2) == Some('\'') {
+                i += 3;
+            } else {
+                i += 1;
+            }
+        } else if is_ident_start(c) {
+            let start = i;
+            while at(i).is_some_and(is_ident) {
+                i += 1;
+            }
+            tokens.push(chars[start..i].iter().collect());
+        } else if c == ':' && at(i + 1) == Some(':') {
+            tokens.push("::".to_string());
+            i += 2;
+        } else {
+            tokens.push(c.to_string());
+            i += 1;
+        }
+    }
+    tokens
 }
 
 #[test]
@@ -166,6 +244,15 @@ fn references_module_covers_every_import_spelling_and_ignores_non_paths() {
         "let x = promotion::promote(input);",
         "let x = crate::owner_site::promotion::promote(input);",
         "pub use promotion::Promoted;",
+        // Layouts a line-based recogniser missed (review by [aria]):
+        "use\n    crate::owner_site::{promotion as promoted};",
+        "use crate::owner_site::{\n    promotion\n        as promoted,\n};",
+        "fn probe() { use crate::owner_site::{promotion as promoted}; }",
+        "#[allow(unused_imports)] use crate::owner_site::{promotion};",
+        "pub(super) use crate::owner_site::{ake, promotion as p};",
+        "use crate::owner_site::{a2_wire::{ClientHelloCore}, promotion::{PromotionInput}};",
+        "/* leading comment */ use super::promotion;",
+        "let s = \"not it\"; promotion::promote()",
     ] {
         assert!(
             references_module(hit, "promotion"),
@@ -182,6 +269,15 @@ fn references_module_covers_every_import_spelling_and_ignores_non_paths() {
         "use crate::owner_site::promotion_input::X;",
         "tracing::debug!(stage = \"owner_site.promotion\");",
         "let promoted = promotion_input.clone();",
+        "mod promotion;",
+        "/* use crate::owner_site::{promotion as p}; */",
+        "/* outer /* nested */ use super::promotion; */",
+        "let raw = r#\"use crate::owner_site::promotion;\"#;",
+        "let raw = r##\"promotion::x \"# still string\"##;",
+        "let c = '\"'; let promotion = 1; // \"",
+        "struct S<'promotion> { p: &'promotion str }",
+        "use crate::owner_site::{promotion_input as pi};",
+        "let b = b\"promotion::x\";",
     ] {
         assert!(
             !references_module(miss, "promotion"),
