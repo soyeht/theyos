@@ -73,6 +73,123 @@ fn terminal_peer_rejection_body(source: &str) -> &str {
     &rest[..end]
 }
 
+/// Does `source` reference the sibling module `name` by path?
+///
+/// After the owner_site modules moved under `owner_site/`, the forbidden
+/// module is a bare identifier (`promotion`) instead of a prefixed one
+/// (`owner_site_promotion`), so a substring needle no longer covers every
+/// spelling. This recognises the identifier in PATH CONTEXT only:
+///
+/// - as a path segment: `crate::owner_site::promotion`, `super::promotion`,
+///   `promotion::Item`, `use ... promotion as p;`
+/// - as an element of a `use` group, possibly aliased:
+///   `use crate::owner_site::{promotion as p, ake};`, across lines.
+///
+/// Comments and string literals are dropped first, so prose that mentions
+/// "promotion" is not a hit; `let promotion = ...`, `.promotion`, a struct
+/// shorthand `{ promotion }` outside a `use`, and `Self::promotion(...)` are
+/// not path references to a module and are not hits either.
+fn references_module(source: &str, name: &str) -> bool {
+    fn code_only(line: &str) -> String {
+        // Strip string literals, then a trailing `//` comment.
+        let mut out = String::with_capacity(line.len());
+        let mut in_str = false;
+        let mut escaped = false;
+        for ch in line.chars() {
+            match (in_str, ch) {
+                (true, '\\') if !escaped => escaped = true,
+                (true, '"') if !escaped => in_str = false,
+                (true, _) => escaped = false,
+                (false, '"') => in_str = true,
+                (false, _) => out.push(ch),
+            }
+        }
+        match out.find("//") {
+            Some(at) => out[..at].to_string(),
+            None => out,
+        }
+    }
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    let mut in_use = false;
+    for raw in source.lines() {
+        let line = code_only(raw);
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("use ")
+            || trimmed.starts_with("pub use ")
+            || trimmed.starts_with("pub(crate) use ")
+        {
+            in_use = true;
+        }
+        let mut from = 0usize;
+        while let Some(rel) = line[from..].find(name) {
+            let at = from + rel;
+            let end = at + name.len();
+            from = end;
+            if line[..at].chars().next_back().is_some_and(is_ident)
+                || line[end..].chars().next().is_some_and(is_ident)
+            {
+                continue;
+            }
+            let prefix = line[..at].trim_end();
+            let suffix = line[end..].trim_start();
+            let segment_before = prefix.ends_with("::");
+            // Inside a `use` group an element may also open a continuation line.
+            let group_before =
+                in_use && (prefix.ends_with('{') || prefix.ends_with(',') || prefix.is_empty());
+            let path_after = suffix.starts_with("::")
+                || suffix.starts_with(';')
+                || suffix.starts_with("as ")
+                || (in_use && (suffix.starts_with(',') || suffix.starts_with('}')));
+            // A bare `promotion::item` after an import is a path too.
+            let head_of_path = suffix.starts_with("::") && !prefix.ends_with('.');
+            if (segment_before || group_before || head_of_path) && path_after {
+                return true;
+            }
+        }
+        if in_use && line.contains(';') {
+            in_use = false;
+        }
+    }
+    false
+}
+
+#[test]
+fn references_module_covers_every_import_spelling_and_ignores_non_paths() {
+    for hit in [
+        "use crate::owner_site::promotion;",
+        "use crate::owner_site::promotion as promoted;",
+        "use crate::owner_site::{promotion as promoted};",
+        "use crate::owner_site::{ake, promotion, authority};",
+        "use super::{promotion as p};",
+        "use super::promotion::PromotionInput;",
+        "use crate::owner_site::{\n    ake,\n    promotion as promoted,\n};",
+        "let x = promotion::promote(input);",
+        "let x = crate::owner_site::promotion::promote(input);",
+        "pub use promotion::Promoted;",
+    ] {
+        assert!(
+            references_module(hit, "promotion"),
+            "must recognise `{hit}`"
+        );
+    }
+    for miss in [
+        "// peer promotion stays unwired",
+        "/// Promotion happens after C3; see promotion notes.",
+        "let promotion = compute();",
+        "let _ = state.promotion;",
+        "Foo { promotion }",
+        "Self::promotion(input)",
+        "use crate::owner_site::promotion_input::X;",
+        "tracing::debug!(stage = \"owner_site.promotion\");",
+        "let promoted = promotion_input.clone();",
+    ] {
+        assert!(
+            !references_module(miss, "promotion"),
+            "must not flag `{miss}`"
+        );
+    }
+}
+
 #[test]
 fn household_claw_contract_routes_are_mounted_with_declared_handlers() {
     let contract = contract();
@@ -321,7 +438,7 @@ fn owner_site_ake_route_is_single_ws_record_aead_and_stays_pre_effect_after_c3()
         "A2 must remain owned by claw_store_routes::household_routes"
     );
     assert!(
-        !bootstrap.contains("owner_site::ake") && !bootstrap.contains("ake::"),
+        !references_module(bootstrap, "ake"),
         "A2 must not add bootstrap lifecycle or production provider wiring"
     );
     assert!(
@@ -554,19 +671,15 @@ fn owner_site_promotion_skeleton_is_deny_only_and_unwired() {
         "the promotion boundary must remain an explicit crate-private module"
     );
     assert!(
-        !ake.contains("owner_site::promotion")
-            && !ake.contains("super::promotion")
-            && !ake.contains("promotion::")
-            && !handlers.contains("owner_site::promotion")
-            && !handlers.contains("promotion::"),
+        !references_module(ake, "promotion") && !references_module(handlers, "promotion"),
         "the A2 route must still close after C3 without wiring peer promotion"
     );
     assert!(
-        !routes.contains("owner_site::promotion") && !routes.contains("promotion::"),
+        !references_module(routes, "promotion"),
         "peer promotion must not register a route in this inert slice"
     );
     assert!(
-        !bootstrap.contains("owner_site::promotion") && !bootstrap.contains("promotion::"),
+        !references_module(bootstrap, "promotion"),
         "peer promotion must not enter household bootstrap wiring"
     );
     for forbidden in [
@@ -669,9 +782,7 @@ fn owner_site_pre_effect_route_is_router_only_and_capability_sibling() {
         "the route-real harness must keep explicit zero challenge issue/claim probes"
     );
     assert!(
-        !capability.contains("use crate::owner_site::challenge")
-            && !capability.contains("use super::challenge")
-            && !capability.contains("challenge::"),
+        !references_module(capability, "challenge"),
         "the inert preflight capability must not acquire the A2 challenge table"
     );
 
@@ -692,7 +803,7 @@ fn owner_site_pre_effect_route_is_router_only_and_capability_sibling() {
     }
 
     assert!(
-        !handler.contains("owner_site::challenge") && !handler.contains("challenge::"),
+        !references_module(handler, "challenge"),
         "the inert preflight handler must not issue or claim an A2 challenge"
     );
     // S2 promoted OwnerSiteChallengeTable from cfg(test) to production.
@@ -840,18 +951,14 @@ fn owner_site_pre_effect_route_is_router_only_and_capability_sibling() {
         "the promotion linearizer lives in the crate-private authority module"
     );
     for surface in [routes, bootstrap, handlers, ake] {
-        for wired in [
-            "OwnerSitePromotionLinearizer",
-            "owner_site::resolution_store",
-            "super::resolution_store",
-            "resolution_store::",
-            "owner_site::promotion",
-            "super::promotion",
-            "promotion::",
-        ] {
+        assert!(
+            !surface.contains("OwnerSitePromotionLinearizer"),
+            "production route/bootstrap/handler/provider must not wire `OwnerSitePromotionLinearizer`"
+        );
+        for module in ["resolution_store", "promotion"] {
             assert!(
-                !surface.contains(wired),
-                "production route/bootstrap/handler/provider must not wire `{wired}`"
+                !references_module(surface, module),
+                "production route/bootstrap/handler/provider must not wire the `{module}` module"
             );
         }
     }
@@ -887,12 +994,7 @@ fn owner_site_pre_effect_route_is_router_only_and_capability_sibling() {
     // Third block: the store persists ONLY the record projection — never the
     // sealed carriers — and keeps the consumed-claim set and envelope identity.
     assert!(
-        !store.contains("crate::owner_site::authority")
-            && !store.contains("super::authority")
-            && !store.contains("authority::")
-            && !store.contains("crate::owner_site::promotion")
-            && !store.contains("super::promotion")
-            && !store.contains("promotion::"),
+        !references_module(store, "authority") && !references_module(store, "promotion"),
         "the store must not import the sealed authority/promotion carriers, so it \
          cannot serialize PendingFinished / witness / VerifiedMeshPeer / DialPermit"
     );
