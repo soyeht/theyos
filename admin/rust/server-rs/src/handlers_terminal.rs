@@ -237,7 +237,14 @@ pub async fn handle_terminal_workspace(
             "session_id": ws.id,
             "container": ws.container,
             "display_name": ws.display_name,
-            "status": ws.status
+            "status": ws.status,
+            // Which process will hold the shell once the PTY is attached, so
+            // a caller learns "this survives an engine update" here and not
+            // at the update.
+            "session_owner": crate::mac_host_supervised::session_owner(
+                &ws.container,
+                state.local_pty_supervisor.is_some(),
+            )
         }
     })))
 }
@@ -288,7 +295,11 @@ pub async fn handle_list_conversations(
                 "is_connected": is_connected,
                 "created_at": ws.created_at,
                 "last_attach_at": ws.last_attach_at,
-                "last_activity_at": ws.last_activity_at
+                "last_activity_at": ws.last_activity_at,
+                "session_owner": crate::mac_host_supervised::session_owner(
+                    &ws.container,
+                    state.local_pty_supervisor.is_some(),
+                )
             })
         })
         .collect();
@@ -372,7 +383,14 @@ pub async fn handle_create_conversation(
             "session_id": ws.id,
             "container": ws.container,
             "display_name": ws.display_name,
-            "status": ws.status
+            "status": ws.status,
+            // Which process will hold the shell once the PTY is attached, so
+            // a caller learns "this survives an engine update" here and not
+            // at the update.
+            "session_owner": crate::mac_host_supervised::session_owner(
+                &ws.container,
+                state.local_pty_supervisor.is_some(),
+            )
         }
     })))
 }
@@ -597,6 +615,23 @@ pub(crate) async fn serve_authorized_terminal_pty(
 
     let cols = if q.cols > 0 { q.cols } else { 80 };
     let rows = if q.rows > 0 { q.rows } else { 24 };
+
+    // This Mac's own shell must not live in this process: the supervisor
+    // owns it, and the client keeps the framing it already speaks.
+    if container == crate::mac_host_supervised::MAC_HOST_CONTAINER {
+        if let Some(client) = &state.local_pty_supervisor {
+            return crate::mac_host_supervised::serve(
+                client.clone(),
+                pty_mgr.ctl_path().to_owned(),
+                session_id,
+                cols,
+                rows,
+                q.full_replay,
+                ws,
+            )
+            .await;
+        }
+    }
 
     let sess = {
         let pm = Arc::clone(&pty_mgr);

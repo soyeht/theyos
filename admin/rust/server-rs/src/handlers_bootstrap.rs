@@ -772,10 +772,10 @@ pub async fn post_claim_setup_invitation(
         }
     };
     let Some(installation) = state.installation.clone() else {
-        return claim_cbor_error(StatusCode::SERVICE_UNAVAILABLE, "profile_missing");
+        return claim_cbor_error(StatusCode::SERVICE_UNAVAILABLE, BootstrapErrorCode::ProfileMissing.as_str());
     };
     if req.installation.as_ref() != Some(&installation) {
-        return claim_cbor_error(StatusCode::CONFLICT, "profile_mismatch");
+        return claim_cbor_error(StatusCode::CONFLICT, BootstrapErrorCode::ProfileMismatch.as_str());
     }
     let Ok(token): Result<[u8; 32], _> = req.token.as_ref().try_into() else {
         return claim_cbor_error(
@@ -917,7 +917,7 @@ pub async fn post_claim_setup_invitation(
         if pending.token.as_ref() != token.as_slice()
             || pending.installation.as_ref() != Some(&installation)
         {
-            return claim_cbor_error(StatusCode::CONFLICT, "invitation_already_claimed");
+            return claim_cbor_error(StatusCode::CONFLICT, BootstrapErrorCode::InvitationAlreadyClaimed.as_str());
         }
         accepted_at = pending.accepted_at.unwrap_or(now);
     }

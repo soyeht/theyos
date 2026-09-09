@@ -52,6 +52,33 @@ use vmrunner_rs::VmRunner;
 #[allow(clippy::too_many_lines)]
 #[tokio::main]
 async fn main() {
+    // ─── `theyos-engine ptyd`: the PTY supervisor from the engine's own file ──
+    //
+    // Dispatched before any engine logging or configuration, because this
+    // process is not an engine: it is the supervisor that owns the pane
+    // shells (`terminal_rs::supervisor_cli` explains why it runs from this
+    // file — macOS Accessibility is granted per executable path, and one
+    // grant on `theyos-engine` must cover the shells' parent). An engine
+    // older than this dispatch would fall through and start an HTTP server
+    // under the supervisor's label; the Mac lifecycle only writes the `ptyd`
+    // LaunchAgent after staging an engine that carries it.
+    let argv: Vec<String> = std::env::args().collect();
+    // `theyos-engine accessibility [--prompt]`: the Mac app asks, with launch
+    // responsibility disclaimed, whether THIS file is trusted for
+    // Accessibility — the identity the supervisor and every pane shell run
+    // under (`server_rs::accessibility_cli`).
+    if argv.len() >= 2 && argv[1] == "accessibility" {
+        std::process::exit(server_rs::accessibility_cli::run(&argv[2..]));
+    }
+    if argv.len() >= 2 && argv[1] == "ptyd" {
+        terminal_rs::supervisor_cli::init_tracing();
+        if let Err(error) = terminal_rs::supervisor_cli::run(&argv[2..]).await {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+        return;
+    }
+
     // Initialise structured logging. Respect RUST_LOG; default to INFO.
     //
     // `THEYOS_LOG_FORMAT` selects the formatter:
@@ -93,7 +120,6 @@ async fn main() {
     // When the binary is invoked with `install` as argv[1], we run the
     // install flow (bootstrap + emit pair-receiving QR) and exit. The daemon
     // is started separately by launchd/systemd without a subcommand.
-    let argv: Vec<String> = std::env::args().collect();
     if argv.len() == 2 && argv[1] == "--build-info" {
         println!("{}", serde_json::to_string(&server_rs::engine_artifact::current())
             .expect("engine artifact metadata must serialize"));

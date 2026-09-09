@@ -82,6 +82,14 @@ pub enum BootstrapErrorCode {
     /// 404 for all of them by design — the caller learns nothing beyond "type
     /// the six words on the Mac's screen again".
     PairCodeRejected,
+    /// The engine has no install profile yet, so it cannot judge which
+    /// install a claim belongs to. Typed on 2026-09-09: the claim handler
+    /// had emitted it as a raw literal since the addressing refactor.
+    ProfileMissing,
+    /// The claim names a different install profile than this engine's.
+    ProfileMismatch,
+    /// The setup invitation was already claimed by another Mac.
+    InvitationAlreadyClaimed,
     /// Unrecognized / future code (fail-soft catch-all).
     #[serde(other)]
     Unknown,
@@ -119,6 +127,9 @@ impl BootstrapErrorCode {
             Self::AcceptHouseholdNotPending => "accept_household_not_pending",
             Self::EngineInitializing => "engine_initializing",
             Self::PairCodeRejected => "pair_code_rejected",
+            Self::ProfileMissing => "profile_missing",
+            Self::ProfileMismatch => "profile_mismatch",
+            Self::InvitationAlreadyClaimed => "invitation_already_claimed",
             Self::Unknown => "unknown",
         }
     }
@@ -152,12 +163,15 @@ impl BootstrapErrorCode {
             "accept_household_not_pending" => Self::AcceptHouseholdNotPending,
             "engine_initializing" => Self::EngineInitializing,
             "pair_code_rejected" => Self::PairCodeRejected,
+            "profile_missing" => Self::ProfileMissing,
+            "profile_mismatch" => Self::ProfileMismatch,
+            "invitation_already_claimed" => Self::InvitationAlreadyClaimed,
             _ => Self::Unknown,
         }
     }
 
     /// Every concrete (non-`Unknown`) code, for exhaustiveness tests + fixtures.
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 28] = [
         Self::InvalidCbor,
         Self::InvalidRequest,
         Self::InvalidName,
@@ -183,6 +197,9 @@ impl BootstrapErrorCode {
         Self::AcceptHouseholdNotPending,
         Self::EngineInitializing,
         Self::PairCodeRejected,
+        Self::ProfileMissing,
+        Self::ProfileMismatch,
+        Self::InvitationAlreadyClaimed,
     ];
 }
 
@@ -259,10 +276,13 @@ mod tests {
                 | BootstrapErrorCode::InvitationNotFound
                 | BootstrapErrorCode::AcceptHouseholdNotPending
                 | BootstrapErrorCode::EngineInitializing
-                | BootstrapErrorCode::PairCodeRejected => {}
+                | BootstrapErrorCode::PairCodeRejected
+                | BootstrapErrorCode::ProfileMissing
+                | BootstrapErrorCode::ProfileMismatch
+                | BootstrapErrorCode::InvitationAlreadyClaimed => {}
                 BootstrapErrorCode::Unknown => panic!("ALL must not contain Unknown"),
             }
         }
-        assert_eq!(BootstrapErrorCode::ALL.len(), 25);
+        assert_eq!(BootstrapErrorCode::ALL.len(), 28);
     }
 }
