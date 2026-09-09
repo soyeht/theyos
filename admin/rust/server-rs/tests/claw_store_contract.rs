@@ -109,7 +109,10 @@ fn household_claw_contract_routes_are_mounted_with_declared_handlers() {
 #[test]
 fn household_claw_contract_handlers_require_declared_auth() {
     let contract = contract();
-    let handlers = include_str!("../src/handlers_household_claws.rs");
+    let handlers = concat!(
+        include_str!("../src/handlers_household_claws.rs"),
+        include_str!("../src/handlers_household_claws/tests.rs")
+    );
 
     assert!(
         handlers.contains(
@@ -287,8 +290,14 @@ fn household_claw_contract_handlers_require_declared_auth() {
 fn owner_site_ake_route_is_single_ws_record_aead_and_stays_pre_effect_after_c3() {
     let routes = include_str!("../src/claw_store_routes.rs");
     let bootstrap = include_str!("../src/household_bootstrap.rs");
-    let handlers = include_str!("../src/handlers_household_claws.rs");
-    let ake = include_str!("../src/owner_site/ake.rs");
+    let handlers = concat!(
+        include_str!("../src/handlers_household_claws.rs"),
+        include_str!("../src/handlers_household_claws/tests.rs")
+    );
+    let ake = concat!(
+        include_str!("../src/owner_site/ake.rs"),
+        include_str!("../src/owner_site/ake/harness.rs")
+    );
     let lib = include_str!("../src/lib.rs");
 
     let route = contract()
@@ -467,8 +476,14 @@ fn owner_site_ake_route_is_single_ws_record_aead_and_stays_pre_effect_after_c3()
 #[test]
 fn owner_site_promotion_skeleton_is_deny_only_and_unwired() {
     let promotion = include_str!("../src/owner_site/promotion.rs");
-    let ake = include_str!("../src/owner_site/ake.rs");
-    let handlers = include_str!("../src/handlers_household_claws.rs");
+    let ake = concat!(
+        include_str!("../src/owner_site/ake.rs"),
+        include_str!("../src/owner_site/ake/harness.rs")
+    );
+    let handlers = concat!(
+        include_str!("../src/handlers_household_claws.rs"),
+        include_str!("../src/handlers_household_claws/tests.rs")
+    );
     let routes = include_str!("../src/claw_store_routes.rs");
     let bootstrap = include_str!("../src/household_bootstrap.rs");
     let lib = include_str!("../src/lib.rs");
@@ -586,7 +601,10 @@ fn owner_site_pre_effect_route_is_router_only_and_capability_sibling() {
     let capability = include_str!("../src/owner_site/capability.rs");
     let authority = include_str!("../src/owner_site/authority.rs");
     let challenge = include_str!("../src/owner_site/challenge.rs");
-    let handlers = include_str!("../src/handlers_household_claws.rs");
+    let handlers = concat!(
+        include_str!("../src/handlers_household_claws.rs"),
+        include_str!("../src/handlers_household_claws/tests.rs")
+    );
     let lib = include_str!("../src/lib.rs");
 
     let route = contract()
@@ -792,7 +810,10 @@ fn owner_site_pre_effect_route_is_router_only_and_capability_sibling() {
     // the store persists only a record projection (never the sealed carriers). ──
     let store = include_str!("../src/owner_site/resolution_store.rs");
     let promotion = include_str!("../src/owner_site/promotion.rs");
-    let ake = include_str!("../src/owner_site/ake.rs");
+    let ake = concat!(
+        include_str!("../src/owner_site/ake.rs"),
+        include_str!("../src/owner_site/ake/harness.rs")
+    );
 
     assert!(
         lib.contains("pub(crate) mod owner_site;")

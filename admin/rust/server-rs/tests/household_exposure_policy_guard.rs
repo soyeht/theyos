@@ -318,8 +318,16 @@ fn plain_http_listener_contract_is_pinned_in_code() {
         "diagnostic echo must remain explicit, fixed-size, and independently routed"
     );
     let household = read_src("handlers_household.rs");
+    // handlers_bootstrap.rs keeps its test listeners in extracted test files;
+    // scan the module with them so the claim still covers the listeners.
+    let bootstrap_with_tests = [
+        bootstrap.as_str(),
+        &read_src("handlers_bootstrap/tests.rs"),
+        &read_src("handlers_bootstrap/household_teardown_lifecycle_tests.rs"),
+    ]
+    .concat();
     for (file, source) in [
-        ("handlers_bootstrap.rs", bootstrap.as_str()),
+        ("handlers_bootstrap.rs", bootstrap_with_tests.as_str()),
         ("handlers_household.rs", household.as_str()),
     ] {
         assert!(

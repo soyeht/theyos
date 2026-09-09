@@ -3574,6 +3574,12 @@ fn assert_passkey_conversion_only_in_local_attested_helper() {
 fn runtime_lines_only(source: &str) -> String {
     let lines: Vec<&str> = source.lines().collect();
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    // An extracted test module file (`<module>/tests.rs`) declares itself with
+    // an inner `#![cfg(test)]` on its first line. Blank it whole, keeping the
+    // line count so reported numbers stay aligned with disk.
+    if source.starts_with("#![cfg(test)]") {
+        return vec![String::new(); lines.len()].join("\n");
+    }
     let mut index = 0usize;
 
     while index < lines.len() {
@@ -3635,6 +3641,19 @@ fn runtime_lines_only_keeps_production_minters_and_drops_test_module_ones() {
     assert!(
         runtime_lines_only(after_module).contains("sign_owner_with_verified_provenance"),
         "a minter call below a test module must survive the filter"
+    );
+
+    // An extracted test module file is excised whole, by its inner attribute.
+    let extracted =
+        "#![cfg(test)]\n\nfn t() {\n    PersonCert::sign_owner_with_verified_provenance();\n}\n";
+    assert!(
+        !runtime_lines_only(extracted).contains("sign_owner_with_verified_provenance"),
+        "a minter call inside an extracted `#![cfg(test)]` module file must be excised"
+    );
+    // Blanked, not truncated: one (empty) line per input line.
+    assert_eq!(
+        runtime_lines_only(extracted).split('\n').count(),
+        extracted.lines().count()
     );
 
     // Blanking, not deleting: reported line numbers stay aligned with disk.
@@ -4619,18 +4638,30 @@ fn product_a_per_claw_vpn_dev_config_remains_default_off_and_unwired() {
             let in_target_session_relay_module = path == target_session_relay_path;
             let in_target_session_router_module = path == target_session_router_path;
             let in_target_session_runtime_module = path == target_session_runtime_path;
-            let in_relay_stream_responder_reverse_connect_module =
-                path == relay_stream_responder_reverse_connect_path;
-            let in_relay_stream_reverse_connect_binding_module =
-                path == relay_stream_reverse_connect_binding_path;
-            let in_relay_stream_reverse_connect_pool_module =
-                path == relay_stream_reverse_connect_pool_path;
+            // A reviewed module is its file plus the extracted test files in
+            // its own directory (`<module>/tests.rs`).
+            let in_relay_stream_responder_reverse_connect_module = path
+                == relay_stream_responder_reverse_connect_path
+                || path.starts_with(
+                    server_src_dir.join("claw_share_relay_stream_responder_reverse_connect"),
+                );
+            let in_relay_stream_reverse_connect_binding_module = path
+                == relay_stream_reverse_connect_binding_path
+                || path.starts_with(
+                    server_src_dir.join("claw_share_relay_stream_reverse_connect_binding"),
+                );
+            let in_relay_stream_reverse_connect_pool_module = path
+                == relay_stream_reverse_connect_pool_path
+                || path.starts_with(
+                    server_src_dir.join("claw_share_relay_stream_reverse_connect_pool"),
+                );
             let in_relay_stream_runtime_module = path == relay_stream_runtime_path;
             let in_relay_stream_mount_module = path == relay_stream_mount_path;
             let in_relay_stream_target_router_module = path == relay_stream_target_router_path;
             let in_runtime_module = path == runtime_path;
             let in_wiring_module = path == wiring_path;
-            let in_startup_wiring_module = path == startup_wiring_path;
+            let in_startup_wiring_module = path == startup_wiring_path
+                || path.starts_with(server_src_dir.join("startup_wiring"));
             let in_linux_tun_module = path == linux_tun_path;
             let in_macos_utun_module = path == macos_utun_path;
             let in_packet_pump_tests = in_packet_pump_module
