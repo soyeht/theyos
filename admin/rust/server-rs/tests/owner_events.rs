@@ -3838,7 +3838,10 @@ fn approved_online_signal_source_guard_remains_stop_gated() {
 
 #[test]
 fn device_pairing_fan_out_gate_source_guard_remains_stop_gated() {
-    let device_pairing = include_str!("../src/handlers_device_pairing.rs");
+    let device_pairing = concat!(
+        include_str!("../src/handlers_device_pairing.rs"),
+        include_str!("../src/handlers_device_pairing/tests.rs")
+    );
     let approve_handler = source_segment(
         device_pairing,
         "pub async fn device_pairing_approve_handler(",
@@ -5418,7 +5421,10 @@ fn owner_webauthn_registration_local_source_guards_fail_closed_boundary() {
     assert!(tcp_finish.contains("authorize_owner_auth_enroll_initial_request"));
     assert!(!tcp_finish.contains("authorize_macos_local_caller"));
 
-    let router_source = include_str!("../src/household_bootstrap.rs");
+    let router_source = concat!(
+        include_str!("../src/household_bootstrap.rs"),
+        include_str!("../src/household_bootstrap/tests.rs")
+    );
     assert!(!router_source.contains("/registration/local/"));
     assert!(!router_source.contains(".merge(owner_webauthn_macos_local_registration_router"));
     assert!(router_source.contains("spawn_macos_local_registration_listener"));
@@ -5623,7 +5629,10 @@ fn owner_approval_rollout_source_guard_requires_explicit_default_off_wiring() {
     assert!(parser.contains("with_secure_upgrade(SecureUpgradeEnforcement::StrongMintingEnabled)"));
     assert!(parser.contains("OwnerApprovalEnforcementPolicy::default()"));
 
-    let router_source = include_str!("../src/household_bootstrap.rs");
+    let router_source = concat!(
+        include_str!("../src/household_bootstrap.rs"),
+        include_str!("../src/household_bootstrap/tests.rs")
+    );
     assert!(router_source.contains(
         "let owner_approval_policy = handlers_owner_events::owner_approval_policy_from_env();"
     ));
@@ -5702,7 +5711,10 @@ fn owner_webauthn_revoke_start_source_guards_read_only_contract() {
     assert!(!auth_helper.contains("HouseholdAddMachine"));
     assert!(!auth_helper.contains("OwnerAuthEnrollInitial"));
 
-    let router_source = include_str!("../src/household_bootstrap.rs");
+    let router_source = concat!(
+        include_str!("../src/household_bootstrap.rs"),
+        include_str!("../src/household_bootstrap/tests.rs")
+    );
     assert!(router_source.contains("/api/v1/household/owner-webauthn/revoke/start"));
 }
 
@@ -5774,7 +5786,10 @@ fn owner_webauthn_add_credential_start_source_guards_challenge_only_contract() {
     assert!(!auth_helper.contains("HouseholdAddMachine"));
     assert!(!auth_helper.contains("OwnerAuthEnrollInitial"));
 
-    let router_source = include_str!("../src/household_bootstrap.rs");
+    let router_source = concat!(
+        include_str!("../src/household_bootstrap.rs"),
+        include_str!("../src/household_bootstrap/tests.rs")
+    );
     assert!(router_source.contains("/api/v1/household/owner-webauthn/add-credential/start"));
     assert!(router_source.contains("/api/v1/household/owner-webauthn/add-credential/finish"));
 }
@@ -5893,7 +5908,10 @@ fn owner_webauthn_add_credential_finish_source_guards_mutation_contract() {
     assert!(!auth_helper.contains("HouseholdAddMachine"));
     assert!(!auth_helper.contains("OwnerAuthEnrollInitial"));
 
-    let router_source = include_str!("../src/household_bootstrap.rs");
+    let router_source = concat!(
+        include_str!("../src/household_bootstrap.rs"),
+        include_str!("../src/household_bootstrap/tests.rs")
+    );
     assert!(router_source.contains("/api/v1/household/owner-webauthn/add-credential/finish"));
 }
 
@@ -5967,7 +5985,10 @@ fn owner_webauthn_revoke_finish_source_guards_mutation_contract() {
     assert!(!auth_helper.contains("HouseholdAddMachine"));
     assert!(!auth_helper.contains("OwnerAuthEnrollInitial"));
 
-    let router_source = include_str!("../src/household_bootstrap.rs");
+    let router_source = concat!(
+        include_str!("../src/household_bootstrap.rs"),
+        include_str!("../src/household_bootstrap/tests.rs")
+    );
     assert!(router_source.contains("/api/v1/household/owner-webauthn/revoke/finish"));
 }
 
@@ -6236,7 +6257,10 @@ fn owner_webauthn_recovery_source_guards_provision_readiness_contract() {
         assert!(!auth_helper.contains("OwnerAuthEnrollInitial"));
     }
 
-    let router_source = include_str!("../src/household_bootstrap.rs");
+    let router_source = concat!(
+        include_str!("../src/household_bootstrap.rs"),
+        include_str!("../src/household_bootstrap/tests.rs")
+    );
     assert!(router_source.contains("/api/v1/household/owner-webauthn/recovery/status"));
     assert!(router_source.contains("/api/v1/household/owner-webauthn/recovery/start"));
     assert!(router_source.contains("/api/v1/household/owner-webauthn/recovery/finish"));

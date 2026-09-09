@@ -691,7 +691,11 @@ fn source_without_dev_datapath_module(source: &str) -> String {
 
 #[test]
 fn source_keeps_session_open_boundary_bounded() {
-    let source = source_without_dev_datapath_module(include_str!("main.rs"));
+    // Production plus this extracted test module, as when the tests were inline.
+    let source = source_without_dev_datapath_module(concat!(
+        include_str!("main.rs"),
+        include_str!("tests.rs")
+    ));
     assert!(source.contains("OpenSession"));
     assert!(source.contains(DEV_HOST_ACK));
     for forbidden in [

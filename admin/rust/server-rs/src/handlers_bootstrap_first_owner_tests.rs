@@ -594,7 +594,12 @@ fn public_attempt_matcher_accepts_one_valid_case_and_rejects_each_divergence() {
 
 #[test]
 fn household_bootstrap_does_not_select_addresses_from_administrative_or_interface_helpers() {
-    let source = include_str!("handlers_bootstrap.rs");
+    // The module's tests live in extracted files; sweep them with it.
+    let source = concat!(
+        include_str!("handlers_bootstrap.rs"),
+        include_str!("handlers_bootstrap/tests.rs"),
+        include_str!("handlers_bootstrap/household_teardown_lifecycle_tests.rs")
+    );
     for forbidden in [
         "best_qr_host",
         "current_tailnet_ipv4",

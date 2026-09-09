@@ -1764,7 +1764,11 @@ fn engine_relay_identity_is_default_off_and_pins_advertised_npub_to_subscription
 
 #[test]
 fn household_bootstrap_relay_mount_stays_mesh_runtime_free() {
-    let source = include_str!("../household_bootstrap.rs");
+    // Production plus this extracted test module, as when the tests were inline.
+    let source = concat!(
+        include_str!("../household_bootstrap.rs"),
+        include_str!("tests.rs")
+    );
     let forbidden = [
         concat!("mesh", "_rs"),
         concat!("THEYOS", "_MESH"),

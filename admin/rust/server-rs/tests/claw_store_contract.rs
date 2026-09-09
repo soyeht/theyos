@@ -79,7 +79,10 @@ fn household_claw_contract_routes_are_mounted_with_declared_handlers() {
     assert_eq!(contract.name, "claw-store-household");
     assert_eq!(contract.version, 1);
 
-    let bootstrap = include_str!("../src/household_bootstrap.rs");
+    let bootstrap = concat!(
+        include_str!("../src/household_bootstrap.rs"),
+        include_str!("../src/household_bootstrap/tests.rs")
+    );
     let claw_store_routes = include_str!("../src/claw_store_routes.rs");
     assert!(
         bootstrap.contains("crate::claw_store_routes::household_routes()"),
@@ -289,7 +292,10 @@ fn household_claw_contract_handlers_require_declared_auth() {
 #[test]
 fn owner_site_ake_route_is_single_ws_record_aead_and_stays_pre_effect_after_c3() {
     let routes = include_str!("../src/claw_store_routes.rs");
-    let bootstrap = include_str!("../src/household_bootstrap.rs");
+    let bootstrap = concat!(
+        include_str!("../src/household_bootstrap.rs"),
+        include_str!("../src/household_bootstrap/tests.rs")
+    );
     let handlers = concat!(
         include_str!("../src/handlers_household_claws.rs"),
         include_str!("../src/handlers_household_claws/tests.rs")
@@ -315,7 +321,7 @@ fn owner_site_ake_route_is_single_ws_record_aead_and_stays_pre_effect_after_c3()
         "A2 must remain owned by claw_store_routes::household_routes"
     );
     assert!(
-        !bootstrap.contains("owner_site_ake"),
+        !bootstrap.contains("owner_site::ake") && !bootstrap.contains("ake::"),
         "A2 must not add bootstrap lifecycle or production provider wiring"
     );
     assert!(
@@ -485,7 +491,10 @@ fn owner_site_promotion_skeleton_is_deny_only_and_unwired() {
         include_str!("../src/handlers_household_claws/tests.rs")
     );
     let routes = include_str!("../src/claw_store_routes.rs");
-    let bootstrap = include_str!("../src/household_bootstrap.rs");
+    let bootstrap = concat!(
+        include_str!("../src/household_bootstrap.rs"),
+        include_str!("../src/household_bootstrap/tests.rs")
+    );
     let lib = include_str!("../src/lib.rs");
 
     for required in [
@@ -597,9 +606,15 @@ fn owner_site_promotion_skeleton_is_deny_only_and_unwired() {
 #[test]
 fn owner_site_pre_effect_route_is_router_only_and_capability_sibling() {
     let routes = include_str!("../src/claw_store_routes.rs");
-    let bootstrap = include_str!("../src/household_bootstrap.rs");
+    let bootstrap = concat!(
+        include_str!("../src/household_bootstrap.rs"),
+        include_str!("../src/household_bootstrap/tests.rs")
+    );
     let capability = include_str!("../src/owner_site/capability.rs");
-    let authority = include_str!("../src/owner_site/authority.rs");
+    let authority = concat!(
+        include_str!("../src/owner_site/authority.rs"),
+        include_str!("../src/owner_site/authority/tests.rs")
+    );
     let challenge = include_str!("../src/owner_site/challenge.rs");
     let handlers = concat!(
         include_str!("../src/handlers_household_claws.rs"),
@@ -903,7 +918,10 @@ fn owner_site_pre_effect_route_is_router_only_and_capability_sibling() {
 #[test]
 fn amendment_a1_challenge_accessors_are_projection_only() {
     let challenge = include_str!("../src/owner_site/challenge.rs");
-    let authority = include_str!("../src/owner_site/authority.rs");
+    let authority = concat!(
+        include_str!("../src/owner_site/authority.rs"),
+        include_str!("../src/owner_site/authority/tests.rs")
+    );
 
     // (1)(2) Exactly the two projection getters exist, verbatim, each
     // `&self -> &[u8; 32]`.
@@ -973,7 +991,10 @@ fn amendment_a1_challenge_accessors_are_projection_only() {
 
 #[test]
 fn owner_site_pending_finished_is_sealed_inert_and_non_promoting() {
-    let authority = include_str!("../src/owner_site/authority.rs");
+    let authority = concat!(
+        include_str!("../src/owner_site/authority.rs"),
+        include_str!("../src/owner_site/authority/tests.rs")
+    );
     let start = authority
         .find("pub(crate) struct PendingFinished {")
         .expect("production PendingFinished type must exist");

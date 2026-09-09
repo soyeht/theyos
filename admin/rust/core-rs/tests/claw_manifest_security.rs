@@ -4,7 +4,10 @@ const CLAW_MANIFEST: &str = include_str!("../../../../claws/manifest.yml");
 const INSTALL_LINUX: &str = include_str!("../../../../scripts/install-linux.sh");
 const LAUNCHER_MAIN: &str = include_str!("../../launcher-rs/src/main.rs");
 const SERVER_CONFIG: &str = include_str!("../../server-rs/src/config.rs");
-const VM_INSTALLER_PLAN: &str = include_str!("../../vmrunner-rs/src/installer_plan.rs");
+const VM_INSTALLER_PLAN: &str = concat!(
+    include_str!("../../vmrunner-rs/src/installer_plan.rs"),
+    include_str!("../../vmrunner-rs/src/installer_plan/tests.rs")
+);
 const VM_TOOLS_PLAN: &str = include_str!("../../vmrunner-rs/src/tools_plan.rs");
 
 #[test]
